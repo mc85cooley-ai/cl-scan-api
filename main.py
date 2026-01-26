@@ -1,4 +1,5 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+# main.py (FULL FILE) — includes /api/identify + makes photo checks NON-BLOCKING
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import JSONResponse
 from typing import Optional, List, Dict, Any
 import numpy as np
@@ -7,12 +8,11 @@ import httpx
 import base64
 import os
 import json
-import re
 import uuid
 
 app = FastAPI(title="Collectors League Scan API")
 
-APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-01-26d")
+APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-01-26b")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
@@ -41,7 +41,7 @@ def decode_image(file_bytes: bytes):
     return cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
 
-def b64_image_from_cv2(img_bgr, fmt=".jpg", quality=92):
+def b64_image_from_cv2(img_bgr, fmt=".jpg", quality=95):
     encode_params = []
     if fmt.lower() in [".jpg", ".jpeg"]:
         encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)]
@@ -77,10 +77,12 @@ def find_card_quad(img_bgr):
 
     for c in contours:
         area = cv2.contourArea(c)
-        if area < img_area * 0.06:
+        if area < img_area * 0.08:
             continue
+
         peri = cv2.arcLength(c, True)
         approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+
         if len(approx) == 4:
             return approx.reshape(4, 2).astype(np.float32)
 
@@ -90,14 +92,16 @@ def find_card_quad(img_bgr):
 def order_points(pts):
     s = pts.sum(axis=1)
     diff = np.diff(pts, axis=1).reshape(-1)
+
     tl = pts[np.argmin(s)]
     br = pts[np.argmax(s)]
     tr = pts[np.argmin(diff)]
     bl = pts[np.argmax(diff)]
+
     return np.array([tl, tr, br, bl], dtype=np.float32)
 
 
-def warp_card(img, quad, out_w=1200, out_h=1680):
+def warp_card(img, quad, out_w=900, out_h=1260):
     pts = order_points(quad)
     dst = np.array([[0, 0], [out_w - 1, 0], [out_w - 1, out_h - 1], [0, out_h - 1]], dtype=np.float32)
     M = cv2.getPerspectiveTransform(pts, dst)
@@ -106,7 +110,7 @@ def warp_card(img, quad, out_w=1200, out_h=1680):
 
 def whitening_risk_edge(gray_warped):
     h, w = gray_warped.shape[:2]
-    band = 12
+    band = 10
     top = gray_warped[0:band, :]
     bot = gray_warped[h - band:h, :]
     left = gray_warped[:, 0:band]
@@ -122,73 +126,64 @@ def surface_line_risk(gray_angle_warped):
     return float(high.mean() / denom)
 
 
-def clamp01(x):
-    return float(max(0.0, min(1.0, x)))
-
-
 def normalize_number(num):
     if not num:
         return None
-    s = str(num).strip()
-    s = s.replace(" ", "")
-    s = s.replace("\\", "/")
+    s = str(num).strip().replace(" ", "").replace("\\", "/")
     return s
 
 
-def safe_str(x):
-    if x is None:
+def extract_response_text(resp_json: dict) -> Optional[str]:
+    """
+    Responses API can vary. This tries multiple patterns to get the model text.
+    """
+    if not isinstance(resp_json, dict):
         return None
-    return str(x).strip() if str(x).strip() else None
+
+    # Some variants include top-level output_text
+    if isinstance(resp_json.get("output_text"), str) and resp_json.get("output_text").strip():
+        return resp_json["output_text"].strip()
+
+    out = resp_json.get("output", [])
+    if isinstance(out, list):
+        for item in out:
+            if not isinstance(item, dict):
+                continue
+            # message style
+            if item.get("type") == "message":
+                content = item.get("content", [])
+                if isinstance(content, list):
+                    for c in content:
+                        if isinstance(c, dict):
+                            t = c.get("text")
+                            if isinstance(t, str) and t.strip():
+                                return t.strip()
+            # generic content style
+            content = item.get("content")
+            if isinstance(content, list):
+                for c in content:
+                    if isinstance(c, dict):
+                        t = c.get("text")
+                        if isinstance(t, str) and t.strip():
+                            return t.strip()
+    return None
 
 
-def crop_regions_for_id(img_bgr):
+async def openai_autoid_pokemon(front_bgr) -> dict:
     """
-    Returns a list of (label, crop_bgr) to improve hit-rate:
-    - full image
-    - top name bar region
-    - bottom number region
-    """
-    h, w = img_bgr.shape[:2]
-    crops = []
-
-    crops.append(("full", img_bgr))
-
-    # top bar (name)
-    y1 = int(h * 0.03)
-    y2 = int(h * 0.22)
-    x1 = int(w * 0.05)
-    x2 = int(w * 0.95)
-    top = img_bgr[y1:y2, x1:x2].copy()
-    crops.append(("top", top))
-
-    # bottom area (collector number)
-    y1b = int(h * 0.78)
-    y2b = int(h * 0.98)
-    x1b = int(w * 0.03)
-    x2b = int(w * 0.55)
-    bot = img_bgr[y1b:y2b, x1b:x2b].copy()
-    crops.append(("bottom", bot))
-
-    return crops
-
-
-async def openai_autoid_pokemon(img_bgr):
-    """
-    FIXED: Responses API needs image_url with a data: URL.
-    Returns dict schema:
-      {name, number, set_name, confidence, notes}
-    or {error: True, ...}
+    Return dict in schema:
+    {name, number, set_name, confidence, notes}
+    Or {error: True, ...}
     """
     if not OPENAI_API_KEY:
         return {"error": True, "reason": "missing_openai_key"}
 
-    img_b64 = b64_image_from_cv2(img_bgr, fmt=".jpg", quality=92)
-    data_url = f"data:image/jpeg;base64,{img_b64}"
+    img_b64 = b64_image_from_cv2(front_bgr, fmt=".jpg", quality=95)
 
     instructions = (
-        "You are identifying a Pokémon trading card from a photo.\n"
-        "Return ONLY valid JSON (no markdown).\n"
-        "Do not guess. If you cannot clearly read something, return null.\n"
+        "Identify this Pokémon trading card from the photo.\n"
+        "Return ONLY valid JSON.\n"
+        "If uncertain, use null.\n"
         "Schema:\n"
         "{"
         "\"name\": string|null,"
@@ -197,106 +192,77 @@ async def openai_autoid_pokemon(img_bgr):
         "\"confidence\": number,"
         "\"notes\": string|null"
         "}\n"
-        "Guidance:\n"
-        "- name should be the printed card name (e.g., 'Charizard ex').\n"
-        "- number should be the collector number like '006/165' (keep leading zeros if shown).\n"
-        "- set_name should be the set as printed/known (e.g., 'Scarlet & Violet—151').\n"
-        "- confidence is 0..1.\n"
+        "Rules:\n"
+        "- Do NOT guess.\n"
+        "- Prefer exact printed card name.\n"
+        "- number should look like '006/165' if visible.\n"
+        "- set_name should be the set title if visible (e.g. 'Scarlet & Violet—151').\n"
     )
 
     payload = {
         "model": OPENAI_MODEL,
         "instructions": instructions,
-        "input": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": "Identify this Pokémon card. Output JSON only."},
-                    {"type": "input_image", "image_url": data_url},
-                ],
-            }
-        ],
+        "input": [{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "Identify this Pokémon card. Return JSON only."},
+                {"type": "input_image", "image_base64": img_b64},
+            ]
+        }],
         "response_format": {"type": "json_object"},
     }
 
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
 
-    async with httpx.AsyncClient(timeout=45) as client:
+    async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post("https://api.openai.com/v1/responses", headers=headers, json=payload)
-        if r.status_code < 200 or r.status_code >= 300:
-            return {"error": True, "status": r.status_code, "body": r.text[:800]}
 
-        data = r.json()
+    if r.status_code < 200 or r.status_code >= 300:
+        return {"error": True, "status": r.status_code, "body": r.text[:800]}
 
-        text = None
-        for item in data.get("output", []):
-            if item.get("type") == "message":
-                for c in item.get("content", []):
-                    if c.get("type") in ("output_text", "text"):
-                        text = c.get("text")
-                        break
-            if text:
-                break
+    data = r.json()
+    text = extract_response_text(data)
+    if not text:
+        return {"error": True, "reason": "no_output_text", "raw": str(data)[:800]}
 
-        if not text:
-            return {"error": True, "reason": "no_output_text", "raw": str(data)[:800]}
-
-        try:
-            return json.loads(text)
-        except Exception:
-            return {"error": True, "reason": "json_parse_failed", "text": str(text)[:800]}
-
-
-def score_id_result(res: Dict[str, Any]) -> float:
-    """
-    Prefer results that contain BOTH name and number, then set_name.
-    Use confidence as base.
-    """
-    if not isinstance(res, dict) or res.get("error"):
-        return -1.0
-    conf = 0.0
     try:
-        conf = float(res.get("confidence") or 0.0)
+        return json.loads(text)
     except Exception:
-        conf = 0.0
-
-    bonus = 0.0
-    if safe_str(res.get("name")):
-        bonus += 0.20
-    if safe_str(res.get("number")):
-        bonus += 0.25
-    if safe_str(res.get("set_name")):
-        bonus += 0.10
-
-    return conf + bonus
+        # Model might return JSON with extra whitespace or wrapper; try to salvage
+        try:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                return json.loads(text[start:end+1])
+        except Exception:
+            pass
+        return {"error": True, "reason": "json_parse_failed", "text": text[:800]}
 
 
-async def autoid_front(front_bgr, front_warped=None):
+async def autoid_best(front_raw, front_warped=None) -> Optional[dict]:
     """
-    Run ID on:
-    - warped (if available) full/top/bottom
-    - raw full/top/bottom
-    Return best.
+    Try warped then raw; return best non-error result by confidence.
     """
-    candidates = []
-
-    imgs = []
-    if front_warped is not None:
-        imgs.append(("warped", front_warped))
-    imgs.append(("raw", front_bgr))
-
-    for base_label, img in imgs:
-        for crop_label, crop in crop_regions_for_id(img):
-            res = await openai_autoid_pokemon(crop)
-            if isinstance(res, dict) and not res.get("error"):
-                res["_src"] = f"{base_label}:{crop_label}"
-                candidates.append(res)
-
-    if not candidates:
-        return None
-
-    candidates.sort(key=score_id_result, reverse=True)
-    return candidates[0]
+    best = None
+    for img in [front_warped, front_raw]:
+        if img is None:
+            continue
+        res = await openai_autoid_pokemon(img)
+        if isinstance(res, dict) and not res.get("error"):
+            try:
+                conf = float(res.get("confidence") or 0.0)
+            except Exception:
+                conf = 0.0
+            if best is None:
+                best = res
+            else:
+                try:
+                    best_conf = float(best.get("confidence") or 0.0)
+                except Exception:
+                    best_conf = 0.0
+                if conf > best_conf:
+                    best = res
+    return best
 
 
 async def pokemontcg_lookup(name, number, set_name):
@@ -304,8 +270,8 @@ async def pokemontcg_lookup(name, number, set_name):
         return None
 
     q_parts = []
-    safe_name_q = name.replace('"', '\\"')
-    q_parts.append(f'name:"{safe_name_q}"')
+    safe_name = name.replace('"', '\\"')
+    q_parts.append(f'name:"{safe_name}"')
 
     if number:
         safe_num = number.replace('"', '\\"')
@@ -324,7 +290,7 @@ async def pokemontcg_lookup(name, number, set_name):
     url = "https://api.pokemontcg.io/v2/cards"
     params = {"q": q, "pageSize": 3}
 
-    async with httpx.AsyncClient(timeout=20) as client:
+    async with httpx.AsyncClient(timeout=25) as client:
         r = await client.get(url, headers=headers, params=params)
         if r.status_code != 200:
             return None
@@ -332,7 +298,7 @@ async def pokemontcg_lookup(name, number, set_name):
         js = r.json()
         cards = js.get("data", [])
         if not cards:
-            params = {"q": f'name:"{safe_name_q}"', "pageSize": 3}
+            params = {"q": f'name:"{safe_name}"', "pageSize": 3}
             r2 = await client.get(url, headers=headers, params=params)
             if r2.status_code != 200:
                 return None
@@ -351,105 +317,122 @@ async def pokemontcg_lookup(name, number, set_name):
             "set_name": set_obj.get("name"),
             "series": set_obj.get("series"),
             "releaseDate": release,
-            "year": year,
+            "year": year
         }
 
 
-def quality_warnings(img_bgr, label) -> List[str]:
+def quality_warnings(img, label, warnings: List[str]):
     """
-    Much less strict. These are WARNINGS only (never block ID).
+    NON-BLOCKING warnings only.
     """
-    warns = []
-    h, w = img_bgr.shape[:2]
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    h, w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # resolution warning
     if min(h, w) < 900:
-        warns.append(f"{label}: Low resolution (move closer / use better light)")
+        warnings.append(f"{label}: Low resolution (move closer)")
 
-    # blur warning (lower threshold than before; less annoying)
     bs = blur_score(gray)
-    if bs < 35:
-        warns.append(f"{label}: May be out of focus (tap to focus, hold steady)")
+    if bs < 70:
+        warnings.append(f"{label}: Slight blur risk (tap to focus)")
 
     over = overexposed_ratio(gray)
-    if over > 0.08:
-        warns.append(f"{label}: Glare risk (tilt slightly, reduce reflections)")
+    if over > 0.06:
+        warnings.append(f"{label}: Glare/overexposure risk")
 
     under = underexposed_ratio(gray)
-    if under > 0.18:
-        warns.append(f"{label}: Too dark (increase lighting)")
+    if under > 0.15:
+        warnings.append(f"{label}: Too dark")
 
-    return warns
+
+def build_identity_from_auto(auto_best: Optional[dict], tcg: Optional[dict]) -> Dict[str, Any]:
+    series = "Unknown"
+    year = "Unknown"
+    name = "Unknown card"
+    number = ""
+
+    id_conf = None
+    if isinstance(auto_best, dict):
+        try:
+            id_conf = float(auto_best.get("confidence")) if auto_best.get("confidence") is not None else None
+        except Exception:
+            id_conf = None
+
+    if tcg:
+        name = tcg.get("name") or name
+        year = tcg.get("year") or year
+        series = tcg.get("series") or tcg.get("set_name") or series
+        number = tcg.get("number") or number
+    else:
+        if isinstance(auto_best, dict):
+            if auto_best.get("name"):
+                name = str(auto_best.get("name"))
+            if auto_best.get("set_name"):
+                series = str(auto_best.get("set_name"))
+            if auto_best.get("number"):
+                number = str(auto_best.get("number"))
+
+    return {
+        "name": name,
+        "series": series,
+        "year": year,
+        "number": number,
+        "id_confidence": id_conf
+    }
 
 
 @app.post("/api/identify")
 async def identify(front: UploadFile = File(...)):
     fb = await front.read()
-    if len(fb) < 1500:
+    if not fb or len(fb) < 1500:
         raise HTTPException(status_code=400, detail="Front image looks empty/corrupt.")
 
     front_img = decode_image(fb)
     if front_img is None:
         raise HTTPException(status_code=400, detail="Could not decode front image.")
 
-    warnings = quality_warnings(front_img, "Front")
+    warnings: List[str] = []
+    quality_warnings(front_img, "Front", warnings)
 
     fq = find_card_quad(front_img)
-    front_warp = warp_card(front_img, fq, out_w=1200, out_h=1680) if fq is not None else None
+    front_warp_id = warp_card(front_img, fq, out_w=1400, out_h=1960) if fq is not None else None
 
-    best = await autoid_front(front_img, front_warp)
+    auto_best = await autoid_best(front_img, front_warp_id)
+
+    card_name = None
+    card_number = None
+    set_name = None
+    if isinstance(auto_best, dict):
+        card_name = auto_best.get("name")
+        card_number = normalize_number(auto_best.get("number"))
+        set_name = auto_best.get("set_name")
+
+    tcg = await pokemontcg_lookup(card_name, card_number, set_name) if card_name else None
+    ident = build_identity_from_auto(auto_best, tcg)
+
+    # if we still can't identify, be explicit but return JSON (never HTML)
+    if ident["name"] == "Unknown card" and not tcg:
+        warnings.append("Auto-ID: Could not confidently read name/number. Reduce glare and move closer to the text.")
 
     identify_token = str(uuid.uuid4())
 
-    # Defaults
-    out_name = "Unknown"
-    out_series = "Unknown"
-    out_year = "Unknown"
-    out_number = ""
-    out_conf = 0.10
+    # Confidence: prefer OpenAI confidence if available; else 0
+    conf = 0.0
+    if ident.get("id_confidence") is not None:
+        conf = float(max(0.0, min(1.0, ident["id_confidence"])))
+    elif tcg:
+        conf = 0.85
 
-    if isinstance(best, dict):
-        card_name = safe_str(best.get("name"))
-        card_number = normalize_number(best.get("number"))
-        set_name = safe_str(best.get("set_name"))
-        try:
-            out_conf = clamp01(float(best.get("confidence") or 0.0))
-        except Exception:
-            out_conf = 0.10
-
-        # If OpenAI gave anything usable, enrich via PokemonTCG
-        tcg = await pokemontcg_lookup(card_name, card_number, set_name) if card_name else None
-
-        if tcg:
-            out_name = safe_str(tcg.get("name")) or (card_name or out_name)
-            out_number = safe_str(tcg.get("number")) or (card_number or out_number)
-            out_series = safe_str(tcg.get("series")) or safe_str(tcg.get("set_name")) or (set_name or out_series)
-            out_year = safe_str(tcg.get("year")) or out_year
-        else:
-            if card_name:
-                out_name = card_name
-            if set_name:
-                out_series = set_name
-            if card_number:
-                out_number = card_number
-
-    # Add a helpful note if quad wasn’t found (but do NOT fail)
-    if fq is None:
-        warnings.append("Front: Could not detect full card boundary (OK for ID, but assessment may need better framing).")
-
-    return JSONResponse(
-        content={
-            "identify_token": identify_token,
-            "name": out_name,
-            "series": out_series,
-            "year": out_year,
-            "number": out_number,
-            "confidence": out_conf,
-            "warnings": warnings,
-            "version": APP_VERSION,
-        }
-    )
+    return JSONResponse(content={
+        "identify_token": identify_token,
+        "name": ident["name"],
+        "series": ident["series"],
+        "year": ident["year"],
+        "number": ident["number"],
+        "confidence": conf,
+        "warnings": warnings,
+        "version": APP_VERSION,
+        "debug_openai": (auto_best if isinstance(auto_best, dict) and auto_best.get("error") else None)
+    })
 
 
 @app.post("/api/verify")
@@ -457,7 +440,7 @@ async def verify(
     front: UploadFile = File(...),
     back: UploadFile = File(...),
     angle: Optional[UploadFile] = File(None),
-    identify_token: Optional[str] = None,
+    identify_token: Optional[str] = Form(None),  # accepted but not required
 ):
     fb = await front.read()
     bb = await back.read()
@@ -477,78 +460,73 @@ async def verify(
 
     defects: List[str] = []
     warnings: List[str] = []
-    confidence = 0.70
+    confidence = 0.72
 
-    # Always provide warnings (never hard-block)
-    warnings += quality_warnings(front_img, "Front")
-    warnings += quality_warnings(back_img, "Back")
+    # Non-blocking warnings
+    quality_warnings(front_img, "Front", warnings)
+    quality_warnings(back_img, "Back", warnings)
     if angle_img is not None:
-        warnings += quality_warnings(angle_img, "Angle")
+        quality_warnings(angle_img, "Angled", warnings)
+    else:
+        warnings.append("Angled: Not provided (recommended for surface/foil assessment)")
 
-    # Try ID again here as well (in case they skipped Identify)
+    # Identity (best-effort, but do NOT hard-fail assessment)
     fq = find_card_quad(front_img)
-    front_warp_id = warp_card(front_img, fq, out_w=1200, out_h=1680) if fq is not None else None
-    best = await autoid_front(front_img, front_warp_id)
+    front_warp_id = warp_card(front_img, fq, out_w=1400, out_h=1960) if fq is not None else None
+    auto_best = await autoid_best(front_img, front_warp_id)
 
     series = "Unknown"
     year = "Unknown"
-    name = "Unknown item/card"
-    number = ""
+    name = "Unknown card"
 
+    card_name = None
+    card_number = None
+    set_name = None
     id_conf = None
-    if isinstance(best, dict):
-        card_name = safe_str(best.get("name"))
-        card_number = normalize_number(best.get("number"))
-        set_name = safe_str(best.get("set_name"))
+
+    if isinstance(auto_best, dict) and not auto_best.get("error"):
+        card_name = auto_best.get("name")
+        card_number = normalize_number(auto_best.get("number"))
+        set_name = auto_best.get("set_name")
         try:
-            id_conf = float(best.get("confidence")) if best.get("confidence") is not None else None
+            id_conf = float(auto_best.get("confidence")) if auto_best.get("confidence") is not None else None
         except Exception:
             id_conf = None
 
-        tcg = await pokemontcg_lookup(card_name, card_number, set_name) if card_name else None
-        if tcg:
-            name = safe_str(tcg.get("name")) or name
-            number = safe_str(tcg.get("number")) or (card_number or "")
-            year = safe_str(tcg.get("year")) or year
-            series = safe_str(tcg.get("series")) or safe_str(tcg.get("set_name")) or series
-        else:
-            if card_name:
-                name = card_name
-            if set_name:
-                series = set_name
-            if card_number:
-                number = card_number
+    tcg = await pokemontcg_lookup(card_name, card_number, set_name) if card_name else None
+    ident = build_identity_from_auto(auto_best, tcg)
 
-    if id_conf is not None and id_conf < 0.35:
-        warnings.append("Auto-ID: Low confidence (try less glare / closer / sharper focus)")
+    name = ident["name"]
+    series = ident["series"]
+    year = ident["year"]
 
-    # ---------- Assessment (LESS STRICT) ----------
+    if id_conf is not None and id_conf < 0.45:
+        warnings.append("Auto-ID: Low confidence (try closer / less glare)")
+
+    # Card detection / warp for assessment (less strict)
     bq = find_card_quad(back_img)
     aq = find_card_quad(angle_img) if angle_img is not None else None
 
     if fq is None or bq is None:
-        defects.append("Assessment: Card boundary not detected (for assessment only). Ensure the full card is inside frame.")
-        confidence -= 0.10
+        defects.append("Card boundary detection weak (fill frame, reduce glare). Assessment may be inaccurate.")
+        confidence -= 0.08
+        # continue anyway with what we can (no warp-based measures)
+        return JSONResponse(content={
+            "pregrade": "Pre-Assessment: Limited (No Warp)",
+            "preapproval": "Pre-Approved — manual review recommended (framing/edge data limited)",
+            "series": series,
+            "year": year,
+            "name": name,
+            "defects": defects,
+            "warnings": warnings,
+            "confidence": float(max(0.10, min(0.90, confidence))),
+            "subgrades": {"photo_quality": "Warn", "card_detected": "Partial"},
+            "version": APP_VERSION,
+            "debug_openai": (auto_best if isinstance(auto_best, dict) and auto_best.get("error") else None)
+        })
 
-        return JSONResponse(
-            content={
-                "pregrade": "Pre-Assessment: Limited (Needs Better Framing)",
-                "preapproval": "Pre-Approved — but assessment is limited due to framing (final grading in-hand)",
-                "series": series,
-                "year": year,
-                "name": name,
-                "number": number,
-                "defects": defects,
-                "warnings": warnings,
-                "confidence": float(max(0.10, min(0.90, confidence))),
-                "subgrades": {"assessment_quality": "Limited"},
-                "version": APP_VERSION,
-            }
-        )
-
-    # Warp for assessment
-    front_w = warp_card(front_img, fq, out_w=900, out_h=1260)
-    back_w = warp_card(back_img, bq, out_w=900, out_h=1260)
+    front_w = warp_card(front_img, fq)
+    back_w = warp_card(back_img, bq)
 
     front_g = cv2.cvtColor(front_w, cv2.COLOR_BGR2GRAY)
     back_g = cv2.cvtColor(back_w, cv2.COLOR_BGR2GRAY)
@@ -556,32 +534,34 @@ async def verify(
     edge_white_front = whitening_risk_edge(front_g)
     edge_white_back = whitening_risk_edge(back_g)
 
-    if edge_white_front > 0.12:
+    if edge_white_front > 0.10:
         defects.append("Front: Edge/corner whitening risk detected")
         confidence -= 0.05
-    if edge_white_back > 0.14:
+    if edge_white_back > 0.12:
         defects.append("Back: Edge/corner whitening risk detected")
         confidence -= 0.06
 
     surface_risk = None
     if angle_img is not None and aq is not None:
-        angle_w = warp_card(angle_img, aq, out_w=900, out_h=1260)
+        angle_w = warp_card(angle_img, aq)
         angle_g = cv2.cvtColor(angle_w, cv2.COLOR_BGR2GRAY)
         surface_risk = surface_line_risk(angle_g)
-        if surface_risk > 0.11:
-            defects.append("Angle: Surface scratch / print-line risk detected")
+        if surface_risk > 0.09:
+            defects.append("Angled: Surface scratch / print-line risk detected")
             confidence -= 0.05
     elif angle_img is not None and aq is None:
-        warnings.append("Angle: Could not detect card boundary (OK — try again if you want surface screening).")
+        warnings.append("Angled: Could not detect card boundary (keep corners visible / reduce glare)")
 
     centering_note = "Centering: Review in-hand"
-    if (edge_white_front < 0.07) and (edge_white_back < 0.08):
+    if (edge_white_front < 0.06) and (edge_white_back < 0.07):
         centering_note = "Centering: Looks acceptable (photo-based)"
 
     subgrades: Dict[str, Any] = {
+        "photo_quality": "Warn" if warnings else "Pass",
+        "card_detected": "Yes",
         "edge_whitening_front": round(edge_white_front, 3),
         "edge_whitening_back": round(edge_white_back, 3),
-        "centering_note": centering_note,
+        "centering_note": centering_note
     }
     if surface_risk is not None:
         subgrades["surface_risk"] = round(float(surface_risk), 3)
@@ -589,27 +569,25 @@ async def verify(
     if len(defects) == 0:
         preapproval = "Pre-Approved — proceed to submission (final assessment in-hand)"
         summary = "Pre-Assessment: Clear"
-        confidence += 0.08
+        confidence += 0.06
     elif len(defects) <= 3:
         preapproval = "Pre-Approved — proceed (minor risks flagged)"
         summary = "Pre-Assessment: Minor Risks"
     else:
-        preapproval = "Pre-Approved — manual review recommended (multiple risks flagged)"
+        preapproval = "Pre-Approved — manual review required (multiple risks flagged)"
         summary = "Pre-Assessment: Review Recommended"
-        confidence -= 0.05
+        confidence -= 0.03
 
-    return JSONResponse(
-        content={
-            "pregrade": summary,
-            "preapproval": preapproval,
-            "series": series,
-            "year": year,
-            "name": name,
-            "number": number,
-            "defects": defects,
-            "warnings": warnings,
-            "confidence": float(max(0.10, min(0.90, confidence))),
-            "subgrades": subgrades,
-            "version": APP_VERSION,
-        }
-    )
+    return JSONResponse(content={
+        "pregrade": summary,
+        "preapproval": preapproval,
+        "series": series,
+        "year": year,
+        "name": name,
+        "defects": defects,
+        "warnings": warnings,
+        "confidence": float(max(0.10, min(0.90, confidence))),
+        "subgrades": subgrades,
+        "version": APP_VERSION,
+        "debug_openai": (auto_best if isinstance(auto_best, dict) and auto_best.get("error") else None)
+    })
