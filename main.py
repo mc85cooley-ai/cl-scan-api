@@ -6,31 +6,37 @@ import cv2
 import httpx
 import base64
 import os
-from datetime import datetime
 
 app = FastAPI(title="Collectors League Scan API")
 
+# Bump this every time you redeploy, so you can confirm Render is running the right code.
+APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-01-26a")
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
-
-# Vision-capable model you have access to
 OPENAI_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4.1-mini")
 
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "cl-scan-api"}
+    return {"status": "ok", "service": "cl-scan-api", "version": APP_VERSION}
 
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {
+        "ok": True,
+        "service": "cl-scan-api",
+        "version": APP_VERSION,
+        "has_openai_key": bool(OPENAI_API_KEY),
+        "has_pokemontcg_key": bool(POKEMONTCG_API_KEY),
+        "model": OPENAI_MODEL
+    }
 
 
 def decode_image(file_bytes: bytes):
     arr = np.frombuffer(file_bytes, dtype=np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    return img
+    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
 
 def blur_score(gray):
@@ -66,8 +72,7 @@ def find_card_quad(img_bgr):
         approx = cv2.approxPolyDP(c, 0.02 * peri, True)
 
         if len(approx) == 4:
-            pts = approx.reshape(4, 2).astype(np.float32)
-            return pts
+            return approx.reshape(4, 2).astype(np.float32)
 
     return None
 
@@ -88,8 +93,7 @@ def warp_card(img, quad, out_w=900, out_h=1260):
     pts = order_points(quad)
     dst = np.array([[0, 0], [out_w - 1, 0], [out_w - 1, out_h - 1], [0, out_h - 1]], dtype=np.float32)
     M = cv2.getPerspectiveTransform(pts, dst)
-    warped = cv2.warpPerspective(img, M, (out_w, out_h))
-    return warped
+    return cv2.warpPerspective(img, M, (out_w, out_h))
 
 
 def whitening_risk_edge(gray_warped):
@@ -121,10 +125,6 @@ def b64_image_from_cv2(img_bgr, fmt=".jpg", quality=90):
 
 
 async def openai_autoid_pokemon(front_bgr):
-    """
-    Always best-effort Auto-ID from the FRONT image.
-    If key missing or error, returns None.
-    """
     if not OPENAI_API_KEY:
         return None
 
@@ -143,29 +143,24 @@ async def openai_autoid_pokemon(front_bgr):
         "} "
         "Rules: "
         "- 'number' should look like '199/165' or '151' etc if visible. "
-        "- 'set_name' should be the set on the card (e.g. 'Scarlet & Violet—151') if visible; otherwise null. "
+        "- 'set_name' should be the set on the card if visible; otherwise null. "
         "- Do not invent."
     )
 
     payload = {
         "model": OPENAI_MODEL,
         "instructions": instructions,
-        "input": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": "Identify this Pokémon card."},
-                    {"type": "input_image", "image_base64": img_b64}
-                ]
-            }
-        ],
+        "input": [{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "Identify this Pokémon card."},
+                {"type": "input_image", "image_base64": img_b64}
+            ]
+        }],
         "response_format": {"type": "json_object"}
     }
 
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
 
     async with httpx.AsyncClient(timeout=45) as client:
         r = await client.post("https://api.openai.com/v1/responses", headers=headers, json=payload)
@@ -173,8 +168,8 @@ async def openai_autoid_pokemon(front_bgr):
             return None
 
         data = r.json()
-
         text = None
+
         for item in data.get("output", []):
             if item.get("type") == "message":
                 for c in item.get("content", []):
@@ -197,8 +192,7 @@ async def openai_autoid_pokemon(front_bgr):
 def normalize_number(num):
     if not num:
         return None
-    s = str(num).strip()
-    s = s.replace(" ", "").replace("\\", "/")
+    s = str(num).strip().replace(" ", "").replace("\\", "/")
     return s
 
 
@@ -231,6 +225,7 @@ async def pokemontcg_lookup(name, number, set_name):
         r = await client.get(url, headers=headers, params=params)
         if r.status_code != 200:
             return None
+
         js = r.json()
         cards = js.get("data", [])
         if not cards:
@@ -245,9 +240,7 @@ async def pokemontcg_lookup(name, number, set_name):
         c0 = cards[0]
         set_obj = c0.get("set", {}) or {}
         release = set_obj.get("releaseDate")
-        year = None
-        if isinstance(release, str) and release[:4].isdigit():
-            year = release[:4]
+        year = release[:4] if isinstance(release, str) and len(release) >= 4 and release[:4].isdigit() else None
 
         return {
             "name": c0.get("name"),
@@ -260,9 +253,6 @@ async def pokemontcg_lookup(name, number, set_name):
 
 
 def assess_quality(img, label, defects, confidence_ref):
-    """
-    Adds quality flags. Returns updated confidence.
-    """
     confidence = confidence_ref
     h, w = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -309,14 +299,12 @@ async def verify(
     if front_img is None or back_img is None:
         raise HTTPException(status_code=400, detail="Could not decode Front or Back image.")
     if ab and angle_img is None:
-        # Angle supplied but decode failed; ignore it (don’t hard-fail intake)
         angle_img = None
 
     defects: List[str] = []
     confidence = 0.70
 
     # ---------- Always attempt Auto-ID (best-effort) ----------
-    # Try warp first (helps ID), but fall back to raw front if quad not found.
     fq = find_card_quad(front_img)
     front_for_id = warp_card(front_img, fq) if fq is not None else front_img
 
@@ -339,9 +327,7 @@ async def verify(
         except Exception:
             id_conf = None
 
-    tcg = None
-    if card_name:
-        tcg = await pokemontcg_lookup(card_name, card_number, set_name)
+    tcg = await pokemontcg_lookup(card_name, card_number, set_name) if card_name else None
 
     if tcg:
         name = tcg.get("name") or name
@@ -365,7 +351,6 @@ async def verify(
     else:
         defects.append("Angled: Not provided (recommended for surface/foil assessment)")
 
-    # If critical quality issues exist, we still return ID, but we DO NOT grade/flag further.
     critical = any(("Low resolution" in d) or ("Blurry" in d) for d in defects)
     if critical:
         return JSONResponse(content={
@@ -376,10 +361,11 @@ async def verify(
             "name": name,
             "defects": defects,
             "confidence": float(max(0.10, min(0.90, confidence))),
-            "subgrades": {"photo_quality": "Fail", "card_detected": "Unknown"}
+            "subgrades": {"photo_quality": "Fail", "card_detected": "Unknown"},
+            "version": APP_VERSION
         })
 
-    # ---------- Card detection / warp (for assessment only) ----------
+    # ---------- Card detection / warp (assessment) ----------
     bq = find_card_quad(back_img)
     aq = find_card_quad(angle_img) if angle_img is not None else None
 
@@ -394,7 +380,8 @@ async def verify(
             "name": name,
             "defects": defects,
             "confidence": float(max(0.10, min(0.90, confidence))),
-            "subgrades": {"photo_quality": "Pass", "card_detected": "No"}
+            "subgrades": {"photo_quality": "Pass", "card_detected": "No"},
+            "version": APP_VERSION
         })
 
     front_w = warp_card(front_img, fq)
@@ -403,7 +390,6 @@ async def verify(
     front_g = cv2.cvtColor(front_w, cv2.COLOR_BGR2GRAY)
     back_g = cv2.cvtColor(back_w, cv2.COLOR_BGR2GRAY)
 
-    # ---------- Pre-assessment flags ----------
     edge_white_front = whitening_risk_edge(front_g)
     edge_white_back = whitening_risk_edge(back_g)
 
@@ -439,8 +425,6 @@ async def verify(
     if surface_risk is not None:
         subgrades["surface_risk"] = round(float(surface_risk), 3)
 
-    # ---------- Pre-approval messaging ----------
-    # (This is deliberately not a "grade number" — it's a screening summary)
     if len(defects) == 0:
         preapproval = "Pre-Approved — proceed to submission (final assessment in-hand)"
         summary = "Pre-Assessment: Clear"
@@ -461,5 +445,6 @@ async def verify(
         "name": name,
         "defects": defects,
         "confidence": float(max(0.10, min(0.90, confidence))),
-        "subgrades": subgrades
+        "subgrades": subgrades,
+        "version": APP_VERSION
     })
