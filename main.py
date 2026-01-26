@@ -2,86 +2,278 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 import numpy as np
 import cv2
+import httpx
+import base64
+import os
+import re
+from datetime import datetime
 
 app = FastAPI(title="Collectors League Scan API")
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
+
+# You can change this to a vision-capable model you have access to in your OpenAI account.
+OPENAI_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4.1-mini")
+
+
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "cl-scan-api"}
+
 
 @app.get("/health")
 def health():
     return {"ok": True}
+
 
 def decode_image(file_bytes: bytes):
     arr = np.frombuffer(file_bytes, dtype=np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     return img
 
+
 def blur_score(gray):
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
 
 def overexposed_ratio(gray):
     return float((gray >= 245).mean())
 
+
 def underexposed_ratio(gray):
     return float((gray <= 10).mean())
 
+
 def find_card_quad(img_bgr):
-    """Try to find a 4-point contour that looks like a card."""
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (5,5), 0)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(gray, 40, 120)
     edges = cv2.dilate(edges, None, iterations=2)
 
     contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:10]
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:12]
 
     h, w = img_bgr.shape[:2]
     img_area = h * w
 
     for c in contours:
         area = cv2.contourArea(c)
-        if area < img_area * 0.08:  # too small
+        if area < img_area * 0.08:
             continue
+
         peri = cv2.arcLength(c, True)
         approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+
         if len(approx) == 4:
             pts = approx.reshape(4, 2).astype(np.float32)
             return pts
+
     return None
 
+
 def order_points(pts):
-    # Standard order: tl, tr, br, bl
     s = pts.sum(axis=1)
     diff = np.diff(pts, axis=1).reshape(-1)
+
     tl = pts[np.argmin(s)]
     br = pts[np.argmax(s)]
     tr = pts[np.argmin(diff)]
     bl = pts[np.argmax(diff)]
+
     return np.array([tl, tr, br, bl], dtype=np.float32)
+
 
 def warp_card(img, quad, out_w=900, out_h=1260):
     pts = order_points(quad)
-    dst = np.array([[0,0],[out_w-1,0],[out_w-1,out_h-1],[0,out_h-1]], dtype=np.float32)
+    dst = np.array([[0, 0], [out_w - 1, 0], [out_w - 1, out_h - 1], [0, out_h - 1]], dtype=np.float32)
     M = cv2.getPerspectiveTransform(pts, dst)
     warped = cv2.warpPerspective(img, M, (out_w, out_h))
     return warped
 
+
 def whitening_risk_edge(gray_warped):
-    """Very rough whitening/chipping risk along the outer edge band."""
     h, w = gray_warped.shape[:2]
-    band = 10  # pixels
+    band = 10
     top = gray_warped[0:band, :]
-    bot = gray_warped[h-band:h, :]
+    bot = gray_warped[h - band:h, :]
     left = gray_warped[:, 0:band]
-    right = gray_warped[:, w-band:w]
+    right = gray_warped[:, w - band:w]
     ring = np.concatenate([top.flatten(), bot.flatten(), left.flatten(), right.flatten()])
-    # ratio of near-white pixels
     return float((ring >= 235).mean())
 
+
 def surface_line_risk(gray_angle_warped):
-    """High-frequency line energy proxy for scratch/print-line risk."""
-    blur = cv2.GaussianBlur(gray_angle_warped, (0,0), 2.0)
+    blur = cv2.GaussianBlur(gray_angle_warped, (0, 0), 2.0)
     high = cv2.absdiff(gray_angle_warped, blur)
     denom = max(1.0, float(gray_angle_warped.mean()))
     return float(high.mean() / denom)
+
+
+def b64_image_from_cv2(img_bgr, fmt=".jpg", quality=90):
+    encode_params = []
+    if fmt.lower() in [".jpg", ".jpeg"]:
+        encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)]
+    ok, buf = cv2.imencode(fmt, img_bgr, encode_params)
+    if not ok:
+        raise ValueError("Could not encode image for base64")
+    return base64.b64encode(buf.tobytes()).decode("utf-8")
+
+
+async def openai_autoid_pokemon(front_warp_bgr):
+    """
+    Uses OpenAI vision to identify Pokémon card name / set / number (best-effort).
+    Requires OPENAI_API_KEY. Uses the Responses API with image input. :contentReference[oaicite:0]{index=0}
+    """
+    if not OPENAI_API_KEY:
+        return None
+
+    img_b64 = b64_image_from_cv2(front_warp_bgr, fmt=".jpg", quality=90)
+
+    # Ask for strict JSON only, so parsing is reliable.
+    instructions = (
+        "You are identifying a Pokémon trading card from a photo. "
+        "Return ONLY valid JSON. If unsure, use nulls. "
+        "Fields: "
+        "{"
+        "\"name\": string|null, "
+        "\"number\": string|null, "
+        "\"set_name\": string|null, "
+        "\"confidence\": number (0..1), "
+        "\"notes\": string|null"
+        "} "
+        "Rules: "
+        "- 'number' should look like '199/165' or '151' etc if visible. "
+        "- 'set_name' should be the set on the card (e.g. 'Scarlet & Violet—151') if visible; otherwise null. "
+        "- Do not invent."
+    )
+
+    payload = {
+        "model": OPENAI_MODEL,
+        "instructions": instructions,
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Identify this Pokémon card."},
+                    {"type": "input_image", "image_base64": img_b64}
+                ]
+            }
+        ],
+        # Ask for a JSON object back
+        "response_format": {"type": "json_object"}
+    }
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    async with httpx.AsyncClient(timeout=45) as client:
+        r = await client.post("https://api.openai.com/v1/responses", headers=headers, json=payload)
+        if r.status_code < 200 or r.status_code >= 300:
+            return None
+
+        data = r.json()
+
+        # Responses API returns output items; easiest robust method:
+        # Look for any "output_text" content and parse it as JSON.
+        text = None
+        for item in data.get("output", []):
+            if item.get("type") == "message":
+                for c in item.get("content", []):
+                    if c.get("type") in ("output_text", "text"):
+                        text = c.get("text")
+                        break
+            if text:
+                break
+
+        if not text:
+            return None
+
+        # Since we requested json_object, text should be JSON.
+        try:
+            import json
+            return json.loads(text)
+        except Exception:
+            return None
+
+
+def normalize_number(num):
+    if not num:
+        return None
+    s = str(num).strip()
+    # common OCR/vision quirks
+    s = s.replace(" ", "")
+    s = s.replace("\\", "/")
+    # allow forms like "199/165" or "199"
+    return s
+
+
+async def pokemontcg_lookup(name, number, set_name):
+    """
+    Use Pokémon TCG API to get canonical details including set series and releaseDate.
+    This is optional (works without API key but may rate limit).
+    """
+    if not name:
+        return None
+
+    q_parts = []
+
+    # Exact-ish name match helps; keep it flexible with quotes.
+    safe_name = name.replace('"', '\\"')
+    q_parts.append(f'name:"{safe_name}"')
+
+    if number:
+        safe_num = number.replace('"', '\\"')
+        q_parts.append(f'number:"{safe_num}"')
+
+    if set_name:
+        safe_set = set_name.replace('"', '\\"')
+        q_parts.append(f'set.name:"{safe_set}"')
+
+    q = " ".join(q_parts)
+
+    headers = {}
+    if POKEMONTCG_API_KEY:
+        headers["X-Api-Key"] = POKEMONTCG_API_KEY
+
+    url = "https://api.pokemontcg.io/v2/cards"
+    params = {"q": q, "pageSize": 3}
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(url, headers=headers, params=params)
+        if r.status_code != 200:
+            return None
+        js = r.json()
+        cards = js.get("data", [])
+        if not cards:
+            # fallback: try only by name if too strict
+            params = {"q": f'name:"{safe_name}"', "pageSize": 3}
+            r2 = await client.get(url, headers=headers, params=params)
+            if r2.status_code != 200:
+                return None
+            cards = r2.json().get("data", [])
+            if not cards:
+                return None
+
+        # Best match = first result
+        c0 = cards[0]
+        set_obj = c0.get("set", {}) or {}
+        release = set_obj.get("releaseDate")  # "YYYY/MM/DD"
+        year = None
+        if isinstance(release, str) and release[:4].isdigit():
+            year = release[:4]
+
+        return {
+            "name": c0.get("name"),
+            "number": c0.get("number"),
+            "set_name": set_obj.get("name"),
+            "series": set_obj.get("series"),
+            "releaseDate": release,
+            "year": year
+        }
+
 
 @app.post("/api/verify")
 async def verify(
@@ -97,15 +289,14 @@ async def verify(
         raise HTTPException(status_code=400, detail="One or more images look empty/corrupt.")
 
     front_img = decode_image(fb)
-    back_img  = decode_image(bb)
+    back_img = decode_image(bb)
     angle_img = decode_image(ab)
 
     if front_img is None or back_img is None or angle_img is None:
         raise HTTPException(status_code=400, detail="Could not decode one or more images.")
 
     defects = []
-    notes = []
-    confidence = 0.60
+    confidence = 0.70
 
     # ---------- Photo quality checks ----------
     def assess_quality(img, label):
@@ -115,30 +306,27 @@ async def verify(
 
         if min(h, w) < 900:
             defects.append(f"{label}: Low resolution (move closer / higher quality)")
-            confidence -= 0.10
+            confidence -= 0.12
 
         bs = blur_score(gray)
         if bs < 80:
             defects.append(f"{label}: Blurry / out of focus")
-            confidence -= 0.12
+            confidence -= 0.14
 
         over = overexposed_ratio(gray)
         if over > 0.06:
             defects.append(f"{label}: Glare/overexposure risk (reduce reflections)")
-            confidence -= 0.08
+            confidence -= 0.10
 
         under = underexposed_ratio(gray)
         if under > 0.15:
             defects.append(f"{label}: Too dark (increase lighting)")
-            confidence -= 0.06
-
-        return gray
+            confidence -= 0.08
 
     assess_quality(front_img, "Front")
-    assess_quality(back_img,  "Back")
+    assess_quality(back_img, "Back")
     assess_quality(angle_img, "Angled")
 
-    # If quality is very poor, stop early with rescan required
     critical = any(("Low resolution" in d) or ("Blurry" in d) for d in defects)
     if critical:
         return JSONResponse(content={
@@ -148,8 +336,8 @@ async def verify(
             "year": "Unknown",
             "name": "Unknown item/card",
             "defects": defects,
-            "confidence": max(0.10, min(0.90, confidence)),
-            "subgrades": {}
+            "confidence": float(max(0.10, min(0.90, confidence))),
+            "subgrades": {"photo_quality": "Fail", "card_detected": "Unknown"}
         })
 
     # ---------- Card detection / warp ----------
@@ -159,8 +347,7 @@ async def verify(
 
     if fq is None or bq is None or aq is None:
         defects.append("Card boundary not clearly detected (ensure all 4 corners visible, fill frame, reduce glare)")
-        confidence -= 0.15
-
+        confidence -= 0.18
         return JSONResponse(content={
             "pregrade": "Pre-Assessment: Needs Rescan",
             "preapproval": "Not pre-approved — card framing insufficient",
@@ -168,40 +355,36 @@ async def verify(
             "year": "Unknown",
             "name": "Unknown item/card",
             "defects": defects,
-            "confidence": max(0.10, min(0.90, confidence)),
-            "subgrades": {}
+            "confidence": float(max(0.10, min(0.90, confidence))),
+            "subgrades": {"photo_quality": "Pass", "card_detected": "No"}
         })
 
     front_w = warp_card(front_img, fq)
-    back_w  = warp_card(back_img, bq)
+    back_w = warp_card(back_img, bq)
     angle_w = warp_card(angle_img, aq)
 
     front_g = cv2.cvtColor(front_w, cv2.COLOR_BGR2GRAY)
-    back_g  = cv2.cvtColor(back_w, cv2.COLOR_BGR2GRAY)
+    back_g = cv2.cvtColor(back_w, cv2.COLOR_BGR2GRAY)
     angle_g = cv2.cvtColor(angle_w, cv2.COLOR_BGR2GRAY)
 
-    # ---------- Edge / corner whitening risk ----------
+    # ---------- Pre-assessment flags ----------
     edge_white_front = whitening_risk_edge(front_g)
-    edge_white_back  = whitening_risk_edge(back_g)
+    edge_white_back = whitening_risk_edge(back_g)
 
     if edge_white_front > 0.10:
         defects.append("Front: Edge/corner whitening risk detected")
-        confidence -= 0.05
+        confidence -= 0.06
     if edge_white_back > 0.12:
         defects.append("Back: Edge/corner whitening risk detected")
-        confidence -= 0.06
+        confidence -= 0.07
 
-    # ---------- Surface risk from angled shot ----------
     surface_risk = surface_line_risk(angle_g)
     if surface_risk > 0.09:
         defects.append("Angled: Surface scratch / print-line risk detected")
         confidence -= 0.06
 
-    # ---------- Centering estimate (simple + honest) ----------
-    # Proper border detection needs more work; for now we only provide a “centering check: OK/Review”
-    # based on symmetry of edge whitening (proxy). This is intentionally conservative.
     centering_note = "Centering: Review in-hand"
-    if edge_white_front < 0.06:
+    if (edge_white_front < 0.06) and (edge_white_back < 0.07):
         centering_note = "Centering: Looks acceptable (photo-based)"
 
     subgrades = {
@@ -213,12 +396,54 @@ async def verify(
         "centering_note": centering_note
     }
 
-    # ---------- Pre-approval rule ----------
-    # If only minor flags, allow submission. If multiple risks, allow but mark “manual review”.
+    # ---------- Auto-ID (best-effort, photo-based) ----------
+    series = "Unknown"
+    year = "Unknown"
+    name = "Unknown item/card"
+
+    # 1) OpenAI vision extraction (best-effort). :contentReference[oaicite:1]{index=1}
+    auto = await openai_autoid_pokemon(front_w)
+    card_name = None
+    card_number = None
+    set_name = None
+    id_conf = None
+
+    if isinstance(auto, dict):
+        card_name = auto.get("name")
+        card_number = normalize_number(auto.get("number"))
+        set_name = auto.get("set_name")
+        try:
+            id_conf = float(auto.get("confidence")) if auto.get("confidence") is not None else None
+        except Exception:
+            id_conf = None
+
+    # 2) Verify/enrich via Pokémon TCG API (gives series + release year) if we have something to search.
+    tcg = None
+    if card_name:
+        tcg = await pokemontcg_lookup(card_name, card_number, set_name)
+
+    if tcg:
+        name = tcg.get("name") or name
+        year = tcg.get("year") or year
+        series = tcg.get("series") or tcg.get("set_name") or series
+    else:
+        # fallback to whatever OpenAI saw
+        if card_name:
+            name = card_name
+        if set_name:
+            series = set_name
+        # year stays unknown unless API resolves it
+
+    # Small confidence adjustment: if ID confidence low, show lower overall confidence
+    if id_conf is not None and id_conf < 0.45:
+        defects.append("Auto-ID: Low confidence (text/set not clear in photo)")
+        confidence -= 0.05
+
+    # ---------- Pre-approval messaging ----------
     if len(defects) == 0:
         preapproval = "Pre-Approved — proceed to submission (final assessment in-hand)"
         summary = "Pre-Assessment: Clear"
-        confidence += 0.10
+        confidence += 0.08
     elif len(defects) <= 2:
         preapproval = "Pre-Approved — proceed (minor risks flagged)"
         summary = "Pre-Assessment: Minor Risks"
@@ -230,10 +455,10 @@ async def verify(
     return JSONResponse(content={
         "pregrade": summary,
         "preapproval": preapproval,
-        "series": "Unknown (Auto-ID next)",
-        "year": "Unknown",
-        "name": "Unknown item/card",
+        "series": series,
+        "year": year,
+        "name": name,
         "defects": defects,
-        "confidence": max(0.10, min(0.90, confidence)),
+        "confidence": float(max(0.10, min(0.90, confidence))),
         "subgrades": subgrades
     })
