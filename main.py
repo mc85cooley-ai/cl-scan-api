@@ -9,7 +9,7 @@ import os
 
 app = FastAPI(title="Collectors League Scan API")
 
-# Bump this every time you redeploy, so you can confirm Render is running the right code.
+# Bump this value when you redeploy if you want a visible version tag.
 APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-01-26a")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
@@ -30,7 +30,7 @@ def health():
         "version": APP_VERSION,
         "has_openai_key": bool(OPENAI_API_KEY),
         "has_pokemontcg_key": bool(POKEMONTCG_API_KEY),
-        "model": OPENAI_MODEL
+        "model": OPENAI_MODEL,
     }
 
 
@@ -114,7 +114,7 @@ def surface_line_risk(gray_angle_warped):
     return float(high.mean() / denom)
 
 
-def b64_image_from_cv2(img_bgr, fmt=".jpg", quality=90):
+def b64_image_from_cv2(img_bgr, fmt=".jpg", quality=95):
     encode_params = []
     if fmt.lower() in [".jpg", ".jpeg"]:
         encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)]
@@ -125,26 +125,32 @@ def b64_image_from_cv2(img_bgr, fmt=".jpg", quality=90):
 
 
 async def openai_autoid_pokemon(front_bgr):
+    """
+    Returns either:
+    - a normal dict: {name, number, set_name, confidence, notes}
+    - OR an error dict: {error: True, ...}
+    """
     if not OPENAI_API_KEY:
-        return None
+        return {"error": True, "reason": "missing_openai_key"}
 
-    img_b64 = b64_image_from_cv2(front_bgr, fmt=".jpg", quality=90)
+    img_b64 = b64_image_from_cv2(front_bgr, fmt=".jpg", quality=95)
 
     instructions = (
-        "You are identifying a Pokémon trading card from a photo. "
-        "Return ONLY valid JSON. If unsure, use nulls. "
-        "Fields: "
+        "Identify this Pokémon trading card from the photo.\n"
+        "Return ONLY valid JSON.\n"
+        "If uncertain, use null.\n"
+        "Schema:\n"
         "{"
-        "\"name\": string|null, "
-        "\"number\": string|null, "
-        "\"set_name\": string|null, "
-        "\"confidence\": number (0..1), "
+        "\"name\": string|null,"
+        "\"number\": string|null,"
+        "\"set_name\": string|null,"
+        "\"confidence\": number,"
         "\"notes\": string|null"
-        "} "
-        "Rules: "
-        "- 'number' should look like '199/165' or '151' etc if visible. "
-        "- 'set_name' should be the set on the card if visible; otherwise null. "
-        "- Do not invent."
+        "}\n"
+        "Rules:\n"
+        "- Do NOT guess.\n"
+        "- If the card name is not clearly readable, set name=null.\n"
+        "- If the set or number is not clearly readable, set them=null.\n"
     )
 
     payload = {
@@ -160,12 +166,16 @@ async def openai_autoid_pokemon(front_bgr):
         "response_format": {"type": "json_object"}
     }
 
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
 
     async with httpx.AsyncClient(timeout=45) as client:
         r = await client.post("https://api.openai.com/v1/responses", headers=headers, json=payload)
+
         if r.status_code < 200 or r.status_code >= 300:
-            return None
+            return {"error": True, "status": r.status_code, "body": r.text[:500]}
 
         data = r.json()
         text = None
@@ -180,13 +190,40 @@ async def openai_autoid_pokemon(front_bgr):
                 break
 
         if not text:
-            return None
+            return {"error": True, "reason": "no_output_text", "raw": str(data)[:500]}
 
         try:
             import json
             return json.loads(text)
         except Exception:
-            return None
+            return {"error": True, "reason": "json_parse_failed", "text": str(text)[:500]}
+
+
+async def autoid_best(front_raw, front_warped=None):
+    """
+    Try both warped + raw (warped usually better for text; raw sometimes better if warp is wrong).
+    Returns best non-error result by confidence, or None if none succeeded.
+    """
+    best = None
+    for img in [front_warped, front_raw]:
+        if img is None:
+            continue
+        res = await openai_autoid_pokemon(img)
+        if isinstance(res, dict) and not res.get("error"):
+            try:
+                conf = float(res.get("confidence") or 0)
+            except Exception:
+                conf = 0.0
+            if best is None:
+                best = res
+            else:
+                try:
+                    best_conf = float(best.get("confidence") or 0)
+                except Exception:
+                    best_conf = 0.0
+                if conf > best_conf:
+                    best = res
+    return best
 
 
 def normalize_number(num):
@@ -304,26 +341,36 @@ async def verify(
     defects: List[str] = []
     confidence = 0.70
 
-    # ---------- Always attempt Auto-ID (best-effort) ----------
+    # ---------- Auto-ID (best-effort) ----------
     fq = find_card_quad(front_img)
-    front_for_id = warp_card(front_img, fq) if fq is not None else front_img
+
+    # Higher-res warp for ID only (better text readability)
+    front_warp_id = warp_card(front_img, fq, out_w=1200, out_h=1680) if fq is not None else None
+    auto_best = await autoid_best(front_img, front_warp_id)
+
+    # Debug: capture OpenAI error ONLY if it failed (temporary)
+    debug_openai = None
+    if auto_best is None:
+        # try once to get error details (so we can see what's going on)
+        tmp = await openai_autoid_pokemon(front_warp_id if front_warp_id is not None else front_img)
+        if isinstance(tmp, dict) and tmp.get("error"):
+            debug_openai = tmp
 
     series = "Unknown"
     year = "Unknown"
     name = "Unknown item/card"
 
-    auto = await openai_autoid_pokemon(front_for_id)
     card_name = None
     card_number = None
     set_name = None
     id_conf = None
 
-    if isinstance(auto, dict):
-        card_name = auto.get("name")
-        card_number = normalize_number(auto.get("number"))
-        set_name = auto.get("set_name")
+    if isinstance(auto_best, dict):
+        card_name = auto_best.get("name")
+        card_number = normalize_number(auto_best.get("number"))
+        set_name = auto_best.get("set_name")
         try:
-            id_conf = float(auto.get("confidence")) if auto.get("confidence") is not None else None
+            id_conf = float(auto_best.get("confidence")) if auto_best.get("confidence") is not None else None
         except Exception:
             id_conf = None
 
@@ -362,7 +409,8 @@ async def verify(
             "defects": defects,
             "confidence": float(max(0.10, min(0.90, confidence))),
             "subgrades": {"photo_quality": "Fail", "card_detected": "Unknown"},
-            "version": APP_VERSION
+            "version": APP_VERSION,
+            "debug_openai": debug_openai
         })
 
     # ---------- Card detection / warp (assessment) ----------
@@ -381,7 +429,8 @@ async def verify(
             "defects": defects,
             "confidence": float(max(0.10, min(0.90, confidence))),
             "subgrades": {"photo_quality": "Pass", "card_detected": "No"},
-            "version": APP_VERSION
+            "version": APP_VERSION,
+            "debug_openai": debug_openai
         })
 
     front_w = warp_card(front_img, fq)
@@ -446,5 +495,6 @@ async def verify(
         "defects": defects,
         "confidence": float(max(0.10, min(0.90, confidence))),
         "subgrades": subgrades,
-        "version": APP_VERSION
+        "version": APP_VERSION,
+        "debug_openai": debug_openai
     })
