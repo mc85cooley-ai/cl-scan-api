@@ -1,11 +1,11 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
+from typing import Optional, List, Dict, Any
 import numpy as np
 import cv2
 import httpx
 import base64
 import os
-import re
 from datetime import datetime
 
 app = FastAPI(title="Collectors League Scan API")
@@ -13,7 +13,7 @@ app = FastAPI(title="Collectors League Scan API")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
 
-# You can change this to a vision-capable model you have access to in your OpenAI account.
+# Vision-capable model you have access to
 OPENAI_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4.1-mini")
 
 
@@ -120,17 +120,16 @@ def b64_image_from_cv2(img_bgr, fmt=".jpg", quality=90):
     return base64.b64encode(buf.tobytes()).decode("utf-8")
 
 
-async def openai_autoid_pokemon(front_warp_bgr):
+async def openai_autoid_pokemon(front_bgr):
     """
-    Uses OpenAI vision to identify Pokémon card name / set / number (best-effort).
-    Requires OPENAI_API_KEY. Uses the Responses API with image input. :contentReference[oaicite:0]{index=0}
+    Always best-effort Auto-ID from the FRONT image.
+    If key missing or error, returns None.
     """
     if not OPENAI_API_KEY:
         return None
 
-    img_b64 = b64_image_from_cv2(front_warp_bgr, fmt=".jpg", quality=90)
+    img_b64 = b64_image_from_cv2(front_bgr, fmt=".jpg", quality=90)
 
-    # Ask for strict JSON only, so parsing is reliable.
     instructions = (
         "You are identifying a Pokémon trading card from a photo. "
         "Return ONLY valid JSON. If unsure, use nulls. "
@@ -160,7 +159,6 @@ async def openai_autoid_pokemon(front_warp_bgr):
                 ]
             }
         ],
-        # Ask for a JSON object back
         "response_format": {"type": "json_object"}
     }
 
@@ -176,8 +174,6 @@ async def openai_autoid_pokemon(front_warp_bgr):
 
         data = r.json()
 
-        # Responses API returns output items; easiest robust method:
-        # Look for any "output_text" content and parse it as JSON.
         text = None
         for item in data.get("output", []):
             if item.get("type") == "message":
@@ -191,7 +187,6 @@ async def openai_autoid_pokemon(front_warp_bgr):
         if not text:
             return None
 
-        # Since we requested json_object, text should be JSON.
         try:
             import json
             return json.loads(text)
@@ -203,24 +198,15 @@ def normalize_number(num):
     if not num:
         return None
     s = str(num).strip()
-    # common OCR/vision quirks
-    s = s.replace(" ", "")
-    s = s.replace("\\", "/")
-    # allow forms like "199/165" or "199"
+    s = s.replace(" ", "").replace("\\", "/")
     return s
 
 
 async def pokemontcg_lookup(name, number, set_name):
-    """
-    Use Pokémon TCG API to get canonical details including set series and releaseDate.
-    This is optional (works without API key but may rate limit).
-    """
     if not name:
         return None
 
     q_parts = []
-
-    # Exact-ish name match helps; keep it flexible with quotes.
     safe_name = name.replace('"', '\\"')
     q_parts.append(f'name:"{safe_name}"')
 
@@ -248,7 +234,6 @@ async def pokemontcg_lookup(name, number, set_name):
         js = r.json()
         cards = js.get("data", [])
         if not cards:
-            # fallback: try only by name if too strict
             params = {"q": f'name:"{safe_name}"', "pageSize": 3}
             r2 = await client.get(url, headers=headers, params=params)
             if r2.status_code != 200:
@@ -257,10 +242,9 @@ async def pokemontcg_lookup(name, number, set_name):
             if not cards:
                 return None
 
-        # Best match = first result
         c0 = cards[0]
         set_obj = c0.get("set", {}) or {}
-        release = set_obj.get("releaseDate")  # "YYYY/MM/DD"
+        release = set_obj.get("releaseDate")
         year = None
         if isinstance(release, str) and release[:4].isdigit():
             year = release[:4]
@@ -275,134 +259,72 @@ async def pokemontcg_lookup(name, number, set_name):
         }
 
 
+def assess_quality(img, label, defects, confidence_ref):
+    """
+    Adds quality flags. Returns updated confidence.
+    """
+    confidence = confidence_ref
+    h, w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    if min(h, w) < 900:
+        defects.append(f"{label}: Low resolution (move closer / higher quality)")
+        confidence -= 0.12
+
+    bs = blur_score(gray)
+    if bs < 80:
+        defects.append(f"{label}: Blurry / out of focus")
+        confidence -= 0.14
+
+    over = overexposed_ratio(gray)
+    if over > 0.06:
+        defects.append(f"{label}: Glare/overexposure risk (reduce reflections)")
+        confidence -= 0.10
+
+    under = underexposed_ratio(gray)
+    if under > 0.15:
+        defects.append(f"{label}: Too dark (increase lighting)")
+        confidence -= 0.08
+
+    return confidence
+
+
 @app.post("/api/verify")
 async def verify(
     front: UploadFile = File(...),
     back: UploadFile = File(...),
-    angle: UploadFile = File(...),
+    angle: Optional[UploadFile] = File(None),  # ✅ optional
 ):
     fb = await front.read()
     bb = await back.read()
-    ab = await angle.read()
+    ab = await angle.read() if angle is not None else None
 
-    if min(len(fb), len(bb), len(ab)) < 1500:
-        raise HTTPException(status_code=400, detail="One or more images look empty/corrupt.")
+    if min(len(fb), len(bb)) < 1500:
+        raise HTTPException(status_code=400, detail="Front or Back image looks empty/corrupt.")
 
     front_img = decode_image(fb)
     back_img = decode_image(bb)
-    angle_img = decode_image(ab)
+    angle_img = decode_image(ab) if ab else None
 
-    if front_img is None or back_img is None or angle_img is None:
-        raise HTTPException(status_code=400, detail="Could not decode one or more images.")
+    if front_img is None or back_img is None:
+        raise HTTPException(status_code=400, detail="Could not decode Front or Back image.")
+    if ab and angle_img is None:
+        # Angle supplied but decode failed; ignore it (don’t hard-fail intake)
+        angle_img = None
 
-    defects = []
+    defects: List[str] = []
     confidence = 0.70
 
-    # ---------- Photo quality checks ----------
-    def assess_quality(img, label):
-        nonlocal confidence
-        h, w = img.shape[:2]
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-        if min(h, w) < 900:
-            defects.append(f"{label}: Low resolution (move closer / higher quality)")
-            confidence -= 0.12
-
-        bs = blur_score(gray)
-        if bs < 80:
-            defects.append(f"{label}: Blurry / out of focus")
-            confidence -= 0.14
-
-        over = overexposed_ratio(gray)
-        if over > 0.06:
-            defects.append(f"{label}: Glare/overexposure risk (reduce reflections)")
-            confidence -= 0.10
-
-        under = underexposed_ratio(gray)
-        if under > 0.15:
-            defects.append(f"{label}: Too dark (increase lighting)")
-            confidence -= 0.08
-
-    assess_quality(front_img, "Front")
-    assess_quality(back_img, "Back")
-    assess_quality(angle_img, "Angled")
-
-    critical = any(("Low resolution" in d) or ("Blurry" in d) for d in defects)
-    if critical:
-        return JSONResponse(content={
-            "pregrade": "Pre-Assessment: Rescan Required",
-            "preapproval": "Not pre-approved — photo quality insufficient",
-            "series": "Unknown",
-            "year": "Unknown",
-            "name": "Unknown item/card",
-            "defects": defects,
-            "confidence": float(max(0.10, min(0.90, confidence))),
-            "subgrades": {"photo_quality": "Fail", "card_detected": "Unknown"}
-        })
-
-    # ---------- Card detection / warp ----------
+    # ---------- Always attempt Auto-ID (best-effort) ----------
+    # Try warp first (helps ID), but fall back to raw front if quad not found.
     fq = find_card_quad(front_img)
-    bq = find_card_quad(back_img)
-    aq = find_card_quad(angle_img)
+    front_for_id = warp_card(front_img, fq) if fq is not None else front_img
 
-    if fq is None or bq is None or aq is None:
-        defects.append("Card boundary not clearly detected (ensure all 4 corners visible, fill frame, reduce glare)")
-        confidence -= 0.18
-        return JSONResponse(content={
-            "pregrade": "Pre-Assessment: Needs Rescan",
-            "preapproval": "Not pre-approved — card framing insufficient",
-            "series": "Unknown",
-            "year": "Unknown",
-            "name": "Unknown item/card",
-            "defects": defects,
-            "confidence": float(max(0.10, min(0.90, confidence))),
-            "subgrades": {"photo_quality": "Pass", "card_detected": "No"}
-        })
-
-    front_w = warp_card(front_img, fq)
-    back_w = warp_card(back_img, bq)
-    angle_w = warp_card(angle_img, aq)
-
-    front_g = cv2.cvtColor(front_w, cv2.COLOR_BGR2GRAY)
-    back_g = cv2.cvtColor(back_w, cv2.COLOR_BGR2GRAY)
-    angle_g = cv2.cvtColor(angle_w, cv2.COLOR_BGR2GRAY)
-
-    # ---------- Pre-assessment flags ----------
-    edge_white_front = whitening_risk_edge(front_g)
-    edge_white_back = whitening_risk_edge(back_g)
-
-    if edge_white_front > 0.10:
-        defects.append("Front: Edge/corner whitening risk detected")
-        confidence -= 0.06
-    if edge_white_back > 0.12:
-        defects.append("Back: Edge/corner whitening risk detected")
-        confidence -= 0.07
-
-    surface_risk = surface_line_risk(angle_g)
-    if surface_risk > 0.09:
-        defects.append("Angled: Surface scratch / print-line risk detected")
-        confidence -= 0.06
-
-    centering_note = "Centering: Review in-hand"
-    if (edge_white_front < 0.06) and (edge_white_back < 0.07):
-        centering_note = "Centering: Looks acceptable (photo-based)"
-
-    subgrades = {
-        "photo_quality": "Pass",
-        "card_detected": "Yes",
-        "edge_whitening_front": round(edge_white_front, 3),
-        "edge_whitening_back": round(edge_white_back, 3),
-        "surface_risk": round(surface_risk, 3),
-        "centering_note": centering_note
-    }
-
-    # ---------- Auto-ID (best-effort, photo-based) ----------
     series = "Unknown"
     year = "Unknown"
     name = "Unknown item/card"
 
-    # 1) OpenAI vision extraction (best-effort). :contentReference[oaicite:1]{index=1}
-    auto = await openai_autoid_pokemon(front_w)
+    auto = await openai_autoid_pokemon(front_for_id)
     card_name = None
     card_number = None
     set_name = None
@@ -417,7 +339,6 @@ async def verify(
         except Exception:
             id_conf = None
 
-    # 2) Verify/enrich via Pokémon TCG API (gives series + release year) if we have something to search.
     tcg = None
     if card_name:
         tcg = await pokemontcg_lookup(card_name, card_number, set_name)
@@ -427,24 +348,104 @@ async def verify(
         year = tcg.get("year") or year
         series = tcg.get("series") or tcg.get("set_name") or series
     else:
-        # fallback to whatever OpenAI saw
         if card_name:
             name = card_name
         if set_name:
             series = set_name
-        # year stays unknown unless API resolves it
 
-    # Small confidence adjustment: if ID confidence low, show lower overall confidence
     if id_conf is not None and id_conf < 0.45:
         defects.append("Auto-ID: Low confidence (text/set not clear in photo)")
         confidence -= 0.05
 
+    # ---------- Photo quality checks ----------
+    confidence = assess_quality(front_img, "Front", defects, confidence)
+    confidence = assess_quality(back_img, "Back", defects, confidence)
+    if angle_img is not None:
+        confidence = assess_quality(angle_img, "Angled", defects, confidence)
+    else:
+        defects.append("Angled: Not provided (recommended for surface/foil assessment)")
+
+    # If critical quality issues exist, we still return ID, but we DO NOT grade/flag further.
+    critical = any(("Low resolution" in d) or ("Blurry" in d) for d in defects)
+    if critical:
+        return JSONResponse(content={
+            "pregrade": "Pre-Assessment: Rescan Required",
+            "preapproval": "Not pre-approved — photo quality insufficient for assessment",
+            "series": series,
+            "year": year,
+            "name": name,
+            "defects": defects,
+            "confidence": float(max(0.10, min(0.90, confidence))),
+            "subgrades": {"photo_quality": "Fail", "card_detected": "Unknown"}
+        })
+
+    # ---------- Card detection / warp (for assessment only) ----------
+    bq = find_card_quad(back_img)
+    aq = find_card_quad(angle_img) if angle_img is not None else None
+
+    if fq is None or bq is None:
+        defects.append("Card boundary not clearly detected (ensure all 4 corners visible, fill frame, reduce glare)")
+        confidence -= 0.18
+        return JSONResponse(content={
+            "pregrade": "Pre-Assessment: Needs Rescan",
+            "preapproval": "Not pre-approved — card framing insufficient for assessment",
+            "series": series,
+            "year": year,
+            "name": name,
+            "defects": defects,
+            "confidence": float(max(0.10, min(0.90, confidence))),
+            "subgrades": {"photo_quality": "Pass", "card_detected": "No"}
+        })
+
+    front_w = warp_card(front_img, fq)
+    back_w = warp_card(back_img, bq)
+
+    front_g = cv2.cvtColor(front_w, cv2.COLOR_BGR2GRAY)
+    back_g = cv2.cvtColor(back_w, cv2.COLOR_BGR2GRAY)
+
+    # ---------- Pre-assessment flags ----------
+    edge_white_front = whitening_risk_edge(front_g)
+    edge_white_back = whitening_risk_edge(back_g)
+
+    if edge_white_front > 0.10:
+        defects.append("Front: Edge/corner whitening risk detected")
+        confidence -= 0.06
+    if edge_white_back > 0.12:
+        defects.append("Back: Edge/corner whitening risk detected")
+        confidence -= 0.07
+
+    surface_risk = None
+    if angle_img is not None and aq is not None:
+        angle_w = warp_card(angle_img, aq)
+        angle_g = cv2.cvtColor(angle_w, cv2.COLOR_BGR2GRAY)
+        surface_risk = surface_line_risk(angle_g)
+        if surface_risk > 0.09:
+            defects.append("Angled: Surface scratch / print-line risk detected")
+            confidence -= 0.06
+    elif angle_img is not None and aq is None:
+        defects.append("Angled: Could not detect card boundary (keep corners visible / reduce glare)")
+
+    centering_note = "Centering: Review in-hand"
+    if (edge_white_front < 0.06) and (edge_white_back < 0.07):
+        centering_note = "Centering: Looks acceptable (photo-based)"
+
+    subgrades: Dict[str, Any] = {
+        "photo_quality": "Pass",
+        "card_detected": "Yes",
+        "edge_whitening_front": round(edge_white_front, 3),
+        "edge_whitening_back": round(edge_white_back, 3),
+        "centering_note": centering_note
+    }
+    if surface_risk is not None:
+        subgrades["surface_risk"] = round(float(surface_risk), 3)
+
     # ---------- Pre-approval messaging ----------
+    # (This is deliberately not a "grade number" — it's a screening summary)
     if len(defects) == 0:
         preapproval = "Pre-Approved — proceed to submission (final assessment in-hand)"
         summary = "Pre-Assessment: Clear"
         confidence += 0.08
-    elif len(defects) <= 2:
+    elif len(defects) <= 3:
         preapproval = "Pre-Approved — proceed (minor risks flagged)"
         summary = "Pre-Assessment: Minor Risks"
     else:
