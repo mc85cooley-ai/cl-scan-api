@@ -1,46 +1,20 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any
 import numpy as np
 import cv2
 import httpx
 import base64
 import os
-import time
 import uuid
-import re
 
 app = FastAPI(title="Collectors League Scan API")
 
-# Bump this value when you redeploy if you want a visible version tag.
-APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-01-26a")
+APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-01-26b")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4.1-mini")
-
-# Optional enforcement: set REQUIRE_X_CLIS_KEY=1 and CLIS_X_KEY=...
-REQUIRE_X_CLIS_KEY = os.getenv("REQUIRE_X_CLIS_KEY", "0").strip()
-CLIS_X_KEY = os.getenv("CLIS_X_KEY", "").strip()
-
-# --- Identify token store (in-memory TTL) ---
-IDENT_TTL_SECONDS = 20 * 60
-_ident_store: Dict[str, Dict[str, Any]] = {}
-
-def _now() -> float:
-    return time.time()
-
-def _prune_store():
-    t = _now()
-    dead = [k for k, v in _ident_store.items() if (t - v.get("ts", 0)) > IDENT_TTL_SECONDS]
-    for k in dead:
-        _ident_store.pop(k, None)
-
-def _require_key_if_enabled(request: Request):
-    if REQUIRE_X_CLIS_KEY == "1":
-        key = request.headers.get("X-CLIS-KEY", "")
-        if not key or key != CLIS_X_KEY:
-            raise HTTPException(status_code=403, detail="Access denied.")
 
 
 @app.get("/")
@@ -50,7 +24,6 @@ def root():
 
 @app.get("/health")
 def health():
-    _prune_store()
     return {
         "ok": True,
         "service": "cl-scan-api",
@@ -67,6 +40,7 @@ def decode_image(file_bytes: bytes):
 
 
 def blur_score(gray):
+    # Laplacian variance
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
@@ -116,7 +90,7 @@ def order_points(pts):
     return np.array([tl, tr, br, bl], dtype=np.float32)
 
 
-def warp_card(img, quad, out_w=900, out_h=1260):
+def warp_card(img, quad, out_w=1200, out_h=1680):
     pts = order_points(quad)
     dst = np.array([[0, 0], [out_w - 1, 0], [out_w - 1, out_h - 1], [0, out_h - 1]], dtype=np.float32)
     M = cv2.getPerspectiveTransform(pts, dst)
@@ -152,11 +126,6 @@ def b64_image_from_cv2(img_bgr, fmt=".jpg", quality=95):
 
 
 async def openai_autoid_pokemon(front_bgr):
-    """
-    Returns either:
-    - a normal dict: {name, number, set_name, confidence, notes}
-    - OR an error dict: {error: True, ...}
-    """
     if not OPENAI_API_KEY:
         return {"error": True, "reason": "missing_openai_key"}
 
@@ -165,18 +134,19 @@ async def openai_autoid_pokemon(front_bgr):
     instructions = (
         "Identify this Pokémon trading card from the photo.\n"
         "Return ONLY valid JSON.\n"
+        "If uncertain, use null.\n"
         "Schema:\n"
         "{"
         "\"name\": string|null,"
-        "\"number\": string|null,"          # allow 199/165
+        "\"number\": string|null,"
         "\"set_name\": string|null,"
         "\"confidence\": number,"
         "\"notes\": string|null"
         "}\n"
         "Rules:\n"
-        "- Prefer reading card name and card number.\n"
-        "- If uncertain, set that field null and lower confidence.\n"
-        "- Confidence must be 0..1.\n"
+        "- Do NOT guess.\n"
+        "- If the card name is not clearly readable, set name=null.\n"
+        "- If the set or number is not clearly readable, set them=null.\n"
     )
 
     payload = {
@@ -185,7 +155,7 @@ async def openai_autoid_pokemon(front_bgr):
         "input": [{
             "role": "user",
             "content": [
-                {"type": "input_text", "text": "Identify this Pokémon card (front)."},
+                {"type": "input_text", "text": "Identify this Pokémon card."},
                 {"type": "input_image", "image_base64": img_b64}
             ]
         }],
@@ -226,10 +196,6 @@ async def openai_autoid_pokemon(front_bgr):
 
 
 async def autoid_best(front_raw, front_warped=None):
-    """
-    Try both warped + raw (warped usually better for text; raw sometimes better if warp is wrong).
-    Returns best non-error result by confidence, or None if none succeeded.
-    """
     best = None
     for img in [front_warped, front_raw]:
         if img is None:
@@ -256,7 +222,6 @@ def normalize_number(num):
     if not num:
         return None
     s = str(num).strip().replace(" ", "").replace("\\", "/")
-    # Try to keep 199/165 if present; if it's just "199" keep it too
     return s
 
 
@@ -268,14 +233,8 @@ async def pokemontcg_lookup(name, number, set_name):
     safe_name = name.replace('"', '\\"')
     q_parts.append(f'name:"{safe_name}"')
 
-    # PokémonTCG API stores number as left part (e.g., "199"), so if we got "199/165" use "199"
-    num_left = None
     if number:
-        s = str(number).strip()
-        m = re.match(r"^(\d{1,3})\s*/\s*(\d{1,3})$", s)
-        num_left = m.group(1) if m else s
-    if num_left:
-        safe_num = str(num_left).replace('"', '\\"')
+        safe_num = number.replace('"', '\\"')
         q_parts.append(f'number:"{safe_num}"')
 
     if set_name:
@@ -312,23 +271,14 @@ async def pokemontcg_lookup(name, number, set_name):
         release = set_obj.get("releaseDate")
         year = release[:4] if isinstance(release, str) and len(release) >= 4 and release[:4].isdigit() else None
 
-        # value estimate (hidden)
-        value_est = None
+        # Optional: pull price data if present
+        prices = None
         try:
-            tcg = c0.get("tcgplayer", {}) or {}
-            prices = tcg.get("prices", {}) or {}
-            best = None
-            for variant, pdata in prices.items():
-                if not isinstance(pdata, dict):
-                    continue
-                for k in ["market", "mid", "high", "low"]:
-                    v = pdata.get(k)
-                    if isinstance(v, (int, float)):
-                        best = v if best is None else max(best, v)
-            if best is not None:
-                value_est = float(best)
+            tcgplayer = (c0.get("tcgplayer") or {})
+            tcg_prices = ((tcgplayer.get("prices") or {}) if isinstance(tcgplayer, dict) else {})
+            prices = tcg_prices
         except Exception:
-            value_est = None
+            prices = None
 
         return {
             "name": c0.get("name"),
@@ -337,69 +287,87 @@ async def pokemontcg_lookup(name, number, set_name):
             "series": set_obj.get("series"),
             "releaseDate": release,
             "year": year,
-            "value_est": value_est
+            "prices": prices,
         }
 
 
-def quality_warnings(img, label) -> Tuple[List[str], float]:
+def compute_internal_value_usd(prices: Any) -> Optional[float]:
     """
-    Returns (warnings, confidence_delta) where delta is negative if quality is poor.
-    NEVER blocks processing.
+    Best-effort estimate using common fields from PokemonTCG "tcgplayer.prices".
+    We pick the highest 'market' across variants to represent potential value ceiling.
     """
-    warnings: List[str] = []
-    delta = 0.0
+    if not prices or not isinstance(prices, dict):
+        return None
 
-    h, w = img.shape[:2]
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    best = None
+    for variant, obj in prices.items():
+        if not isinstance(obj, dict):
+            continue
+        market = obj.get("market")
+        try:
+            mv = float(market) if market is not None else None
+        except Exception:
+            mv = None
+        if mv is None:
+            continue
+        if best is None or mv > best:
+            best = mv
+    return best
 
-    if min(h, w) < 900:
-        warnings.append(f"{label}: Low resolution (move closer / higher quality)")
-        delta -= 0.10
+
+def photo_warnings(img_bgr, label: str) -> List[str]:
+    """
+    VERY light-touch warnings only. Do not hard-fail unless totally unusable.
+    """
+    warns = []
+    h, w = img_bgr.shape[:2]
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+    if min(h, w) < 700:
+        warns.append(f"{label}: Low resolution (move closer)")
 
     bs = blur_score(gray)
-    if bs < 70:
-        warnings.append(f"{label}: Possible blur / focus issue")
-        delta -= 0.08
+    # soften thresholds: common phone shots can sit 30–70 and still be readable
+    if bs < 35:
+        warns.append(f"{label}: Soft focus (tap to focus / more light)")
+    if bs < 18:
+        warns.append(f"{label}: Very blurry (may fail ID)")
 
     over = overexposed_ratio(gray)
-    if over > 0.06:
-        warnings.append(f"{label}: Glare/overexposure risk (reduce reflections)")
-        delta -= 0.06
+    if over > 0.08:
+        warns.append(f"{label}: Glare/overexposure risk")
 
     under = underexposed_ratio(gray)
-    if under > 0.15:
-        warnings.append(f"{label}: Too dark (increase lighting)")
-        delta -= 0.05
+    if under > 0.20:
+        warns.append(f"{label}: Too dark")
 
-    return warnings, delta
+    return warns
 
 
-def value_weighted_preapproval(preapproval: str, value_est: Optional[float]) -> str:
+def should_hard_fail_for_photo(img_bgr) -> Optional[str]:
     """
-    Hidden rule: high value cards get bumped up a step.
-    Not disclosed to user.
+    Only block when image is clearly unusable.
     """
-    if value_est is None:
-        return preapproval
+    h, w = img_bgr.shape[:2]
+    if min(h, w) < 450:
+        return "Image too small/unusable. Move closer or use higher quality photo."
 
-    low = preapproval.lower()
-    if value_est >= 250:
-        if "not pre-approved" in low or "declined" in low:
-            return "Review Required — high value item (internal priority)"
-        if "review" in low:
-            return "Pre-Approved — proceed (internal priority)"
-    if value_est >= 100:
-        if "not pre-approved" in low or "declined" in low:
-            return "Review Required — internal priority"
-    return preapproval
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    bs = blur_score(gray)
+    if bs < 10:
+        return "Image extremely blurry/unusable. Tap to focus and use more light."
+
+    # If it's basically pure black/white, it's broken
+    if float(gray.mean()) < 8:
+        return "Image too dark/unusable."
+    if float(gray.mean()) > 245:
+        return "Image too bright/unusable."
+
+    return None
 
 
-# -------------------- NEW: Check 1 /api/identify --------------------
 @app.post("/api/identify")
-async def identify(request: Request, front: UploadFile = File(...)):
-    _require_key_if_enabled(request)
-    _prune_store()
-
+async def identify(front: UploadFile = File(...)):
     fb = await front.read()
     if len(fb) < 1500:
         raise HTTPException(status_code=400, detail="Front image looks empty/corrupt.")
@@ -408,95 +376,95 @@ async def identify(request: Request, front: UploadFile = File(...)):
     if front_img is None:
         raise HTTPException(status_code=400, detail="Could not decode Front image.")
 
-    # Warnings only
-    warnings, delta = quality_warnings(front_img, "Front")
+    hard = should_hard_fail_for_photo(front_img)
+    warnings = photo_warnings(front_img, "Front")
 
-    # Warp for ID attempt (better text)
+    # Attempt warp for better OCR/vision
     fq = find_card_quad(front_img)
-    front_warp_id = warp_card(front_img, fq, out_w=1200, out_h=1680) if fq is not None else None
+    front_warp = warp_card(front_img, fq, out_w=1200, out_h=1680) if fq is not None else None
 
-    auto_best = await autoid_best(front_img, front_warp_id)
-
-    debug_openai = None
-    if auto_best is None:
-        tmp = await openai_autoid_pokemon(front_warp_id if front_warp_id is not None else front_img)
-        if isinstance(tmp, dict) and tmp.get("error"):
-            debug_openai = tmp
+    auto_best = await autoid_best(front_img, front_warp)
 
     card_name = None
     card_number = None
     set_name = None
-    id_conf = 0.35
+    id_conf = 0.0
 
+    debug_openai = None
     if isinstance(auto_best, dict):
         card_name = auto_best.get("name")
         card_number = normalize_number(auto_best.get("number"))
         set_name = auto_best.get("set_name")
         try:
-            id_conf = float(auto_best.get("confidence")) if auto_best.get("confidence") is not None else id_conf
+            id_conf = float(auto_best.get("confidence") or 0.0)
         except Exception:
-            id_conf = id_conf
+            id_conf = 0.0
+    else:
+        # capture error details if OpenAI failed
+        tmp = await openai_autoid_pokemon(front_warp if front_warp is not None else front_img)
+        if isinstance(tmp, dict) and tmp.get("error"):
+            debug_openai = tmp
+        warnings.append("Auto-ID: Could not identify from photo (try less glare / sharper text)")
 
     tcg = await pokemontcg_lookup(card_name, card_number, set_name) if card_name else None
 
-    series = "Unknown"
-    year = "Unknown"
-    name = "Unknown item/card"
+    name_out = "Unknown"
+    series_out = "Unknown"
+    year_out = "Unknown"
     number_out = card_number or ""
 
-    value_est = None
+    internal_value_usd = None
+    internal_value_aud = None
 
     if tcg:
-        name = tcg.get("name") or name
-        year = tcg.get("year") or year
-        series = tcg.get("series") or tcg.get("set_name") or series
-        value_est = tcg.get("value_est")
-        # if we didn't get full 199/165, keep user-visible number as what we have
-        if not number_out and tcg.get("number"):
-            number_out = str(tcg.get("number"))
-        id_conf = max(id_conf, 0.60)
+        name_out = tcg.get("name") or name_out
+        series_out = tcg.get("series") or tcg.get("set_name") or series_out
+        year_out = tcg.get("year") or year_out
+        number_out = tcg.get("number") or number_out
+
+        internal_value_usd = compute_internal_value_usd(tcg.get("prices"))
+        # optional rough AUD conversion fallback if you want it stored;
+        # leave None if not available
+        if internal_value_usd is not None:
+            # keep it conservative and avoid pretending it's "live"
+            internal_value_aud = round(internal_value_usd * 1.5, 2)
+
     else:
         if card_name:
-            name = card_name
+            name_out = card_name
         if set_name:
-            series = set_name
+            series_out = set_name
 
-    # Generate token for stage 2
-    token = str(uuid.uuid4())
-    _ident_store[token] = {
-        "ts": _now(),
-        "identity": {"name": name, "series": series, "year": year, "number": number_out, "confidence": float(max(0.0, min(1.0, id_conf)))},
-        "value_est": value_est,
-        "debug_openai": debug_openai,
-    }
+    # If photo is hard-fail, still return JSON (never HTML), but mark low confidence
+    if hard:
+        warnings.insert(0, hard)
+        id_conf = min(id_conf, 0.15)
+
+    identify_token = str(uuid.uuid4())
 
     return JSONResponse(content={
-        "ok": True,
-        "identify_token": token,
-        "name": name,
-        "series": series,
-        "year": year,
+        "identify_token": identify_token,
+        "name": name_out,
+        "series": series_out,
+        "year": year_out,
         "number": number_out,
-        "confidence": float(max(0.0, min(1.0, id_conf + delta))),
+        "confidence": float(max(0.0, min(1.0, id_conf))),
         "warnings": warnings,
-        # keep debug optional; you can remove later
+        # internal-only (WP ignores unless you later choose to store)
+        "internal_value_usd": internal_value_usd,
+        "internal_value_aud": internal_value_aud,
+        "version": APP_VERSION,
         "debug_openai": debug_openai,
-        "version": APP_VERSION
     })
 
 
-# -------------------- UPDATED: /api/verify (Check 2) --------------------
 @app.post("/api/verify")
 async def verify(
-    request: Request,
     front: UploadFile = File(...),
     back: UploadFile = File(...),
     angle: Optional[UploadFile] = File(None),
-    identify_token: Optional[str] = Form(None),  # ✅ stage-1 token (optional)
+    identify_token: Optional[str] = None
 ):
-    _require_key_if_enabled(request)
-    _prune_store()
-
     fb = await front.read()
     bb = await back.read()
     ab = await angle.read() if angle is not None else None
@@ -515,111 +483,95 @@ async def verify(
 
     defects: List[str] = []
     warnings: List[str] = []
-    confidence = 0.70
 
-    # ------------- Identity: prefer identify_token -------------
-    series = "Unknown"
-    year = "Unknown"
-    name = "Unknown item/card"
-    value_est = None
-    debug_openai = None
-
-    if identify_token and identify_token in _ident_store:
-        cached = _ident_store.get(identify_token) or {}
-        ident = cached.get("identity") or {}
-        name = ident.get("name") or name
-        series = ident.get("series") or series
-        year = ident.get("year") or year
-        debug_openai = cached.get("debug_openai")
-        value_est = cached.get("value_est")
-    else:
-        # Fallback: best-effort auto-id again (but do NOT block on it)
-        fq_tmp = find_card_quad(front_img)
-        front_warp_id = warp_card(front_img, fq_tmp, out_w=1200, out_h=1680) if fq_tmp is not None else None
-        auto_best = await autoid_best(front_img, front_warp_id)
-
-        if auto_best is None:
-            tmp = await openai_autoid_pokemon(front_warp_id if front_warp_id is not None else front_img)
-            if isinstance(tmp, dict) and tmp.get("error"):
-                debug_openai = tmp
-
-        card_name = None
-        card_number = None
-        set_name = None
-        id_conf = None
-
-        if isinstance(auto_best, dict):
-            card_name = auto_best.get("name")
-            card_number = normalize_number(auto_best.get("number"))
-            set_name = auto_best.get("set_name")
-            try:
-                id_conf = float(auto_best.get("confidence")) if auto_best.get("confidence") is not None else None
-            except Exception:
-                id_conf = None
-
-        tcg = await pokemontcg_lookup(card_name, card_number, set_name) if card_name else None
-        if tcg:
-            name = tcg.get("name") or name
-            year = tcg.get("year") or year
-            series = tcg.get("series") or tcg.get("set_name") or series
-            value_est = tcg.get("value_est")
-        else:
-            if card_name:
-                name = card_name
-            if set_name:
-                series = set_name
-
-        if id_conf is not None and id_conf < 0.45:
-            warnings.append("Auto-ID: Low confidence (text/set not clear in photo)")
-            confidence -= 0.04
-
-    # ------------- Quality warnings (never hard fail) -------------
-    w1, d1 = quality_warnings(front_img, "Front"); warnings += w1; confidence += d1
-    w2, d2 = quality_warnings(back_img, "Back");  warnings += w2; confidence += d2
+    # Always compute warnings, but do NOT hard-fail just for blur anymore
+    warnings += photo_warnings(front_img, "Front")
+    warnings += photo_warnings(back_img, "Back")
     if angle_img is not None:
-        w3, d3 = quality_warnings(angle_img, "Angled"); warnings += w3; confidence += d3
+        warnings += photo_warnings(angle_img, "Angled")
     else:
         warnings.append("Angled: Not provided (recommended for surface/foil assessment)")
 
-    # ------------- Card boundary detection (assessment) -------------
+    # Step 1 ID again (backend does its own ID for verify output consistency)
     fq = find_card_quad(front_img)
+    front_warp_id = warp_card(front_img, fq, out_w=1200, out_h=1680) if fq is not None else None
+    auto_best = await autoid_best(front_img, front_warp_id)
+
+    series = "Unknown"
+    year = "Unknown"
+    name = "Unknown item/card"
+    number = ""
+
+    id_conf = None
+    card_name = None
+    card_number = None
+    set_name = None
+
+    debug_openai = None
+    if isinstance(auto_best, dict):
+        card_name = auto_best.get("name")
+        card_number = normalize_number(auto_best.get("number"))
+        set_name = auto_best.get("set_name")
+        try:
+            id_conf = float(auto_best.get("confidence")) if auto_best.get("confidence") is not None else None
+        except Exception:
+            id_conf = None
+    else:
+        tmp = await openai_autoid_pokemon(front_warp_id if front_warp_id is not None else front_img)
+        if isinstance(tmp, dict) and tmp.get("error"):
+            debug_openai = tmp
+        warnings.append("Auto-ID: Could not confidently identify from photo")
+
+    tcg = await pokemontcg_lookup(card_name, card_number, set_name) if card_name else None
+
+    internal_value_usd = None
+    internal_value_aud = None
+
+    if tcg:
+        name = tcg.get("name") or name
+        year = tcg.get("year") or year
+        series = tcg.get("series") or tcg.get("set_name") or series
+        number = tcg.get("number") or (card_number or "")
+
+        internal_value_usd = compute_internal_value_usd(tcg.get("prices"))
+        if internal_value_usd is not None:
+            internal_value_aud = round(internal_value_usd * 1.5, 2)
+    else:
+        if card_name:
+            name = card_name
+        if set_name:
+            series = set_name
+        number = card_number or ""
+
+    # Step 2: assessment – if we can't detect card boundary, flag and reduce confidence
+    confidence = 0.70
+
     bq = find_card_quad(back_img)
     aq = find_card_quad(angle_img) if angle_img is not None else None
 
-    subgrades: Dict[str, Any] = {
-        "photo_quality": "Warn" if warnings else "Pass",
-        "card_detected": "Yes" if (fq is not None and bq is not None) else "No",
-        "version": APP_VERSION
-    }
-
-    # If we can't detect card boundaries, DO NOT stop. Return softer assessment.
     if fq is None or bq is None:
-        defects.append("Card boundary not reliably detected (fill frame, reduce glare, strong contrast background)")
-        confidence -= 0.14
-
-        preapproval = "Review Required — card framing unclear (photo-based)"
-        summary = "Pre-Assessment: Review Required"
-
-        # Hidden value weighting
-        preapproval = value_weighted_preapproval(preapproval, value_est)
+        defects.append("Card boundary not clearly detected (ensure all 4 corners visible, fill frame, reduce glare)")
+        confidence -= 0.18
 
         return JSONResponse(content={
-            "pregrade": summary,
-            "preapproval": preapproval,
+            "pregrade": "Pre-Assessment: Needs Rescan",
+            "preapproval": "Not pre-approved — card framing insufficient for assessment",
             "series": series,
             "year": year,
             "name": name,
+            "number": number,
             "defects": defects,
             "warnings": warnings,
             "confidence": float(max(0.10, min(0.90, confidence))),
-            "subgrades": subgrades,
+            "subgrades": {"photo_quality": "Pass", "card_detected": "No"},
             "version": APP_VERSION,
+            "internal_value_usd": internal_value_usd,
+            "internal_value_aud": internal_value_aud,
             "debug_openai": debug_openai
         })
 
-    # If detected, proceed with warp-based checks
-    front_w = warp_card(front_img, fq)
-    back_w = warp_card(back_img, bq)
+    front_w = warp_card(front_img, fq, out_w=900, out_h=1260)
+    back_w = warp_card(back_img, bq, out_w=900, out_h=1260)
 
     front_g = cv2.cvtColor(front_w, cv2.COLOR_BGR2GRAY)
     back_g = cv2.cvtColor(back_w, cv2.COLOR_BGR2GRAY)
@@ -636,30 +588,29 @@ async def verify(
 
     surface_risk = None
     if angle_img is not None and aq is not None:
-        angle_w = warp_card(angle_img, aq)
+        angle_w = warp_card(angle_img, aq, out_w=900, out_h=1260)
         angle_g = cv2.cvtColor(angle_w, cv2.COLOR_BGR2GRAY)
         surface_risk = surface_line_risk(angle_g)
         if surface_risk > 0.09:
             defects.append("Angled: Surface scratch / print-line risk detected")
             confidence -= 0.06
     elif angle_img is not None and aq is None:
-        warnings.append("Angled: Could not detect card boundary (reduce glare / keep corners visible)")
+        warnings.append("Angled: Could not detect card boundary (keep corners visible / reduce glare)")
 
     centering_note = "Centering: Review in-hand"
     if (edge_white_front < 0.06) and (edge_white_back < 0.07):
         centering_note = "Centering: Looks acceptable (photo-based)"
 
-    subgrades.update({
-        "photo_quality": "Warn" if warnings else "Pass",
+    subgrades: Dict[str, Any] = {
+        "photo_quality": "Pass",
         "card_detected": "Yes",
         "edge_whitening_front": round(edge_white_front, 3),
         "edge_whitening_back": round(edge_white_back, 3),
         "centering_note": centering_note
-    })
+    }
     if surface_risk is not None:
         subgrades["surface_risk"] = round(float(surface_risk), 3)
 
-    # Decision summary
     if len(defects) == 0:
         preapproval = "Pre-Approved — proceed to submission (final assessment in-hand)"
         summary = "Pre-Assessment: Clear"
@@ -668,12 +619,9 @@ async def verify(
         preapproval = "Pre-Approved — proceed (minor risks flagged)"
         summary = "Pre-Assessment: Minor Risks"
     else:
-        preapproval = "Review Required — multiple risks flagged (photo-based)"
-        summary = "Pre-Assessment: Review Required"
+        preapproval = "Pre-Approved — manual review required (multiple risks flagged)"
+        summary = "Pre-Assessment: Review Recommended"
         confidence -= 0.05
-
-    # Hidden value weighting (NOT exposed)
-    preapproval = value_weighted_preapproval(preapproval, value_est)
 
     return JSONResponse(content={
         "pregrade": summary,
@@ -681,10 +629,13 @@ async def verify(
         "series": series,
         "year": year,
         "name": name,
+        "number": number,
         "defects": defects,
         "warnings": warnings,
         "confidence": float(max(0.10, min(0.90, confidence))),
         "subgrades": subgrades,
         "version": APP_VERSION,
+        "internal_value_usd": internal_value_usd,
+        "internal_value_aud": internal_value_aud,
         "debug_openai": debug_openai
     })
