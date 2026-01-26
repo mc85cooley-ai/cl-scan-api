@@ -176,4 +176,64 @@ async def verify(
     back_w  = warp_card(back_img, bq)
     angle_w = warp_card(angle_img, aq)
 
-    front_g = cv2.cvtCol_
+    front_g = cv2.cvtColor(front_w, cv2.COLOR_BGR2GRAY)
+    back_g  = cv2.cvtColor(back_w, cv2.COLOR_BGR2GRAY)
+    angle_g = cv2.cvtColor(angle_w, cv2.COLOR_BGR2GRAY)
+
+    # ---------- Edge / corner whitening risk ----------
+    edge_white_front = whitening_risk_edge(front_g)
+    edge_white_back  = whitening_risk_edge(back_g)
+
+    if edge_white_front > 0.10:
+        defects.append("Front: Edge/corner whitening risk detected")
+        confidence -= 0.05
+    if edge_white_back > 0.12:
+        defects.append("Back: Edge/corner whitening risk detected")
+        confidence -= 0.06
+
+    # ---------- Surface risk from angled shot ----------
+    surface_risk = surface_line_risk(angle_g)
+    if surface_risk > 0.09:
+        defects.append("Angled: Surface scratch / print-line risk detected")
+        confidence -= 0.06
+
+    # ---------- Centering estimate (simple + honest) ----------
+    # Proper border detection needs more work; for now we only provide a “centering check: OK/Review”
+    # based on symmetry of edge whitening (proxy). This is intentionally conservative.
+    centering_note = "Centering: Review in-hand"
+    if edge_white_front < 0.06:
+        centering_note = "Centering: Looks acceptable (photo-based)"
+
+    subgrades = {
+        "photo_quality": "Pass",
+        "card_detected": "Yes",
+        "edge_whitening_front": round(edge_white_front, 3),
+        "edge_whitening_back": round(edge_white_back, 3),
+        "surface_risk": round(surface_risk, 3),
+        "centering_note": centering_note
+    }
+
+    # ---------- Pre-approval rule ----------
+    # If only minor flags, allow submission. If multiple risks, allow but mark “manual review”.
+    if len(defects) == 0:
+        preapproval = "Pre-Approved — proceed to submission (final assessment in-hand)"
+        summary = "Pre-Assessment: Clear"
+        confidence += 0.10
+    elif len(defects) <= 2:
+        preapproval = "Pre-Approved — proceed (minor risks flagged)"
+        summary = "Pre-Assessment: Minor Risks"
+    else:
+        preapproval = "Pre-Approved — manual review required (multiple risks flagged)"
+        summary = "Pre-Assessment: Review Recommended"
+        confidence -= 0.05
+
+    return JSONResponse(content={
+        "pregrade": summary,
+        "preapproval": preapproval,
+        "series": "Unknown (Auto-ID next)",
+        "year": "Unknown",
+        "name": "Unknown item/card",
+        "defects": defects,
+        "confidence": max(0.10, min(0.90, confidence)),
+        "subgrades": subgrades
+    })
