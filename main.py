@@ -1,4 +1,4 @@
-# main.py (FULL FILE) — includes /api/identify + makes photo checks NON-BLOCKING
+# main.py (FULL FILE) — Fixed OpenAI integration with standard Chat Completions API
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import JSONResponse
 from typing import Optional, List, Dict, Any
@@ -12,11 +12,12 @@ import uuid
 
 app = FastAPI(title="Collectors League Scan API")
 
-APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-01-26b")
+APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-01-27-fixed")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4.1-mini")
+# Fixed: Use valid OpenAI model name
+OPENAI_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini")
 
 
 @app.get("/")
@@ -133,44 +134,9 @@ def normalize_number(num):
     return s
 
 
-def extract_response_text(resp_json: dict) -> Optional[str]:
-    """
-    Responses API can vary. This tries multiple patterns to get the model text.
-    """
-    if not isinstance(resp_json, dict):
-        return None
-
-    # Some variants include top-level output_text
-    if isinstance(resp_json.get("output_text"), str) and resp_json.get("output_text").strip():
-        return resp_json["output_text"].strip()
-
-    out = resp_json.get("output", [])
-    if isinstance(out, list):
-        for item in out:
-            if not isinstance(item, dict):
-                continue
-            # message style
-            if item.get("type") == "message":
-                content = item.get("content", [])
-                if isinstance(content, list):
-                    for c in content:
-                        if isinstance(c, dict):
-                            t = c.get("text")
-                            if isinstance(t, str) and t.strip():
-                                return t.strip()
-            # generic content style
-            content = item.get("content")
-            if isinstance(content, list):
-                for c in content:
-                    if isinstance(c, dict):
-                        t = c.get("text")
-                        if isinstance(t, str) and t.strip():
-                            return t.strip()
-    return None
-
-
 async def openai_autoid_pokemon(front_bgr) -> dict:
     """
+    FIXED: Use standard Chat Completions API
     Return dict in schema:
     {name, number, set_name, confidence, notes}
     Or {error: True, ...}
@@ -180,63 +146,155 @@ async def openai_autoid_pokemon(front_bgr) -> dict:
 
     img_b64 = b64_image_from_cv2(front_bgr, fmt=".jpg", quality=95)
 
-    instructions = (
-        "Identify this Pokémon trading card from the photo.\n"
-        "Return ONLY valid JSON.\n"
-        "If uncertain, use null.\n"
-        "Schema:\n"
-        "{"
-        "\"name\": string|null,"
-        "\"number\": string|null,"
-        "\"set_name\": string|null,"
-        "\"confidence\": number,"
-        "\"notes\": string|null"
-        "}\n"
-        "Rules:\n"
-        "- Do NOT guess.\n"
-        "- Prefer exact printed card name.\n"
-        "- number should look like '006/165' if visible.\n"
-        "- set_name should be the set title if visible (e.g. 'Scarlet & Violet—151').\n"
+    system_prompt = (
+        "You are a Pokémon card identification expert. "
+        "Identify cards from photos and return ONLY valid JSON. "
+        "If uncertain, use null for that field. "
+        "Do NOT guess - only return what you can see clearly. "
+        "Schema: {\"name\": string|null, \"number\": string|null, "
+        "\"set_name\": string|null, \"confidence\": number (0-1), \"notes\": string|null}"
     )
 
     payload = {
         "model": OPENAI_MODEL,
-        "instructions": instructions,
-        "input": [{
-            "role": "user",
-            "content": [
-                {"type": "input_text", "text": "Identify this Pokémon card. Return JSON only."},
-                {"type": "input_image", "image_base64": img_b64},
-            ]
-        }],
+        "messages": [
+            {
+                "role": "system",
+                "content": system_prompt
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Identify this Pokémon card. Return JSON with:\n"
+                            "- name: The card's name (e.g. 'Charizard ex')\n"
+                            "- number: Card number as printed (e.g. '006/165')\n"
+                            "- set_name: Set name if visible (e.g. 'Scarlet & Violet—151')\n"
+                            "- confidence: 0-1 scale (0=can't read, 1=very clear)\n"
+                            "- notes: Any observations or uncertainties"
+                        )
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{img_b64}"
+                        }
+                    }
+                ]
+            }
+        ],
         "response_format": {"type": "json_object"},
+        "max_tokens": 500,
+        "temperature": 0.1  # Low temperature for more consistent results
     }
 
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post("https://api.openai.com/v1/responses", headers=headers, json=payload)
-
-    if r.status_code < 200 or r.status_code >= 300:
-        return {"error": True, "status": r.status_code, "body": r.text[:800]}
-
-    data = r.json()
-    text = extract_response_text(data)
-    if not text:
-        return {"error": True, "reason": "no_output_text", "raw": str(data)[:800]}
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
 
     try:
-        return json.loads(text)
-    except Exception:
-        # Model might return JSON with extra whitespace or wrapper; try to salvage
+        async with httpx.AsyncClient(timeout=60) as client:
+            # FIXED: Use standard Chat Completions endpoint
+            r = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=payload
+            )
+
+        if r.status_code < 200 or r.status_code >= 300:
+            error_body = r.text[:800] if r.text else "No response body"
+            return {
+                "error": True,
+                "status": r.status_code,
+                "body": error_body,
+                "reason": f"openai_http_{r.status_code}"
+            }
+
+        data = r.json()
+        
+        # FIXED: Extract from standard Chat Completions format
+        choices = data.get("choices", [])
+        if not choices:
+            return {
+                "error": True,
+                "reason": "no_choices",
+                "raw": str(data)[:800]
+            }
+
+        message = choices[0].get("message", {})
+        content = message.get("content", "")
+        
+        if not content:
+            return {
+                "error": True,
+                "reason": "no_content",
+                "raw": str(data)[:800]
+            }
+
+        # Parse JSON from content
         try:
-            start = text.find("{")
-            end = text.rfind("}")
+            result = json.loads(content)
+            
+            # Validate the result has expected fields
+            if not isinstance(result, dict):
+                return {
+                    "error": True,
+                    "reason": "invalid_json_structure",
+                    "text": content[:800]
+                }
+            
+            # Ensure confidence is a number
+            if "confidence" in result:
+                try:
+                    result["confidence"] = float(result["confidence"])
+                except (ValueError, TypeError):
+                    result["confidence"] = 0.5
+            else:
+                result["confidence"] = 0.5
+            
+            return result
+            
+        except json.JSONDecodeError:
+            # Try to extract JSON from text (in case model added markdown)
+            start = content.find("{")
+            end = content.rfind("}")
             if start != -1 and end != -1 and end > start:
-                return json.loads(text[start:end+1])
-        except Exception:
-            pass
-        return {"error": True, "reason": "json_parse_failed", "text": text[:800]}
+                try:
+                    result = json.loads(content[start:end+1])
+                    # Ensure confidence field
+                    if "confidence" not in result:
+                        result["confidence"] = 0.5
+                    return result
+                except:
+                    pass
+            
+            return {
+                "error": True,
+                "reason": "json_parse_failed",
+                "text": content[:800]
+            }
+    
+    except httpx.TimeoutException:
+        return {
+            "error": True,
+            "reason": "timeout",
+            "message": "OpenAI API request timed out"
+        }
+    except httpx.RequestError as e:
+        return {
+            "error": True,
+            "reason": "request_error",
+            "message": str(e)
+        }
+    except Exception as e:
+        return {
+            "error": True,
+            "reason": "exception",
+            "message": str(e)
+        }
 
 
 async def autoid_best(front_raw, front_warped=None) -> Optional[dict]:
@@ -290,35 +348,38 @@ async def pokemontcg_lookup(name, number, set_name):
     url = "https://api.pokemontcg.io/v2/cards"
     params = {"q": q, "pageSize": 3}
 
-    async with httpx.AsyncClient(timeout=25) as client:
-        r = await client.get(url, headers=headers, params=params)
-        if r.status_code != 200:
-            return None
-
-        js = r.json()
-        cards = js.get("data", [])
-        if not cards:
-            params = {"q": f'name:"{safe_name}"', "pageSize": 3}
-            r2 = await client.get(url, headers=headers, params=params)
-            if r2.status_code != 200:
+    try:
+        async with httpx.AsyncClient(timeout=25) as client:
+            r = await client.get(url, headers=headers, params=params)
+            if r.status_code != 200:
                 return None
-            cards = r2.json().get("data", [])
+
+            js = r.json()
+            cards = js.get("data", [])
             if not cards:
-                return None
+                params = {"q": f'name:"{safe_name}"', "pageSize": 3}
+                r2 = await client.get(url, headers=headers, params=params)
+                if r2.status_code != 200:
+                    return None
+                cards = r2.json().get("data", [])
+                if not cards:
+                    return None
 
-        c0 = cards[0]
-        set_obj = c0.get("set", {}) or {}
-        release = set_obj.get("releaseDate")
-        year = release[:4] if isinstance(release, str) and len(release) >= 4 and release[:4].isdigit() else None
+            c0 = cards[0]
+            set_obj = c0.get("set", {}) or {}
+            release = set_obj.get("releaseDate")
+            year = release[:4] if isinstance(release, str) and len(release) >= 4 and release[:4].isdigit() else None
 
-        return {
-            "name": c0.get("name"),
-            "number": c0.get("number"),
-            "set_name": set_obj.get("name"),
-            "series": set_obj.get("series"),
-            "releaseDate": release,
-            "year": year
-        }
+            return {
+                "name": c0.get("name"),
+                "number": c0.get("number"),
+                "set_name": set_obj.get("name"),
+                "series": set_obj.get("series"),
+                "releaseDate": release,
+                "year": year
+            }
+    except Exception:
+        return None
 
 
 def quality_warnings(img, label, warnings: List[str]):
@@ -398,6 +459,27 @@ async def identify(front: UploadFile = File(...)):
 
     auto_best = await autoid_best(front_img, front_warp_id)
 
+    # Check for OpenAI errors
+    if isinstance(auto_best, dict) and auto_best.get("error"):
+        error_reason = auto_best.get("reason", "unknown")
+        error_msg = auto_best.get("message", "") or auto_best.get("body", "")
+        
+        # Log for debugging
+        print(f"OpenAI Error: {error_reason} - {error_msg}")
+        
+        # Add warning but continue (allow fallback to TCG lookup)
+        warnings.append(f"Auto-ID error: {error_reason}")
+        
+        # If it's a critical error (missing key, auth failure), return error
+        if error_reason in ["missing_openai_key", "openai_http_401", "openai_http_403"]:
+            raise HTTPException(
+                status_code=500, 
+                detail=f"OpenAI API configuration error: {error_reason}"
+            )
+        
+        # For other errors, continue with empty auto_best
+        auto_best = None
+
     card_name = None
     card_number = None
     set_name = None
@@ -409,13 +491,13 @@ async def identify(front: UploadFile = File(...)):
     tcg = await pokemontcg_lookup(card_name, card_number, set_name) if card_name else None
     ident = build_identity_from_auto(auto_best, tcg)
 
-    # if we still can't identify, be explicit but return JSON (never HTML)
+    # if we still can't identify, be explicit
     if ident["name"] == "Unknown card" and not tcg:
-        warnings.append("Auto-ID: Could not confidently read name/number. Reduce glare and move closer to the text.")
+        warnings.append("Could not identify card. Ensure name/number are clearly visible with good lighting.")
 
     identify_token = str(uuid.uuid4())
 
-    # Confidence: prefer OpenAI confidence if available; else 0
+    # Confidence: prefer OpenAI confidence if available; else use TCG lookup confidence
     conf = 0.0
     if ident.get("id_confidence") is not None:
         conf = float(max(0.0, min(1.0, ident["id_confidence"])))
@@ -440,7 +522,7 @@ async def verify(
     front: UploadFile = File(...),
     back: UploadFile = File(...),
     angle: Optional[UploadFile] = File(None),
-    identify_token: Optional[str] = Form(None),  # accepted but not required
+    identify_token: Optional[str] = Form(None),
 ):
     fb = await front.read()
     bb = await back.read()
@@ -503,14 +585,13 @@ async def verify(
     if id_conf is not None and id_conf < 0.45:
         warnings.append("Auto-ID: Low confidence (try closer / less glare)")
 
-    # Card detection / warp for assessment (less strict)
+    # Card detection / warp for assessment
     bq = find_card_quad(back_img)
     aq = find_card_quad(angle_img) if angle_img is not None else None
 
     if fq is None or bq is None:
         defects.append("Card boundary detection weak (fill frame, reduce glare). Assessment may be inaccurate.")
         confidence -= 0.08
-        # continue anyway with what we can (no warp-based measures)
         return JSONResponse(content={
             "pregrade": "Pre-Assessment: Limited (No Warp)",
             "preapproval": "Pre-Approved — manual review recommended (framing/edge data limited)",
