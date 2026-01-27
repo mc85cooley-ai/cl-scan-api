@@ -1,4 +1,4 @@
-# main.py (FULL FILE) — Fixed OpenAI integration with standard Chat Completions API
+# main.py (FULL FILE) — FIXED for OpenAI Responses API
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import JSONResponse
 from typing import Optional, List, Dict, Any
@@ -12,12 +12,11 @@ import uuid
 
 app = FastAPI(title="Collectors League Scan API")
 
-APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-01-27-fixed")
+APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-01-27-responses-api-fixed")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
-# Fixed: Use valid OpenAI model name
-OPENAI_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini")
+OPENAI_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4.1-mini")
 
 
 @app.get("/")
@@ -136,7 +135,7 @@ def normalize_number(num):
 
 async def openai_autoid_pokemon(front_bgr) -> dict:
     """
-    FIXED: Use standard Chat Completions API
+    FIXED: Use correct Responses API format with proper image_url field
     Return dict in schema:
     {name, number, set_name, confidence, notes}
     Or {error: True, ...}
@@ -146,48 +145,41 @@ async def openai_autoid_pokemon(front_bgr) -> dict:
 
     img_b64 = b64_image_from_cv2(front_bgr, fmt=".jpg", quality=95)
 
-    system_prompt = (
-        "You are a Pokémon card identification expert. "
-        "Identify cards from photos and return ONLY valid JSON. "
-        "If uncertain, use null for that field. "
-        "Do NOT guess - only return what you can see clearly. "
-        "Schema: {\"name\": string|null, \"number\": string|null, "
-        "\"set_name\": string|null, \"confidence\": number (0-1), \"notes\": string|null}"
+    instructions = (
+        "Identify this Pokémon trading card from the photo.\n"
+        "Return ONLY valid JSON.\n"
+        "If uncertain, use null.\n"
+        "Schema:\n"
+        "{"
+        "\"name\": string|null,"
+        "\"number\": string|null,"
+        "\"set_name\": string|null,"
+        "\"confidence\": number,"
+        "\"notes\": string|null"
+        "}\n"
+        "Rules:\n"
+        "- Do NOT guess.\n"
+        "- Prefer exact printed card name.\n"
+        "- number should look like '006/165' if visible.\n"
+        "- set_name should be the set title if visible (e.g. 'Scarlet & Violet—151').\n"
     )
 
+    # FIXED: Use correct format for Responses API
     payload = {
         "model": OPENAI_MODEL,
-        "messages": [
-            {
-                "role": "system",
-                "content": system_prompt
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": (
-                            "Identify this Pokémon card. Return JSON with:\n"
-                            "- name: The card's name (e.g. 'Charizard ex')\n"
-                            "- number: Card number as printed (e.g. '006/165')\n"
-                            "- set_name: Set name if visible (e.g. 'Scarlet & Violet—151')\n"
-                            "- confidence: 0-1 scale (0=can't read, 1=very clear)\n"
-                            "- notes: Any observations or uncertainties"
-                        )
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{img_b64}"
-                        }
-                    }
-                ]
-            }
-        ],
+        "instructions": instructions,
+        "input": [{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "Identify this Pokémon card. Return JSON only."},
+                {
+                    "type": "input_image",
+                    # FIXED: Use image_url with data URI, not image_base64
+                    "image_url": f"data:image/jpeg;base64,{img_b64}"
+                },
+            ]
+        }],
         "response_format": {"type": "json_object"},
-        "max_tokens": 500,
-        "temperature": 0.1  # Low temperature for more consistent results
     }
 
     headers = {
@@ -197,9 +189,8 @@ async def openai_autoid_pokemon(front_bgr) -> dict:
 
     try:
         async with httpx.AsyncClient(timeout=60) as client:
-            # FIXED: Use standard Chat Completions endpoint
             r = await client.post(
-                "https://api.openai.com/v1/chat/completions",
+                "https://api.openai.com/v1/responses",
                 headers=headers,
                 json=payload
             )
@@ -215,35 +206,57 @@ async def openai_autoid_pokemon(front_bgr) -> dict:
 
         data = r.json()
         
-        # FIXED: Extract from standard Chat Completions format
-        choices = data.get("choices", [])
-        if not choices:
-            return {
-                "error": True,
-                "reason": "no_choices",
-                "raw": str(data)[:800]
-            }
-
-        message = choices[0].get("message", {})
-        content = message.get("content", "")
+        # Try to extract output_text from various possible locations
+        text = None
         
-        if not content:
+        # Method 1: Direct output_text field
+        if "output_text" in data and isinstance(data["output_text"], str):
+            text = data["output_text"]
+        
+        # Method 2: output array
+        elif "output" in data and isinstance(data["output"], list):
+            for item in data["output"]:
+                if isinstance(item, dict):
+                    # Check for message type
+                    if item.get("type") == "message":
+                        content = item.get("content", [])
+                        if isinstance(content, list):
+                            for c in content:
+                                if isinstance(c, dict) and "text" in c:
+                                    text = c["text"]
+                                    break
+                    # Check for direct content
+                    elif "content" in item:
+                        content = item["content"]
+                        if isinstance(content, list):
+                            for c in content:
+                                if isinstance(c, dict) and "text" in c:
+                                    text = c["text"]
+                                    break
+                        elif isinstance(content, str):
+                            text = content
+                if text:
+                    break
+        
+        if not text:
             return {
                 "error": True,
-                "reason": "no_content",
+                "reason": "no_output_text",
                 "raw": str(data)[:800]
             }
 
-        # Parse JSON from content
+        # Parse JSON from text
+        text = text.strip()
+        
         try:
-            result = json.loads(content)
+            result = json.loads(text)
             
-            # Validate the result has expected fields
+            # Validate structure
             if not isinstance(result, dict):
                 return {
                     "error": True,
                     "reason": "invalid_json_structure",
-                    "text": content[:800]
+                    "text": text[:800]
                 }
             
             # Ensure confidence is a number
@@ -258,13 +271,12 @@ async def openai_autoid_pokemon(front_bgr) -> dict:
             return result
             
         except json.JSONDecodeError:
-            # Try to extract JSON from text (in case model added markdown)
-            start = content.find("{")
-            end = content.rfind("}")
+            # Try to extract JSON from text (in case wrapped in markdown)
+            start = text.find("{")
+            end = text.rfind("}")
             if start != -1 and end != -1 and end > start:
                 try:
-                    result = json.loads(content[start:end+1])
-                    # Ensure confidence field
+                    result = json.loads(text[start:end+1])
                     if "confidence" not in result:
                         result["confidence"] = 0.5
                     return result
@@ -274,7 +286,7 @@ async def openai_autoid_pokemon(front_bgr) -> dict:
             return {
                 "error": True,
                 "reason": "json_parse_failed",
-                "text": content[:800]
+                "text": text[:800]
             }
     
     except httpx.TimeoutException:
@@ -474,7 +486,7 @@ async def identify(front: UploadFile = File(...)):
         if error_reason in ["missing_openai_key", "openai_http_401", "openai_http_403"]:
             raise HTTPException(
                 status_code=500, 
-                detail=f"OpenAI API configuration error: {error_reason}"
+                detail=f"OpenAI API configuration error: {error_reason}. Check OPENAI_API_KEY environment variable."
             )
         
         # For other errors, continue with empty auto_best
