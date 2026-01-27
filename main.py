@@ -1,22 +1,21 @@
-# main.py (FULL FILE) — FIXED for OpenAI Responses API
+# main.py - OCR + Pokemon TCG API Approach (Simple, Fast, Accurate)
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import JSONResponse
 from typing import Optional, List, Dict, Any
 import numpy as np
 import cv2
 import httpx
-import base64
 import os
 import json
 import uuid
+import re
+from PIL import Image
 
 app = FastAPI(title="Collectors League Scan API")
 
-APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-01-27-responses-api-fixed")
+APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-01-27-ocr-tcg")
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4.1-mini")
 
 
 @app.get("/")
@@ -30,25 +29,14 @@ def health():
         "ok": True,
         "service": "cl-scan-api",
         "version": APP_VERSION,
-        "has_openai_key": bool(OPENAI_API_KEY),
         "has_pokemontcg_key": bool(POKEMONTCG_API_KEY),
-        "model": OPENAI_MODEL,
+        "method": "OCR + Pokemon TCG API"
     }
 
 
 def decode_image(file_bytes: bytes):
     arr = np.frombuffer(file_bytes, dtype=np.uint8)
     return cv2.imdecode(arr, cv2.IMREAD_COLOR)
-
-
-def b64_image_from_cv2(img_bgr, fmt=".jpg", quality=95):
-    encode_params = []
-    if fmt.lower() in [".jpg", ".jpeg"]:
-        encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)]
-    ok, buf = cv2.imencode(fmt, img_bgr, encode_params)
-    if not ok:
-        raise ValueError("Could not encode image for base64")
-    return base64.b64encode(buf.tobytes()).decode("utf-8")
 
 
 def blur_score(gray):
@@ -133,271 +121,211 @@ def normalize_number(num):
     return s
 
 
-async def openai_autoid_pokemon(front_bgr) -> dict:
+def extract_text_from_image(img_bgr):
     """
-    FIXED: Use correct Responses API format with proper image_url field
-    Return dict in schema:
-    {name, number, set_name, confidence, notes}
-    Or {error: True, ...}
+    Extract text from card image using OpenCV preprocessing + pytesseract
     """
-    if not OPENAI_API_KEY:
-        return {"error": True, "reason": "missing_openai_key"}
-
-    img_b64 = b64_image_from_cv2(front_bgr, fmt=".jpg", quality=95)
-
-    instructions = (
-        "Identify this Pokémon trading card from the photo.\n"
-        "Return ONLY valid JSON.\n"
-        "If uncertain, use null.\n"
-        "Schema:\n"
-        "{"
-        "\"name\": string|null,"
-        "\"number\": string|null,"
-        "\"set_name\": string|null,"
-        "\"confidence\": number,"
-        "\"notes\": string|null"
-        "}\n"
-        "Rules:\n"
-        "- Do NOT guess.\n"
-        "- Prefer exact printed card name.\n"
-        "- number should look like '006/165' if visible.\n"
-        "- set_name should be the set title if visible (e.g. 'Scarlet & Violet—151').\n"
-    )
-
-    # FIXED: Use correct format for Responses API
-    payload = {
-        "model": OPENAI_MODEL,
-        "instructions": instructions,
-        "input": [{
-            "role": "user",
-            "content": [
-                {"type": "input_text", "text": "Identify this Pokémon card. Return JSON only."},
-                {
-                    "type": "input_image",
-                    # FIXED: Use image_url with data URI, not image_base64
-                    "image_url": f"data:image/jpeg;base64,{img_b64}"
-                },
-            ]
-        }],
-        "response_format": {"type": "json_object"},
-    }
-
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json"
-    }
-
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.post(
-                "https://api.openai.com/v1/responses",
-                headers=headers,
-                json=payload
-            )
-
-        if r.status_code < 200 or r.status_code >= 300:
-            error_body = r.text[:800] if r.text else "No response body"
-            return {
-                "error": True,
-                "status": r.status_code,
-                "body": error_body,
-                "reason": f"openai_http_{r.status_code}"
-            }
-
-        data = r.json()
-        
-        # Try to extract output_text from various possible locations
-        text = None
-        
-        # Method 1: Direct output_text field
-        if "output_text" in data and isinstance(data["output_text"], str):
-            text = data["output_text"]
-        
-        # Method 2: output array
-        elif "output" in data and isinstance(data["output"], list):
-            for item in data["output"]:
-                if isinstance(item, dict):
-                    # Check for message type
-                    if item.get("type") == "message":
-                        content = item.get("content", [])
-                        if isinstance(content, list):
-                            for c in content:
-                                if isinstance(c, dict) and "text" in c:
-                                    text = c["text"]
-                                    break
-                    # Check for direct content
-                    elif "content" in item:
-                        content = item["content"]
-                        if isinstance(content, list):
-                            for c in content:
-                                if isinstance(c, dict) and "text" in c:
-                                    text = c["text"]
-                                    break
-                        elif isinstance(content, str):
-                            text = content
-                if text:
-                    break
-        
-        if not text:
-            return {
-                "error": True,
-                "reason": "no_output_text",
-                "raw": str(data)[:800]
-            }
-
-        # Parse JSON from text
-        text = text.strip()
-        
-        try:
-            result = json.loads(text)
-            
-            # Validate structure
-            if not isinstance(result, dict):
-                return {
-                    "error": True,
-                    "reason": "invalid_json_structure",
-                    "text": text[:800]
-                }
-            
-            # Ensure confidence is a number
-            if "confidence" in result:
-                try:
-                    result["confidence"] = float(result["confidence"])
-                except (ValueError, TypeError):
-                    result["confidence"] = 0.5
-            else:
-                result["confidence"] = 0.5
-            
-            return result
-            
-        except json.JSONDecodeError:
-            # Try to extract JSON from text (in case wrapped in markdown)
-            start = text.find("{")
-            end = text.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                try:
-                    result = json.loads(text[start:end+1])
-                    if "confidence" not in result:
-                        result["confidence"] = 0.5
-                    return result
-                except:
-                    pass
-            
-            return {
-                "error": True,
-                "reason": "json_parse_failed",
-                "text": text[:800]
-            }
+        import pytesseract
+    except ImportError:
+        print("pytesseract not installed, returning empty text")
+        return ""
     
-    except httpx.TimeoutException:
-        return {
-            "error": True,
-            "reason": "timeout",
-            "message": "OpenAI API request timed out"
-        }
-    except httpx.RequestError as e:
-        return {
-            "error": True,
-            "reason": "request_error",
-            "message": str(e)
-        }
-    except Exception as e:
-        return {
-            "error": True,
-            "reason": "exception",
-            "message": str(e)
-        }
+    # Convert to grayscale
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    
+    # Apply thresholding to preprocess
+    gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+    
+    # Extract text
+    text = pytesseract.image_to_string(gray, config='--psm 6')
+    
+    return text
 
 
-async def autoid_best(front_raw, front_warped=None) -> Optional[dict]:
+def parse_card_info(text):
     """
-    Try warped then raw; return best non-error result by confidence.
+    Parse card name and number from OCR text
+    Returns: (card_name, card_number)
     """
-    best = None
-    for img in [front_warped, front_raw]:
-        if img is None:
-            continue
-        res = await openai_autoid_pokemon(img)
-        if isinstance(res, dict) and not res.get("error"):
-            try:
-                conf = float(res.get("confidence") or 0.0)
-            except Exception:
-                conf = 0.0
-            if best is None:
-                best = res
-            else:
-                try:
-                    best_conf = float(best.get("confidence") or 0.0)
-                except Exception:
-                    best_conf = 0.0
-                if conf > best_conf:
-                    best = res
-    return best
+    lines = [line.strip() for line in text.split('\n') if line.strip()]
+    
+    card_name = None
+    card_number = None
+    
+    # Look for card number pattern: XXX/XXX or XXX/XXXXX
+    number_pattern = r'\b(\d{1,4})/(\d{1,4})\b'
+    
+    for line in lines:
+        # Try to find card number
+        match = re.search(number_pattern, line)
+        if match and not card_number:
+            card_number = match.group(0)
+            print(f"Found card number: {card_number}")
+        
+        # Look for card name (usually capitalized, at top of card)
+        # Skip if line is too short or looks like set info
+        if not card_name and len(line) > 3:
+            # Skip lines that look like they contain numbers or symbols
+            if not re.search(r'\d{2,}', line) and len(line) < 50:
+                # Likely the card name
+                card_name = line
+                print(f"Found potential card name: {card_name}")
+    
+    return card_name, card_number
 
 
-async def pokemontcg_lookup(name, number, set_name):
-    if not name:
+async def pokemontcg_search(name=None, number=None, set_name=None):
+    """
+    Search Pokemon TCG API for card
+    """
+    if not name and not number:
         return None
 
     q_parts = []
-    safe_name = name.replace('"', '\\"')
-    q_parts.append(f'name:"{safe_name}"')
-
+    
+    if name:
+        # Clean name for search
+        safe_name = name.replace('"', '\\"').strip()
+        q_parts.append(f'name:"{safe_name}"')
+    
     if number:
-        safe_num = number.replace('"', '\\"')
+        safe_num = number.replace('"', '\\"').strip()
         q_parts.append(f'number:"{safe_num}"')
-
+    
     if set_name:
-        safe_set = set_name.replace('"', '\\"')
+        safe_set = set_name.replace('"', '\\"').strip()
         q_parts.append(f'set.name:"{safe_set}"')
 
     q = " ".join(q_parts)
+    
+    print(f"Pokemon TCG API query: {q}")
 
     headers = {}
     if POKEMONTCG_API_KEY:
         headers["X-Api-Key"] = POKEMONTCG_API_KEY
 
     url = "https://api.pokemontcg.io/v2/cards"
-    params = {"q": q, "pageSize": 3}
+    params = {"q": q, "pageSize": 5, "orderBy": "-set.releaseDate"}
 
     try:
         async with httpx.AsyncClient(timeout=25) as client:
             r = await client.get(url, headers=headers, params=params)
+            
             if r.status_code != 200:
+                print(f"Pokemon TCG API error: {r.status_code}")
                 return None
 
-            js = r.json()
-            cards = js.get("data", [])
+            data = r.json()
+            cards = data.get("data", [])
+            
+            print(f"Found {len(cards)} cards")
+            
             if not cards:
-                params = {"q": f'name:"{safe_name}"', "pageSize": 3}
-                r2 = await client.get(url, headers=headers, params=params)
-                if r2.status_code != 200:
-                    return None
-                cards = r2.json().get("data", [])
-                if not cards:
-                    return None
+                # Try fuzzy search with just name
+                if name:
+                    print(f"Trying fuzzy search with name only: {name}")
+                    params = {"q": f'name:"{safe_name}"', "pageSize": 5, "orderBy": "-set.releaseDate"}
+                    r2 = await client.get(url, headers=headers, params=params)
+                    if r2.status_code == 200:
+                        cards = r2.json().get("data", [])
+                        print(f"Fuzzy search found {len(cards)} cards")
+            
+            if not cards:
+                return None
 
-            c0 = cards[0]
-            set_obj = c0.get("set", {}) or {}
+            # Return the most recent card (first result)
+            card = cards[0]
+            set_obj = card.get("set", {}) or {}
             release = set_obj.get("releaseDate")
             year = release[:4] if isinstance(release, str) and len(release) >= 4 and release[:4].isdigit() else None
 
-            return {
-                "name": c0.get("name"),
-                "number": c0.get("number"),
+            result = {
+                "name": card.get("name"),
+                "number": card.get("number"),
                 "set_name": set_obj.get("name"),
                 "series": set_obj.get("series"),
                 "releaseDate": release,
-                "year": year
+                "year": year,
+                "rarity": card.get("rarity"),
+                "image_url": card.get("images", {}).get("large")
             }
-    except Exception:
+            
+            print(f"Selected card: {result['name']} from {result['set_name']}")
+            
+            return result
+            
+    except Exception as e:
+        print(f"Pokemon TCG API exception: {e}")
         return None
 
 
+async def identify_card_ocr(front_img):
+    """
+    Identify card using OCR + Pokemon TCG API
+    """
+    # Try to warp card for better OCR
+    quad = find_card_quad(front_img)
+    if quad is not None:
+        warped = warp_card(front_img, quad, out_w=1200, out_h=1680)
+        print("Using warped image for OCR")
+    else:
+        warped = front_img
+        print("Using original image for OCR")
+    
+    # Extract text
+    text = extract_text_from_image(warped)
+    print(f"OCR extracted text (first 200 chars): {text[:200]}")
+    
+    if not text or len(text) < 3:
+        return {
+            "error": True,
+            "reason": "ocr_failed",
+            "message": "Could not extract text from image"
+        }
+    
+    # Parse card info
+    card_name, card_number = parse_card_info(text)
+    
+    print(f"Parsed - Name: {card_name}, Number: {card_number}")
+    
+    if not card_name and not card_number:
+        return {
+            "error": True,
+            "reason": "no_card_info",
+            "message": "Could not find card name or number in image"
+        }
+    
+    # Search Pokemon TCG API
+    result = await pokemontcg_search(name=card_name, number=card_number)
+    
+    if result:
+        confidence = 0.95 if card_number else 0.75  # Higher confidence if we matched by number
+        return {
+            "name": result["name"],
+            "series": result["series"] or result["set_name"],
+            "year": result["year"] or "Unknown",
+            "number": result["number"] or "",
+            "confidence": confidence,
+            "rarity": result.get("rarity"),
+            "set_name": result["set_name"],
+            "image_url": result.get("image_url"),
+            "method": "OCR + Pokemon TCG API"
+        }
+    else:
+        # Return what we found even if not in database
+        return {
+            "name": card_name or "Unknown card",
+            "series": "Unknown",
+            "year": "Unknown",
+            "number": card_number or "",
+            "confidence": 0.3,
+            "method": "OCR only (not found in Pokemon TCG database)"
+        }
+
+
 def quality_warnings(img, label, warnings: List[str]):
-    """
-    NON-BLOCKING warnings only.
-    """
+    """NON-BLOCKING warnings only."""
     h, w = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
@@ -417,42 +345,6 @@ def quality_warnings(img, label, warnings: List[str]):
         warnings.append(f"{label}: Too dark")
 
 
-def build_identity_from_auto(auto_best: Optional[dict], tcg: Optional[dict]) -> Dict[str, Any]:
-    series = "Unknown"
-    year = "Unknown"
-    name = "Unknown card"
-    number = ""
-
-    id_conf = None
-    if isinstance(auto_best, dict):
-        try:
-            id_conf = float(auto_best.get("confidence")) if auto_best.get("confidence") is not None else None
-        except Exception:
-            id_conf = None
-
-    if tcg:
-        name = tcg.get("name") or name
-        year = tcg.get("year") or year
-        series = tcg.get("series") or tcg.get("set_name") or series
-        number = tcg.get("number") or number
-    else:
-        if isinstance(auto_best, dict):
-            if auto_best.get("name"):
-                name = str(auto_best.get("name"))
-            if auto_best.get("set_name"):
-                series = str(auto_best.get("set_name"))
-            if auto_best.get("number"):
-                number = str(auto_best.get("number"))
-
-    return {
-        "name": name,
-        "series": series,
-        "year": year,
-        "number": number,
-        "id_confidence": id_conf
-    }
-
-
 @app.post("/api/identify")
 async def identify(front: UploadFile = File(...)):
     fb = await front.read()
@@ -466,66 +358,39 @@ async def identify(front: UploadFile = File(...)):
     warnings: List[str] = []
     quality_warnings(front_img, "Front", warnings)
 
-    fq = find_card_quad(front_img)
-    front_warp_id = warp_card(front_img, fq, out_w=1400, out_h=1960) if fq is not None else None
+    # Identify using OCR + Pokemon TCG API
+    result = await identify_card_ocr(front_img)
 
-    auto_best = await autoid_best(front_img, front_warp_id)
-
-    # Check for OpenAI errors
-    if isinstance(auto_best, dict) and auto_best.get("error"):
-        error_reason = auto_best.get("reason", "unknown")
-        error_msg = auto_best.get("message", "") or auto_best.get("body", "")
+    if result.get("error"):
+        # OCR failed, return error
+        error_msg = result.get("message", "Could not identify card")
+        warnings.append(error_msg)
         
-        # Log for debugging
-        print(f"OpenAI Error: {error_reason} - {error_msg}")
-        
-        # Add warning but continue (allow fallback to TCG lookup)
-        warnings.append(f"Auto-ID error: {error_reason}")
-        
-        # If it's a critical error (missing key, auth failure), return error
-        if error_reason in ["missing_openai_key", "openai_http_401", "openai_http_403"]:
-            raise HTTPException(
-                status_code=500, 
-                detail=f"OpenAI API configuration error: {error_reason}. Check OPENAI_API_KEY environment variable."
-            )
-        
-        # For other errors, continue with empty auto_best
-        auto_best = None
-
-    card_name = None
-    card_number = None
-    set_name = None
-    if isinstance(auto_best, dict):
-        card_name = auto_best.get("name")
-        card_number = normalize_number(auto_best.get("number"))
-        set_name = auto_best.get("set_name")
-
-    tcg = await pokemontcg_lookup(card_name, card_number, set_name) if card_name else None
-    ident = build_identity_from_auto(auto_best, tcg)
-
-    # if we still can't identify, be explicit
-    if ident["name"] == "Unknown card" and not tcg:
-        warnings.append("Could not identify card. Ensure name/number are clearly visible with good lighting.")
+        return JSONResponse(content={
+            "identify_token": str(uuid.uuid4()),
+            "name": "Unknown card",
+            "series": "Unknown",
+            "year": "Unknown",
+            "number": "",
+            "confidence": 0.0,
+            "warnings": warnings,
+            "version": APP_VERSION
+        })
 
     identify_token = str(uuid.uuid4())
 
-    # Confidence: prefer OpenAI confidence if available; else use TCG lookup confidence
-    conf = 0.0
-    if ident.get("id_confidence") is not None:
-        conf = float(max(0.0, min(1.0, ident["id_confidence"])))
-    elif tcg:
-        conf = 0.85
-
     return JSONResponse(content={
         "identify_token": identify_token,
-        "name": ident["name"],
-        "series": ident["series"],
-        "year": ident["year"],
-        "number": ident["number"],
-        "confidence": conf,
+        "name": result.get("name", "Unknown card"),
+        "series": result.get("series", "Unknown"),
+        "year": result.get("year", "Unknown"),
+        "number": result.get("number", ""),
+        "confidence": result.get("confidence", 0.5),
         "warnings": warnings,
         "version": APP_VERSION,
-        "debug_openai": (auto_best if isinstance(auto_best, dict) and auto_best.get("error") else None)
+        "method": result.get("method", "OCR + Pokemon TCG API"),
+        "rarity": result.get("rarity"),
+        "image_url": result.get("image_url")
     })
 
 
@@ -564,40 +429,15 @@ async def verify(
     else:
         warnings.append("Angled: Not provided (recommended for surface/foil assessment)")
 
-    # Identity (best-effort, but do NOT hard-fail assessment)
-    fq = find_card_quad(front_img)
-    front_warp_id = warp_card(front_img, fq, out_w=1400, out_h=1960) if fq is not None else None
-    auto_best = await autoid_best(front_img, front_warp_id)
-
-    series = "Unknown"
-    year = "Unknown"
-    name = "Unknown card"
-
-    card_name = None
-    card_number = None
-    set_name = None
-    id_conf = None
-
-    if isinstance(auto_best, dict) and not auto_best.get("error"):
-        card_name = auto_best.get("name")
-        card_number = normalize_number(auto_best.get("number"))
-        set_name = auto_best.get("set_name")
-        try:
-            id_conf = float(auto_best.get("confidence")) if auto_best.get("confidence") is not None else None
-        except Exception:
-            id_conf = None
-
-    tcg = await pokemontcg_lookup(card_name, card_number, set_name) if card_name else None
-    ident = build_identity_from_auto(auto_best, tcg)
-
-    name = ident["name"]
-    series = ident["series"]
-    year = ident["year"]
-
-    if id_conf is not None and id_conf < 0.45:
-        warnings.append("Auto-ID: Low confidence (try closer / less glare)")
+    # Identify card
+    ident_result = await identify_card_ocr(front_img)
+    
+    name = ident_result.get("name", "Unknown card")
+    series = ident_result.get("series", "Unknown")
+    year = ident_result.get("year", "Unknown")
 
     # Card detection / warp for assessment
+    fq = find_card_quad(front_img)
     bq = find_card_quad(back_img)
     aq = find_card_quad(angle_img) if angle_img is not None else None
 
@@ -614,8 +454,7 @@ async def verify(
             "warnings": warnings,
             "confidence": float(max(0.10, min(0.90, confidence))),
             "subgrades": {"photo_quality": "Warn", "card_detected": "Partial"},
-            "version": APP_VERSION,
-            "debug_openai": (auto_best if isinstance(auto_best, dict) and auto_best.get("error") else None)
+            "version": APP_VERSION
         })
 
     front_w = warp_card(front_img, fq)
@@ -681,6 +520,5 @@ async def verify(
         "warnings": warnings,
         "confidence": float(max(0.10, min(0.90, confidence))),
         "subgrades": subgrades,
-        "version": APP_VERSION,
-        "debug_openai": (auto_best if isinstance(auto_best, dict) and auto_best.get("error") else None)
+        "version": APP_VERSION
     })
