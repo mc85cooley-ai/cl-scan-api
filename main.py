@@ -1,24 +1,45 @@
-# main.py - Simple Pokemon TCG API Only (No OCR, No OpenAI)
+"""
+Collectors League Scan API - Full AI Integration
+Uses OpenAI Vision API for card identification and grading
+"""
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import JSONResponse
-from typing import Optional, List, Dict, Any
-import numpy as np
-import cv2
-import httpx
+from fastapi.middleware.cors import CORSMiddleware
+from typing import Optional
+import base64
 import os
 import json
-import uuid
+import secrets
+import httpx
 
 app = FastAPI(title="Collectors League Scan API")
 
-APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-01-27-simple-tcg")
+# CORS for WordPress
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
+# Configuration
+APP_VERSION = "2026-01-28-ai-vision"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
+
+if not OPENAI_API_KEY:
+    print("WARNING: OPENAI_API_KEY not set!")
 
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "cl-scan-api", "version": APP_VERSION}
+    return {
+        "status": "ok",
+        "service": "cl-scan-api",
+        "version": APP_VERSION,
+        "message": "Collectors League Card Grading API"
+    }
 
 
 @app.get("/health")
@@ -27,208 +48,173 @@ def health():
         "ok": True,
         "service": "cl-scan-api",
         "version": APP_VERSION,
+        "has_openai_key": bool(OPENAI_API_KEY),
         "has_pokemontcg_key": bool(POKEMONTCG_API_KEY),
-        "method": "Pokemon TCG API (manual entry)"
+        "model": "gpt-4o-mini"
     }
 
 
-def decode_image(file_bytes: bytes):
-    arr = np.frombuffer(file_bytes, dtype=np.uint8)
-    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+def image_to_base64(image_bytes: bytes) -> str:
+    """Convert image bytes to base64 string"""
+    return base64.b64encode(image_bytes).decode('utf-8')
 
 
-def blur_score(gray):
-    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
-
-
-def overexposed_ratio(gray):
-    return float((gray >= 245).mean())
-
-
-def underexposed_ratio(gray):
-    return float((gray <= 10).mean())
-
-
-def find_card_quad(img_bgr):
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(gray, 40, 120)
-    edges = cv2.dilate(edges, None, iterations=2)
-
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:12]
-
-    h, w = img_bgr.shape[:2]
-    img_area = h * w
-
-    for c in contours:
-        area = cv2.contourArea(c)
-        if area < img_area * 0.08:
-            continue
-
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-
-        if len(approx) == 4:
-            return approx.reshape(4, 2).astype(np.float32)
-
-    return None
-
-
-def order_points(pts):
-    s = pts.sum(axis=1)
-    diff = np.diff(pts, axis=1).reshape(-1)
-
-    tl = pts[np.argmin(s)]
-    br = pts[np.argmax(s)]
-    tr = pts[np.argmin(diff)]
-    bl = pts[np.argmax(diff)]
-
-    return np.array([tl, tr, br, bl], dtype=np.float32)
-
-
-def warp_card(img, quad, out_w=900, out_h=1260):
-    pts = order_points(quad)
-    dst = np.array([[0, 0], [out_w - 1, 0], [out_w - 1, out_h - 1], [0, out_h - 1]], dtype=np.float32)
-    M = cv2.getPerspectiveTransform(pts, dst)
-    return cv2.warpPerspective(img, M, (out_w, out_h))
-
-
-def whitening_risk_edge(gray_warped):
-    h, w = gray_warped.shape[:2]
-    band = 10
-    top = gray_warped[0:band, :]
-    bot = gray_warped[h - band:h, :]
-    left = gray_warped[:, 0:band]
-    right = gray_warped[:, w - band:w]
-    ring = np.concatenate([top.flatten(), bot.flatten(), left.flatten(), right.flatten()])
-    return float((ring >= 235).mean())
-
-
-def surface_line_risk(gray_angle_warped):
-    blur = cv2.GaussianBlur(gray_angle_warped, (0, 0), 2.0)
-    high = cv2.absdiff(gray_angle_warped, blur)
-    denom = max(1.0, float(gray_angle_warped.mean()))
-    return float(high.mean() / denom)
-
-
-async def pokemontcg_search(name=None, number=None) -> Optional[dict]:
-    """Search Pokemon TCG API"""
-    if not name and not number:
-        return None
-
-    q_parts = []
+async def call_openai_vision(image_base64: str, prompt: str, max_tokens: int = 800) -> dict:
+    """Call OpenAI Vision API"""
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=500, detail="OpenAI API key not configured")
     
-    if name:
-        clean_name = name.replace('"', '').strip()
-        q_parts.append(f'name:"{clean_name}"')
+    url = "https://api.openai.com/v1/chat/completions"
     
-    if number:
-        safe_num = number.replace('"', '').strip()
-        q_parts.append(f'number:"{safe_num}"')
-
-    q = " ".join(q_parts)
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
     
-    print(f"Pokemon TCG API query: {q}")
-
-    headers = {}
-    if POKEMONTCG_API_KEY:
-        headers["X-Api-Key"] = POKEMONTCG_API_KEY
-
-    url = "https://api.pokemontcg.io/v2/cards"
-    params = {"q": q, "pageSize": 5, "orderBy": "-set.releaseDate"}
-
-    try:
-        async with httpx.AsyncClient(timeout=25) as client:
-            r = await client.get(url, headers=headers, params=params)
-            
-            if r.status_code != 200:
-                print(f"Pokemon TCG API error: {r.status_code}")
-                return None
-
-            data = r.json()
-            cards = data.get("data", [])
-            
-            print(f"Pokemon TCG API returned {len(cards)} results")
-            
-            if not cards and name:
-                # Try fuzzy search
-                params = {"q": f'name:"{clean_name}"', "pageSize": 5}
-                r2 = await client.get(url, headers=headers, params=params)
-                if r2.status_code == 200:
-                    cards = r2.json().get("data", [])
-            
-            if not cards:
-                return None
-
-            card = cards[0]
-            set_obj = card.get("set", {}) or {}
-            release = set_obj.get("releaseDate")
-            year = release[:4] if isinstance(release, str) and len(release) >= 4 and release[:4].isdigit() else None
-
-            return {
-                "name": card.get("name"),
-                "number": card.get("number"),
-                "set_name": set_obj.get("name"),
-                "series": set_obj.get("series"),
-                "year": year
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": prompt
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{image_base64}"
+                        }
+                    }
+                ]
             }
+        ],
+        "max_tokens": max_tokens,
+        "temperature": 0.1
+    }
+    
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(url, headers=headers, json=payload)
+            
+            if response.status_code != 200:
+                print(f"OpenAI API Error: {response.status_code}")
+                print(f"Response: {response.text[:500]}")
+                return {
+                    "error": True,
+                    "status": response.status_code,
+                    "message": response.text[:200]
+                }
+            
+            data = response.json()
+            
+            if "choices" not in data or len(data["choices"]) == 0:
+                return {"error": True, "message": "No response from OpenAI"}
+            
+            content = data["choices"][0]["message"]["content"]
+            return {"error": False, "content": content}
+            
     except Exception as e:
-        print(f"Pokemon TCG API exception: {str(e)}")
-        return None
-
-
-def quality_warnings(img, label, warnings: List[str]):
-    """NON-BLOCKING warnings only."""
-    h, w = img.shape[:2]
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-    if min(h, w) < 900:
-        warnings.append(f"{label}: Low resolution (move closer)")
-
-    bs = blur_score(gray)
-    if bs < 70:
-        warnings.append(f"{label}: Slight blur risk (tap to focus)")
-
-    over = overexposed_ratio(gray)
-    if over > 0.06:
-        warnings.append(f"{label}: Glare/overexposure risk")
-
-    under = underexposed_ratio(gray)
-    if under > 0.15:
-        warnings.append(f"{label}: Too dark")
+        print(f"OpenAI API Exception: {str(e)}")
+        return {"error": True, "message": str(e)}
 
 
 @app.post("/api/identify")
 async def identify(front: UploadFile = File(...)):
     """
-    Simple identification - just validates image quality
-    User will manually enter card details in WordPress
+    Identify a trading card from its front image using AI vision
+    Returns: name, series, year, card_number, type, confidence
     """
-    fb = await front.read()
-    if not fb or len(fb) < 1500:
-        raise HTTPException(status_code=400, detail="Front image looks empty/corrupt.")
+    try:
+        # Read image
+        image_bytes = await front.read()
+        
+        if not image_bytes or len(image_bytes) < 1000:
+            raise HTTPException(status_code=400, detail="Image is too small or empty")
+        
+        # Convert to base64
+        image_base64 = image_to_base64(image_bytes)
+        
+        # Prepare prompt for identification
+        prompt = """Identify this trading card. Analyze the image and provide ONLY a JSON response with these exact fields:
 
-    front_img = decode_image(fb)
-    if front_img is None:
-        raise HTTPException(status_code=400, detail="Could not decode front image.")
+{
+  "name": "exact card name including variants (ex, V, VMAX, holo, first edition, etc.)",
+  "series": "set or series name",
+  "year": "release year (4 digits)",
+  "card_number": "card number if visible",
+  "type": "Pokemon/Magic/YuGiOh/Sports/Other",
+  "confidence": 0.0-1.0
+}
 
-    warnings: List[str] = []
-    quality_warnings(front_img, "Front", warnings)
-
-    # For now, return placeholder data
-    # User can manually enter card details in WordPress
-    return JSONResponse(content={
-        "identify_token": str(uuid.uuid4()),
-        "name": "Manual Entry Required",
-        "series": "Please enter card details manually",
-        "year": "Unknown",
-        "number": "",
-        "confidence": 0.0,
-        "warnings": warnings,
-        "version": APP_VERSION,
-        "note": "Automatic identification requires manual card entry for now"
-    })
+Be specific with the card name. Include any variants like "ex", "V", "VMAX", "GX", "holo", "reverse holo", "first edition", etc.
+If you cannot identify with confidence, set confidence to 0.0 and name to "Unknown".
+Respond ONLY with valid JSON, no other text."""
+        
+        # Call OpenAI Vision
+        result = await call_openai_vision(image_base64, prompt, max_tokens=500)
+        
+        if result.get("error"):
+            print(f"Vision API error: {result.get('message')}")
+            # Return fallback response
+            return JSONResponse(content={
+                "name": "Could not identify",
+                "series": "Unknown",
+                "year": "Unknown",
+                "card_number": "",
+                "type": "Other",
+                "confidence": 0.0,
+                "identify_token": f"idt_{secrets.token_urlsafe(12)}",
+                "error": "AI identification failed"
+            })
+        
+        # Parse JSON from response
+        content = result["content"].strip()
+        
+        # Remove markdown code blocks if present
+        if content.startswith("```json"):
+            content = content[7:]
+        if content.startswith("```"):
+            content = content[3:]
+        if content.endswith("```"):
+            content = content[:-3]
+        content = content.strip()
+        
+        try:
+            card_data = json.loads(content)
+        except json.JSONDecodeError as e:
+            print(f"JSON parse error: {e}")
+            print(f"Content: {content}")
+            # Return fallback
+            return JSONResponse(content={
+                "name": "Parse error",
+                "series": "Unknown",
+                "year": "Unknown",
+                "card_number": "",
+                "type": "Other",
+                "confidence": 0.0,
+                "identify_token": f"idt_{secrets.token_urlsafe(12)}",
+                "error": "Could not parse AI response"
+            })
+        
+        # Generate identify token
+        identify_token = f"idt_{secrets.token_urlsafe(12)}"
+        
+        # Return identified card data
+        return JSONResponse(content={
+            "name": card_data.get("name", "Unknown"),
+            "series": card_data.get("series", "Unknown"),
+            "year": str(card_data.get("year", "Unknown")),
+            "card_number": str(card_data.get("card_number", "")),
+            "type": card_data.get("type", "Other"),
+            "confidence": float(card_data.get("confidence", 0.0)),
+            "identify_token": identify_token
+        })
+        
+    except Exception as e:
+        print(f"Identify endpoint error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
 
 
 @app.post("/api/verify")
@@ -236,119 +222,117 @@ async def verify(
     front: UploadFile = File(...),
     back: UploadFile = File(...),
     angle: Optional[UploadFile] = File(None),
-    identify_token: Optional[str] = Form(None),
+    identify_token: Optional[str] = Form(None)
 ):
-    fb = await front.read()
-    bb = await back.read()
-    ab = await angle.read() if angle is not None else None
+    """
+    Assess card condition from front and back images using AI vision
+    Returns: grade, corners, edges, surface, centering, defects
+    """
+    try:
+        # Read front image (primary for grading)
+        front_bytes = await front.read()
+        
+        if not front_bytes or len(front_bytes) < 1000:
+            raise HTTPException(status_code=400, detail="Front image is too small or empty")
+        
+        # Convert to base64
+        front_base64 = image_to_base64(front_bytes)
+        
+        # Prepare prompt for condition assessment
+        prompt = """You are a professional card grader. Analyze this trading card's condition and provide ONLY a JSON response with these exact fields:
 
-    if min(len(fb), len(bb)) < 1500:
-        raise HTTPException(status_code=400, detail="Front or Back image looks empty/corrupt.")
+{
+  "pregrade": "estimated PSA-style grade 1-10",
+  "grade_corners": {
+    "grade": "Mint/Near Mint/Excellent/Good/Poor",
+    "notes": "specific observations about corner condition"
+  },
+  "grade_edges": {
+    "grade": "Mint/Near Mint/Excellent/Good/Poor",
+    "notes": "specific observations about edge condition"
+  },
+  "grade_surface": {
+    "grade": "Mint/Near Mint/Excellent/Good/Poor",
+    "notes": "specific observations about surface condition"
+  },
+  "grade_centering": {
+    "grade": "60/40 or better / 70/30 / 80/20 / Off-center",
+    "notes": "specific observations about centering"
+  },
+  "confidence": 0.0-1.0,
+  "defects": ["list specific defects found, or empty array if none"]
+}
 
-    front_img = decode_image(fb)
-    back_img = decode_image(bb)
-    angle_img = decode_image(ab) if ab else None
+Be conservative in grading. Look for:
+- Corner wear or whitening
+- Edge chipping or roughness  
+- Surface scratches, print lines, or stains
+- Centering issues (uneven borders)
 
-    if front_img is None or back_img is None:
-        raise HTTPException(status_code=400, detail="Could not decode Front or Back image.")
-    if ab and angle_img is None:
-        angle_img = None
-
-    defects: List[str] = []
-    warnings: List[str] = []
-    confidence = 0.72
-
-    quality_warnings(front_img, "Front", warnings)
-    quality_warnings(back_img, "Back", warnings)
-    if angle_img is not None:
-        quality_warnings(angle_img, "Angled", warnings)
-    else:
-        warnings.append("Angled: Not provided (recommended for surface/foil assessment)")
-
-    name = "Manual Entry Required"
-    series = "Unknown"
-    year = "Unknown"
-
-    fq = find_card_quad(front_img)
-    bq = find_card_quad(back_img)
-    aq = find_card_quad(angle_img) if angle_img is not None else None
-
-    if fq is None or bq is None:
-        defects.append("Card boundary detection weak (fill frame, reduce glare).")
-        confidence -= 0.08
+Respond ONLY with valid JSON, no other text."""
+        
+        # Call OpenAI Vision
+        result = await call_openai_vision(front_base64, prompt, max_tokens=1000)
+        
+        if result.get("error"):
+            print(f"Vision API error: {result.get('message')}")
+            # Return fallback response
+            return JSONResponse(content={
+                "pregrade": "Unable to assess",
+                "grade_corners": {"grade": "N/A", "notes": "Assessment failed"},
+                "grade_edges": {"grade": "N/A", "notes": "Assessment failed"},
+                "grade_surface": {"grade": "N/A", "notes": "Assessment failed"},
+                "grade_centering": {"grade": "N/A", "notes": "Assessment failed"},
+                "confidence": 0.0,
+                "defects": [],
+                "error": "AI grading failed"
+            })
+        
+        # Parse JSON from response
+        content = result["content"].strip()
+        
+        # Remove markdown code blocks if present
+        if content.startswith("```json"):
+            content = content[7:]
+        if content.startswith("```"):
+            content = content[3:]
+        if content.endswith("```"):
+            content = content[:-3]
+        content = content.strip()
+        
+        try:
+            grade_data = json.loads(content)
+        except json.JSONDecodeError as e:
+            print(f"JSON parse error: {e}")
+            print(f"Content: {content}")
+            # Return fallback
+            return JSONResponse(content={
+                "pregrade": "Parse error",
+                "grade_corners": {"grade": "N/A", "notes": "Could not parse response"},
+                "grade_edges": {"grade": "N/A", "notes": "Could not parse response"},
+                "grade_surface": {"grade": "N/A", "notes": "Could not parse response"},
+                "grade_centering": {"grade": "N/A", "notes": "Could not parse response"},
+                "confidence": 0.0,
+                "defects": []
+            })
+        
+        # Return grading data
         return JSONResponse(content={
-            "pregrade": "Pre-Assessment: Limited",
-            "preapproval": "Pre-Approved — manual review recommended",
-            "series": series,
-            "year": year,
-            "name": name,
-            "defects": defects,
-            "warnings": warnings,
-            "confidence": float(max(0.10, min(0.90, confidence))),
-            "subgrades": {"photo_quality": "Warn", "card_detected": "Partial"},
-            "version": APP_VERSION
+            "pregrade": grade_data.get("pregrade", "N/A"),
+            "grade_corners": grade_data.get("grade_corners", {"grade": "N/A", "notes": ""}),
+            "grade_edges": grade_data.get("grade_edges", {"grade": "N/A", "notes": ""}),
+            "grade_surface": grade_data.get("grade_surface", {"grade": "N/A", "notes": ""}),
+            "grade_centering": grade_data.get("grade_centering", {"grade": "N/A", "notes": ""}),
+            "confidence": float(grade_data.get("confidence", 0.0)),
+            "defects": grade_data.get("defects", [])
         })
+        
+    except Exception as e:
+        print(f"Verify endpoint error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
 
-    front_w = warp_card(front_img, fq)
-    back_w = warp_card(back_img, bq)
 
-    front_g = cv2.cvtColor(front_w, cv2.COLOR_BGR2GRAY)
-    back_g = cv2.cvtColor(back_w, cv2.COLOR_BGR2GRAY)
-
-    edge_white_front = whitening_risk_edge(front_g)
-    edge_white_back = whitening_risk_edge(back_g)
-
-    if edge_white_front > 0.10:
-        defects.append("Front: Edge/corner whitening risk detected")
-        confidence -= 0.05
-    if edge_white_back > 0.12:
-        defects.append("Back: Edge/corner whitening risk detected")
-        confidence -= 0.06
-
-    surface_risk = None
-    if angle_img is not None and aq is not None:
-        angle_w = warp_card(angle_img, aq)
-        angle_g = cv2.cvtColor(angle_w, cv2.COLOR_BGR2GRAY)
-        surface_risk = surface_line_risk(angle_g)
-        if surface_risk > 0.09:
-            defects.append("Angled: Surface scratch / print-line risk detected")
-            confidence -= 0.05
-
-    centering_note = "Centering: Review in-hand"
-    if (edge_white_front < 0.06) and (edge_white_back < 0.07):
-        centering_note = "Centering: Looks acceptable (photo-based)"
-
-    subgrades: Dict[str, Any] = {
-        "photo_quality": "Warn" if warnings else "Pass",
-        "card_detected": "Yes",
-        "edge_whitening_front": round(edge_white_front, 3),
-        "edge_whitening_back": round(edge_white_back, 3),
-        "centering_note": centering_note
-    }
-    if surface_risk is not None:
-        subgrades["surface_risk"] = round(float(surface_risk), 3)
-
-    if len(defects) == 0:
-        preapproval = "Pre-Approved — proceed to submission"
-        summary = "Pre-Assessment: Clear"
-        confidence += 0.06
-    elif len(defects) <= 3:
-        preapproval = "Pre-Approved — proceed (minor risks flagged)"
-        summary = "Pre-Assessment: Minor Risks"
-    else:
-        preapproval = "Pre-Approved — manual review required"
-        summary = "Pre-Assessment: Review Recommended"
-        confidence -= 0.03
-
-    return JSONResponse(content={
-        "pregrade": summary,
-        "preapproval": preapproval,
-        "series": series,
-        "year": year,
-        "name": name,
-        "defects": defects,
-        "warnings": warnings,
-        "confidence": float(max(0.10, min(0.90, confidence))),
-        "subgrades": subgrades,
-        "version": APP_VERSION
-    })
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 10000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
