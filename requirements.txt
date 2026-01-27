@@ -1,6 +1,8 @@
-fastapi==0.110.0
-uvicorn==0.27.1
-python-multipart==0.0.9
-opencv-python-headless==4.9.0.80
-numpy==1.26.4
-httpx==0.27.0
+fastapi
+uvicorn[standard]
+httpx
+opencv-python-headless
+numpy
+python-multipart
+pytesseract
+Pillow
