@@ -263,6 +263,25 @@ async def verify(
   "defects": ["list specific defects found, or empty array if none"]
 }
 
+prompt = f"""You are a professional card grader...
+
+CRITICAL INSTRUCTION FOR MODERN CARDS:
+Many modern trading cards have INTENTIONAL textured surfaces as part of their design:
+- Holographic patterns and effects
+- Raised/textured printing
+- Sparkle or glitter effects
+- Designed texture finishes
+
+DO NOT mark these intentional design features as "surface scratches" or defects.
+
+ONLY mark actual damage:
+- Scratches that break through the surface
+- Dents, creases, or bends
+- Wear marks from handling
+- Actual manufacturing defects
+
+If you see texture, first determine: Is this part of the card's design? If yes, DO NOT list as defect.
+
 Be conservative in grading. Look for:
 - Corner wear or whitening
 - Edge chipping or roughness  
