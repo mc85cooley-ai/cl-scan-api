@@ -1,4 +1,4 @@
-# main.py - OCR + Pokemon TCG API Approach (Simple, Fast, Accurate)
+# main.py - Simple Pokemon TCG API Only (No OCR, No OpenAI)
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import JSONResponse
 from typing import Optional, List, Dict, Any
@@ -8,12 +8,10 @@ import httpx
 import os
 import json
 import uuid
-import re
-from PIL import Image
 
 app = FastAPI(title="Collectors League Scan API")
 
-APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-01-27-ocr-tcg")
+APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-01-27-simple-tcg")
 
 POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
 
@@ -30,7 +28,7 @@ def health():
         "service": "cl-scan-api",
         "version": APP_VERSION,
         "has_pokemontcg_key": bool(POKEMONTCG_API_KEY),
-        "method": "OCR + Pokemon TCG API"
+        "method": "Pokemon TCG API (manual entry)"
     }
 
 
@@ -114,88 +112,20 @@ def surface_line_risk(gray_angle_warped):
     return float(high.mean() / denom)
 
 
-def normalize_number(num):
-    if not num:
-        return None
-    s = str(num).strip().replace(" ", "").replace("\\", "/")
-    return s
-
-
-def extract_text_from_image(img_bgr):
-    """
-    Extract text from card image using OpenCV preprocessing + pytesseract
-    """
-    try:
-        import pytesseract
-    except ImportError:
-        print("pytesseract not installed, returning empty text")
-        return ""
-    
-    # Convert to grayscale
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    
-    # Apply thresholding to preprocess
-    gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-    
-    # Extract text
-    text = pytesseract.image_to_string(gray, config='--psm 6')
-    
-    return text
-
-
-def parse_card_info(text):
-    """
-    Parse card name and number from OCR text
-    Returns: (card_name, card_number)
-    """
-    lines = [line.strip() for line in text.split('\n') if line.strip()]
-    
-    card_name = None
-    card_number = None
-    
-    # Look for card number pattern: XXX/XXX or XXX/XXXXX
-    number_pattern = r'\b(\d{1,4})/(\d{1,4})\b'
-    
-    for line in lines:
-        # Try to find card number
-        match = re.search(number_pattern, line)
-        if match and not card_number:
-            card_number = match.group(0)
-            print(f"Found card number: {card_number}")
-        
-        # Look for card name (usually capitalized, at top of card)
-        # Skip if line is too short or looks like set info
-        if not card_name and len(line) > 3:
-            # Skip lines that look like they contain numbers or symbols
-            if not re.search(r'\d{2,}', line) and len(line) < 50:
-                # Likely the card name
-                card_name = line
-                print(f"Found potential card name: {card_name}")
-    
-    return card_name, card_number
-
-
-async def pokemontcg_search(name=None, number=None, set_name=None):
-    """
-    Search Pokemon TCG API for card
-    """
+async def pokemontcg_search(name=None, number=None) -> Optional[dict]:
+    """Search Pokemon TCG API"""
     if not name and not number:
         return None
 
     q_parts = []
     
     if name:
-        # Clean name for search
-        safe_name = name.replace('"', '\\"').strip()
-        q_parts.append(f'name:"{safe_name}"')
+        clean_name = name.replace('"', '').strip()
+        q_parts.append(f'name:"{clean_name}"')
     
     if number:
-        safe_num = number.replace('"', '\\"').strip()
+        safe_num = number.replace('"', '').strip()
         q_parts.append(f'number:"{safe_num}"')
-    
-    if set_name:
-        safe_set = set_name.replace('"', '\\"').strip()
-        q_parts.append(f'set.name:"{safe_set}"')
 
     q = " ".join(q_parts)
     
@@ -219,109 +149,33 @@ async def pokemontcg_search(name=None, number=None, set_name=None):
             data = r.json()
             cards = data.get("data", [])
             
-            print(f"Found {len(cards)} cards")
+            print(f"Pokemon TCG API returned {len(cards)} results")
             
-            if not cards:
-                # Try fuzzy search with just name
-                if name:
-                    print(f"Trying fuzzy search with name only: {name}")
-                    params = {"q": f'name:"{safe_name}"', "pageSize": 5, "orderBy": "-set.releaseDate"}
-                    r2 = await client.get(url, headers=headers, params=params)
-                    if r2.status_code == 200:
-                        cards = r2.json().get("data", [])
-                        print(f"Fuzzy search found {len(cards)} cards")
+            if not cards and name:
+                # Try fuzzy search
+                params = {"q": f'name:"{clean_name}"', "pageSize": 5}
+                r2 = await client.get(url, headers=headers, params=params)
+                if r2.status_code == 200:
+                    cards = r2.json().get("data", [])
             
             if not cards:
                 return None
 
-            # Return the most recent card (first result)
             card = cards[0]
             set_obj = card.get("set", {}) or {}
             release = set_obj.get("releaseDate")
             year = release[:4] if isinstance(release, str) and len(release) >= 4 and release[:4].isdigit() else None
 
-            result = {
+            return {
                 "name": card.get("name"),
                 "number": card.get("number"),
                 "set_name": set_obj.get("name"),
                 "series": set_obj.get("series"),
-                "releaseDate": release,
-                "year": year,
-                "rarity": card.get("rarity"),
-                "image_url": card.get("images", {}).get("large")
+                "year": year
             }
-            
-            print(f"Selected card: {result['name']} from {result['set_name']}")
-            
-            return result
-            
     except Exception as e:
-        print(f"Pokemon TCG API exception: {e}")
+        print(f"Pokemon TCG API exception: {str(e)}")
         return None
-
-
-async def identify_card_ocr(front_img):
-    """
-    Identify card using OCR + Pokemon TCG API
-    """
-    # Try to warp card for better OCR
-    quad = find_card_quad(front_img)
-    if quad is not None:
-        warped = warp_card(front_img, quad, out_w=1200, out_h=1680)
-        print("Using warped image for OCR")
-    else:
-        warped = front_img
-        print("Using original image for OCR")
-    
-    # Extract text
-    text = extract_text_from_image(warped)
-    print(f"OCR extracted text (first 200 chars): {text[:200]}")
-    
-    if not text or len(text) < 3:
-        return {
-            "error": True,
-            "reason": "ocr_failed",
-            "message": "Could not extract text from image"
-        }
-    
-    # Parse card info
-    card_name, card_number = parse_card_info(text)
-    
-    print(f"Parsed - Name: {card_name}, Number: {card_number}")
-    
-    if not card_name and not card_number:
-        return {
-            "error": True,
-            "reason": "no_card_info",
-            "message": "Could not find card name or number in image"
-        }
-    
-    # Search Pokemon TCG API
-    result = await pokemontcg_search(name=card_name, number=card_number)
-    
-    if result:
-        confidence = 0.95 if card_number else 0.75  # Higher confidence if we matched by number
-        return {
-            "name": result["name"],
-            "series": result["series"] or result["set_name"],
-            "year": result["year"] or "Unknown",
-            "number": result["number"] or "",
-            "confidence": confidence,
-            "rarity": result.get("rarity"),
-            "set_name": result["set_name"],
-            "image_url": result.get("image_url"),
-            "method": "OCR + Pokemon TCG API"
-        }
-    else:
-        # Return what we found even if not in database
-        return {
-            "name": card_name or "Unknown card",
-            "series": "Unknown",
-            "year": "Unknown",
-            "number": card_number or "",
-            "confidence": 0.3,
-            "method": "OCR only (not found in Pokemon TCG database)"
-        }
 
 
 def quality_warnings(img, label, warnings: List[str]):
@@ -347,6 +201,10 @@ def quality_warnings(img, label, warnings: List[str]):
 
 @app.post("/api/identify")
 async def identify(front: UploadFile = File(...)):
+    """
+    Simple identification - just validates image quality
+    User will manually enter card details in WordPress
+    """
     fb = await front.read()
     if not fb or len(fb) < 1500:
         raise HTTPException(status_code=400, detail="Front image looks empty/corrupt.")
@@ -358,39 +216,18 @@ async def identify(front: UploadFile = File(...)):
     warnings: List[str] = []
     quality_warnings(front_img, "Front", warnings)
 
-    # Identify using OCR + Pokemon TCG API
-    result = await identify_card_ocr(front_img)
-
-    if result.get("error"):
-        # OCR failed, return error
-        error_msg = result.get("message", "Could not identify card")
-        warnings.append(error_msg)
-        
-        return JSONResponse(content={
-            "identify_token": str(uuid.uuid4()),
-            "name": "Unknown card",
-            "series": "Unknown",
-            "year": "Unknown",
-            "number": "",
-            "confidence": 0.0,
-            "warnings": warnings,
-            "version": APP_VERSION
-        })
-
-    identify_token = str(uuid.uuid4())
-
+    # For now, return placeholder data
+    # User can manually enter card details in WordPress
     return JSONResponse(content={
-        "identify_token": identify_token,
-        "name": result.get("name", "Unknown card"),
-        "series": result.get("series", "Unknown"),
-        "year": result.get("year", "Unknown"),
-        "number": result.get("number", ""),
-        "confidence": result.get("confidence", 0.5),
+        "identify_token": str(uuid.uuid4()),
+        "name": "Manual Entry Required",
+        "series": "Please enter card details manually",
+        "year": "Unknown",
+        "number": "",
+        "confidence": 0.0,
         "warnings": warnings,
         "version": APP_VERSION,
-        "method": result.get("method", "OCR + Pokemon TCG API"),
-        "rarity": result.get("rarity"),
-        "image_url": result.get("image_url")
+        "note": "Automatic identification requires manual card entry for now"
     })
 
 
@@ -421,7 +258,6 @@ async def verify(
     warnings: List[str] = []
     confidence = 0.72
 
-    # Non-blocking warnings
     quality_warnings(front_img, "Front", warnings)
     quality_warnings(back_img, "Back", warnings)
     if angle_img is not None:
@@ -429,24 +265,20 @@ async def verify(
     else:
         warnings.append("Angled: Not provided (recommended for surface/foil assessment)")
 
-    # Identify card
-    ident_result = await identify_card_ocr(front_img)
-    
-    name = ident_result.get("name", "Unknown card")
-    series = ident_result.get("series", "Unknown")
-    year = ident_result.get("year", "Unknown")
+    name = "Manual Entry Required"
+    series = "Unknown"
+    year = "Unknown"
 
-    # Card detection / warp for assessment
     fq = find_card_quad(front_img)
     bq = find_card_quad(back_img)
     aq = find_card_quad(angle_img) if angle_img is not None else None
 
     if fq is None or bq is None:
-        defects.append("Card boundary detection weak (fill frame, reduce glare). Assessment may be inaccurate.")
+        defects.append("Card boundary detection weak (fill frame, reduce glare).")
         confidence -= 0.08
         return JSONResponse(content={
-            "pregrade": "Pre-Assessment: Limited (No Warp)",
-            "preapproval": "Pre-Approved — manual review recommended (framing/edge data limited)",
+            "pregrade": "Pre-Assessment: Limited",
+            "preapproval": "Pre-Approved — manual review recommended",
             "series": series,
             "year": year,
             "name": name,
@@ -481,8 +313,6 @@ async def verify(
         if surface_risk > 0.09:
             defects.append("Angled: Surface scratch / print-line risk detected")
             confidence -= 0.05
-    elif angle_img is not None and aq is None:
-        warnings.append("Angled: Could not detect card boundary (keep corners visible / reduce glare)")
 
     centering_note = "Centering: Review in-hand"
     if (edge_white_front < 0.06) and (edge_white_back < 0.07):
@@ -499,14 +329,14 @@ async def verify(
         subgrades["surface_risk"] = round(float(surface_risk), 3)
 
     if len(defects) == 0:
-        preapproval = "Pre-Approved — proceed to submission (final assessment in-hand)"
+        preapproval = "Pre-Approved — proceed to submission"
         summary = "Pre-Assessment: Clear"
         confidence += 0.06
     elif len(defects) <= 3:
         preapproval = "Pre-Approved — proceed (minor risks flagged)"
         summary = "Pre-Assessment: Minor Risks"
     else:
-        preapproval = "Pre-Approved — manual review required (multiple risks flagged)"
+        preapproval = "Pre-Approved — manual review required"
         summary = "Pre-Assessment: Review Recommended"
         confidence -= 0.03
 
