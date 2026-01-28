@@ -135,10 +135,79 @@ async def identify(front: UploadFile = File(...)):
         
         # Convert to base64
         image_base64 = image_to_base64(image_bytes)
-        
-        # Prepare prompt for identification
-        prompt = """Identify this trading card. Analyze the image and provide ONLY a JSON response with these exact fields:
 
+        # NEW: Texture-aware prompt
+    texture_note = ""
+    if texture_aware:
+        texture_note = """
+        
+CRITICAL - MODERN CARD TEXTURES:
+Modern trading cards have INTENTIONAL textured surfaces that are DESIGN FEATURES, not defects:
+- Holographic/prismatic patterns (rainbow effects, shifting colors)
+- Raised/embossed text and borders
+- Sparkle/glitter effects in the card design
+- Foil/metallic finishes
+- Textured backgrounds (linen, canvas, etc.)
+- Etched patterns
+
+DO NOT mark these design features as surface damage or defects.
+ONLY mark ACTUAL damage:
+- Scratches that break through the surface
+- Dents or creases in the card
+- Wear marks or scuffing
+- Print lines or factory errors
+- Stains or discoloration
+
+If you see holographic patterns or raised text, that is NORMAL and should NOT lower the surface grade.
+        """
+        # Prepare prompt for identification
+        prompt = """Identify this trading card. f"""Analyze this trading card for professional grading. 
+You are grading like PSA/BGS/CGC professionals.
+
+{texture_note}
+
+Front Image: <base64 encoded>
+Back Image: <base64 encoded>
+
+Assess the following:
+
+1. CORNERS (grade 1-10):
+   - Look for wear, whitening, fraying
+   - Sharp corners = 10, slightly rounded = 8-9, visible wear = 5-7
+
+2. EDGES (grade 1-10):
+   - Check all four edges for wear, chipping
+   - Clean edges = 10, minor wear = 8-9, visible wear = 5-7
+
+3. SURFACE (grade 1-10):
+   - IGNORE intentional holographic/textured patterns
+   - ONLY mark actual scratches, scuffs, print defects
+   - Pristine = 10, minor marks = 8-9, visible damage = 5-7
+
+4. CENTERING:
+   - Measure borders (should be equal on all sides)
+   - Report as ratio (e.g., "60/40" means 60% on one side, 40% on other)
+   - Perfect = 50/50, good = 55/45 to 60/40
+
+5. OVERALL GRADE (1-10):
+   - Weighted average of all factors
+   - Consider: corners (25%), edges (25%), surface (25%), centering (25%)
+
+6. DEFECTS:
+   - List ONLY actual damage (not design features)
+   - Be specific about location and severity
+
+Return JSON:
+{{
+  "grade_overall": "9",
+  "grade_corners": {{"grade": "9", "notes": "Sharp with minimal wear"}},
+  "grade_edges": {{"grade": "9", "notes": "Clean edges"}},
+  "grade_surface": {{"grade": "9", "notes": "Near mint, holographic pattern is intentional"}},
+  "grade_centering": {{"grade": "60/40", "notes": "Slightly off-center"}},
+  "confidence": 0.87,
+  "defects": ["Minor corner wear top-right", "Slight edge wear bottom"]
+}}
+"""
 {
   "name": "exact card name including variants (ex, V, VMAX, holo, first edition, etc.)",
   "series": "set or series name",
