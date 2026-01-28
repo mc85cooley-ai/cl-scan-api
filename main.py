@@ -144,11 +144,11 @@ async def identify(front: UploadFile = File(...)):
   "series": "set or series name",
   "year": "release year (4 digits)",
   "card_number": "card number if visible",
-  "type": "Pokemon/Magic/YuGiOh/Sports/Other",
+  "type": "Pokemon/Magic/YuGiOh/Sports/Onepiece/Other",
   "confidence": 0.0-1.0
 }
 
-Be specific with the card name. Include any variants like "ex", "V", "VMAX", "GX", "holo", "reverse holo", "first edition", etc.
+Be specific with the card name. Include any variants like "ex", "V", "VMAX", "GX", "holo", "reverse holo", "first edition", "special illustration rare (sir)" etc.
 If you cannot identify with confidence, set confidence to 0.0 and name to "Unknown".
 Respond ONLY with valid JSON, no other text."""
         
@@ -238,84 +238,94 @@ async def verify(
         # Convert to base64
         front_base64 = image_to_base64(front_bytes)
         
-def assess_card_condition(image_path_front, image_path_back, texture_aware=True):
-    front_base64 = encode_image(image_path_front)
-    back_base64 = encode_image(image_path_back)
-    
-    # NEW: Texture-aware prompt
-    texture_note = ""
-    if texture_aware:
-        texture_note = """
+        # Prepare prompt for condition assessment
+        prompt = """You are a professional card grader, be aware of modern card texture not to mistake for defects. Analyze this trading card's condition and provide ONLY a JSON response with these exact fields:
+
+{
+  "pregrade": "estimated PSA-style grade 1-10",
+  "grade_corners": {
+    "grade": "Mint/Near Mint/Excellent/Good/Poor",
+    "notes": "specific observations about corner condition"
+  },
+  "grade_edges": {
+    "grade": "Mint/Near Mint/Excellent/Good/Poor",
+    "notes": "specific observations about edge condition"
+  },
+  "grade_surface": {
+    "grade": "Mint/Near Mint/Excellent/Good/Poor",
+    "notes": "specific observations about surface condition"
+  },
+  "grade_centering": {
+    "grade": "60/40 or better / 70/30 / 80/20 / Off-center",
+    "notes": "specific observations about centering"
+  },
+  "confidence": 0.0-1.0,
+  "defects": ["list specific defects found, or empty array if none"]
+}
+
+Be conservative in grading. Look for:
+- Corner wear or whitening
+- Edge chipping or roughness  
+- Surface scratches, print lines, or stains
+- Centering issues (uneven borders)
+
+Respond ONLY with valid JSON, no other text."""
         
-CRITICAL - MODERN CARD TEXTURES:
-Modern trading cards have INTENTIONAL textured surfaces that are DESIGN FEATURES, not defects:
-- Holographic/prismatic patterns (rainbow effects, shifting colors)
-- Raised/embossed text and borders
-- Sparkle/glitter effects in the card design
-- Foil/metallic finishes
-- Textured backgrounds (linen, canvas, etc.)
-- Etched patterns
-
-DO NOT mark these design features as surface damage or defects.
-ONLY mark ACTUAL damage:
-- Scratches that break through the surface
-- Dents or creases in the card
-- Wear marks or scuffing
-- Print lines or factory errors
-- Stains or discoloration
-
-If you see holographic patterns or raised text, that is NORMAL and should NOT lower the surface grade.
-        """
-    
-    prompt = f"""Analyze this trading card for professional grading. 
-You are grading like PSA/BGS/CGC professionals.
-
-{texture_note}
-
-Front Image: <base64 encoded>
-Back Image: <base64 encoded>
-
-Assess the following:
-
-1. CORNERS (grade 1-10):
-   - Look for wear, whitening, fraying
-   - Sharp corners = 10, slightly rounded = 8-9, visible wear = 5-7
-
-2. EDGES (grade 1-10):
-   - Check all four edges for wear, chipping
-   - Clean edges = 10, minor wear = 8-9, visible wear = 5-7
-
-3. SURFACE (grade 1-10):
-   - IGNORE intentional holographic/textured patterns
-   - ONLY mark actual scratches, scuffs, print defects
-   - Pristine = 10, minor marks = 8-9, visible damage = 5-7
-
-4. CENTERING:
-   - Measure borders (should be equal on all sides)
-   - Report as ratio (e.g., "60/40" means 60% on one side, 40% on other)
-   - Perfect = 50/50, good = 55/45 to 60/40
-
-5. OVERALL GRADE (1-10):
-   - Weighted average of all factors
-   - Consider: corners (25%), edges (25%), surface (25%), centering (25%)
-
-6. DEFECTS:
-   - List ONLY actual damage (not design features)
-   - Be specific about location and severity
-
-Return JSON:
-{{
-  "grade_overall": "9",
-  "grade_corners": {{"grade": "9", "notes": "Sharp with minimal wear"}},
-  "grade_edges": {{"grade": "9", "notes": "Clean edges"}},
-  "grade_surface": {{"grade": "9", "notes": "Near mint, holographic pattern is intentional"}},
-  "grade_centering": {{"grade": "60/40", "notes": "Slightly off-center"}},
-  "confidence": 0.87,
-  "defects": ["Minor corner wear top-right", "Slight edge wear bottom"]
-}}
-"""
-    
-    # Rest of your existing code...
+        # Call OpenAI Vision
+        result = await call_openai_vision(front_base64, prompt, max_tokens=1000)
+        
+        if result.get("error"):
+            print(f"Vision API error: {result.get('message')}")
+            # Return fallback response
+            return JSONResponse(content={
+                "pregrade": "Unable to assess",
+                "grade_corners": {"grade": "N/A", "notes": "Assessment failed"},
+                "grade_edges": {"grade": "N/A", "notes": "Assessment failed"},
+                "grade_surface": {"grade": "N/A", "notes": "Assessment failed"},
+                "grade_centering": {"grade": "N/A", "notes": "Assessment failed"},
+                "confidence": 0.0,
+                "defects": [],
+                "error": "AI grading failed"
+            })
+        
+        # Parse JSON from response
+        content = result["content"].strip()
+        
+        # Remove markdown code blocks if present
+        if content.startswith("```json"):
+            content = content[7:]
+        if content.startswith("```"):
+            content = content[3:]
+        if content.endswith("```"):
+            content = content[:-3]
+        content = content.strip()
+        
+        try:
+            grade_data = json.loads(content)
+        except json.JSONDecodeError as e:
+            print(f"JSON parse error: {e}")
+            print(f"Content: {content}")
+            # Return fallback
+            return JSONResponse(content={
+                "pregrade": "Parse error",
+                "grade_corners": {"grade": "N/A", "notes": "Could not parse response"},
+                "grade_edges": {"grade": "N/A", "notes": "Could not parse response"},
+                "grade_surface": {"grade": "N/A", "notes": "Could not parse response"},
+                "grade_centering": {"grade": "N/A", "notes": "Could not parse response"},
+                "confidence": 0.0,
+                "defects": []
+            })
+        
+        # Return grading data
+        return JSONResponse(content={
+            "pregrade": grade_data.get("pregrade", "N/A"),
+            "grade_corners": grade_data.get("grade_corners", {"grade": "N/A", "notes": ""}),
+            "grade_edges": grade_data.get("grade_edges", {"grade": "N/A", "notes": ""}),
+            "grade_surface": grade_data.get("grade_surface", {"grade": "N/A", "notes": ""}),
+            "grade_centering": grade_data.get("grade_centering", {"grade": "N/A", "notes": ""}),
+            "confidence": float(grade_data.get("confidence", 0.0)),
+            "defects": grade_data.get("defects", [])
+        })
         
     except Exception as e:
         print(f"Verify endpoint error: {str(e)}")
