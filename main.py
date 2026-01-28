@@ -1,6 +1,7 @@
 """
 Collectors League Scan API - Full AI Integration
 Uses OpenAI Vision API for card identification and grading
+VERSION 3.2 - Enhanced AI Detail + Texture Awareness
 """
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import JSONResponse
@@ -24,7 +25,7 @@ app.add_middleware(
 )
 
 # Configuration
-APP_VERSION = "2026-01-28-ai-vision"
+APP_VERSION = "2026-01-28-enhanced-detail"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
 
@@ -38,7 +39,7 @@ def root():
         "status": "ok",
         "service": "cl-scan-api",
         "version": APP_VERSION,
-        "message": "Collectors League Card Grading API"
+        "message": "Collectors League Card Grading API - Enhanced Detail"
     }
 
 
@@ -144,11 +145,11 @@ async def identify(front: UploadFile = File(...)):
   "series": "set or series name",
   "year": "release year (4 digits)",
   "card_number": "card number if visible",
-  "type": "Pokemon/Magic/YuGiOh/Sports/Onepiece/Other",
+  "type": "Pokemon/Magic/YuGiOh/Sports/OnePiece/Other",
   "confidence": 0.0-1.0
 }
 
-Be specific with the card name. Include any variants like "ex", "V", "VMAX", "GX", "holo", "reverse holo", "first edition", "special illustration rare (sir)" etc.
+Be specific with the card name. Include any variants like "ex", "V", "VMAX", "GX", "holo", "reverse holo", "first edition", "special illustration rare (SIR)", etc.
 If you cannot identify with confidence, set confidence to 0.0 and name to "Unknown".
 Respond ONLY with valid JSON, no other text."""
         
@@ -227,6 +228,8 @@ async def verify(
     """
     Assess card condition from front and back images using AI vision
     Returns: grade, corners, edges, surface, centering, defects
+    
+    ENHANCED VERSION: More detailed analysis + texture awareness
     """
     try:
         # Read front image (primary for grading)
@@ -238,41 +241,67 @@ async def verify(
         # Convert to base64
         front_base64 = image_to_base64(front_bytes)
         
-        # Prepare prompt for condition assessment
-        prompt = """You are a professional card grader, be aware of modern card texture not to mistake for defects. Analyze this trading card's condition and provide ONLY a JSON response with these exact fields:
+        # ENHANCED PROMPT - More detail + texture awareness
+        prompt = """You are a professional card grader with expertise in modern trading cards. Analyze this card's condition in detail.
+
+🚨 CRITICAL - MODERN CARD TEXTURES:
+Many modern cards have INTENTIONAL textured finishes as design features:
+- Holographic/prismatic rainbow patterns (normal on holos)
+- Raised/embossed text and borders (normal on textured cards)
+- Sparkle/glitter effects (normal on special editions)
+- Metallic foil finishes (normal on ultra rares)
+- Intentional textured backgrounds (normal on modern prints)
+
+DO NOT mark these as damage or defects. These are FEATURES, not flaws.
+
+ONLY mark ACTUAL DAMAGE:
+- Scratches that break through the surface coating
+- Physical dents, creases, or bends in the card
+- Edge whitening or chipping from wear
+- Corner fraying or whitening
+- Print lines (factory defects)
+- Stains, discoloration, or dirt
+- Actual surface scuffs from handling
+
+Be VERY specific in your analysis. For each category, describe exactly what you observe.
+
+Provide ONLY a JSON response with these exact fields:
 
 {
   "pregrade": "estimated PSA-style grade 1-10",
   "grade_corners": {
     "grade": "Mint/Near Mint/Excellent/Good/Poor",
-    "notes": "specific observations about corner condition"
+    "notes": "Describe each corner specifically: Top-left: [condition]. Top-right: [condition]. Bottom-left: [condition]. Bottom-right: [condition]. Look for whitening, fraying, soft corners, or damage."
   },
   "grade_edges": {
     "grade": "Mint/Near Mint/Excellent/Good/Poor",
-    "notes": "specific observations about edge condition"
+    "notes": "Examine all 4 edges. Describe: Are edges sharp and clean? Any whitening? Chipping? Roughness? Wear from handling? Be specific about which edges have issues."
   },
   "grade_surface": {
     "grade": "Mint/Near Mint/Excellent/Good/Poor",
-    "notes": "specific observations about surface condition"
+    "notes": "IGNORE intentional textures/holo patterns. Look for: Actual scratches in coating? Scuffs from handling? Print lines? Stains or dirt? Creases? Surface wear? Be detailed about location and severity."
   },
   "grade_centering": {
     "grade": "60/40 or better / 70/30 / 80/20 / Off-center",
-    "notes": "specific observations about centering"
+    "notes": "Measure border widths. Left vs Right borders: [X%]/[Y%]. Top vs Bottom borders: [X%]/[Y%]. Is text/image centered in frame? Specify which direction it's off if not centered."
   },
   "confidence": 0.0-1.0,
-  "defects": ["list specific defects found, or empty array if none"]
+  "defects": ["List each specific defect with location, e.g., 'Top-right corner whitening', 'Horizontal scratch on center-left surface', 'Left edge minor whitening'. If no defects, empty array."]
 }
 
-Be conservative in grading. Look for:
-- Corner wear or whitening
-- Edge chipping or roughness  
-- Surface scratches, print lines, or stains
-- Centering issues (uneven borders)
+GRADING SCALE:
+- Mint (9-10): Perfect or near-perfect condition, sharp corners, clean edges, flawless surface
+- Near Mint (7-8): Minor wear, slight corner softness, very minor edge wear
+- Excellent (5-6): Noticeable wear, corner whitening, edge whitening, minor surface issues
+- Good (3-4): Significant wear, damaged corners, edge damage, surface scratches
+- Poor (1-2): Heavy damage, creases, major corner/edge damage
+
+Be CONSERVATIVE but FAIR. Don't penalize intentional card features. Be DETAILED in your notes.
 
 Respond ONLY with valid JSON, no other text."""
         
-        # Call OpenAI Vision
-        result = await call_openai_vision(front_base64, prompt, max_tokens=1000)
+        # Call OpenAI Vision with MORE tokens for detailed response
+        result = await call_openai_vision(front_base64, prompt, max_tokens=1500)
         
         if result.get("error"):
             print(f"Vision API error: {result.get('message')}")
