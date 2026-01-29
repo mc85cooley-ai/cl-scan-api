@@ -1,7 +1,7 @@
 """
 Collectors League Scan API - Full AI Integration
 Uses OpenAI Vision API for card identification and grading
-VERSION 3.2 - Enhanced AI Detail + Texture Awareness
+VERSION 4.0 - Added Memorabilia & Sealed Product Support
 """
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import JSONResponse
@@ -25,7 +25,7 @@ app.add_middleware(
 )
 
 # Configuration
-APP_VERSION = "2026-01-28-enhanced-detail"
+APP_VERSION = "2026-01-29-memorabilia-support"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
 
@@ -39,7 +39,7 @@ def root():
         "status": "ok",
         "service": "cl-scan-api",
         "version": APP_VERSION,
-        "message": "Collectors League Card Grading API - Enhanced Detail"
+        "message": "Collectors League Multi-Item Assessment API"
     }
 
 
@@ -51,7 +51,8 @@ def health():
         "version": APP_VERSION,
         "has_openai_key": bool(OPENAI_API_KEY),
         "has_pokemontcg_key": bool(POKEMONTCG_API_KEY),
-        "model": "gpt-4o-mini"
+        "model": "gpt-4o-mini",
+        "supports": ["cards", "memorabilia", "sealed_products"]
     }
 
 
@@ -120,6 +121,10 @@ async def call_openai_vision(image_base64: str, prompt: str, max_tokens: int = 8
         print(f"OpenAI API Exception: {str(e)}")
         return {"error": True, "message": str(e)}
 
+
+# ============================================================================
+# COLLECTOR CARDS - EXISTING ENDPOINTS
+# ============================================================================
 
 @app.post("/api/identify")
 async def identify(front: UploadFile = File(...)):
@@ -202,11 +207,11 @@ Respond ONLY with valid JSON, no other text."""
         # Generate identify token
         identify_token = f"idt_{secrets.token_urlsafe(12)}"
         
-        # Return identified card data
+        # Return identification data
         return JSONResponse(content={
             "name": card_data.get("name", "Unknown"),
-            "series": card_data.get("series", "Unknown"),
-            "year": str(card_data.get("year", "Unknown")),
+            "series": card_data.get("series", ""),
+            "year": str(card_data.get("year", "")),
             "card_number": str(card_data.get("card_number", "")),
             "type": card_data.get("type", "Other"),
             "confidence": float(card_data.get("confidence", 0.0)),
@@ -219,65 +224,32 @@ Respond ONLY with valid JSON, no other text."""
 
 
 @app.post("/api/verify")
-async def verify(
-    front: UploadFile = File(...),
-    back: UploadFile = File(...),
-    angle: Optional[UploadFile] = File(None),
-    identify_token: Optional[str] = Form(None)
-):
+async def verify(front: UploadFile = File(...), back: UploadFile = File(...)):
     """
-    Assess card condition from front and back images using AI vision
-    Returns: grade, corners, edges, surface, centering, defects
-    
-    ENHANCED VERSION: Analyzes BOTH front and back + texture awareness
+    AI-powered card grading with both front and back images
     """
     try:
-        # Read BOTH images
+        # Read both images
         front_bytes = await front.read()
         back_bytes = await back.read()
         
-        if not front_bytes or len(front_bytes) < 1000:
-            raise HTTPException(status_code=400, detail="Front image is too small or empty")
+        if not front_bytes or not back_bytes or len(front_bytes) < 1000 or len(back_bytes) < 1000:
+            raise HTTPException(status_code=400, detail="Images are too small or empty")
         
-        if not back_bytes or len(back_bytes) < 1000:
-            raise HTTPException(status_code=400, detail="Back image is too small or empty")
-        
-        # Convert both to base64
+        # Convert to base64
         front_base64 = image_to_base64(front_bytes)
         back_base64 = image_to_base64(back_bytes)
         
-        # ENHANCED PROMPT - Analyzes BOTH sides
-        prompt = """You are a professional card grader with expertise in modern trading cards. Analyze BOTH images (front and back) of this card to provide a comprehensive condition assessment.
-
-🚨 CRITICAL - MODERN CARD TEXTURES:
-Many modern cards have INTENTIONAL textured finishes as design features:
-- Holographic/prismatic rainbow patterns (normal on holos)
-- Raised/embossed text and borders (normal on textured cards)
-- Sparkle/glitter effects (normal on special editions)
-- Metallic foil finishes (normal on ultra rares)
-- Intentional textured backgrounds (normal on modern prints)
-- Textured energy symbols or card backs (normal)
-
-DO NOT mark these as damage or defects. These are FEATURES, not flaws.
-
-ONLY mark ACTUAL DAMAGE:
-- Scratches that break through the surface coating
-- Physical dents, creases, or bends in the card
-- Edge whitening or chipping from wear
-- Corner fraying or whitening
-- Print lines (factory defects)
-- Stains, discoloration, or dirt
-- Actual surface scuffs from handling
-- Silvering (edge wear showing white core)
-
-📋 ASSESSMENT PROCESS:
-Examine BOTH front and back images carefully:
+        if not OPENAI_API_KEY:
+            raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+        
+        # Prepare dual-image grading prompt
+        prompt = """You are a professional trading card grader. Analyze BOTH the front and back images of this card and provide a comprehensive grade assessment.
 
 **CORNERS** - Check all 4 corners on BOTH sides:
-- Are corners sharp and well-defined?
-- Any whitening or fraying visible?
-- Any soft or rounded corners?
-- Compare front vs back corner condition
+- Are corners sharp, soft, or rounded?
+- Any whitening visible (especially on back)?
+- Specify WHICH corner and WHICH side (front/back)
 
 **EDGES** - Examine all 4 edges on BOTH sides:
 - Are edges clean and sharp?
@@ -382,12 +354,12 @@ Respond ONLY with valid JSON, no other text."""
                     ]
                 }
             ],
-            "max_tokens": 2000,  # Increased for detailed dual-image analysis
+            "max_tokens": 2000,
             "temperature": 0.1
         }
         
         try:
-            async with httpx.AsyncClient(timeout=90.0) as client:  # Longer timeout for 2 images
+            async with httpx.AsyncClient(timeout=90.0) as client:
                 response = await client.post(url, headers=headers, json=payload)
                 
                 if response.status_code != 200:
@@ -473,6 +445,397 @@ Respond ONLY with valid JSON, no other text."""
         
     except Exception as e:
         print(f"Verify endpoint error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+
+
+# ============================================================================
+# MEMORABILIA & SEALED PRODUCTS - NEW ENDPOINTS
+# ============================================================================
+
+@app.post("/api/identify-memorabilia")
+async def identify_memorabilia(
+    image1: UploadFile = File(...),
+    image2: UploadFile = File(None),
+    image3: UploadFile = File(None),
+    image4: UploadFile = File(None)
+):
+    """
+    Identify memorabilia or sealed product from 1-4 images
+    Returns: item_type, description, authenticity_notes, confidence
+    """
+    try:
+        # Read primary image (required)
+        image1_bytes = await image1.read()
+        if not image1_bytes or len(image1_bytes) < 1000:
+            raise HTTPException(status_code=400, detail="Primary image is too small or empty")
+        
+        # Convert images to base64
+        images_base64 = [image_to_base64(image1_bytes)]
+        
+        # Process optional images
+        if image2:
+            img2_bytes = await image2.read()
+            if img2_bytes and len(img2_bytes) >= 1000:
+                images_base64.append(image_to_base64(img2_bytes))
+        
+        if image3:
+            img3_bytes = await image3.read()
+            if img3_bytes and len(img3_bytes) >= 1000:
+                images_base64.append(image_to_base64(img3_bytes))
+        
+        if image4:
+            img4_bytes = await image4.read()
+            if img4_bytes and len(img4_bytes) >= 1000:
+                images_base64.append(image_to_base64(img4_bytes))
+        
+        if not OPENAI_API_KEY:
+            raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+        
+        # Build multi-image prompt
+        prompt = """Analyze these images of collectible memorabilia or sealed product. Identify what this item is and assess its key characteristics.
+
+Provide ONLY a JSON response with these exact fields:
+
+{
+  "item_type": "Sealed Booster Box/Elite Trainer Box/Blister Pack/Graded Card/Signed Memorabilia/Display Case/Other",
+  "description": "Detailed description of the item including brand, set/series, year if visible",
+  "signatures": "Description of any visible signatures or autographs, or 'None visible'",
+  "seal_condition": "Factory sealed/Opened/Resealed/Not applicable",
+  "authenticity_notes": "Any observations about authenticity markers, holograms, serial numbers, packaging quality, or red flags",
+  "notable_features": "Any special features, variants, errors, or unique aspects",
+  "confidence": 0.0-1.0
+}
+
+Look for:
+- Product type and brand
+- Set/series name and logos
+- Seal integrity (shrink wrap condition, factory seals)
+- Authentication markers (holograms, serial numbers, official stamps)
+- Signs of tampering or resealing
+- Signatures or autographs (check if present)
+- Overall condition and packaging quality
+- Any red flags or concerning aspects
+
+If you cannot identify with confidence, set confidence to 0.0 and provide your best assessment in description.
+Respond ONLY with valid JSON, no other text."""
+        
+        # Build content array for API call
+        content = [{"type": "text", "text": prompt}]
+        
+        # Add all images with labels
+        image_labels = ["Primary Image", "Additional View", "Detail/Close-up", "Alternative Angle"]
+        for idx, img_b64 in enumerate(images_base64):
+            if idx > 0:
+                content.append({
+                    "type": "text",
+                    "text": f"--- {image_labels[idx]} ---"
+                })
+            content.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{img_b64}",
+                    "detail": "high"
+                }
+            })
+        
+        # Call OpenAI Vision API
+        url = "https://api.openai.com/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": content}],
+            "max_tokens": 1000,
+            "temperature": 0.1
+        }
+        
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            response = await client.post(url, headers=headers, json=payload)
+            
+            if response.status_code != 200:
+                print(f"OpenAI API Error: {response.status_code}")
+                return JSONResponse(content={
+                    "item_type": "Unknown",
+                    "description": "Could not identify",
+                    "signatures": "Unable to assess",
+                    "seal_condition": "Unable to assess",
+                    "authenticity_notes": "AI identification failed",
+                    "notable_features": "",
+                    "confidence": 0.0,
+                    "identify_token": f"idt_{secrets.token_urlsafe(12)}",
+                    "error": "AI identification failed"
+                })
+            
+            data = response.json()
+            
+            if "choices" not in data or len(data["choices"]) == 0:
+                return JSONResponse(content={
+                    "item_type": "Unknown",
+                    "description": "No response from AI",
+                    "signatures": "Unable to assess",
+                    "seal_condition": "Unable to assess",
+                    "authenticity_notes": "",
+                    "notable_features": "",
+                    "confidence": 0.0,
+                    "identify_token": f"idt_{secrets.token_urlsafe(12)}"
+                })
+            
+            content_text = data["choices"][0]["message"]["content"].strip()
+            
+            # Parse JSON
+            if content_text.startswith("```json"):
+                content_text = content_text[7:]
+            if content_text.startswith("```"):
+                content_text = content_text[3:]
+            if content_text.endswith("```"):
+                content_text = content_text[:-3]
+            content_text = content_text.strip()
+            
+            try:
+                item_data = json.loads(content_text)
+            except json.JSONDecodeError as e:
+                print(f"JSON parse error: {e}")
+                return JSONResponse(content={
+                    "item_type": "Parse error",
+                    "description": "Could not parse AI response",
+                    "signatures": "Unable to assess",
+                    "seal_condition": "Unable to assess",
+                    "authenticity_notes": "",
+                    "notable_features": "",
+                    "confidence": 0.0,
+                    "identify_token": f"idt_{secrets.token_urlsafe(12)}"
+                })
+            
+            # Generate identify token
+            identify_token = f"idt_{secrets.token_urlsafe(12)}"
+            
+            return JSONResponse(content={
+                "item_type": item_data.get("item_type", "Unknown"),
+                "description": item_data.get("description", ""),
+                "signatures": item_data.get("signatures", "None visible"),
+                "seal_condition": item_data.get("seal_condition", "Not applicable"),
+                "authenticity_notes": item_data.get("authenticity_notes", ""),
+                "notable_features": item_data.get("notable_features", ""),
+                "confidence": float(item_data.get("confidence", 0.0)),
+                "identify_token": identify_token
+            })
+        
+    except Exception as e:
+        print(f"Identify memorabilia endpoint error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+
+
+@app.post("/api/assess-memorabilia")
+async def assess_memorabilia(
+    image1: UploadFile = File(...),
+    image2: UploadFile = File(None),
+    image3: UploadFile = File(None),
+    image4: UploadFile = File(None)
+):
+    """
+    Assess condition and authenticity of memorabilia/sealed products from 1-4 images
+    """
+    try:
+        # Read primary image (required)
+        image1_bytes = await image1.read()
+        if not image1_bytes or len(image1_bytes) < 1000:
+            raise HTTPException(status_code=400, detail="Primary image is too small or empty")
+        
+        # Convert images to base64
+        images_base64 = [image_to_base64(image1_bytes)]
+        
+        # Process optional images
+        if image2:
+            img2_bytes = await image2.read()
+            if img2_bytes and len(img2_bytes) >= 1000:
+                images_base64.append(image_to_base64(img2_bytes))
+        
+        if image3:
+            img3_bytes = await image3.read()
+            if img3_bytes and len(img3_bytes) >= 1000:
+                images_base64.append(image_to_base64(img3_bytes))
+        
+        if image4:
+            img4_bytes = await image4.read()
+            if img4_bytes and len(img4_bytes) >= 1000:
+                images_base64.append(image_to_base64(img4_bytes))
+        
+        if not OPENAI_API_KEY:
+            raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+        
+        # Build comprehensive assessment prompt
+        prompt = """You are a professional memorabilia and sealed product authenticator. Analyze these images comprehensively.
+
+For SEALED PRODUCTS, assess:
+- Seal integrity (factory seal vs resealed, shrink wrap condition)
+- Packaging condition (box corners, crushing, dents, shelf wear)
+- Authentication markers (holograms, serial numbers, factory stamps)
+- Signs of tampering or opening
+- Overall preservation
+
+For SIGNED MEMORABILIA, assess:
+- Signature authenticity indicators
+- Signature placement and quality
+- Item condition
+- Certificate of Authenticity if visible
+- Any authentication markers
+
+For ALL ITEMS, evaluate:
+- Overall condition grade
+- Notable defects or issues
+- Authenticity confidence
+- Value-impacting factors
+
+Provide ONLY a JSON response:
+
+{
+  "overall_assessment": "Brief 2-3 sentence summary of item condition and authenticity",
+  "condition_grade": "Mint/Near Mint/Excellent/Very Good/Good/Fair/Poor",
+  "seal_integrity": {
+    "grade": "Factory Sealed/Intact/Compromised/Opened/Not Applicable",
+    "notes": "Detailed assessment of seals, shrink wrap, factory seals. Note any signs of tampering or resealing."
+  },
+  "packaging_condition": {
+    "grade": "Mint/Near Mint/Excellent/Very Good/Good/Fair/Poor",
+    "notes": "Assess box/packaging: corners, edges, crushing, dents, shelf wear, printing quality"
+  },
+  "authenticity_assessment": {
+    "grade": "Highly Confident/Likely Authentic/Uncertain/Concerns Present/Likely Counterfeit",
+    "notes": "Check authentication markers, holograms, serial numbers, packaging quality, known counterfeit indicators"
+  },
+  "signature_assessment": {
+    "present": true/false,
+    "grade": "Authentic/Likely Authentic/Uncertain/Concerns/Not Applicable",
+    "notes": "If signatures present: assess authenticity markers, placement, ink quality, any COA visible"
+  },
+  "defects": ["List specific issues: 'Box corner crushing top-right', 'Shrink wrap tear left side', 'Signature smudged', etc. Empty array if none."],
+  "value_factors": ["List factors affecting value: positive or negative"],
+  "confidence": 0.0-1.0
+}
+
+GRADING SCALE:
+- Mint: Perfect condition, factory fresh
+- Near Mint: Minimal wear, excellent overall
+- Excellent: Minor wear, still very presentable
+- Very Good: Noticeable wear but intact
+- Good: Significant wear, structural integrity maintained
+- Fair: Heavy wear, may have damage
+- Poor: Severe damage, barely collectible
+
+Be thorough, specific, and honest. Note both positives and concerns.
+Respond ONLY with valid JSON, no other text."""
+        
+        # Build content array
+        content = [{"type": "text", "text": prompt}]
+        
+        image_labels = ["Primary Image", "Additional View", "Detail/Close-up", "Alternative Angle"]
+        for idx, img_b64 in enumerate(images_base64):
+            if idx > 0:
+                content.append({
+                    "type": "text",
+                    "text": f"--- {image_labels[idx]} ---"
+                })
+            content.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{img_b64}",
+                    "detail": "high"
+                }
+            })
+        
+        # Call OpenAI
+        url = "https://api.openai.com/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": content}],
+            "max_tokens": 2000,
+            "temperature": 0.1
+        }
+        
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(url, headers=headers, json=payload)
+            
+            if response.status_code != 200:
+                print(f"OpenAI API Error: {response.status_code}")
+                return JSONResponse(content={
+                    "overall_assessment": "Assessment failed",
+                    "condition_grade": "Unable to assess",
+                    "seal_integrity": {"grade": "N/A", "notes": "Assessment failed"},
+                    "packaging_condition": {"grade": "N/A", "notes": "Assessment failed"},
+                    "authenticity_assessment": {"grade": "N/A", "notes": "Assessment failed"},
+                    "signature_assessment": {"present": False, "grade": "N/A", "notes": "Assessment failed"},
+                    "defects": [],
+                    "value_factors": [],
+                    "confidence": 0.0,
+                    "error": "AI assessment failed"
+                })
+            
+            data = response.json()
+            
+            if "choices" not in data or len(data["choices"]) == 0:
+                return JSONResponse(content={
+                    "overall_assessment": "No response",
+                    "condition_grade": "N/A",
+                    "seal_integrity": {"grade": "N/A", "notes": "No AI response"},
+                    "packaging_condition": {"grade": "N/A", "notes": "No AI response"},
+                    "authenticity_assessment": {"grade": "N/A", "notes": "No AI response"},
+                    "signature_assessment": {"present": False, "grade": "N/A", "notes": "No AI response"},
+                    "defects": [],
+                    "value_factors": [],
+                    "confidence": 0.0
+                })
+            
+            content_text = data["choices"][0]["message"]["content"].strip()
+            
+            # Parse JSON
+            if content_text.startswith("```json"):
+                content_text = content_text[7:]
+            if content_text.startswith("```"):
+                content_text = content_text[3:]
+            if content_text.endswith("```"):
+                content_text = content_text[:-3]
+            content_text = content_text.strip()
+            
+            try:
+                assessment_data = json.loads(content_text)
+            except json.JSONDecodeError as e:
+                print(f"JSON parse error: {e}")
+                print(f"Content: {content_text[:500]}")
+                return JSONResponse(content={
+                    "overall_assessment": "Parse error",
+                    "condition_grade": "N/A",
+                    "seal_integrity": {"grade": "N/A", "notes": "Could not parse response"},
+                    "packaging_condition": {"grade": "N/A", "notes": "Could not parse response"},
+                    "authenticity_assessment": {"grade": "N/A", "notes": "Could not parse response"},
+                    "signature_assessment": {"present": False, "grade": "N/A", "notes": "Could not parse response"},
+                    "defects": [],
+                    "value_factors": [],
+                    "confidence": 0.0
+                })
+            
+            # Return assessment
+            return JSONResponse(content={
+                "overall_assessment": assessment_data.get("overall_assessment", ""),
+                "condition_grade": assessment_data.get("condition_grade", "N/A"),
+                "seal_integrity": assessment_data.get("seal_integrity", {"grade": "N/A", "notes": ""}),
+                "packaging_condition": assessment_data.get("packaging_condition", {"grade": "N/A", "notes": ""}),
+                "authenticity_assessment": assessment_data.get("authenticity_assessment", {"grade": "N/A", "notes": ""}),
+                "signature_assessment": assessment_data.get("signature_assessment", {"present": False, "grade": "N/A", "notes": ""}),
+                "defects": assessment_data.get("defects", []),
+                "value_factors": assessment_data.get("value_factors", []),
+                "confidence": float(assessment_data.get("confidence", 0.0))
+            })
+        
+    except Exception as e:
+        print(f"Assess memorabilia endpoint error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
 
 
