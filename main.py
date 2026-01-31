@@ -41,7 +41,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-01-31-v6.0.0")
+APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-01-31-v6.1.1")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
 
@@ -118,14 +118,27 @@ def _norm_ws(s: str) -> str:
 
 
 def _norm_num(s: str) -> str:
+    """Normalize a card number string without destroying meaningful leading zeros.
+
+    Examples:
+    - "004/120" stays "004/120"
+    - "4/102" stays "4/102"
+    - "#004" -> "004"
+    """
     s = (s or "").strip()
     s = s.replace("#", "").strip()
-    # Keep formats like 4/102, but remove leading zeros from the first part
     if "/" in s:
         a, b = s.split("/", 1)
-        a = a.lstrip("0") or "0"
-        return f"{a}/{b}"
-    return s.lstrip("0") or s
+        return f"{a.strip()}/{b.strip()}"
+    return s
+
+
+def _pok_num(card_number: str) -> str:
+    """PokemonTCG expects the left-side card number without leading zeros (e.g. 004/120 -> 4)."""
+    s = _norm_num(card_number)
+    left = s.split('/', 1)[0].strip() if s else ''
+    left = left.lstrip('0') or '0' if left else ''
+    return left
 
 
 async def _openai_chat(messages: List[Dict[str, Any]], max_tokens: int = 1200, temperature: float = 0.1) -> Dict[str, Any]:
@@ -236,36 +249,130 @@ async def _pokemontcg_get(path: str, params: Optional[Dict[str, Any]] = None) ->
         return {}
 
 
-async def _pokemontcg_resolve_card_id(card_name: str, set_code: str, card_number: str, set_name: str = "") -> str:
-    """Resolve most likely PokemonTCG card id using a query ladder."""
+
+async def _pokemontcg_set_by_ptcgo(set_code: str) -> Dict[str, Any]:
+    """Fetch the most likely set object for a given ptcgoCode."""
+    sc = (set_code or "").strip().upper()
+    if not sc:
+        return {}
+    data = await _pokemontcg_get("/sets", params={"q": f"ptcgoCode:{sc}", "pageSize": 10})
+    sets = (data.get("data") or [])
+    if not sets:
+        return {}
+    # If multiple sets share a ptcgoCode (rare), return the most recently released.
+    def _rd(s):
+        return str((s.get("releaseDate") or ""))
+    sets_sorted = sorted([s for s in sets if isinstance(s, dict)], key=_rd, reverse=True)
+    return sets_sorted[0] if sets_sorted else {}
+
+
+
+async def _pokemontcg_resolve_card_id(
+    card_name: str,
+    set_code: str,
+    card_number_printed: str,
+    set_name: str = "",
+    year: str = "",
+    rarity: str = "",
+) -> str:
+    """Resolve the closest PokemonTCG card id using ALL known fields (query ladder + scoring).
+
+    Notes:
+    - Keep printed numbers exactly as seen on-card (e.g. '004/120') for storage/display.
+    - PokemonTCG's `number` is typically the left side without leading zeros (e.g. '4').
+    """
     name = _norm_ws(card_name)
     sc = (set_code or "").strip().upper()
-    num = _norm_num(card_number or "")
     sn = _norm_ws(set_name or "")
+    yr = (str(year or "").strip())
+    rar = _norm_ws(rarity or "")
+    num_print = _norm_num(card_number_printed or "")
+    num_query = _pok_num(num_print)  # strips /total and leading zeros
 
+    # Resolve set object (gives set.id + official set.name)
+    set_obj: Dict[str, Any] = {}
+    set_id = ""
+    if sc:
+        set_obj = await _pokemontcg_set_by_ptcgo(sc)
+        set_id = str(set_obj.get("id") or "").strip()
+
+    # Build a strict-to-loose ladder
     queries: List[str] = []
-    if sc and num:
-        queries.append(f"number:{num} set.ptcgoCode:{sc}")
-    if name and num and sn:
-        queries.append(f'name:"{name}" number:{num} set.name:"{sn}"')
-    if name and num:
-        queries.append(f'name:"{name}" number:{num}')
-    if name and sn:
-        queries.append(f'name:"{name}" set.name:"{sn}"')
+
+    # Deterministic first: set.id / ptcgoCode + number
+    if set_id and num_query:
+        queries.append(f"set.id:{set_id} number:{num_query}")
+    if sc and num_query:
+        queries.append(f"set.ptcgoCode:{sc} number:{num_query}")
+
+    # Add name phrase as a further constraint
+    if name and set_id and num_query:
+        queries.append(f'set.id:{set_id} number:{num_query} name:"{name}"')
+    if name and sc and num_query:
+        queries.append(f'set.ptcgoCode:{sc} number:{num_query} name:"{name}"')
+
+    # Fallbacks using set name
+    if name and sn and num_query:
+        queries.append(f'name:"{name}" set.name:"{sn}" number:{num_query}')
+    if sn and num_query:
+        queries.append(f'set.name:"{sn}" number:{num_query}')
+
+    # Last resorts
+    if name and num_query:
+        queries.append(f'name:"{name}" number:{num_query}')
     if name:
         queries.append(f'name:"{name}"')
 
+    def score_card(c: Dict[str, Any]) -> int:
+        score = 0
+        try:
+            cnum = _pok_num(str(c.get("number", "")))
+        except Exception:
+            cnum = ""
+        cset = c.get("set") if isinstance(c.get("set"), dict) else {}
+        c_ptcgo = str((cset or {}).get("ptcgoCode") or "").strip().upper()
+        c_setid = str((cset or {}).get("id") or "").strip()
+        cname = _norm_ws(str(c.get("name") or ""))
+        c_rar = _norm_ws(str(c.get("rarity") or ""))
+
+        if sc and c_ptcgo == sc:
+            score += 100
+        if set_id and c_setid == set_id:
+            score += 100
+        if num_query and cnum == num_query:
+            score += 80
+        if name and cname == name:
+            score += 60
+        elif name and name in cname:
+            score += 30
+        if sn:
+            c_setname = _norm_ws(str((cset or {}).get("name") or ""))
+            if c_setname == sn:
+                score += 30
+        if rar and c_rar and (c_rar == rar):
+            score += 15
+        # Year: compare against set.releaseDate prefix if available
+        if yr:
+            rd = str((cset or {}).get("releaseDate") or "")
+            if rd.startswith(yr):
+                score += 10
+        return score
+
+    # Execute ladder and pick best scored candidate
     for q in queries:
-        data = await _pokemontcg_get("/cards", params={"q": q, "pageSize": 5})
-        cards = (data.get("data") or [])
+        data = await _pokemontcg_get("/cards", params={"q": q, "pageSize": 20, "orderBy": "-set.releaseDate"})
+        cards = [c for c in (data.get("data") or []) if isinstance(c, dict)]
         if not cards:
             continue
-        if num:
-            for c in cards:
-                if _norm_num(str(c.get("number", ""))) == num:
-                    return str(c.get("id", "")) or ""
-        return str(cards[0].get("id", "")) or ""
+        best = max(cards, key=score_card)
+        best_score = score_card(best)
+        # If the best candidate is very weak, continue searching.
+        if best_score < 80 and q != queries[-1]:
+            continue
+        return str(best.get("id", "")) or ""
+
     return ""
+
 
 
 async def _pokemontcg_card_by_id(card_id: str) -> Dict[str, Any]:
@@ -451,8 +558,9 @@ Respond ONLY with JSON, no extra text."""
         pid = await _pokemontcg_resolve_card_id(
             card_name=card_name,
             set_code=set_info["set_code"],
-            card_number=card_number,
+            card_number_printed=card_number,
             set_name=set_info["set_name"],
+            year=(card_year or ""),
         )
         if pid:
             card = await _pokemontcg_card_by_id(pid)
@@ -964,21 +1072,10 @@ async def market_context(
         card_name=clean_name,
         set_name=set_info["set_name"],
         set_code=set_info["set_code"],
-        card_number=clean_number,
+        card_number_printed=clean_number,
         card_type=clean_type,
     )
-
-    # Gather eBay samples via ladder
-    gathered = await _gather_market_samples(query_ladder)
-    used_query = gathered["used_query"]
-    raw_prices = gathered["raw_prices"]
-    raw_currency = gathered["raw_currency"]
-    graded_prices = gathered["graded_prices"]
-    meta_urls = gathered["meta_urls"]
-
-    sources: List[str] = []
-    if raw_prices or any(graded_prices.get(k) for k in ("10", "9", "8")):
-        sources.append("eBay (sold/completed)")
+    is_pokemon = ("pokemon" in clean_type.lower())
 
     # PokemonTCG authoritative details + price anchors (Pokemon cards only)
     pokemontcg_card: Optional[Dict[str, Any]] = None
@@ -988,13 +1085,17 @@ async def market_context(
     anchor_currencies: List[str] = []
     anchor_currency: str = ""
 
-    if POKEMONTCG_API_KEY and ("pokemon" in clean_type.lower()):
-        pokemontcg_id = await _pokemontcg_resolve_card_id(
-            card_name=clean_name,
-            set_code=set_info["set_code"],
-            card_number=clean_number,
-            set_name=set_info["set_name"],
-        )
+    sources: List[str] = []
+    meta_urls: Dict[str, str] = {}
+    used_query = ""
+    raw_prices: List[float] = []
+    raw_currency: str = ""
+    graded_prices: Dict[str, List[float]] = {"10": [], "9": [], "8": []}
+
+    # IMPORTANT: For Pokemon cards, prefer PokemonTCG.io data FIRST and do NOT
+    # block the UX on eBay scraping (which can be slow / rate-limited).
+    if POKEMONTCG_API_KEY and is_pokemon:
+        pokemontcg_id = await _pokemontcg_resolve_card_id(card_name=clean_name, set_code=set_info['set_code'], card_number_printed=clean_number, set_name=set_info['set_name'], year='')
         if pokemontcg_id:
             pokemontcg_card = await _pokemontcg_card_by_id(pokemontcg_id)
             ptcg_prices = _pokemontcg_extract_prices(pokemontcg_card or {})
@@ -1002,6 +1103,19 @@ async def market_context(
             anchor_currencies = (ptcg_prices.get("currencies") or [])
             anchor_currency = anchor_currencies[0] if anchor_currencies else "USD"
             sources.append("PokemonTCG API (details + prices)")
+
+    # eBay sold/completed (optional)
+    # Default: skip eBay for Pokemon cards to avoid timeouts.
+    use_ebay_for_pokemon = os.getenv("USE_EBAY_FOR_POKEMON", "0").strip() == "1"
+    if (not is_pokemon) or use_ebay_for_pokemon:
+        gathered = await _gather_market_samples(query_ladder)
+        used_query = gathered["used_query"]
+        raw_prices = gathered["raw_prices"]
+        raw_currency = gathered["raw_currency"]
+        graded_prices = gathered["graded_prices"]
+        meta_urls = gathered["meta_urls"]
+        if raw_prices or any(graded_prices.get(k) for k in ("10", "9", "8")):
+            sources.append("eBay (sold/completed)")
 
     # Decide availability: if ANY samples exist, return available with liquidity label
     has_any = bool(raw_prices) or any(len(v) > 0 for v in graded_prices.values()) or bool(anchor_prices)
@@ -1151,7 +1265,7 @@ async def market_intelligence_alias(
         card_name=card_name,
         predicted_grade=predicted_grade,
         confidence=confidence,
-        card_number=card_number,
+        card_number_printed=card_number,
         card_set=card_set,
         set_code=set_code,
         card_type=card_type,
