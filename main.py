@@ -1,12 +1,13 @@
 """
 The Collectors League Australia — Scan API
-Futureproof v6 (2026-01-31)
+Futureproof v6 (2026-01-31) - ENHANCED SEARCH EDITION
 
 Goals:
 - Canonical identification object (stable IDs)
 - Set-code aware identification (e.g., PFL -> Phantasmal Flames)
 - Richer grading detail (front/back + per-corner breakdown + detailed flags)
 - Click-only Market Context that is resilient (multi-pass query ladder + never "nothing" if any samples exist)
+- ENHANCED: Aggressive search with 20-30 variations to maximize data discovery
 - No financial advice framing; informational context only.
 
 NOTE: This file expects these dependencies in requirements.txt:
@@ -41,7 +42,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-01-31-v6.0.0")
+APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-01-31-v6.0.0-enhanced")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
 
@@ -56,10 +57,7 @@ if not OPENAI_API_KEY:
 # ==============================
 # Set Code Mapping (expand over time)
 # ==============================
-# Keep this conservative: only include codes you are certain about.
-# You can expand this safely as you see more items.
 SET_CODE_MAP: Dict[str, str] = {
-    # Examples (replace/expand with your real catalog)
     "PFL": "Phantasmal Flames",
     "OBF": "Obsidian Flames",
     "SVI": "Scarlet & Violet",
@@ -118,7 +116,6 @@ def _norm_ws(s: str) -> str:
 def _norm_num(s: str) -> str:
     s = (s or "").strip()
     s = s.replace("#", "").strip()
-    # Keep formats like 4/102, but remove leading zeros from the first part
     if "/" in s:
         a, b = s.split("/", 1)
         a = a.lstrip("0") or "0"
@@ -127,9 +124,6 @@ def _norm_num(s: str) -> str:
 
 
 async def _openai_chat(messages: List[Dict[str, Any]], max_tokens: int = 1200, temperature: float = 0.1) -> Dict[str, Any]:
-    """
-    Unified OpenAI Chat Completions call for text+image content payloads.
-    """
     if not OPENAI_API_KEY:
         raise HTTPException(status_code=500, detail="OpenAI API key not configured")
 
@@ -171,9 +165,6 @@ def _grade_bucket(predicted_grade: str) -> Optional[int]:
 
 
 def _grade_distribution(predicted_grade: int, confidence: float) -> Dict[str, float]:
-    """
-    Conservative distribution over grades {10,9,8} around predicted_grade.
-    """
     c = _clamp(confidence, 0.05, 0.95)
     p_pred = 0.45 + 0.50 * c
     remainder = 1.0 - p_pred
@@ -203,7 +194,6 @@ def _canonicalize_set(set_code: Optional[str], set_name: Optional[str]) -> Dict[
     if sc and sn:
         return {"set_code": sc, "set_name": sn, "set_source": "ai+code"}
     if sn:
-        # attempt to infer code from map reverse (rare)
         rev = {v.lower(): k for k, v in SET_CODE_MAP.items()}
         maybe = rev.get(sn.lower())
         if maybe:
@@ -223,7 +213,7 @@ def root():
         "status": "ok",
         "service": "cl-scan-api",
         "version": APP_VERSION,
-        "message": "The Collectors League Australia — Multi-Item Assessment API (Futureproof v6)",
+        "message": "The Collectors League Australia — Multi-Item Assessment API (Futureproof v6 Enhanced)",
     }
 
 
@@ -236,7 +226,7 @@ def health():
         "has_openai_key": bool(OPENAI_API_KEY),
         "has_pokemontcg_key": bool(POKEMONTCG_API_KEY),
         "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-        "supports": ["cards", "memorabilia", "sealed_products", "market_context_click_only", "canonical_id", "detailed_grading"],
+        "supports": ["cards", "memorabilia", "sealed_products", "market_context_click_only", "canonical_id", "detailed_grading", "enhanced_search"],
         "ebay_domain": EBAY_DOMAIN,
     }
 
@@ -246,10 +236,6 @@ def health():
 # ==============================
 @app.post("/api/identify")
 async def identify(front: UploadFile = File(...)):
-    """
-    Identify a trading card from its front image using AI vision.
-    Returns a canonical_id object that future-proofs downstream market + registry usage.
-    """
     image_bytes = await front.read()
     if not image_bytes or len(image_bytes) < 1000:
         raise HTTPException(status_code=400, detail="Image is too small or empty")
@@ -360,18 +346,12 @@ async def verify(
     card_type: Optional[str] = Form(None),
     set_code: Optional[str] = Form(None),
 ):
-    """
-    AI-powered card pre-assessment using front + back images.
-    Returns detailed grading: corners/edges/surface front+back + per-corner notes + flags.
-    Market estimates are NOT computed here (click-only endpoint).
-    """
     front_bytes = await front.read()
     back_bytes = await back.read()
 
     if not front_bytes or not back_bytes or len(front_bytes) < 1000 or len(back_bytes) < 1000:
         raise HTTPException(status_code=400, detail="Images are too small or empty")
 
-    # Canonicalize provided ID context (if any)
     provided_name = _norm_ws(card_name or "")
     provided_set = _norm_ws(card_set or "")
     provided_num = _norm_num(card_number or "")
@@ -491,7 +471,6 @@ Respond ONLY with JSON."""
 
     data = _parse_json_or_none(result.get("content", "")) or {}
 
-    # Normalize observed ID with code map
     obs = data.get("observed_id", {}) if isinstance(data.get("observed_id", {}), dict) else {}
     obs_name = _norm_ws(str(obs.get("card_name", "")))
     obs_type = _norm_ws(str(obs.get("card_type", "")))
@@ -538,7 +517,7 @@ Respond ONLY with JSON."""
 
 
 # ==============================
-# Market Context (Click-only, resilient)
+# Market Context Helpers
 # ==============================
 _PRICE_RE = re.compile(r"(?P<cur>AU\$|A\$|US\$|\$)?\s*(?P<num>[0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)")
 
@@ -687,7 +666,8 @@ def _stats(values: List[float]) -> Dict[str, Any]:
 
 def _build_query_ladder(card_name: str, set_name: str, set_code: str, card_number: str, card_type: str) -> List[str]:
     """
-    Build multiple query variants from strict -> relaxed.
+    Build MANY query variants from strict -> relaxed.
+    ENHANCED to generate 20-30 variations for maximum data discovery.
     """
     name = _norm_ws(card_name)
     sn = _norm_ws(set_name)
@@ -696,35 +676,99 @@ def _build_query_ladder(card_name: str, set_name: str, set_code: str, card_numbe
     t = _norm_ws(card_type)
 
     variants: List[str] = []
-    # Strict
+    
+    # Extract base name (remove variant suffixes)
+    base_name = re.sub(
+        r'\s+(V|VMAX|VSTAR|GX|EX|ex|Holo|Reverse Holo|First Edition|1st Ed|Shadowless|Unlimited)\s*',
+        ' ',
+        name,
+        flags=re.IGNORECASE
+    ).strip()
+    base_name = _norm_ws(base_name)
+    
+    # Remove special characters version
+    name_simple = re.sub(r'[^a-zA-Z0-9\s]', ' ', name)
+    name_simple = _norm_ws(name_simple)
+    
+    # TIER 1: EXACT OFFICIAL FORMATS
     base_parts = [name]
     if sn and sn.lower() not in name.lower():
         base_parts.append(sn)
     if num:
         base_parts.append(num)
-    variants.append(" ".join([p for p in base_parts if p]))
+    if base_parts:
+        variants.append(" ".join([p for p in base_parts if p]))
+    
+    if sn and num:
+        variants.extend([
+            f"{name} {sn} #{num}",
+            f"{name} - {sn} {num}",
+            f"{name} ({sn}) {num}",
+            f"{name}, {sn} #{num}",
+        ])
+    
+    if sc and num:
+        variants.extend([
+            f"{name} {sc} {num}",
+            f"{name} {sc}-{num}",
+            f"{name} {sc}#{num}",
+        ])
 
-    # Code-based
-    if sc:
-        parts = [name, sc]
-        if num:
-            parts.append(num)
-        variants.append(" ".join(parts))
-
-    # Relaxed set name (no number)
+    # TIER 2: WITHOUT NUMBER
     if sn:
-        variants.append(" ".join([name, sn]))
+        variants.extend([
+            f"{name} {sn}",
+            f"{base_name} {sn}",
+            f"{name_simple} {sn}",
+            f"{name} from {sn}",
+            f"{name} - {sn}",
+        ])
 
-    # Relaxed code (no number)
     if sc:
-        variants.append(" ".join([name, sc]))
+        variants.extend([
+            f"{name} {sc}",
+            f"{base_name} {sc}",
+            f"{name_simple} {sc}",
+        ])
 
-    # Name only + type hint
+    # TIER 3: WITH TYPE CONTEXT
     if t and t.lower() not in name.lower():
-        variants.append(" ".join([name, t]))
-    variants.append(name)
+        variants.extend([
+            f"{name} {t}",
+            f"{t} {name}",
+            f"{base_name} {t}",
+        ])
+    
+    if "pokemon" in t.lower() or not t:
+        variants.extend([
+            f"{name} Pokemon",
+            f"{name} Pokemon Card",
+            f"{name} TCG",
+            f"{base_name} Pokemon",
+        ])
 
-    # De-dupe preserving order
+    # TIER 4: NAME VARIATIONS
+    variants.extend([
+        name,
+        base_name,
+        name_simple,
+    ])
+    
+    # TIER 5: REVERSE ORDER
+    if sn:
+        variants.append(f"{sn} {name}")
+    if sc:
+        variants.append(f"{sc} {name}")
+
+    # TIER 6: ULTRA-BROAD
+    first_word = name.split()[0] if name else ""
+    if first_word and len(first_word) > 3:
+        if sn:
+            variants.append(f"{first_word} {sn}")
+        if sc:
+            variants.append(f"{first_word} {sc}")
+
+    # De-dupe
     out: List[str] = []
     seen = set()
     for q in variants:
@@ -732,55 +776,91 @@ def _build_query_ladder(card_name: str, set_name: str, set_code: str, card_numbe
         if qn and qn.lower() not in seen:
             out.append(qn)
             seen.add(qn.lower())
+    
+    print(f"🔍 Generated {len(out)} search variations")
     return out
 
 
 async def _gather_market_samples(query_ladder: List[str]) -> Dict[str, Any]:
     """
-    Try multiple query strings until we have at least some usable samples.
-    Returns raw + graded samples and meta urls for transparency.
+    Try multiple query strings until we have usable samples.
+    ENHANCED to be more aggressive and try ALL variations.
     """
     meta_urls: Dict[str, str] = {}
-    used_query = ""
+    used_queries: List[str] = []
     raw_prices: List[float] = []
     raw_currency = ""
     graded_prices: Dict[str, List[float]] = {"10": [], "9": [], "8": []}
 
-    # Thresholds: allow "something" (futureproof UX) but label liquidity accordingly.
-    target_raw = 3
-    target_graded_each = 2  # lower than before
+    target_raw = 2
+    target_graded_each = 1
 
-    for q in query_ladder:
-        used_query = q
-        # raw
+    print(f"🔎 Searching with {len(query_ladder)} query variations...")
+    
+    for idx, q in enumerate(query_ladder, 1):
+        print(f"  [{idx}/{len(query_ladder)}] Trying: {q}")
+        used_queries.append(q)
+        
         raw_res = await _search_ebay_sold_prices(q, negate_terms=["graded", "psa", "bgs", "cgc", "slab"], limit=30)
         meta_urls[f"ebay_raw::{q}"] = raw_res.get("url", "")
         if raw_res["prices"]:
-            raw_prices = raw_res["prices"]
-            raw_currency = raw_res.get("currency", "") or raw_currency
+            print(f"    ✅ Found {len(raw_res['prices'])} raw prices")
+            raw_prices.extend(raw_res["prices"])
+            if not raw_currency:
+                raw_currency = raw_res.get("currency", "")
 
-        # graded attempts (PSA 10/9/8)
         for grade in ("10", "9", "8"):
-            gr_res = await _search_ebay_sold_prices(f"{q} PSA {grade}", negate_terms=[], limit=20)
-            meta_urls[f"ebay_psa_{grade}::{q}"] = gr_res.get("url", "")
-            if gr_res["prices"]:
-                graded_prices[grade] = gr_res["prices"]
+            graded_queries = [
+                f"{q} PSA {grade}",
+                f"{q} PSA-{grade}",
+                f"PSA {grade} {q}",
+            ]
+            
+            for gq in graded_queries:
+                gr_res = await _search_ebay_sold_prices(gq, negate_terms=[], limit=20)
+                if gr_res["prices"]:
+                    print(f"    ✅ Found {len(gr_res['prices'])} PSA {grade} prices")
+                    graded_prices[grade].extend(gr_res["prices"])
+                    meta_urls[f"ebay_psa_{grade}::{q}"] = gr_res.get("url", "")
+                    break
 
-        # Stop early if we have enough
-        ok_raw = len(raw_prices) >= target_raw
+        total_raw = len(raw_prices)
+        total_graded = sum(len(v) for v in graded_prices.values())
+        
+        print(f"    📊 Running total: {total_raw} raw, {total_graded} graded")
+        
+        ok_raw = total_raw >= target_raw
         ok_graded = sum(1 for g in ("10", "9", "8") if len(graded_prices[g]) >= target_graded_each) >= 2
+        
         if ok_raw or ok_graded:
+            print(f"  ✅ SUCCESS! Found sufficient data after {idx} attempts")
+            break
+        
+        if idx >= 5 and (total_raw > 0 or total_graded > 0):
+            print(f"  ⚠️ Found SOME data, stopping early")
             break
 
+    raw_prices = list(set(raw_prices))
+    for grade in graded_prices:
+        graded_prices[grade] = list(set(graded_prices[grade]))
+    
+    total_found = len(raw_prices) + sum(len(v) for v in graded_prices.values())
+    print(f"📊 Final results: {len(raw_prices)} raw, {sum(len(v) for v in graded_prices.values())} graded ({total_found} total)")
+
     return {
-        "used_query": used_query,
+        "used_query": used_queries[-1] if used_queries else "",
+        "used_queries": used_queries,
         "raw_prices": raw_prices,
         "raw_currency": raw_currency,
         "graded_prices": graded_prices,
         "meta_urls": meta_urls,
+        "total_attempts": len(used_queries),
     }
 
 
+# ==============================
+# Market Context Endpoint
+# ==============================
 @app.post("/api/market-context")
 async def market_context(
     card_name: str = Form(...),
@@ -794,16 +874,18 @@ async def market_context(
 ):
     """
     Click-only market context endpoint.
-
-    This is informational only and should not be framed as financial advice.
+    ENHANCED with aggressive search that tries many variations.
     """
+    print(f"\n{'='*70}")
+    print(f"🎯 MARKET SEARCH: {card_name}")
+    print(f"{'='*70}")
+    
     clean_name = _norm_ws(card_name)
     clean_set = _norm_ws(card_set or "")
     clean_code = _norm_ws(set_code or "").upper()
     clean_number = _norm_num(card_number or "")
     clean_type = _norm_ws(card_type or "")
 
-    # Apply code map
     set_info = _canonicalize_set(clean_code, clean_set)
 
     conf = _clamp(_safe_float(confidence, 0.0), 0.0, 1.0)
@@ -817,19 +899,19 @@ async def market_context(
         card_type=clean_type,
     )
 
-    # Gather eBay samples via ladder
     gathered = await _gather_market_samples(query_ladder)
     used_query = gathered["used_query"]
+    used_queries = gathered.get("used_queries", [used_query])
     raw_prices = gathered["raw_prices"]
     raw_currency = gathered["raw_currency"]
     graded_prices = gathered["graded_prices"]
     meta_urls = gathered["meta_urls"]
+    total_attempts = gathered.get("total_attempts", len(used_queries))
 
     sources: List[str] = []
     if raw_prices or any(graded_prices.get(k) for k in ("10", "9", "8")):
         sources.append("eBay (sold/completed)")
 
-    # Optional raw anchor (PokemonTCG)
     anchor_prices: List[float] = []
     anchor_currency = ""
     if clean_type.lower() == "pokemon" or "pokemon" in clean_type.lower() or POKEMONTCG_API_KEY:
@@ -839,9 +921,11 @@ async def market_context(
         if anchor_prices:
             sources.append("PokemonTCG API (raw anchor)")
 
-    # Decide availability: if ANY samples exist, return available with liquidity label
     has_any = bool(raw_prices) or bool(anchor_prices) or any(len(v) > 0 for v in graded_prices.values())
+    
     if not has_any:
+        print(f"❌ NO DATA FOUND after {total_attempts} attempts")
+        print(f"{'='*70}\n")
         return JSONResponse(content={
             "available": False,
             "mode": "click_only",
@@ -852,20 +936,31 @@ async def market_context(
                 "number": clean_number,
                 "type": clean_type,
             },
+            "search_info": {
+                "total_variations_generated": len(query_ladder),
+                "total_attempts": total_attempts,
+                "queries_tried": used_queries[:5],
+            },
             "query_ladder": query_ladder,
             "used_query": used_query,
-            "message": "No market samples found from the available sources for this item. Try adjusting the set name/code or card number.",
+            "message": f"No market data found after trying {total_attempts} search variations. This card may be very rare, new, or misspelled.",
             "sources": sources,
             "meta": {"urls": meta_urls},
             "timestamp": datetime.utcnow().isoformat() + "Z",
             "disclaimer": "Informational market context only. Not financial advice."
         })
 
+    print(f"✅ DATA FOUND!")
+    print(f"   Raw: {len(raw_prices)} prices")
+    print(f"   PSA 10: {len(graded_prices['10'])} prices")
+    print(f"   PSA 9: {len(graded_prices['9'])} prices")
+    print(f"   PSA 8: {len(graded_prices['8'])} prices")
+    print(f"{'='*70}\n")
+
     raw_stats = _stats(raw_prices)
     anchor_stats = _stats(anchor_prices)
     graded_stats: Dict[str, Any] = {k: _stats(v) for k, v in graded_prices.items() if v}
 
-    # Choose baseline
     raw_baseline = 0.0
     if raw_stats["sample_size"] >= 2:
         raw_baseline = raw_stats["median"] or raw_stats["avg"]
@@ -878,7 +973,6 @@ async def market_context(
     dist = _grade_distribution(g, conf)
     expected_value = None
 
-    # Expected value only if we have at least SOME graded pricing
     if graded_stats:
         expected_value = 0.0
         for grade, p in dist.items():
@@ -893,7 +987,6 @@ async def market_context(
     if expected_value is not None and raw_baseline:
         value_difference = round(expected_value - raw_baseline - float(grading_cost or 0.0), 2)
 
-    # Sensitivity PSA10 vs PSA9
     sensitivity = "unknown"
     if "10" in graded_stats and "9" in graded_stats and graded_stats["10"]["sample_size"] >= 2 and graded_stats["9"]["sample_size"] >= 2:
         p10 = graded_stats["10"]["median"] or graded_stats["10"]["avg"]
@@ -911,7 +1004,6 @@ async def market_context(
 
     currency = raw_currency or (anchor_currency if anchor_prices else "") or "unknown"
 
-    # Confidence label based on sample sizes
     sample_total = raw_stats["sample_size"] + sum(st["sample_size"] for st in graded_stats.values()) + anchor_stats["sample_size"]
     confidence_label = "high" if sample_total >= 20 else "moderate" if sample_total >= 8 else "low"
 
@@ -925,6 +1017,11 @@ async def market_context(
             "set_code": set_info["set_code"],
             "number": clean_number,
             "type": clean_type,
+        },
+        "search_info": {
+            "total_variations_generated": len(query_ladder),
+            "total_attempts": total_attempts,
+            "successful_queries": used_queries[:3],
         },
         "query_ladder": query_ladder,
         "used_query": used_query,
@@ -977,7 +1074,7 @@ async def market_intelligence_alias(
     )
     if isinstance(res, JSONResponse):
         payload = json.loads(res.body.decode("utf-8"))
-        payload["deprecated"] = True
+        payload["deprecated"] = True,
         payload["deprecated_message"] = "Use /api/market-context (click-only) instead."
         return JSONResponse(content=payload, status_code=res.status_code)
     return res
