@@ -318,6 +318,33 @@ def _pc_trend(product_id: str, days: int = 30) -> dict:
 
 POKEMONTCG_BASE = "https://api.pokemontcg.io/v2"
 
+# ==============================
+# Set Code Mapping + Canonicalization
+# ==============================
+SET_CODE_MAP: Dict[str, str] = {
+    "MEW": "Scarlet & Violet—151",
+    "OBF": "Obsidian Flames",
+    "SVI": "Scarlet & Violet",
+    "PFL": "Phantasmal Flames",
+    "BS": "Base Set",
+}
+
+def _canonicalize_set(set_code: Optional[str], set_name: Optional[str]) -> Dict[str, str]:
+    sc = (set_code or "").strip().upper()
+    sn = _norm_ws(set_name or "")
+    mapped = SET_CODE_MAP.get(sc) if sc else None
+    if mapped:
+        return {"set_code": sc, "set_name": mapped, "set_source": "code_map"}
+    if sc and sn:
+        return {"set_code": sc, "set_name": sn, "set_source": "provided"}
+    if sn:
+        return {"set_code": sc or "", "set_name": sn, "set_source": "name_only"}
+    if sc:
+        return {"set_code": sc, "set_name": "", "set_source": "code_only"}
+    return {"set_code": "", "set_name": "", "set_source": "unknown"}
+
+
+
 # eBay API scaffolding (disabled by default)
 USE_EBAY_API = os.getenv("USE_EBAY_API", "0").strip() in ("1", "true", "TRUE", "yes", "YES")
 EBAY_APP_ID = os.getenv("EBAY_APP_ID", "").strip()
@@ -346,6 +373,11 @@ def _b64(img: bytes) -> str:
 
 def _norm_ws(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
+
+
+def _is_blankish(s: str) -> bool:
+    s=(s or "").strip().lower()
+    return s in ("", "unknown", "n/a", "na", "none", "not sure", "unsure")
 
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
@@ -794,6 +826,10 @@ Respond ONLY with JSON, no extra text.
     card_number_display = _clean_card_number_display(str(data.get("card_number", "")))
     set_code = _norm_ws(str(data.get("set_code", ""))).upper()
     set_name = _norm_ws(str(data.get("set_name", "")))
+    if _is_blankish(set_name):
+        set_name = ""
+    if set_name.strip().lower() in ("unknown","n/a","na","none"):
+        set_name = ""
     conf = _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0)
     notes = _norm_ws(str(data.get("notes", "")))
 
@@ -839,16 +875,31 @@ Respond ONLY with JSON, no extra text.
                 }
                 notes = f"Verified via PokemonTCG API (id {pid})"
 
+    
+    # Canonicalize set (prefer map / resolved name) + build canonical id for frontend
+    set_info = _canonicalize_set(set_code, set_name)
+    canonical_id = {
+        "card_name": card_name,
+        "card_type": card_type,
+        "year": year,
+        "card_number": card_number_display,
+        "set_code": set_info["set_code"],
+        "set_name": set_info["set_name"],
+        "set_source": set_info.get("set_source", "unknown"),
+        "confidence": conf,
+    }
+
     return JSONResponse(content={
         "card_name": card_name,
         "card_type": card_type,
         "year": year,
         "card_number": card_number_display,
-        "set_code": set_code,
-        "set_name": set_name,
+        "set_code": set_info["set_code"],
+        "set_name": set_info["set_name"],
         "set_id": set_id,
         "confidence": conf,
         "notes": notes,
+        "canonical_id": canonical_id,
         "identify_token": f"idt_{secrets.token_urlsafe(12)}",
         "pokemontcg": ptcg_payload,
         "pokemontcg_enriched": enriched,
@@ -876,6 +927,8 @@ async def verify(
 
     provided_name = _norm_ws(card_name or "")
     provided_set = _norm_ws(card_set or "")
+    if _is_blankish(provided_set):
+        provided_set = ""
     provided_num_display = _clean_card_number_display(card_number or "")
     provided_year = _norm_ws(card_year or "")
     provided_type = _norm_ws(card_type or "")
@@ -967,6 +1020,9 @@ Return ONLY valid JSON with this EXACT structure:
 }}
 
 Important:
+- You MUST call out any obvious major damage: bends, creases/folds, warping, peeling, stains, writing, heavy whitening, edge chipping, dents.
+- If major damage is present, include it in BOTH "defects" and "flags", and describe it in "assessment_summary".
+- Do not downplay severe issues: if you see a crease/fold, say so clearly with SIDE + location.
 - If something cannot be determined, use empty string "" or empty arrays.
 - Do not include market values in this endpoint.
 Respond ONLY with JSON.
@@ -1297,6 +1353,9 @@ async def market_context(
                 pc_prices = _pc_extract_price_fields(detail or {})
             else:
                 pc_prices = _pc_extract_price_fields(top)
+
+    # Currency best-effort (PriceCharting prices are usually USD unless your account is configured)
+    currency = (pc_best.get('currency') if isinstance(pc_best, dict) else None) or 'USD'
 
     # Build useful "raw" vs graded extracts (best effort)
     raw_candidates: List[float] = []
