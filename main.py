@@ -305,6 +305,14 @@ async def _pokemontcg_card_by_id(card_id: str) -> Dict[str, Any]:
     return card if isinstance(card, dict) else {}
 
 def _pokemontcg_extract_prices(card: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Extract "anchor" price points from PokemonTCG metadata.
+
+    Notes:
+    - Many cards in the PokemonTCG dataset have NO price fields (tcgplayer/cardmarket absent).
+    - Even when present, "market" can be null; we fall back to mid/low/high/trend/avg where available.
+    - Returned values are "observed anchors" only (click-only context), not predictions.
+    """
     tcg = (card or {}).get("tcgplayer", {}) or {}
     cm = (card or {}).get("cardmarket", {}) or {}
 
@@ -314,29 +322,44 @@ def _pokemontcg_extract_prices(card: Dict[str, Any]) -> Dict[str, Any]:
     anchor: List[float] = []
     currencies: List[str] = []
 
+    # --- TCGplayer (USD) ---
     if isinstance(tcg_prices, dict) and tcg_prices:
         currencies.append("USD")
         for _, obj in tcg_prices.items():
-            if isinstance(obj, dict) and obj.get("market") is not None:
+            if not isinstance(obj, dict):
+                continue
+
+            # Prefer market, then fall back to mid/low/high/directLow if present
+            for key in ("market", "mid", "low", "high", "directLow"):
+                v = obj.get(key)
+                if v is None:
+                    continue
                 try:
-                    anchor.append(float(obj["market"]))
+                    fv = float(v)
+                    if 0.01 < fv < 500000:
+                        anchor.append(fv)
                 except Exception:
                     pass
 
+    # --- Cardmarket (EUR) ---
     if isinstance(cm_prices, dict) and cm_prices:
         currencies.append("EUR")
-        for k in ("trendPrice", "averageSellPrice"):
-            if cm_prices.get(k) is not None:
-                try:
-                    anchor.append(float(cm_prices[k]))
-                except Exception:
-                    pass
+        for key in ("trendPrice", "averageSellPrice", "lowPrice", "avg1", "avg7", "avg30"):
+            v = cm_prices.get(key)
+            if v is None:
+                continue
+            try:
+                fv = float(v)
+                if 0.01 < fv < 500000:
+                    anchor.append(fv)
+            except Exception:
+                pass
 
     return {
         "anchor_values": anchor,
         "currencies": currencies,
-        "tcgplayer": {"url": tcg.get("url", ""), "prices": tcg_prices} if isinstance(tcg_prices, dict) and tcg_prices else None,
-        "cardmarket": {"url": cm.get("url", ""), "prices": cm_prices} if isinstance(cm_prices, dict) and cm_prices else None,
+        "tcgplayer": {"url": tcg.get("url", ""), "prices": tcg_prices} if isinstance(tcg_prices, dict) and tcg_prices else ({"url": tcg.get("url", "")} if isinstance(tcg, dict) and tcg.get("url") else None),
+        "cardmarket": {"url": cm.get("url", ""), "prices": cm_prices} if isinstance(cm_prices, dict) and cm_prices else ({"url": cm.get("url", "")} if isinstance(cm, dict) and cm.get("url") else None),
     }
 
 # ==============================
@@ -1005,9 +1028,203 @@ Respond ONLY with JSON.
         "verify_token": f"vfy_{secrets.token_urlsafe(12)}",
     })
 
+
 # ==============================
-# Market Context (click-only)
+# Market Context (Click-only)
+#
+# IMPORTANT DESIGN:
+# - PokemonTCG (pokemontcg.io) is used for IDENTIFICATION + metadata enrichment.
+# - Market pricing is sourced from:
+#     1) TCGplayer OFFICIAL API (if credentials provided)  ✅ preferred for raw pricing history
+#     2) PokemonTCG API embedded anchors (tcgplayer/cardmarket) as a fallback (not "history")
+#     3) eBay OFFICIAL API (disabled by default; pre-wired for when your dev account is ready)
+#     4) Optional PriceCharting scrape (disabled by default) for graded context
+#
+# All outputs are informational market context only (no guarantees / no financial advice).
 # ==============================
+
+from urllib.parse import quote_plus
+
+# ---- Provider toggles (all OFF by default unless env set) ----
+USE_TCGPLAYER_API = os.getenv("USE_TCGPLAYER_API", "0").strip() in ("1","true","TRUE","yes","YES")
+TCGPLAYER_PUBLIC_KEY = os.getenv("TCGPLAYER_PUBLIC_KEY", "").strip()
+TCGPLAYER_PRIVATE_KEY = os.getenv("TCGPLAYER_PRIVATE_KEY", "").strip()
+TCGPLAYER_APP_NAME = os.getenv("TCGPLAYER_APP_NAME", "CollectorsLeague").strip()  # optional
+
+USE_EBAY_API = os.getenv("USE_EBAY_API", "0").strip() in ("1","true","TRUE","yes","YES")
+EBAY_CLIENT_ID = os.getenv("EBAY_CLIENT_ID", "").strip()
+EBAY_CLIENT_SECRET = os.getenv("EBAY_CLIENT_SECRET", "").strip()
+EBAY_MARKETPLACE_ID = os.getenv("EBAY_MARKETPLACE_ID", "EBAY_AU").strip()  # EBAY_US, EBAY_GB, etc.
+
+ENABLE_PRICECHARTING_SCRAPE = os.getenv("ENABLE_PRICECHARTING_SCRAPE", "0").strip() in ("1","true","TRUE","yes","YES")
+
+_PRICE_RE = re.compile(r"(?P<cur>AU\$|A\$|US\$|\$)?\s*(?P<num>[0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)")
+
+def _extract_prices(text: str) -> List[Tuple[float, str]]:
+    out: List[Tuple[float, str]] = []
+    for m in _PRICE_RE.finditer(text or ""):
+        cur = (m.group("cur") or "").strip()
+        num = m.group("num")
+        try:
+            val = float(num.replace(",", ""))
+        except Exception:
+            continue
+        if 0.5 <= val <= 500000:
+            out.append((val, cur or ""))
+    return out
+
+def _trim_outliers(values: List[float]) -> List[float]:
+    if len(values) < 6:
+        return values
+    v = sorted(values)
+    k = max(1, len(v) // 10)  # 10% trim each side
+    trimmed = v[k:-k] if len(v) > 2 * k else v
+    return trimmed if trimmed else v
+
+def _stats(values: List[float]) -> Dict[str, Any]:
+    if not values:
+        return {"avg": 0, "median": 0, "low": 0, "high": 0, "sample_size": 0}
+    trimmed = _trim_outliers(values)
+    return {
+        "avg": round(mean(trimmed), 2) if trimmed else 0,
+        "median": round(median(trimmed), 2) if trimmed else 0,
+        "low": round(min(values), 2),
+        "high": round(max(values), 2),
+        "sample_size": len(values),
+    }
+
+def _liquidity_label(n: int) -> str:
+    if n >= 25: return "high"
+    if n >= 10: return "moderate"
+    if n >= 5:  return "thin"
+    if n >= 2:  return "very_thin"
+    return "insufficient"
+
+def _tcgplayer_product_id_from_url(url: str) -> str:
+    m = re.search(r"/product/(\d+)", (url or ""))
+    return m.group(1) if m else ""
+
+async def _tcgplayer_get_token() -> str:
+    """Get OAuth token for TCGplayer (official). Requires public/private keys."""
+    if not (TCGPLAYER_PUBLIC_KEY and TCGPLAYER_PRIVATE_KEY):
+        return ""
+    # TCGplayer uses client_credentials to obtain a bearer token.
+    # Endpoint details can vary by region/edition; keep configurable.
+    token_url = os.getenv("TCGPLAYER_TOKEN_URL", "https://api.tcgplayer.com/token")
+    data = {
+        "grant_type": "client_credentials",
+        "client_id": TCGPLAYER_PUBLIC_KEY,
+        "client_secret": TCGPLAYER_PRIVATE_KEY,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.post(token_url, data=data, headers={"User-Agent": UA})
+            if r.status_code != 200:
+                return ""
+            j = r.json()
+            return str(j.get("access_token", "")) if isinstance(j, dict) else ""
+    except Exception:
+        return ""
+
+async def _tcgplayer_market_price_by_product(product_id: str) -> Dict[str, Any]:
+    """Fetch market pricing for a product ID from TCGplayer API (official)."""
+    if not product_id:
+        return {"ok": False, "prices": [], "currency": "USD", "sample_size": 0, "note": "missing_product_id"}
+    token = await _tcgplayer_get_token()
+    if not token:
+        return {"ok": False, "prices": [], "currency": "USD", "sample_size": 0, "note": "tcgplayer_auth_not_configured"}
+
+    base = os.getenv("TCGPLAYER_API_BASE", "https://api.tcgplayer.com")
+    # Common endpoint pattern: /pricing/product/{productId}
+    pricing_url = f"{base}/pricing/product/{product_id}"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(
+                pricing_url,
+                headers={
+                    "Authorization": f"bearer {token}",
+                    "User-Agent": UA,
+                    "Accept": "application/json",
+                },
+            )
+            if r.status_code != 200:
+                return {"ok": False, "prices": [], "currency": "USD", "sample_size": 0, "note": f"tcgplayer_http_{r.status_code}"}
+
+            j = r.json() if r.content else {}
+            results = (j.get("results") or []) if isinstance(j, dict) else []
+            vals: List[float] = []
+            # Try to extract "marketPrice" or similar fields.
+            for row in results:
+                if not isinstance(row, dict): 
+                    continue
+                for key in ("marketPrice", "midPrice", "lowPrice", "highPrice"):
+                    v = row.get(key)
+                    if v is not None:
+                        try:
+                            fv = float(v)
+                            if 0.5 <= fv <= 500000:
+                                vals.append(fv)
+                        except Exception:
+                            pass
+            vals = vals[:25]
+            return {"ok": True, "prices": vals, "currency": "USD", "sample_size": len(vals), "raw": results[:5]}
+    except Exception as e:
+        return {"ok": False, "prices": [], "currency": "USD", "sample_size": 0, "note": str(e)}
+
+async def _ebay_sold_prices_official(query: str, limit: int = 25) -> Dict[str, Any]:
+    """
+    Placeholder for eBay official sold-price lookup (Marketplace Insights / Browse APIs).
+    This is intentionally DISABLED unless USE_EBAY_API=1 and credentials exist.
+    """
+    if not (USE_EBAY_API and EBAY_CLIENT_ID and EBAY_CLIENT_SECRET):
+        return {"ok": False, "prices": [], "currency": "", "sample_size": 0, "note": "ebay_api_not_enabled"}
+
+    # Implementing the full OAuth + sold-comps request depends on your chosen eBay API (varies by program).
+    # Keep the wiring here so you can drop in the final calls once approved.
+    return {"ok": False, "prices": [], "currency": "", "sample_size": 0, "note": "ebay_api_wired_not_implemented"}
+
+# Optional legacy scraper (still available but OFF by default and not recommended long-term)
+async def _fetch_html(url: str) -> str:
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.get(url, headers={"User-Agent": UA}, follow_redirects=True)
+        if r.status_code != 200:
+            return ""
+        return r.text or ""
+
+async def _search_ebay_sold_prices_scrape(query: str, negate_terms: Optional[List[str]] = None, limit: int = 25) -> Dict[str, Any]:
+    negate_terms = negate_terms or []
+    q = query.strip()
+    for t in negate_terms:
+        if t:
+            q += f" -{t}"
+    encoded = q.replace(" ", "+")
+    url = f"https://{EBAY_DOMAIN}/sch/i.html?_nkw={encoded}&_sacat=0&LH_Sold=1&LH_Complete=1&_sop=13"
+
+    html = await _fetch_html(url)
+    if not html:
+        return {"ok": False, "prices": [], "currency": "", "sample_size": 0, "url": url, "query": query, "note": "scrape_failed"}
+
+    soup = BeautifulSoup(html, "html.parser")
+    price_spans = soup.find_all("span", class_=re.compile(r"s-item__price"))
+    prices: List[float] = []
+    currencies: List[str] = []
+
+    for span in price_spans[: max(10, limit)]:
+        txt = span.get_text(" ", strip=True)
+        for val, cur in _extract_prices(txt):
+            prices.append(val)
+            currencies.append(cur)
+
+    currency = ""
+    if currencies:
+        au_count = sum(1 for c in currencies if c in ("AU$", "A$"))
+        us_count = sum(1 for c in currencies if c == "US$")
+        if au_count >= max(1, len(currencies) // 3): currency = "AUD"
+        elif us_count >= max(1, len(currencies) // 3): currency = "USD"
+
+    prices = [p for p in prices if 1 < p < 500000][:limit]
+    return {"ok": True, "prices": prices, "currency": currency, "sample_size": len(prices), "url": url, "query": query}
+
 @app.post("/api/market-context")
 @safe_endpoint
 async def market_context(
@@ -1019,7 +1236,15 @@ async def market_context(
     set_code: Optional[str] = Form(None),
     card_type: Optional[str] = Form(None),
     grading_cost: float = Form(55.0),
+
+    # Optional direct link to a TCGplayer product page from your UI (preferred if you have it)
+    tcgplayer_url: Optional[str] = Form(None),
+    tcgplayer_product_id: Optional[str] = Form(None),
+
+    # Item class (helps route providers for non-card items)
+    item_class: Optional[str] = Form("card"),
 ):
+    """Return informational market context. No predictions, no advice."""
     import asyncio
     try:
         return await asyncio.wait_for(
@@ -1032,17 +1257,17 @@ async def market_context(
                 set_code=set_code,
                 card_type=card_type,
                 grading_cost=grading_cost,
+                tcgplayer_url=tcgplayer_url,
+                tcgplayer_product_id=tcgplayer_product_id,
+                item_class=item_class,
             ),
             timeout=35.0
         )
     except asyncio.TimeoutError:
         return JSONResponse(content={
             "available": False,
-            "mode": "click_only",
             "error": "Timeout after 35 seconds",
             "message": "Market context request took too long. Try again.",
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "disclaimer": "Informational market context only. Not financial advice."
         })
 
 async def _market_context_impl(
@@ -1054,36 +1279,59 @@ async def _market_context_impl(
     set_code: Optional[str],
     card_type: Optional[str],
     grading_cost: float,
+    tcgplayer_url: Optional[str],
+    tcgplayer_product_id: Optional[str],
+    item_class: str,
 ):
     clean_name = _norm_ws(card_name or "")
     clean_type = _norm_ws(card_type or "")
     clean_set = _norm_ws(card_set or "")
     clean_code = _norm_ws(set_code or "").upper()
     clean_number_display = _clean_card_number_display(card_number or "")
-
-    # If set code exists but set name missing, resolve from PokemonTCG sets endpoint
-    ptcg_set = {}
-    if POKEMONTCG_API_KEY and clean_code and not clean_set:
-        ptcg_set = await _pokemontcg_resolve_set_by_ptcgo(clean_code)
-        if ptcg_set.get("name"):
-            clean_set = _norm_ws(str(ptcg_set.get("name", "")))
-
-    set_info = _canonicalize_set(clean_code, clean_set)
+    clean_item_class = _norm_ws(item_class or "card").lower()
 
     conf = _clamp(_safe_float(confidence, 0.0), 0.0, 1.0)
     g = _grade_bucket(predicted_grade) or 9
     dist = _grade_distribution(g, conf)
 
     sources: List[str] = []
-    meta_urls: Dict[str, str] = {}
+    meta: Dict[str, Any] = {"urls": {}, "use_ebay_scrape": USE_EBAY, "use_ebay_api": USE_EBAY_API, "use_tcgplayer_api": USE_TCGPLAYER_API}
 
+    # If caller gave a tcgplayer URL, extract product id
+    pid_from_url = _tcgplayer_product_id_from_url(tcgplayer_url or "")
+    product_id = (tcgplayer_product_id or pid_from_url or "").strip()
+
+    # ------------------------------------
+    # Provider 1: TCGplayer OFFICIAL API (raw pricing)
+    # ------------------------------------
+    tcgplayer_prices: List[float] = []
+    tcgplayer_stats = {"avg": 0, "median": 0, "low": 0, "high": 0, "sample_size": 0}
+    if USE_TCGPLAYER_API and product_id:
+        tcg = await _tcgplayer_market_price_by_product(product_id)
+        meta["tcgplayer"] = {"product_id": product_id, "ok": tcg.get("ok"), "note": tcg.get("note", "")}
+        tcgplayer_prices = tcg.get("prices", []) or []
+        if tcgplayer_prices:
+            tcgplayer_stats = _stats(tcgplayer_prices)
+            sources.append("TCGplayer API (official)")
+
+    # ------------------------------------
+    # Provider 2: PokemonTCG embedded anchors (fallback)
+    # ------------------------------------
     pokemontcg_out = None
     anchor_prices: List[float] = []
     anchor_stats = {"avg": 0, "median": 0, "low": 0, "high": 0, "sample_size": 0}
-    currency_anchor = "unknown"
+    currency = "unknown"
 
-    # PokemonTCG is PRIMARY for Pokemon cards
-    if POKEMONTCG_API_KEY and ("pokemon" in clean_type.lower() or clean_type == ""):
+    set_info = _canonicalize_set(clean_code, clean_set)
+
+    if POKEMONTCG_API_KEY and ("pokemon" in clean_type.lower() or clean_type.lower() == "pokemon") and clean_item_class == "card":
+        ptcg_set = {}
+        if clean_code and not clean_set:
+            ptcg_set = await _pokemontcg_resolve_set_by_ptcgo(clean_code)
+            if ptcg_set.get("name"):
+                clean_set = _norm_ws(str(ptcg_set.get("name", "")))
+                set_info = _canonicalize_set(clean_code, clean_set)
+
         pid = await _pokemontcg_resolve_card_id(
             card_name=clean_name,
             set_code=set_info["set_code"],
@@ -1096,8 +1344,9 @@ async def _market_context_impl(
             ptcg_prices = _pokemontcg_extract_prices(card or {})
             anchor_prices = (ptcg_prices.get("anchor_values") or [])
             anchor_stats = _stats(anchor_prices)
-            currency_anchor = (ptcg_prices.get("currencies") or ["unknown"])[0]
-            sources.append("PokemonTCG API (TCGplayer/Cardmarket)")
+            currency = (ptcg_prices.get("currencies") or ["unknown"])[0]
+            sources.append("PokemonTCG API (tcgplayer/cardmarket anchors)")
+
             pokemontcg_out = {
                 "id": pid,
                 "name": (card or {}).get("name", ""),
@@ -1107,26 +1356,82 @@ async def _market_context_impl(
                 "images": (card or {}).get("images", {}) or {},
                 "prices": ptcg_prices,
             }
+            # If we didn't get an official product_id, try to surface a URL for the frontend to use next time.
+            try:
+                tcg_url = ((card or {}).get("tcgplayer") or {}).get("url", "")
+                if tcg_url and not tcgplayer_url:
+                    meta["urls"]["tcgplayer"] = tcg_url
+            except Exception:
+                pass
 
+    # ------------------------------------
+    # Provider 3: eBay (official) - prewired but not implemented
+    # Provider 4: eBay scrape (optional legacy, off by default)
+    # ------------------------------------
     raw_prices: List[float] = []
     raw_currency = ""
+    if USE_EBAY_API:
+        q_bits = [clean_name, set_info.get("set_name",""), clean_number_display]
+        query = " ".join([b for b in q_bits if b]).strip()
+        ebay_off = await _ebay_sold_prices_official(query, limit=25)
+        meta["urls"]["ebay_query"] = query
+        raw_prices = ebay_off.get("prices", []) or []
+        raw_currency = ebay_off.get("currency", "") or ""
+        if raw_prices:
+            sources.append("eBay API (official)")
 
-    # Optional eBay (OFF by default)
-    if USE_EBAY:
+    elif USE_EBAY:
         q_bits = [clean_name]
         if set_info["set_name"] and set_info["set_name"].lower() not in clean_name.lower():
             q_bits.append(set_info["set_name"])
         if clean_number_display:
             q_bits.append(clean_number_display)
         query = " ".join([b for b in q_bits if b]).strip()
-        raw_res = await _search_ebay_sold_prices(query, negate_terms=["graded", "psa", "bgs", "cgc", "slab"], limit=25)
-        meta_urls["ebay_raw"] = raw_res.get("url", "")
+        raw_res = await _search_ebay_sold_prices_scrape(query, negate_terms=["graded", "psa", "bgs", "cgc", "slab"], limit=25)
+        meta["urls"]["ebay_raw"] = raw_res.get("url", "")
         raw_prices = raw_res.get("prices", []) or []
         raw_currency = raw_res.get("currency", "") or ""
         if raw_prices:
-            sources.append("eBay (sold/completed)")
+            sources.append("eBay (sold/completed) [scrape]")
 
-    has_any = bool(anchor_prices) or bool(raw_prices)
+    # ------------------------------------
+    # Choose baseline for context
+    # Priority: TCGplayer official -> PokemonTCG anchors -> eBay (if enabled)
+    # ------------------------------------
+    currency_out = "USD"
+    baseline = 0.0
+
+    if tcgplayer_stats["sample_size"] >= 1:
+        baseline = tcgplayer_stats["median"] or tcgplayer_stats["avg"]
+        currency_out = "USD"
+    elif anchor_stats["sample_size"] >= 1:
+        baseline = anchor_stats["median"] or anchor_stats["avg"]
+        currency_out = currency if currency != "unknown" else "USD"
+    elif raw_prices:
+        raw_stats = _stats(raw_prices)
+        baseline = raw_stats["median"] or raw_stats["avg"]
+        currency_out = raw_currency or "AUD"
+
+    # Build observed stats output
+    raw_stats = _stats(raw_prices)
+    liquidity = _liquidity_label(max(tcgplayer_stats["sample_size"], anchor_stats["sample_size"], raw_stats["sample_size"]))
+
+    value_difference = None
+    if baseline and grading_cost:
+        try:
+            value_difference = round(float(baseline) - float(grading_cost or 0.0), 2)
+        except Exception:
+            value_difference = None
+
+    has_any = bool(tcgplayer_prices) or bool(anchor_prices) or bool(raw_prices)
+
+    # Helpful diagnostics if we have a card match but no prices
+    diag: Dict[str, Any] = {}
+    if pokemontcg_out and not anchor_prices:
+        diag["pokemontcg_no_anchor_prices"] = True
+        diag["pokemontcg_has_tcgplayer_block"] = bool(((pokemontcg_out.get("prices") or {}).get("tcgplayer")))
+        diag["pokemontcg_has_cardmarket_block"] = bool(((pokemontcg_out.get("prices") or {}).get("cardmarket")))
+
     if not has_any:
         return JSONResponse(content={
             "available": False,
@@ -1137,33 +1442,25 @@ async def _market_context_impl(
                 "set_code": set_info["set_code"],
                 "number": clean_number_display,
                 "type": clean_type,
+                "item_class": clean_item_class,
             },
-            "message": "No market anchor data available from PokemonTCG (and eBay is disabled or returned no samples).",
+            "message": "No market data available from configured providers. (TCGplayer API not configured or missing product_id; PokemonTCG returned no price anchors; eBay disabled.)",
             "sources": sources,
+            "tcgplayer": {"enabled": USE_TCGPLAYER_API, "product_id": product_id or "", "url": tcgplayer_url or meta["urls"].get("tcgplayer","")},
             "pokemontcg": pokemontcg_out,
-            "meta": {"urls": meta_urls, "use_ebay": USE_EBAY},
+            "observed": {
+                "tcgplayer_official": tcgplayer_stats if tcgplayer_stats["sample_size"] else None,
+                "pokemontcg_anchor": anchor_stats if anchor_stats["sample_size"] else None,
+                "ebay": raw_stats if raw_stats["sample_size"] else None,
+                "liquidity": liquidity,
+            },
+            "diagnostics": diag,
+            "meta": meta,
             "timestamp": datetime.utcnow().isoformat() + "Z",
             "disclaimer": "Informational market context only. Not financial advice."
         })
 
-    raw_stats = _stats(raw_prices)
-    liquidity = _liquidity_label(max(raw_stats["sample_size"], anchor_stats["sample_size"]))
-    currency_out = raw_currency or currency_anchor
-
-    baseline = 0.0
-    if anchor_stats["sample_size"] >= 1:
-        baseline = anchor_stats["median"] or anchor_stats["avg"]
-    elif raw_stats["sample_size"] >= 1:
-        baseline = raw_stats["median"] or raw_stats["avg"]
-
-    baseline_minus_grading = None
-    if baseline and grading_cost:
-        try:
-            baseline_minus_grading = round(float(baseline) - float(grading_cost or 0.0), 2)
-        except Exception:
-            baseline_minus_grading = None
-
-    sample_total = raw_stats["sample_size"] + anchor_stats["sample_size"]
+    sample_total = tcgplayer_stats["sample_size"] + anchor_stats["sample_size"] + raw_stats["sample_size"]
     confidence_label = "high" if sample_total >= 20 else "moderate" if sample_total >= 8 else "low"
 
     return JSONResponse(content={
@@ -1176,11 +1473,13 @@ async def _market_context_impl(
             "set_code": set_info["set_code"],
             "number": clean_number_display,
             "type": clean_type,
+            "item_class": clean_item_class,
         },
         "observed": {
             "currency": currency_out,
-            "pokemon_prices_anchor": anchor_stats if anchor_stats["sample_size"] else None,
-            "ebay_raw": raw_stats if raw_stats["sample_size"] else None,
+            "tcgplayer_official": tcgplayer_stats if tcgplayer_stats["sample_size"] else None,
+            "pokemontcg_anchor": anchor_stats if anchor_stats["sample_size"] else None,
+            "ebay": raw_stats if raw_stats["sample_size"] else None,
             "liquidity": liquidity,
         },
         "grade_impact": {
@@ -1189,14 +1488,26 @@ async def _market_context_impl(
             "grade_distribution": dist,
             "baseline_value": round(baseline, 2) if baseline else None,
             "grading_cost": round(float(grading_cost or 0.0), 2),
-            "baseline_minus_grading_cost": baseline_minus_grading,
+            "baseline_minus_grading_cost": value_difference,
+            "note": "Baseline is an observed/anchor price (not a prediction)."
+        },
+        "recommendation": {
+            "label": "consider" if (baseline and grading_cost and baseline >= grading_cost*2) else "not_recommended",
+            "reason": "Based on baseline minus grading cost and sample liquidity. Always consider risk and your goals."
+        },
+        "tcgplayer": {
+            "enabled": USE_TCGPLAYER_API,
+            "product_id": product_id,
+            "url": tcgplayer_url or meta["urls"].get("tcgplayer",""),
         },
         "pokemontcg": pokemontcg_out,
         "sources": sources,
-        "meta": {"urls": meta_urls, "use_ebay": USE_EBAY},
+        "diagnostics": diag,
+        "meta": meta,
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "disclaimer": "Informational market context only. Figures are third-party anchors and/or observed sales and may vary. Not financial advice."
     })
+
 
 # Legacy alias (keep older frontend working)
 @app.post("/api/market-intelligence")
