@@ -899,18 +899,26 @@ async def verify(
 
     prompt = f"""You are a professional trading card grader.
 
-Analyze BOTH images (front + back). Return ONLY valid JSON.
+Analyze BOTH images (front + back) at high scrutiny. Your job is to surface *everything visible* — do NOT be polite or optimistic.
 
-You MUST provide:
-- Separate assessments for FRONT and BACK
-- Per-corner notes (top_left, top_right, bottom_left, bottom_right)
-- Separate edges and surface notes for front/back
-- Centering ratios for front/back (e.g. "55/45" and "60/40")
-- A clear Assessment Summary (2-4 sentences) mentioning specific issues you see.
+CRITICAL RULES (follow exactly):
+1) **Do not miss obvious damage.** If you see any of these, you MUST mention them explicitly with SIDE + precise location:
+   - bends / creases / folds / dents / dings / impressions
+   - peeling / lifted foil / surface gouges
+   - heavy whitening, corner rounding, edge chipping, tears
+   - stains / marks / writing / residue
+   - moisture warp / ripples / gloss loss / scuffs
+2) **Grade must reflect the worst visible defect.** Use conservative PSA-style logic:
+   - Any clear crease/fold, strong bend, tear, or major dent → pregrade MUST be **4 or lower**.
+   - Any visible bend/ding/impression, heavy corner rounding, or multiple heavy edge chips → pregrade MUST be **5 or lower**.
+   - Moderate whitening/edge wear across multiple edges/corners → pregrade typically **6–7** (not higher).
+   - Only call corners "sharp" if they are truly sharp with no rounding, whitening, or bend.
+3) **Be explicit and specific.** Write defects as clear sentences with side + location + severity (minor/moderate/severe).
+4) If something cannot be confirmed due to blur/glare, state it in notes and lower confidence.
 
 {context}
 
-Return JSON with this EXACT structure:
+Return ONLY valid JSON with this EXACT structure:
 
 {{
   "pregrade": "estimated PSA-style grade 1-10 (e.g. 8, 9, 10)",
@@ -921,29 +929,33 @@ Return JSON with this EXACT structure:
   }},
   "corners": {{
     "front": {{
-      "top_left": {{"condition":"sharp/minor_whitening/whitening/bend/ding","notes":"..."}} ,
-      "top_right": {{"condition":"...","notes":"..."}} ,
-      "bottom_left": {{"condition":"...","notes":"..."}} ,
-      "bottom_right": {{"condition":"...","notes":"..."}}
+      "top_left": {{"condition":"sharp/minor_whitening/whitening/bend/ding/crease","notes":"..."}}, 
+      "top_right": {{"condition":"sharp/minor_whitening/whitening/bend/ding/crease","notes":"..."}}, 
+      "bottom_left": {{"condition":"sharp/minor_whitening/whitening/bend/ding/crease","notes":"..."}}, 
+      "bottom_right": {{"condition":"sharp/minor_whitening/whitening/bend/ding/crease","notes":"..."}}
     }},
     "back": {{
-      "top_left": {{"condition":"...","notes":"..."}} ,
-      "top_right": {{"condition":"...","notes":"..."}} ,
-      "bottom_left": {{"condition":"...","notes":"..."}} ,
-      "bottom_right": {{"condition":"...","notes":"..."}}
+      "top_left": {{"condition":"sharp/minor_whitening/whitening/bend/ding/crease","notes":"..."}}, 
+      "top_right": {{"condition":"sharp/minor_whitening/whitening/bend/ding/crease","notes":"..."}}, 
+      "bottom_left": {{"condition":"sharp/minor_whitening/whitening/bend/ding/crease","notes":"..."}}, 
+      "bottom_right": {{"condition":"sharp/minor_whitening/whitening/bend/ding/crease","notes":"..."}}
     }}
   }},
   "edges": {{
-    "front": {{"grade":"Mint/Near Mint/Excellent/Good/Poor","notes":"detailed notes"}} ,
+    "front": {{"grade":"Mint/Near Mint/Excellent/Good/Poor","notes":"detailed notes"}}, 
     "back":  {{"grade":"Mint/Near Mint/Excellent/Good/Poor","notes":"detailed notes"}}
   }},
   "surface": {{
-    "front": {{"grade":"Mint/Near Mint/Excellent/Good/Poor","notes":"detailed notes"}} ,
+    "front": {{"grade":"Mint/Near Mint/Excellent/Good/Poor","notes":"detailed notes"}}, 
     "back":  {{"grade":"Mint/Near Mint/Excellent/Good/Poor","notes":"detailed notes"}}
   }},
-  "defects": ["..."],
-  "flags": ["..."],
-  "assessment_summary": "2-4 sentence narrative.",
+  "defects": [
+    "Each defect as a clear sentence with SIDE and location + severity (minor/moderate/severe)"
+  ],
+  "flags": [
+    "Short bullet flags for important issues (crease, bend, dent, heavy whitening, edge chipping, peeling, stain, writing, warp)"
+  ],
+  "assessment_summary": "2-4 sentence narrative. Mention front vs back differences, the worst defect(s), and why they cap the grade.",
   "observed_id": {{
     "card_name": "best-effort from images",
     "set_code": "best-effort from images (only if visible)",
@@ -978,6 +990,24 @@ Respond ONLY with JSON.
 
     raw_pregrade = str(data.get("pregrade", "")).strip()
     g = _grade_bucket(raw_pregrade)
+
+    # Conservative safety net: if the model lists severe physical damage, cap the grade accordingly.
+    # This helps avoid "Mint-ish" outputs when the card is clearly damaged.
+    try:
+        flags_txt = " ".join([str(x) for x in (data.get("flags") or [])]).lower()
+        defects_txt = " ".join([str(x) for x in (data.get("defects") or [])]).lower()
+        dmg_txt = (flags_txt + " " + defects_txt).strip()
+
+        if g is not None:
+            if any(k in dmg_txt for k in ["tear", "ripped", "major crease", "strong crease", "severe crease", "fold", "water damage"]):
+                g = min(g, 4)
+            elif any(k in dmg_txt for k in ["crease", "bent", "bend", "dent", "ding", "impression", "peeling", "lifted foil"]):
+                g = min(g, 5)
+            elif any(k in dmg_txt for k in ["heavy whitening", "heavy edge", "edge chipping", "rounded corners", "corner rounding"]):
+                g = min(g, 6)
+    except Exception:
+        pass
+
     pregrade_norm = str(g) if g is not None else ""
 
     return JSONResponse(content={
@@ -1141,6 +1171,9 @@ Respond ONLY with JSON.
         seal["status"] = "Not Applicable"
     if not seal.get("notes"):
         seal["notes"] = ""
+    if not seal.get("grade"):
+        # Frontend may expect "grade" - mirror status for compatibility
+        seal["grade"] = seal.get("status", "Not Applicable")
 
     return JSONResponse(content={
         "condition_grade": _norm_ws(str(data.get("condition_grade", "N/A"))),
