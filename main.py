@@ -935,7 +935,7 @@ async def verify(
     provided_code = _norm_ws(set_code or "").upper()
 
     # Backfill set name if needed
-    if POKEMONTCG_API_KEY and provided_code and (not provided_set or provided_set.lower()=='unknown'):
+    if POKEMONTCG_API_KEY and provided_code and not provided_set:
         ptcg_set = await _pokemontcg_resolve_set_by_ptcgo(provided_code)
         if ptcg_set.get("name"):
             provided_set = _norm_ws(str(ptcg_set.get("name", "")))
@@ -1066,39 +1066,6 @@ Respond ONLY with JSON.
 
     pregrade_norm = str(g) if g is not None else ""
 
-
-    # Ensure assessment_summary is detailed enough (UI-friendly)
-    summary = _norm_ws(str(data.get("assessment_summary", "")))
-    if len(summary.split()) < 35:
-        # Build a fuller summary from structured fields (without inventing defects)
-        flags_list = data.get("flags", []) if isinstance(data.get("flags", []), list) else []
-        defects_list = data.get("defects", []) if isinstance(data.get("defects", []), list) else []
-        cen = data.get("centering", {}) if isinstance(data.get("centering", {}), dict) else {}
-        cen_f = (cen.get("front") or {}) if isinstance(cen.get("front") or {}, dict) else {}
-        cen_b = (cen.get("back") or {}) if isinstance(cen.get("back") or {}, dict) else {}
-        edges = data.get("edges", {}) if isinstance(data.get("edges", {}), dict) else {}
-        surf = data.get("surface", {}) if isinstance(data.get("surface", {}), dict) else {}
-        ef = (edges.get("front") or {}) if isinstance(edges.get("front") or {}, dict) else {}
-        eb = (edges.get("back") or {}) if isinstance(edges.get("back") or {}, dict) else {}
-        sf = (surf.get("front") or {}) if isinstance(surf.get("front") or {}, dict) else {}
-        sb = (surf.get("back") or {}) if isinstance(surf.get("back") or {}, dict) else {}
-
-        parts = []
-        parts.append(f"Overall, this looks like a PSA-style {pregrade_norm or raw_pregrade or 'N/A'} estimate based on what is visible in the photos.")
-        if cen_f.get("grade") or cen_b.get("grade"):
-            parts.append(f"Centering appears around Front {cen_f.get('grade','').strip() or 'N/A'} and Back {cen_b.get('grade','').strip() or 'N/A'}.")
-        if ef.get("grade") or eb.get("grade"):
-            parts.append(f"Edges read as Front {ef.get('grade','').strip() or 'N/A'} / Back {eb.get('grade','').strip() or 'N/A'}; notes: {_norm_ws(str(ef.get('notes','')))} {_norm_ws(str(eb.get('notes','')))}".strip())
-        if sf.get("grade") or sb.get("grade"):
-            parts.append(f"Surface reads as Front {sf.get('grade','').strip() or 'N/A'} / Back {sb.get('grade','').strip() or 'N/A'}; notes: {_norm_ws(str(sf.get('notes','')))} {_norm_ws(str(sb.get('notes','')))}".strip())
-        if defects_list:
-            parts.append("Visible issues noted: " + "; ".join([_norm_ws(str(d)) for d in defects_list[:8]]) + ("" if len(defects_list) <= 8 else " (and more)."))
-        if flags_list:
-            parts.append("Key flags: " + ", ".join([_norm_ws(str(f)) for f in flags_list[:10]]) + ("" if len(flags_list) <= 10 else ", …") + ".")
-        parts.append("Biggest grade limiters are the most severe corner/edge whitening/chipping, any surface scratches/print lines, and any bends/creases/dents if present.")
-        summary = " ".join([p for p in parts if p]).strip()
-
-        data["assessment_summary"] = summary
     return JSONResponse(content={
         "pregrade": pregrade_norm or "N/A",
         "confidence": _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0),
@@ -1108,7 +1075,7 @@ Respond ONLY with JSON.
         "surface": data.get("surface", {"front": {"grade": "", "notes": ""}, "back": {"grade": "", "notes": ""}}),
         "defects": data.get("defects", []) if isinstance(data.get("defects", []), list) else [],
         "flags": data.get("flags", []) if isinstance(data.get("flags", []), list) else [],
-        "assessment_summary": _norm_ws(str(data.get("assessment_summary", ""))) or summary or "",
+        "assessment_summary": _norm_ws(str(data.get("assessment_summary", ""))),
         "observed_id": data.get("observed_id", {}) if isinstance(data.get("observed_id", {}), dict) else {},
         "verify_token": f"vfy_{secrets.token_urlsafe(12)}",
         "market_context_mode": "click_only",
