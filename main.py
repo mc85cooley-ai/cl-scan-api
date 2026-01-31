@@ -1,55 +1,330 @@
 """
-CCollectors League Scan API - Full AI Integration
-Uses OpenAI Vision API for card identification and grading
-VERSION 4.0 - Added Memorabilia & Sealed Product Support
-VERSION 4.1 - Added Market Intelligence & Live Pricing
+The Collectors League Australia — Scan API
+Futureproof v6 (2026-01-31)
+
+Goals:
+- Canonical identification object (stable IDs)
+- Set-code aware identification (e.g., PFL -> Phantasmal Flames)
+- Richer grading detail (front/back + per-corner breakdown + detailed flags)
+- Click-only Market Context that is resilient (multi-pass query ladder + never "nothing" if any samples exist)
+- No financial advice framing; informational context only.
+
+NOTE: This file expects these dependencies in requirements.txt:
+fastapi, uvicorn[standard], python-multipart, httpx, beautifulsoup4, lxml
 """
+
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional, Dict, List  # ← CHANGED: Added Dict, List
+from typing import Optional, Dict, Any, List, Tuple
 import base64
 import os
 import json
 import secrets
+import re
+from datetime import datetime
+from statistics import mean, median
+
 import httpx
+from bs4 import BeautifulSoup
 
-# ========================================
-# NEW IMPORTS FOR MARKET INTELLIGENCE
-# ========================================
-from bs4 import BeautifulSoup  # For parsing eBay HTML
-import re                       # For extracting prices from text
-from statistics import mean, median  # For calculating averages
-from datetime import datetime   # For timestamps
-# ========================================
-
+# ==============================
+# App & Config
+# ==============================
 app = FastAPI(title="Collectors League Scan API")
 
-# CORS for WordPress
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # WordPress
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Configuration
-APP_VERSION = "2026-01-29-memorabilia-support"
+APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-01-31-v6.0.0")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
+
+POKEMONTCG_BASE = "https://api.pokemontcg.io/v2"
+
+# eBay region: AU by default
+EBAY_DOMAIN = os.getenv("EBAY_DOMAIN", "www.ebay.com.au").strip() or "www.ebay.com.au"
+
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 
 if not OPENAI_API_KEY:
     print("WARNING: OPENAI_API_KEY not set!")
 
+# ==============================
+# Set Code Mapping (expand over time)
+# ==============================
+# Keep this conservative: only include codes you are certain about.
+# You can expand this safely as you see more items.
+SET_CODE_MAP: Dict[str, str] = {
+    # Examples (replace/expand with your real catalog)
+    "PFL": "Phantasmal Flames",
+    "OBF": "Obsidian Flames",
+    "SVI": "Scarlet & Violet",
+    "BS": "Base Set",
+}
 
+# ==============================
+# Helpers
+# ==============================
+def _b64(img: bytes) -> str:
+    return base64.b64encode(img).decode("utf-8")
+
+
+def _strip_code_fences(s: str) -> str:
+    s = (s or "").strip()
+    if s.startswith("```json"):
+        s = s[7:]
+    if s.startswith("```"):
+        s = s[3:]
+    if s.endswith("```"):
+        s = s[:-3]
+    return (s or "").strip()
+
+
+def _parse_json_or_none(s: str) -> Optional[Dict[str, Any]]:
+    s = _strip_code_fences(s)
+    if not s:
+        return None
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        m = re.search(r"\{.*\}", s, flags=re.DOTALL)
+        if not m:
+            return None
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            return None
+
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
+def _norm_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+
+def _norm_num(s: str) -> str:
+    s = (s or "").strip()
+    s = s.replace("#", "").strip()
+    # Keep formats like 4/102, but remove leading zeros from the first part
+    if "/" in s:
+        a, b = s.split("/", 1)
+        a = a.lstrip("0") or "0"
+        return f"{a}/{b}"
+    return s.lstrip("0") or s
+
+
+async def _openai_chat(messages: List[Dict[str, Any]], max_tokens: int = 1200, temperature: float = 0.1) -> Dict[str, Any]:
+    """
+    Unified OpenAI Chat Completions call for text+image content payloads.
+    """
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+
+    url = "https://api.openai.com/v1/chat/completions"
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            r = await client.post(url, headers=headers, json=payload)
+            if r.status_code != 200:
+                return {"error": True, "status": r.status_code, "message": r.text[:400]}
+            data = r.json()
+            content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+            return {"error": False, "content": content}
+    except Exception as e:
+        return {"error": True, "status": 0, "message": str(e)}
+
+
+def _grade_bucket(predicted_grade: str) -> Optional[int]:
+    m = re.search(r"(\d{1,2})", (predicted_grade or "").strip())
+    if not m:
+        return None
+    g = int(m.group(1))
+    if 1 <= g <= 10:
+        return g
+    return None
+
+
+def _grade_distribution(predicted_grade: int, confidence: float) -> Dict[str, float]:
+    """
+    Conservative distribution over grades {10,9,8} around predicted_grade.
+    """
+    c = _clamp(confidence, 0.05, 0.95)
+    p_pred = 0.45 + 0.50 * c
+    remainder = 1.0 - p_pred
+
+    if predicted_grade >= 10:
+        dist = {"10": p_pred, "9": remainder * 0.75, "8": remainder * 0.25}
+    elif predicted_grade == 9:
+        dist = {"10": remainder * 0.25, "9": p_pred, "8": remainder * 0.75}
+    else:
+        dist = {"10": remainder * 0.10, "9": remainder * 0.30, "8": p_pred + remainder * 0.60}
+
+    total = sum(dist.values())
+    if total <= 0:
+        return {"10": 0.0, "9": 0.0, "8": 0.0}
+    for k in dist:
+        dist[k] = round(dist[k] / total, 4)
+    return dist
+
+
+def _canonicalize_set(set_code: Optional[str], set_name: Optional[str]) -> Dict[str, Any]:
+    sc = (set_code or "").strip().upper()
+    sn = _norm_ws(set_name or "")
+
+    mapped = SET_CODE_MAP.get(sc) if sc else None
+    if mapped:
+        return {"set_code": sc, "set_name": mapped, "set_source": "code_map"}
+    if sc and sn:
+        return {"set_code": sc, "set_name": sn, "set_source": "ai+code"}
+    if sn:
+        # attempt to infer code from map reverse (rare)
+        rev = {v.lower(): k for k, v in SET_CODE_MAP.items()}
+        maybe = rev.get(sn.lower())
+        if maybe:
+            return {"set_code": maybe, "set_name": sn, "set_source": "reverse_map"}
+        return {"set_code": "", "set_name": sn, "set_source": "ai_name_only"}
+    if sc:
+        return {"set_code": sc, "set_name": "", "set_source": "code_only"}
+    return {"set_code": "", "set_name": "", "set_source": "unknown"}
+
+
+
+# ==============================
+# PokemonTCG.io helpers (authoritative card data + prices)
+# ==============================
+async def _pokemontcg_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """GET helper for PokemonTCG API. `path` may be full URL or relative like '/cards'."""
+    if not POKEMONTCG_API_KEY:
+        return {}
+    url = path if path.startswith("http") else f"{POKEMONTCG_BASE}{path}"
+    headers = {"X-Api-Key": POKEMONTCG_API_KEY}
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            r = await client.get(url, headers=headers, params=params)
+            if r.status_code != 200:
+                return {}
+            return r.json() if r.content else {}
+    except Exception:
+        return {}
+
+
+async def _pokemontcg_resolve_card_id(card_name: str, set_code: str, card_number: str, set_name: str = "") -> str:
+    """Resolve most likely PokemonTCG card id using a query ladder."""
+    name = _norm_ws(card_name)
+    sc = (set_code or "").strip().upper()
+    num = _norm_num(card_number or "")
+    sn = _norm_ws(set_name or "")
+
+    queries: List[str] = []
+    if sc and num:
+        queries.append(f"number:{num} set.ptcgoCode:{sc}")
+    if name and num and sn:
+        queries.append(f'name:"{name}" number:{num} set.name:"{sn}"')
+    if name and num:
+        queries.append(f'name:"{name}" number:{num}')
+    if name and sn:
+        queries.append(f'name:"{name}" set.name:"{sn}"')
+    if name:
+        queries.append(f'name:"{name}"')
+
+    for q in queries:
+        data = await _pokemontcg_get("/cards", params={"q": q, "pageSize": 5})
+        cards = (data.get("data") or [])
+        if not cards:
+            continue
+        if num:
+            for c in cards:
+                if _norm_num(str(c.get("number", ""))) == num:
+                    return str(c.get("id", "")) or ""
+        return str(cards[0].get("id", "")) or ""
+    return ""
+
+
+async def _pokemontcg_card_by_id(card_id: str) -> Dict[str, Any]:
+    if not card_id:
+        return {}
+    data = await _pokemontcg_get(f"/cards/{card_id}")
+    card = data.get("data") if isinstance(data, dict) else None
+    return card if isinstance(card, dict) else {}
+
+
+def _pokemontcg_extract_prices(card: Dict[str, Any]) -> Dict[str, Any]:
+    """Return full price objects + a simple numeric anchor list for calculations."""
+    tcg = (card or {}).get("tcgplayer", {}) or {}
+    cm = (card or {}).get("cardmarket", {}) or {}
+
+    tcg_prices = tcg.get("prices") if isinstance(tcg, dict) else None
+    cm_prices = cm.get("prices") if isinstance(cm, dict) else None
+
+    anchor: List[float] = []
+    currencies: List[str] = []
+
+    # TCGplayer markets (USD)
+    if isinstance(tcg_prices, dict) and tcg_prices:
+        currencies.append("USD")
+        for _, obj in tcg_prices.items():
+            if isinstance(obj, dict) and obj.get("market") is not None:
+                try:
+                    anchor.append(float(obj["market"]))
+                except Exception:
+                    pass
+
+    # Cardmarket trend/avg (EUR)
+    if isinstance(cm_prices, dict) and cm_prices:
+        currencies.append("EUR")
+        for k in ("trendPrice", "averageSellPrice"):
+            if cm_prices.get(k) is not None:
+                try:
+                    anchor.append(float(cm_prices[k]))
+                except Exception:
+                    pass
+
+    return {
+        "anchor_values": anchor,
+        "currencies": currencies,
+        "tcgplayer": {"url": tcg.get("url", ""), "prices": tcg_prices} if isinstance(tcg_prices, dict) and tcg_prices else None,
+        "cardmarket": {"url": cm.get("url", ""), "prices": cm_prices} if isinstance(cm_prices, dict) and cm_prices else None,
+    }
+
+
+# ==============================
+# Root & Health
+# ==============================
 @app.get("/")
 def root():
     return {
         "status": "ok",
         "service": "cl-scan-api",
         "version": APP_VERSION,
-        "message": "Collectors League Multi-Item Assessment API"
+        "message": "The Collectors League Australia — Multi-Item Assessment API (Futureproof v6)",
     }
 
 
@@ -61,1099 +336,836 @@ def health():
         "version": APP_VERSION,
         "has_openai_key": bool(OPENAI_API_KEY),
         "has_pokemontcg_key": bool(POKEMONTCG_API_KEY),
-        "model": "gpt-4o-mini",
-        "supports": ["cards", "memorabilia", "sealed_products"]
+        "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        "supports": ["cards", "memorabilia", "sealed_products", "market_context_click_only", "canonical_id", "detailed_grading"],
+        "ebay_domain": EBAY_DOMAIN,
     }
 
-
-def image_to_base64(image_bytes: bytes) -> str:
-    """Convert image bytes to base64 string"""
-    return base64.b64encode(image_bytes).decode('utf-8')
-
-
-async def call_openai_vision(image_base64: str, prompt: str, max_tokens: int = 800) -> dict:
-    """Call OpenAI Vision API"""
-    if not OPENAI_API_KEY:
-        raise HTTPException(status_code=500, detail="OpenAI API key not configured")
-    
-    url = "https://api.openai.com/v1/chat/completions"
-    
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    
-    payload = {
-        "model": "gpt-4o-mini",
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": prompt
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{image_base64}"
-                        }
-                    }
-                ]
-            }
-        ],
-        "max_tokens": max_tokens,
-        "temperature": 0.1
-    }
-    
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(url, headers=headers, json=payload)
-            
-            if response.status_code != 200:
-                print(f"OpenAI API Error: {response.status_code}")
-                print(f"Response: {response.text[:500]}")
-                return {
-                    "error": True,
-                    "status": response.status_code,
-                    "message": response.text[:200]
-                }
-            
-            data = response.json()
-            
-            if "choices" not in data or len(data["choices"]) == 0:
-                return {"error": True, "message": "No response from OpenAI"}
-            
-            content = data["choices"][0]["message"]["content"]
-            return {"error": False, "content": content}
-            
-    except Exception as e:
-        print(f"OpenAI API Exception: {str(e)}")
-        return {"error": True, "message": str(e)}
+@app.head("/")
+def head_root():
+    return Response(status_code=200)
 
 
-# ============================================================================
-# COLLECTOR CARDS - EXISTING ENDPOINTS
-# ============================================================================
+@app.head("/health")
+def head_health():
+    return Response(status_code=200)
+
+
+
+# ==============================
+# Card: Identify
+# ==============================
 
 @app.post("/api/identify")
 async def identify(front: UploadFile = File(...)):
     """
-    Identify a trading card from its front image using AI vision
-    Returns: name, series, year, card_number, type, confidence
+    Identify a trading card from its front image using AI vision.
+    Returns canonical_id plus (for Pokemon) an optional authoritative PokemonTCG card resolution.
     """
-    try:
-        # Read image
-        image_bytes = await front.read()
-        
-        if not image_bytes or len(image_bytes) < 1000:
-            raise HTTPException(status_code=400, detail="Image is too small or empty")
-        
-        # Convert to base64
-        image_base64 = image_to_base64(image_bytes)
-        
-        # Prepare prompt for identification
-        prompt = """Identify this trading card. Analyze the image and provide ONLY a JSON response with these exact fields:
+    image_bytes = await front.read()
+    if not image_bytes or len(image_bytes) < 200:
+        raise HTTPException(status_code=400, detail="Image is too small or empty")
+
+    prompt = """You are identifying a trading card from a front photo.
+
+Return ONLY valid JSON with these exact fields:
 
 {
-  "name": "exact card name including variants (ex, V, VMAX, holo, first edition, etc.)",
-  "series": "set or series name",
-  "year": "release year (4 digits)",
-  "card_number": "card number if visible",
-  "type": "Pokemon/Magic/YuGiOh/Sports/OnePiece/Other",
-  "confidence": 0.0-1.0
-}
-
-Be specific with the card name. Include any variants like "ex", "V", "VMAX", "GX", "holo", "reverse holo", "first edition", "special illustration rare (SIR)", etc.
-If you cannot identify with confidence, set confidence to 0.0 and name to "Unknown".
-Respond ONLY with valid JSON, no other text."""
-        
-        # Call OpenAI Vision
-        result = await call_openai_vision(image_base64, prompt, max_tokens=500)
-        
-        if result.get("error"):
-            print(f"Vision API error: {result.get('message')}")
-            # Return fallback response
-            return JSONResponse(content={
-                "name": "Could not identify",
-                "series": "Unknown",
-                "year": "Unknown",
-                "card_number": "",
-                "type": "Other",
-                "confidence": 0.0,
-                "identify_token": f"idt_{secrets.token_urlsafe(12)}",
-                "error": "AI identification failed"
-            })
-        
-        # Parse JSON from response
-        content = result["content"].strip()
-        
-        # Remove markdown code blocks if present
-        if content.startswith("```json"):
-            content = content[7:]
-        if content.startswith("```"):
-            content = content[3:]
-        if content.endswith("```"):
-            content = content[:-3]
-        content = content.strip()
-        
-        try:
-            card_data = json.loads(content)
-        except json.JSONDecodeError as e:
-            print(f"JSON parse error: {e}")
-            print(f"Content: {content}")
-            # Return fallback
-            return JSONResponse(content={
-                "name": "Parse error",
-                "series": "Unknown",
-                "year": "Unknown",
-                "card_number": "",
-                "type": "Other",
-                "confidence": 0.0,
-                "identify_token": f"idt_{secrets.token_urlsafe(12)}",
-                "error": "Could not parse AI response"
-            })
-        
-        # Generate identify token
-        identify_token = f"idt_{secrets.token_urlsafe(12)}"
-        
-        # Return identification data
-        return JSONResponse(content={
-            "name": card_data.get("name", "Unknown"),
-            "series": card_data.get("series", ""),
-            "year": str(card_data.get("year", "")),
-            "card_number": str(card_data.get("card_number", "")),
-            "type": card_data.get("type", "Other"),
-            "confidence": float(card_data.get("confidence", 0.0)),
-            "identify_token": identify_token
-        })
-        
-    except Exception as e:
-        print(f"Identify endpoint error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
-
-
-@app.post("/api/verify")
-async def verify(front: UploadFile = File(...), back: UploadFile = File(...)):
-    """
-    AI-powered card grading with both front and back images
-    """
-    try:
-        # Read both images
-        front_bytes = await front.read()
-        back_bytes = await back.read()
-        
-        if not front_bytes or not back_bytes or len(front_bytes) < 1000 or len(back_bytes) < 1000:
-            raise HTTPException(status_code=400, detail="Images are too small or empty")
-        
-        # Convert to base64
-        front_base64 = image_to_base64(front_bytes)
-        back_base64 = image_to_base64(back_bytes)
-        
-        if not OPENAI_API_KEY:
-            raise HTTPException(status_code=500, detail="OpenAI API key not configured")
-        
-        # Prepare dual-image grading prompt
-        prompt = """You are a professional trading card grader. Analyze BOTH the front and back images of this card and provide a comprehensive grade assessment.
-
-**CORNERS** - Check all 4 corners on BOTH sides:
-- Are corners sharp, soft, or rounded?
-- Any whitening visible (especially on back)?
-- Specify WHICH corner and WHICH side (front/back)
-
-**EDGES** - Examine all 4 edges on BOTH sides:
-- Are edges clean and sharp?
-- Any whitening (especially visible on back)?
-- Any chipping or roughness?
-- Any silvering (white card core showing)?
-
-**SURFACE** - Analyze front AND back surfaces:
-- Front: Ignore holo patterns. Look for scratches, scuffs, print lines
-- Back: Check for scratches, scuffs, wear marks
-- Any creases visible on either side?
-- Any stains or discoloration?
-
-**CENTERING** - Primarily check the front:
-- Measure border widths around the card image
-- Is the artwork/text centered properly?
-
-Be VERY specific in your analysis. Mention which side (front/back) each issue appears on.
-
-Provide ONLY a JSON response with these exact fields:
-
-{
-  "pregrade": "estimated PSA-style grade 1-10",
-  "grade_corners": {
-    "grade": "Mint/Near Mint/Excellent/Good/Poor",
-    "notes": "Describe each corner on BOTH sides. Example: 'Front: Top-left sharp, top-right minor softness. Back: All corners sharp with slight whitening on bottom-right.' Be specific about which side and which corner."
-  },
-  "grade_edges": {
-    "grade": "Mint/Near Mint/Excellent/Good/Poor",
-    "notes": "Examine all 4 edges on BOTH front and back. Example: 'Front edges clean. Back shows minor whitening on left and top edges, typical of handling.' Specify front vs back."
-  },
-  "grade_surface": {
-    "grade": "Mint/Near Mint/Excellent/Good/Poor",
-    "notes": "IGNORE intentional textures/holo patterns. Analyze BOTH surfaces. Example: 'Front surface: Clean with no visible scratches. Holo pattern is intentional. Back surface: Minor scuff mark in center-left area, otherwise clean.' Be detailed about front vs back."
-  },
-  "grade_centering": {
-    "grade": "60/40 or better / 70/30 / 80/20 / Off-center",
-    "notes": "Measure front borders. Left vs Right: [X%]/[Y%]. Top vs Bottom: [X%]/[Y%]. Example: 'Front centering is 65/35 left-to-right, 60/40 top-to-bottom. Slightly off-center but acceptable.'"
-  },
+  "card_name": "exact card name including variants (ex, V, VMAX, holo, first edition, etc.)",
+  "card_type": "Pokemon/Magic/YuGiOh/Sports/OnePiece/Other",
+  "year": "4 digit year if visible else empty string",
+  "card_number": "card number if visible (e.g. 4/102 or 004) else empty string",
+  "set_code": "2-4 letter/number set abbreviation printed on the card if visible (e.g. PFL, OBF, SVI). EMPTY if not visible",
+  "set_name": "set or series name (full name) if visible/known else empty string",
   "confidence": 0.0-1.0,
-  "defects": ["List each specific defect with SIDE and location. Examples: 'Front: Top-right corner whitening', 'Back: Horizontal scratch center-left', 'Back: Left edge minor silvering', 'Both sides: Bottom-left corner soft'. If no defects, empty array."]
+  "notes": "one short sentence about how you identified it"
 }
 
-GRADING SCALE (PSA-style):
-- 10 (Gem Mint): Flawless card, perfect centering, sharp corners, pristine surfaces
-- 9 (Mint): Near-perfect, may have tiny imperfections, excellent centering
-- 8 (Near Mint-Mint): Very minor wear, slight corner touches, minor centering issues
-- 7 (Near Mint): Minor wear visible, slight corner whitening, good overall appearance
-- 6 (Excellent-Mint): Noticeable wear, minor edge/corner issues, slightly off-center
-- 5 (Excellent): Moderate wear, edge whitening, corner rounding, centering issues
-- 4 (Very Good-Excellent): Significant wear, damaged corners/edges, surface issues
-- 3 (Very Good): Heavy wear, major corner/edge damage, creases
-- 2 (Good): Severe damage, creases, major surface issues
-- 1 (Poor): Extremely damaged, multiple creases, barely collectible
+Rules:
+- PRIORITIZE the set_code if you can see one.
+- Do not guess a set_code you cannot see.
+- If you cannot identify with confidence, set card_name to "Unknown" and confidence to 0.0.
+Respond ONLY with JSON, no extra text."""
 
-IMPORTANT:
-- Be CONSERVATIVE but FAIR
-- Don't penalize intentional card features
-- Consider BOTH front and back in your assessment
-- Modern cards often have more texture - distinguish texture from damage
-- Be DETAILED in your notes - specify which side each issue appears on
-- Defects should always indicate FRONT or BACK
+    msg = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(image_bytes)}", "detail": "high"}},
+        ],
+    }]
 
-Respond ONLY with valid JSON, no other text."""
-        
-        # Call OpenAI Vision with BOTH images
-        url = "https://api.openai.com/v1/chat/completions"
-        
-        headers = {
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        
-        payload = {
-            "model": "gpt-4o-mini",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": prompt
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{front_base64}",
-                                "detail": "high"
-                            }
-                        },
-                        {
-                            "type": "text",
-                            "text": "FRONT IMAGE ABOVE ☝️ | BACK IMAGE BELOW 👇"
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{back_base64}",
-                                "detail": "high"
-                            }
-                        }
-                    ]
-                }
-            ],
-            "max_tokens": 2000,
-            "temperature": 0.1
-        }
-        
-        try:
-            async with httpx.AsyncClient(timeout=90.0) as client:
-                response = await client.post(url, headers=headers, json=payload)
-                
-                if response.status_code != 200:
-                    print(f"OpenAI API Error: {response.status_code}")
-                    print(f"Response: {response.text[:500]}")
-                    # Return fallback response
-                    return JSONResponse(content={
-                        "pregrade": "Unable to assess",
-                        "grade_corners": {"grade": "N/A", "notes": "Assessment failed"},
-                        "grade_edges": {"grade": "N/A", "notes": "Assessment failed"},
-                        "grade_surface": {"grade": "N/A", "notes": "Assessment failed"},
-                        "grade_centering": {"grade": "N/A", "notes": "Assessment failed"},
-                        "confidence": 0.0,
-                        "defects": [],
-                        "error": "AI grading failed"
-                    })
-                
-                data = response.json()
-                
-                if "choices" not in data or len(data["choices"]) == 0:
-                    return JSONResponse(content={
-                        "pregrade": "No response",
-                        "grade_corners": {"grade": "N/A", "notes": "No AI response"},
-                        "grade_edges": {"grade": "N/A", "notes": "No AI response"},
-                        "grade_surface": {"grade": "N/A", "notes": "No AI response"},
-                        "grade_centering": {"grade": "N/A", "notes": "No AI response"},
-                        "confidence": 0.0,
-                        "defects": []
-                    })
-                
-                content = data["choices"][0]["message"]["content"]
-                
-        except Exception as e:
-            print(f"OpenAI API Exception: {str(e)}")
-            return JSONResponse(content={
-                "pregrade": "Error",
-                "grade_corners": {"grade": "N/A", "notes": f"Error: {str(e)[:100]}"},
-                "grade_edges": {"grade": "N/A", "notes": "Error"},
-                "grade_surface": {"grade": "N/A", "notes": "Error"},
-                "grade_centering": {"grade": "N/A", "notes": "Error"},
-                "confidence": 0.0,
-                "defects": []
-            })
-        
-        # Parse JSON from response
-        content = content.strip()
-        
-        # Remove markdown code blocks if present
-        if content.startswith("```json"):
-            content = content[7:]
-        if content.startswith("```"):
-            content = content[3:]
-        if content.endswith("```"):
-            content = content[:-3]
-        content = content.strip()
-        
-        try:
-            grade_data = json.loads(content)
-        except json.JSONDecodeError as e:
-            print(f"JSON parse error: {e}")
-            print(f"Content: {content[:500]}")
-            # Return fallback
-            return JSONResponse(content={
-                "pregrade": "Parse error",
-                "grade_corners": {"grade": "N/A", "notes": "Could not parse response"},
-                "grade_edges": {"grade": "N/A", "notes": "Could not parse response"},
-                "grade_surface": {"grade": "N/A", "notes": "Could not parse response"},
-                "grade_centering": {"grade": "N/A", "notes": "Could not parse response"},
-                "confidence": 0.0,
-                "defects": []
-            })
-        
-        # Return grading data
+    result = await _openai_chat(msg, max_tokens=800, temperature=0.1)
+    if result.get("error"):
         return JSONResponse(content={
-            "pregrade": grade_data.get("pregrade", "N/A"),
-            "grade_corners": grade_data.get("grade_corners", {"grade": "N/A", "notes": ""}),
-            "grade_edges": grade_data.get("grade_edges", {"grade": "N/A", "notes": ""}),
-            "grade_surface": grade_data.get("grade_surface", {"grade": "N/A", "notes": ""}),
-            "grade_centering": grade_data.get("grade_centering", {"grade": "N/A", "notes": ""}),
-            "confidence": float(grade_data.get("confidence", 0.0)),
-            "defects": grade_data.get("defects", [])
-        })
-        
-    except Exception as e:
-        print(f"Verify endpoint error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
-
-
-# ============================================================================
-# MEMORABILIA & SEALED PRODUCTS - NEW ENDPOINTS
-# ============================================================================
-
-@app.post("/api/identify-memorabilia")
-async def identify_memorabilia(
-    image1: UploadFile = File(...),
-    image2: UploadFile = File(None),
-    image3: UploadFile = File(None),
-    image4: UploadFile = File(None)
-):
-    """
-    Identify memorabilia or sealed product from 1-4 images
-    Returns: item_type, description, authenticity_notes, confidence
-    """
-    try:
-        # Read primary image (required)
-        image1_bytes = await image1.read()
-        if not image1_bytes or len(image1_bytes) < 1000:
-            raise HTTPException(status_code=400, detail="Primary image is too small or empty")
-        
-        # Convert images to base64
-        images_base64 = [image_to_base64(image1_bytes)]
-        
-        # Process optional images
-        if image2:
-            img2_bytes = await image2.read()
-            if img2_bytes and len(img2_bytes) >= 1000:
-                images_base64.append(image_to_base64(img2_bytes))
-        
-        if image3:
-            img3_bytes = await image3.read()
-            if img3_bytes and len(img3_bytes) >= 1000:
-                images_base64.append(image_to_base64(img3_bytes))
-        
-        if image4:
-            img4_bytes = await image4.read()
-            if img4_bytes and len(img4_bytes) >= 1000:
-                images_base64.append(image_to_base64(img4_bytes))
-        
-        if not OPENAI_API_KEY:
-            raise HTTPException(status_code=500, detail="OpenAI API key not configured")
-        
-        # Build multi-image prompt
-        prompt = """Analyze these images of collectible memorabilia or sealed product. Identify what this item is and assess its key characteristics.
-
-Provide ONLY a JSON response with these exact fields:
-
-{
-  "item_type": "Sealed Booster Box/Elite Trainer Box/Blister Pack/Graded Card/Signed Memorabilia/Display Case/Other",
-  "description": "Detailed description of the item including brand, set/series, year if visible",
-  "signatures": "Description of any visible signatures or autographs, or 'None visible'",
-  "seal_condition": "Factory sealed/Opened/Resealed/Not applicable",
-  "authenticity_notes": "Any observations about authenticity markers, holograms, serial numbers, packaging quality, or red flags",
-  "notable_features": "Any special features, variants, errors, or unique aspects",
-  "confidence": 0.0-1.0
-}
-
-Look for:
-- Product type and brand
-- Set/series name and logos
-- Seal integrity (shrink wrap condition, factory seals)
-- Authentication markers (holograms, serial numbers, official stamps)
-- Signs of tampering or resealing
-- Signatures or autographs (check if present)
-- Overall condition and packaging quality
-- Any red flags or concerning aspects
-
-If you cannot identify with confidence, set confidence to 0.0 and provide your best assessment in description.
-Respond ONLY with valid JSON, no other text."""
-        
-        # Build content array for API call
-        content = [{"type": "text", "text": prompt}]
-        
-        # Add all images with labels
-        image_labels = ["Primary Image", "Additional View", "Detail/Close-up", "Alternative Angle"]
-        for idx, img_b64 in enumerate(images_base64):
-            if idx > 0:
-                content.append({
-                    "type": "text",
-                    "text": f"--- {image_labels[idx]} ---"
-                })
-            content.append({
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/jpeg;base64,{img_b64}",
-                    "detail": "high"
-                }
-            })
-        
-        # Call OpenAI Vision API
-        url = "https://api.openai.com/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        
-        payload = {
-            "model": "gpt-4o-mini",
-            "messages": [{"role": "user", "content": content}],
-            "max_tokens": 1000,
-            "temperature": 0.1
-        }
-        
-        async with httpx.AsyncClient(timeout=90.0) as client:
-            response = await client.post(url, headers=headers, json=payload)
-            
-            if response.status_code != 200:
-                print(f"OpenAI API Error: {response.status_code}")
-                return JSONResponse(content={
-                    "item_type": "Unknown",
-                    "description": "Could not identify",
-                    "signatures": "Unable to assess",
-                    "seal_condition": "Unable to assess",
-                    "authenticity_notes": "AI identification failed",
-                    "notable_features": "",
-                    "confidence": 0.0,
-                    "identify_token": f"idt_{secrets.token_urlsafe(12)}",
-                    "error": "AI identification failed"
-                })
-            
-            data = response.json()
-            
-            if "choices" not in data or len(data["choices"]) == 0:
-                return JSONResponse(content={
-                    "item_type": "Unknown",
-                    "description": "No response from AI",
-                    "signatures": "Unable to assess",
-                    "seal_condition": "Unable to assess",
-                    "authenticity_notes": "",
-                    "notable_features": "",
-                    "confidence": 0.0,
-                    "identify_token": f"idt_{secrets.token_urlsafe(12)}"
-                })
-            
-            content_text = data["choices"][0]["message"]["content"].strip()
-            
-            # Parse JSON
-            if content_text.startswith("```json"):
-                content_text = content_text[7:]
-            if content_text.startswith("```"):
-                content_text = content_text[3:]
-            if content_text.endswith("```"):
-                content_text = content_text[:-3]
-            content_text = content_text.strip()
-            
-            try:
-                item_data = json.loads(content_text)
-            except json.JSONDecodeError as e:
-                print(f"JSON parse error: {e}")
-                return JSONResponse(content={
-                    "item_type": "Parse error",
-                    "description": "Could not parse AI response",
-                    "signatures": "Unable to assess",
-                    "seal_condition": "Unable to assess",
-                    "authenticity_notes": "",
-                    "notable_features": "",
-                    "confidence": 0.0,
-                    "identify_token": f"idt_{secrets.token_urlsafe(12)}"
-                })
-            
-            # Generate identify token
-            identify_token = f"idt_{secrets.token_urlsafe(12)}"
-            
-            return JSONResponse(content={
-                "item_type": item_data.get("item_type", "Unknown"),
-                "description": item_data.get("description", ""),
-                "signatures": item_data.get("signatures", "None visible"),
-                "seal_condition": item_data.get("seal_condition", "Not applicable"),
-                "authenticity_notes": item_data.get("authenticity_notes", ""),
-                "notable_features": item_data.get("notable_features", ""),
-                "confidence": float(item_data.get("confidence", 0.0)),
-                "identify_token": identify_token
-            })
-        
-    except Exception as e:
-        print(f"Identify memorabilia endpoint error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
-
-
-@app.post("/api/assess-memorabilia")
-async def assess_memorabilia(
-    image1: UploadFile = File(...),
-    image2: UploadFile = File(None),
-    image3: UploadFile = File(None),
-    image4: UploadFile = File(None)
-):
-    """
-    Assess condition and authenticity of memorabilia/sealed products from 1-4 images
-    """
-    try:
-        # Read primary image (required)
-        image1_bytes = await image1.read()
-        if not image1_bytes or len(image1_bytes) < 1000:
-            raise HTTPException(status_code=400, detail="Primary image is too small or empty")
-        
-        # Convert images to base64
-        images_base64 = [image_to_base64(image1_bytes)]
-        
-        # Process optional images
-        if image2:
-            img2_bytes = await image2.read()
-            if img2_bytes and len(img2_bytes) >= 1000:
-                images_base64.append(image_to_base64(img2_bytes))
-        
-        if image3:
-            img3_bytes = await image3.read()
-            if img3_bytes and len(img3_bytes) >= 1000:
-                images_base64.append(image_to_base64(img3_bytes))
-        
-        if image4:
-            img4_bytes = await image4.read()
-            if img4_bytes and len(img4_bytes) >= 1000:
-                images_base64.append(image_to_base64(img4_bytes))
-        
-        if not OPENAI_API_KEY:
-            raise HTTPException(status_code=500, detail="OpenAI API key not configured")
-        
-        # Build comprehensive assessment prompt
-        prompt = """You are a professional memorabilia and sealed product authenticator. Analyze these images comprehensively.
-
-For SEALED PRODUCTS, assess:
-- Seal integrity (factory seal vs resealed, shrink wrap condition)
-- Packaging condition (box corners, crushing, dents, shelf wear)
-- Authentication markers (holograms, serial numbers, factory stamps)
-- Signs of tampering or opening
-- Overall preservation
-
-For SIGNED MEMORABILIA, assess:
-- Signature authenticity indicators
-- Signature placement and quality
-- Item condition
-- Certificate of Authenticity if visible
-- Any authentication markers
-
-For ALL ITEMS, evaluate:
-- Overall condition grade
-- Notable defects or issues
-- Authenticity confidence
-- Value-impacting factors
-
-Provide ONLY a JSON response:
-
-{
-  "overall_assessment": "Brief 2-3 sentence summary of item condition and authenticity",
-  "condition_grade": "Mint/Near Mint/Excellent/Very Good/Good/Fair/Poor",
-  "seal_integrity": {
-    "grade": "Factory Sealed/Intact/Compromised/Opened/Not Applicable",
-    "notes": "Detailed assessment of seals, shrink wrap, factory seals. Note any signs of tampering or resealing."
-  },
-  "packaging_condition": {
-    "grade": "Mint/Near Mint/Excellent/Very Good/Good/Fair/Poor",
-    "notes": "Assess box/packaging: corners, edges, crushing, dents, shelf wear, printing quality"
-  },
-  "authenticity_assessment": {
-    "grade": "Highly Confident/Likely Authentic/Uncertain/Concerns Present/Likely Counterfeit",
-    "notes": "Check authentication markers, holograms, serial numbers, packaging quality, known counterfeit indicators"
-  },
-  "signature_assessment": {
-    "present": true/false,
-    "grade": "Authentic/Likely Authentic/Uncertain/Concerns/Not Applicable",
-    "notes": "If signatures present: assess authenticity markers, placement, ink quality, any COA visible"
-  },
-  "defects": ["List specific issues: 'Box corner crushing top-right', 'Shrink wrap tear left side', 'Signature smudged', etc. Empty array if none."],
-  "value_factors": ["List factors affecting value: positive or negative"],
-  "confidence": 0.0-1.0
-}
-
-GRADING SCALE:
-- Mint: Perfect condition, factory fresh
-- Near Mint: Minimal wear, excellent overall
-- Excellent: Minor wear, still very presentable
-- Very Good: Noticeable wear but intact
-- Good: Significant wear, structural integrity maintained
-- Fair: Heavy wear, may have damage
-- Poor: Severe damage, barely collectible
-
-Be thorough, specific, and honest. Note both positives and concerns.
-Respond ONLY with valid JSON, no other text."""
-        
-        # Build content array
-        content = [{"type": "text", "text": prompt}]
-        
-        image_labels = ["Primary Image", "Additional View", "Detail/Close-up", "Alternative Angle"]
-        for idx, img_b64 in enumerate(images_base64):
-            if idx > 0:
-                content.append({
-                    "type": "text",
-                    "text": f"--- {image_labels[idx]} ---"
-                })
-            content.append({
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/jpeg;base64,{img_b64}",
-                    "detail": "high"
-                }
-            })
-        
-        # Call OpenAI
-        url = "https://api.openai.com/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        
-        payload = {
-            "model": "gpt-4o-mini",
-            "messages": [{"role": "user", "content": content}],
-            "max_tokens": 2000,
-            "temperature": 0.1
-        }
-        
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            response = await client.post(url, headers=headers, json=payload)
-            
-            if response.status_code != 200:
-                print(f"OpenAI API Error: {response.status_code}")
-                return JSONResponse(content={
-                    "overall_assessment": "Assessment failed",
-                    "condition_grade": "Unable to assess",
-                    "seal_integrity": {"grade": "N/A", "notes": "Assessment failed"},
-                    "packaging_condition": {"grade": "N/A", "notes": "Assessment failed"},
-                    "authenticity_assessment": {"grade": "N/A", "notes": "Assessment failed"},
-                    "signature_assessment": {"present": False, "grade": "N/A", "notes": "Assessment failed"},
-                    "defects": [],
-                    "value_factors": [],
-                    "confidence": 0.0,
-                    "error": "AI assessment failed"
-                })
-            
-            data = response.json()
-            
-            if "choices" not in data or len(data["choices"]) == 0:
-                return JSONResponse(content={
-                    "overall_assessment": "No response",
-                    "condition_grade": "N/A",
-                    "seal_integrity": {"grade": "N/A", "notes": "No AI response"},
-                    "packaging_condition": {"grade": "N/A", "notes": "No AI response"},
-                    "authenticity_assessment": {"grade": "N/A", "notes": "No AI response"},
-                    "signature_assessment": {"present": False, "grade": "N/A", "notes": "No AI response"},
-                    "defects": [],
-                    "value_factors": [],
-                    "confidence": 0.0
-                })
-            
-            content_text = data["choices"][0]["message"]["content"].strip()
-            
-            # Parse JSON
-            if content_text.startswith("```json"):
-                content_text = content_text[7:]
-            if content_text.startswith("```"):
-                content_text = content_text[3:]
-            if content_text.endswith("```"):
-                content_text = content_text[:-3]
-            content_text = content_text.strip()
-            
-            try:
-                assessment_data = json.loads(content_text)
-            except json.JSONDecodeError as e:
-                print(f"JSON parse error: {e}")
-                print(f"Content: {content_text[:500]}")
-                return JSONResponse(content={
-                    "overall_assessment": "Parse error",
-                    "condition_grade": "N/A",
-                    "seal_integrity": {"grade": "N/A", "notes": "Could not parse response"},
-                    "packaging_condition": {"grade": "N/A", "notes": "Could not parse response"},
-                    "authenticity_assessment": {"grade": "N/A", "notes": "Could not parse response"},
-                    "signature_assessment": {"present": False, "grade": "N/A", "notes": "Could not parse response"},
-                    "defects": [],
-                    "value_factors": [],
-                    "confidence": 0.0
-                })
-            
-            # Return assessment
-            return JSONResponse(content={
-                "overall_assessment": assessment_data.get("overall_assessment", ""),
-                "condition_grade": assessment_data.get("condition_grade", "N/A"),
-                "seal_integrity": assessment_data.get("seal_integrity", {"grade": "N/A", "notes": ""}),
-                "packaging_condition": assessment_data.get("packaging_condition", {"grade": "N/A", "notes": ""}),
-                "authenticity_assessment": assessment_data.get("authenticity_assessment", {"grade": "N/A", "notes": ""}),
-                "signature_assessment": assessment_data.get("signature_assessment", {"present": False, "grade": "N/A", "notes": ""}),
-                "defects": assessment_data.get("defects", []),
-                "value_factors": assessment_data.get("value_factors", []),
-                "confidence": float(assessment_data.get("confidence", 0.0))
-            })
-        
-    except Exception as e:
-        print(f"Assess memorabilia endpoint error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
-
-# ========================================
-# MARKET INTELLIGENCE ENDPOINT
-# Added: 2026-01-30
-# ========================================
-
-@app.post("/api/market-intelligence")
-async def market_intelligence(
-    card_name: str = Form(...),
-    card_number: str = Form(None),
-    card_set: str = Form(None),
-    predicted_grade: str = Form(...),
-    grading_cost: float = Form(50.0)
-):
-    """Search live market for card prices and calculate ROI"""
-    try:
-        print(f"🔍 Market Intelligence: {card_name} #{card_number} (Grade: {predicted_grade})")
-        
-        card_identifier = f"{card_name} {card_set or ''} #{card_number or ''}".strip()
-        
-        market_data = {
-            "raw_prices": [],
-            "graded_prices": {},
-            "sources": []
-        }
-        
-        # Search eBay for raw cards
-        raw_listings = await search_ebay_raw(card_identifier)
-        if raw_listings:
-            market_data["raw_prices"].extend(raw_listings)
-            market_data["sources"].append("eBay")
-        
-        # Search eBay for graded cards
-        for grade in ["PSA 10", "PSA 9", "PSA 8"]:
-            graded_listings = await search_ebay_graded(card_identifier, grade)
-            if graded_listings:
-                grade_num = grade.split()[1]
-                market_data["graded_prices"][grade_num] = graded_listings
-        
-        # Try TCGPlayer if available
-        if POKEMONTCG_API_KEY:
-            tcg_data = await search_tcgplayer(card_name, card_set)
-            if tcg_data:
-                market_data["raw_prices"].extend(tcg_data.get("raw_prices", []))
-                market_data["sources"].append("TCGPlayer")
-        
-        # Check if we found any data
-        if not market_data["raw_prices"] and not market_data["graded_prices"]:
-            return JSONResponse(content={
-                "has_data": False,
-                "message": f"No market data found for {card_name}",
-                "searched": card_identifier
-            })
-        
-        # Calculate statistics
-        stats = calculate_market_stats(market_data, predicted_grade)
-        
-        # Calculate ROI
-        roi_analysis = calculate_roi(stats, predicted_grade, grading_cost)
-        
-        return JSONResponse(content={
-            "has_data": True,
-            "card": {
-                "name": card_name,
-                "number": card_number,
-                "set": card_set,
-                "identifier": card_identifier
+            "card_name": "Unknown",
+            "card_type": "Other",
+            "year": "",
+            "card_number": "",
+            "set_code": "",
+            "set_name": "",
+            "confidence": 0.0,
+            "notes": "AI identification failed",
+            "identify_token": f"idt_{secrets.token_urlsafe(12)}",
+            "canonical_id": {
+                "card_name": "Unknown",
+                "card_type": "Other",
+                "year": "",
+                "card_number": "",
+                "set_code": "",
+                "set_name": "",
+                "confidence": 0.0,
+                "set_source": "unknown"
             },
-            "market_stats": stats,
-            "roi_analysis": roi_analysis,
-            "data_freshness": "live",
-            "sources": market_data["sources"],
-            "timestamp": datetime.now().isoformat()
-        })
-        
-    except Exception as e:
-        print(f"❌ Market intelligence error: {str(e)}")
-        return JSONResponse(content={
-            "has_data": False,
-            "error": str(e),
-            "message": "Unable to fetch market data"
+            "pokemontcg": None,
+            "error": "AI identification failed"
         })
 
+    data = _parse_json_or_none(result.get("content", "")) or {}
 
-async def search_ebay_raw(card_identifier: str) -> List[float]:
-    """Search eBay for raw card sold prices"""
-    try:
-        search_query = f"{card_identifier} -graded -psa -bgs -cgc"
-        encoded_query = search_query.replace(" ", "+")
-        url = f"https://www.ebay.com/sch/i.html?_nkw={encoded_query}&_sacat=0&LH_Sold=1&LH_Complete=1&_sop=13"
-        
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(url, headers=headers, follow_redirects=True)
-            
-            if response.status_code != 200:
-                return []
-            
-            soup = BeautifulSoup(response.text, 'html.parser')
-            prices = []
-            price_elements = soup.find_all('span', class_='s-item__price')
-            
-            for elem in price_elements[:20]:
-                price_text = elem.get_text()
-                price_matches = re.findall(r'\$([0-9,]+\.?[0-9]*)', price_text)
-                
-                for match in price_matches:
-                    try:
-                        price = float(match.replace(',', ''))
-                        if 1 < price < 10000:
-                            prices.append(price)
-                    except ValueError:
-                        continue
-            
-            return prices
-            
-    except Exception as e:
-        print(f"⚠️ eBay raw search error: {str(e)}")
-        return []
+    card_name = _norm_ws(str(data.get("card_name", "Unknown")))
+    card_type = _norm_ws(str(data.get("card_type", "Other")))
+    year = _norm_ws(str(data.get("year", "")))
+    card_number = _norm_num(str(data.get("card_number", "")))
+    set_code = _norm_ws(str(data.get("set_code", ""))).upper()
+    set_name = _norm_ws(str(data.get("set_name", "")))
+    conf = _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0)
+    notes = _norm_ws(str(data.get("notes", "")))
 
+    set_info = _canonicalize_set(set_code, set_name)
 
-async def search_ebay_graded(card_identifier: str, grade: str) -> List[float]:
-    """Search eBay for graded card prices"""
-    try:
-        search_query = f"{card_identifier} {grade}"
-        encoded_query = search_query.replace(" ", "+")
-        url = f"https://www.ebay.com/sch/i.html?_nkw={encoded_query}&_sacat=0&LH_Sold=1&LH_Complete=1&_sop=13"
-        
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(url, headers=headers, follow_redirects=True)
-            
-            if response.status_code != 200:
-                return []
-            
-            soup = BeautifulSoup(response.text, 'html.parser')
-            prices = []
-            price_elements = soup.find_all('span', class_='s-item__price')
-            
-            for elem in price_elements[:15]:
-                price_text = elem.get_text()
-                price_matches = re.findall(r'\$([0-9,]+\.?[0-9]*)', price_text)
-                
-                for match in price_matches:
-                    try:
-                        price = float(match.replace(',', ''))
-                        if 1 < price < 50000:
-                            prices.append(price)
-                    except ValueError:
-                        continue
-            
-            return prices
-            
-    except Exception as e:
-        print(f"⚠️ eBay graded search error: {str(e)}")
-        return []
-
-
-async def search_tcgplayer(card_name: str, card_set: Optional[str]) -> Optional[Dict]:
-    """Search TCGPlayer API for prices"""
-    try:
-        if not POKEMONTCG_API_KEY:
-            return None
-        
-        headers = {"X-Api-Key": POKEMONTCG_API_KEY}
-        search_query = f"name:{card_name}"
-        if card_set:
-            search_query += f" set.name:{card_set}"
-        
-        url = f"https://api.pokemontcg.io/v2/cards?q={search_query}"
-        
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.get(url, headers=headers)
-            
-            if response.status_code != 200:
-                return None
-            
-            data = response.json()
-            if not data.get('data'):
-                return None
-            
-            card = data['data'][0]
-            prices = card.get('tcgplayer', {}).get('prices', {})
-            
-            raw_prices = []
-            for price_type in ['normal', 'holofoil', 'reverseHolofoil']:
-                if price_type in prices:
-                    market_price = prices[price_type].get('market')
-                    if market_price:
-                        raw_prices.append(float(market_price))
-            
-            if raw_prices:
-                return {"raw_prices": raw_prices}
-            
-            return None
-            
-    except Exception as e:
-        return None
-
-
-def calculate_market_stats(market_data: Dict, predicted_grade: str) -> Dict:
-    """Calculate statistics from market data"""
-    stats = {}
-    
-    raw_prices = market_data["raw_prices"]
-    if raw_prices:
-        sorted_prices = sorted(raw_prices)
-        trim_count = max(1, len(sorted_prices) // 10)
-        trimmed = sorted_prices[trim_count:-trim_count] if len(sorted_prices) > 4 else sorted_prices
-        
-        stats["raw_avg"] = round(mean(trimmed), 2)
-        stats["raw_median"] = round(median(trimmed), 2)
-        stats["raw_low"] = round(min(raw_prices), 2)
-        stats["raw_high"] = round(max(raw_prices), 2)
-        stats["raw_sample_size"] = len(raw_prices)
-    else:
-        stats["raw_avg"] = 0
-        stats["raw_median"] = 0
-        stats["raw_low"] = 0
-        stats["raw_high"] = 0
-        stats["raw_sample_size"] = 0
-    
-    graded_prices = market_data["graded_prices"]
-    stats["graded"] = {}
-    
-    for grade, prices in graded_prices.items():
-        if prices:
-            sorted_prices = sorted(prices)
-            trim_count = max(1, len(sorted_prices) // 10)
-            trimmed = sorted_prices[trim_count:-trim_count] if len(sorted_prices) > 4 else sorted_prices
-            
-            stats["graded"][grade] = {
-                "avg": round(mean(trimmed), 2),
-                "median": round(median(trimmed), 2),
-                "low": round(min(prices), 2),
-                "high": round(max(prices), 2),
-                "sample_size": len(prices)
-            }
-    
-    return stats
-
-
-def calculate_roi(stats: Dict, predicted_grade: str, grading_cost: float) -> Dict:
-    """Calculate ROI for grading decision"""
-    raw_value = stats.get("raw_avg", 0) or stats.get("raw_median", 0)
-    
-    if raw_value == 0:
-        if predicted_grade in stats.get("graded", {}):
-            graded_avg = stats["graded"][predicted_grade]["avg"]
-            raw_value = round(graded_avg * 0.3, 2)
-        else:
-            raw_value = 10
-    
-    graded_value = 0
-    if predicted_grade in stats.get("graded", {}):
-        graded_value = stats["graded"][predicted_grade]["avg"]
-    else:
-        return {
-            "raw_value": raw_value,
-            "grading_cost": grading_cost,
-            "graded_value": 0,
-            "potential_gain": 0,
-            "roi_percentage": 0,
-            "recommendation": "insufficient_data",
-            "recommendation_text": "⚠️ Insufficient market data",
-            "confidence": "low"
-        }
-    
-    potential_gain = graded_value - raw_value - grading_cost
-    roi_percentage = (potential_gain / grading_cost) * 100 if grading_cost > 0 else 0
-    
-    if roi_percentage > 500:
-        recommendation = "strong"
-        recommendation_text = "✅ Excellent grading candidate - Very high ROI"
-        confidence = "high"
-    elif roi_percentage > 200:
-        recommendation = "recommended"
-        recommendation_text = "✅ Recommended for grading - Strong ROI"
-        confidence = "high"
-    elif roi_percentage > 100:
-        recommendation = "consider"
-        recommendation_text = "⚠️ Consider grading - Moderate ROI"
-        confidence = "medium"
-    elif roi_percentage > 0:
-        recommendation = "marginal"
-        recommendation_text = "⚠️ Marginal returns - Low ROI"
-        confidence = "medium"
-    else:
-        recommendation = "not_recommended"
-        recommendation_text = "❌ Not recommended - Negative ROI"
-        confidence = "high"
-    
-    return {
-        "raw_value": round(raw_value, 2),
-        "grading_cost": round(grading_cost, 2),
-        "graded_value": round(graded_value, 2),
-        "potential_gain": round(potential_gain, 2),
-        "roi_percentage": round(roi_percentage, 1),
-        "recommendation": recommendation,
-        "recommendation_text": recommendation_text,
-        "confidence": confidence
+    canonical_id: Dict[str, Any] = {
+        "card_name": card_name,
+        "card_type": card_type,
+        "year": year,
+        "card_number": card_number,
+        "set_code": set_info["set_code"],
+        "set_name": set_info["set_name"],
+        "set_source": set_info["set_source"],
+        "confidence": conf,
     }
+
+    # Optional: resolve PokemonTCG card id for Pokemon items (authoritative metadata)
+    pokemontcg_payload = None
+    if POKEMONTCG_API_KEY and card_type.strip().lower() == "pokemon":
+        pid = await _pokemontcg_resolve_card_id(
+            card_name=card_name,
+            set_code=set_info["set_code"],
+            card_number=card_number,
+            set_name=set_info["set_name"],
+        )
+        if pid:
+            card = await _pokemontcg_card_by_id(pid)
+            canonical_id["external_ids"] = {"pokemontcg_id": pid}
+            pokemontcg_payload = {
+                "id": pid,
+                "name": card.get("name", ""),
+                "number": card.get("number", ""),
+                "rarity": card.get("rarity", ""),
+                "set": card.get("set", {}) or {},
+                "images": card.get("images", {}) or {},
+                "links": {
+                    "tcgplayer": (card.get("tcgplayer", {}) or {}).get("url", ""),
+                    "cardmarket": (card.get("cardmarket", {}) or {}).get("url", ""),
+                }
+            }
+
+    return JSONResponse(content={
+        "card_name": card_name,
+        "card_type": card_type,
+        "year": year,
+        "card_number": card_number,
+        "set_code": set_info["set_code"],
+        "set_name": set_info["set_name"],
+        "confidence": conf,
+        "notes": notes,
+        "identify_token": f"idt_{secrets.token_urlsafe(12)}",
+        "canonical_id": canonical_id,
+        "pokemontcg": pokemontcg_payload,
+    })
+
+
+# ==============================
+# Card: Verify (detailed grading)
+# ==============================
+# ==============================
+# Card: Verify (detailed grading)
+# ==============================
+@app.post("/api/verify")
+async def verify(
+    front: UploadFile = File(...),
+    back: UploadFile = File(...),
+    card_name: Optional[str] = Form(None),
+    card_set: Optional[str] = Form(None),
+    card_number: Optional[str] = Form(None),
+    card_year: Optional[str] = Form(None),
+    card_type: Optional[str] = Form(None),
+    set_code: Optional[str] = Form(None),
+):
+    """
+    AI-powered card pre-assessment using front + back images.
+    Returns detailed grading: corners/edges/surface front+back + per-corner notes + flags.
+    Market estimates are NOT computed here (click-only endpoint).
+    """
+    front_bytes = await front.read()
+    back_bytes = await back.read()
+
+    if (not front_bytes or not back_bytes or len(front_bytes) < 200 or len(back_bytes) < 200):
+        raise HTTPException(status_code=400, detail="Images are too small or empty")
+
+    # Canonicalize provided ID context (if any)
+    provided_name = _norm_ws(card_name or "")
+    provided_set = _norm_ws(card_set or "")
+    provided_num = _norm_num(card_number or "")
+    provided_year = _norm_ws(card_year or "")
+    provided_type = _norm_ws(card_type or "")
+    provided_code = _norm_ws(set_code or "").upper()
+
+    set_info = _canonicalize_set(provided_code, provided_set)
+
+    context = ""
+    if provided_name or set_info["set_name"] or provided_num or provided_year or provided_type or set_info["set_code"]:
+        context = "\n\nKNOWN/PROVIDED CARD DETAILS (use as hints, do not force if images contradict):\n"
+        if provided_name:
+            context += f"- Card Name: {provided_name}\n"
+        if set_info["set_name"]:
+            context += f"- Set Name: {set_info['set_name']}\n"
+        if set_info["set_code"]:
+            context += f"- Set Code: {set_info['set_code']}\n"
+        if provided_num:
+            context += f"- Card Number: {provided_num}\n"
+        if provided_year:
+            context += f"- Year: {provided_year}\n"
+        if provided_type:
+            context += f"- Type: {provided_type}\n"
+
+    prompt = f"""You are a professional trading card grader.
+
+Analyze BOTH images (front + back). Return ONLY valid JSON.
+
+You MUST provide:
+- Separate assessments for FRONT and BACK
+- Per-corner notes (top_left, top_right, bottom_left, bottom_right)
+- Separate edges and surface notes for front/back
+- Centering ratios for front/back (e.g. "55/45" and "60/40")
+- A clear, more detailed Assessment Summary (2-4 sentences) mentioning the specific issues you see.
+
+{context}
+
+Return JSON with this EXACT structure:
+
+{{
+  "pregrade": "estimated PSA-style grade 1-10 (e.g. 8, 9, 10)",
+  "confidence": 0.0-1.0,
+  "centering": {{
+    "front": {{"grade":"55/45","notes":"..."}},
+    "back":  {{"grade":"60/40","notes":"..."}}
+  }},
+  "corners": {{
+    "front": {{
+      "top_left": {{"condition":"sharp/minor_whitening/whitening/bend/ding","notes":"..."}},
+      "top_right": {{"condition":"...","notes":"..."}},
+      "bottom_left": {{"condition":"...","notes":"..."}},
+      "bottom_right": {{"condition":"...","notes":"..."}}
+    }},
+    "back": {{
+      "top_left": {{"condition":"...","notes":"..."}},
+      "top_right": {{"condition":"...","notes":"..."}},
+      "bottom_left": {{"condition":"...","notes":"..."}},
+      "bottom_right": {{"condition":"...","notes":"..."}}
+    }}
+  }},
+  "edges": {{
+    "front": {{"grade":"Mint/Near Mint/Excellent/Good/Poor","notes":"detailed notes"}},
+    "back":  {{"grade":"Mint/Near Mint/Excellent/Good/Poor","notes":"detailed notes"}}
+  }},
+  "surface": {{
+    "front": {{"grade":"Mint/Near Mint/Excellent/Good/Poor","notes":"detailed notes"}},
+    "back":  {{"grade":"Mint/Near Mint/Excellent/Good/Poor","notes":"detailed notes"}}
+  }},
+  "defects": [
+    "Each defect as a clear sentence with SIDE and location (e.g. 'BACK bottom-left corner: whitening')"
+  ],
+  "flags": [
+    "Short bullet flags for important issues (print line, holo scratches, whitening, edge chipping, dent, crease, stain, writing)"
+  ],
+  "assessment_summary": "2-4 sentence narrative. Mention front vs back differences and the biggest grade limiters.",
+  "observed_id": {{
+    "card_name": "best-effort from images",
+    "set_code": "best-effort from images (only if visible)",
+    "set_name": "best-effort from images",
+    "card_number": "best-effort from images",
+    "year": "best-effort from images",
+    "card_type": "Pokemon/Magic/YuGiOh/Sports/OnePiece/Other"
+  }}
+}}
+
+Important:
+- If something cannot be determined, use empty string "" or empty arrays.
+- Do not include market values in this endpoint.
+Respond ONLY with JSON."""
+
+    msg = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(front_bytes)}", "detail": "high"}},
+            {"type": "text", "text": "FRONT IMAGE ABOVE ☝️ | BACK IMAGE BELOW 👇"},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(back_bytes)}", "detail": "high"}},
+        ],
+    }]
+
+    result = await _openai_chat(msg, max_tokens=2200, temperature=0.1)
+    if result.get("error"):
+        return JSONResponse(content={
+            "pregrade": "Unable to assess",
+            "confidence": 0.0,
+            "centering": {"front": {"grade": "N/A", "notes": ""}, "back": {"grade": "N/A", "notes": ""}},
+            "corners": {"front": {}, "back": {}},
+            "edges": {"front": {"grade": "N/A", "notes": ""}, "back": {"grade": "N/A", "notes": ""}},
+            "surface": {"front": {"grade": "N/A", "notes": ""}, "back": {"grade": "N/A", "notes": ""}},
+            "defects": [],
+            "flags": [],
+            "assessment_summary": "Assessment failed.",
+            "observed_id": {"card_name": "", "set_code": "", "set_name": "", "card_number": "", "year": "", "card_type": ""},
+            "error": "AI grading failed"
+        })
+
+    data = _parse_json_or_none(result.get("content", "")) or {}
+
+    # Normalize observed ID with code map
+    obs = data.get("observed_id", {}) if isinstance(data.get("observed_id", {}), dict) else {}
+    obs_name = _norm_ws(str(obs.get("card_name", "")))
+    obs_type = _norm_ws(str(obs.get("card_type", "")))
+    obs_year = _norm_ws(str(obs.get("year", "")))
+    obs_num = _norm_num(str(obs.get("card_number", "")))
+    obs_code = _norm_ws(str(obs.get("set_code", ""))).upper()
+    obs_set = _norm_ws(str(obs.get("set_name", "")))
+    obs_set_info = _canonicalize_set(obs_code, obs_set)
+
+    canonical_id = {
+        "card_name": provided_name or obs_name,
+        "card_type": provided_type or obs_type,
+        "year": provided_year or obs_year,
+        "card_number": provided_num or obs_num,
+        "set_code": set_info["set_code"] or obs_set_info["set_code"],
+        "set_name": set_info["set_name"] or obs_set_info["set_name"],
+        "set_source": (set_info["set_source"] if (set_info["set_code"] or set_info["set_name"]) else obs_set_info["set_source"]),
+        "confidence": _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0),
+    }
+
+    # Normalize pregrade to a simple "1"-"10" string for downstream DB consistency
+    raw_pregrade = str(data.get("pregrade", "")).strip()
+    m_pg = re.search(r"(10|[1-9])", raw_pregrade)
+    pregrade_norm = m_pg.group(1) if m_pg else (str(_grade_bucket(raw_pregrade) or "") if raw_pregrade else "")
+    return JSONResponse(content={
+        "pregrade": pregrade_norm or "N/A",
+        "confidence": _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0),
+        "centering": data.get("centering", {"front": {"grade": "", "notes": ""}, "back": {"grade": "", "notes": ""}}),
+        "corners": data.get("corners", {"front": {}, "back": {}}),
+        "edges": data.get("edges", {"front": {"grade": "", "notes": ""}, "back": {"grade": "", "notes": ""}}),
+        "surface": data.get("surface", {"front": {"grade": "", "notes": ""}, "back": {"grade": "", "notes": ""}}),
+        "defects": data.get("defects", []) if isinstance(data.get("defects", []), list) else [],
+        "flags": data.get("flags", []) if isinstance(data.get("flags", []), list) else [],
+        "assessment_summary": _norm_ws(str(data.get("assessment_summary", ""))),
+        "observed_id": {
+            "card_name": obs_name,
+            "card_type": obs_type,
+            "year": obs_year,
+            "card_number": obs_num,
+            "set_code": obs_set_info["set_code"],
+            "set_name": obs_set_info["set_name"],
+            "set_source": obs_set_info["set_source"],
+        },
+        "canonical_id": canonical_id,
+        "verify_token": f"vfy_{secrets.token_urlsafe(12)}",
+        "market_context_mode": "click_only",
+    })
+
+
+# ==============================
+# Market Context (Click-only, resilient)
+# ==============================
+_PRICE_RE = re.compile(r"(?P<cur>AU\$|A\$|US\$|\$)?\s*(?P<num>[0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)")
+
+
+def _extract_prices(text: str) -> List[Tuple[float, str]]:
+    out: List[Tuple[float, str]] = []
+    for m in _PRICE_RE.finditer(text or ""):
+        cur = (m.group("cur") or "").strip()
+        num = m.group("num")
+        try:
+            val = float(num.replace(",", ""))
+        except Exception:
+            continue
+        if 0.5 <= val <= 500000:
+            out.append((val, cur or ""))
+    return out
+
+
+def _trim_outliers(values: List[float]) -> List[float]:
+    if len(values) < 6:
+        return values
+    v = sorted(values)
+    k = max(1, len(v) // 10)
+    trimmed = v[k:-k] if len(v) > 2 * k else v
+    return trimmed if trimmed else v
+
+
+async def _fetch_html(url: str) -> str:
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.get(url, headers={"User-Agent": UA}, follow_redirects=True)
+        if r.status_code != 200:
+            return ""
+        return r.text or ""
+
+
+async def _search_ebay_sold_prices(query: str, negate_terms: Optional[List[str]] = None, limit: int = 25) -> Dict[str, Any]:
+    negate_terms = negate_terms or []
+    q = query.strip()
+    for t in negate_terms:
+        if t:
+            q += f" -{t}"
+    encoded = q.replace(" ", "+")
+    url = f"https://{EBAY_DOMAIN}/sch/i.html?_nkw={encoded}&_sacat=0&LH_Sold=1&LH_Complete=1&_sop=13"
+
+    html = await _fetch_html(url)
+    if not html:
+        return {"prices": [], "currency": "", "sample_size": 0, "url": url, "query": query}
+
+    soup = BeautifulSoup(html, "html.parser")
+    price_spans = soup.find_all("span", class_=re.compile(r"s-item__price"))
+    prices: List[float] = []
+    currencies: List[str] = []
+
+    for span in price_spans[: max(10, limit)]:
+        txt = span.get_text(" ", strip=True)
+        for val, cur in _extract_prices(txt):
+            prices.append(val)
+            currencies.append(cur)
+
+    currency = ""
+    if currencies:
+        au_count = sum(1 for c in currencies if c in ("AU$", "A$"))
+        us_count = sum(1 for c in currencies if c == "US$")
+        if au_count >= max(1, len(currencies) // 3):
+            currency = "AUD"
+        elif us_count >= max(1, len(currencies) // 3):
+            currency = "USD"
+
+    prices = [p for p in prices if 1 < p < 500000][:limit]
+
+    return {"prices": prices, "currency": currency, "sample_size": len(prices), "url": url, "query": query}
+
+
+async def _tcgplayer_raw_anchor(card_name: str, card_set: Optional[str]) -> Dict[str, Any]:
+    if not POKEMONTCG_API_KEY:
+        return {"prices": [], "currency": "USD", "sample_size": 0}
+
+    try:
+        headers = {"X-Api-Key": POKEMONTCG_API_KEY}
+        q = f"name:{card_name}"
+        if card_set:
+            q += f" set.name:{card_set}"
+        url = f"https://api.pokemontcg.io/v2/cards?q={q}"
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(url, headers=headers)
+            if r.status_code != 200:
+                return {"prices": [], "currency": "USD", "sample_size": 0}
+            data = r.json()
+            cards = data.get("data") or []
+            if not cards:
+                return {"prices": [], "currency": "USD", "sample_size": 0}
+            card = cards[0]
+            prices = card.get("tcgplayer", {}).get("prices", {}) or {}
+            out: List[float] = []
+            for k in ("normal", "holofoil", "reverseHolofoil"):
+                if k in prices:
+                    v = prices[k].get("market")
+                    if v:
+                        out.append(float(v))
+            return {"prices": out, "currency": "USD", "sample_size": len(out)}
+    except Exception:
+        return {"prices": [], "currency": "USD", "sample_size": 0}
+
+
+def _market_trend_from_recent(prices: List[float]) -> str:
+    if len(prices) < 10:
+        return "insufficient_data"
+    recent = prices[:5]
+    older = prices[-5:]
+    r = mean(recent) if recent else 0
+    o = mean(older) if older else 0
+    if o <= 0:
+        return "insufficient_data"
+    change = (r - o) / o
+    if change > 0.10:
+        return "increasing"
+    if change < -0.10:
+        return "decreasing"
+    return "stable"
+
+
+def _liquidity_label(n: int) -> str:
+    if n >= 25:
+        return "high"
+    if n >= 10:
+        return "moderate"
+    if n >= 5:
+        return "thin"
+    if n >= 2:
+        return "very_thin"
+    return "insufficient"
+
+
+def _stats(values: List[float]) -> Dict[str, Any]:
+    if not values:
+        return {"avg": 0, "median": 0, "low": 0, "high": 0, "sample_size": 0}
+    trimmed = _trim_outliers(values)
+    return {
+        "avg": round(mean(trimmed), 2) if trimmed else 0,
+        "median": round(median(trimmed), 2) if trimmed else 0,
+        "low": round(min(values), 2),
+        "high": round(max(values), 2),
+        "sample_size": len(values),
+    }
+
+
+def _build_query_ladder(card_name: str, set_name: str, set_code: str, card_number: str, card_type: str) -> List[str]:
+    """
+    Build multiple query variants from strict -> relaxed.
+    """
+    name = _norm_ws(card_name)
+    sn = _norm_ws(set_name)
+    sc = (set_code or "").strip().upper()
+    num = _norm_num(card_number)
+    t = _norm_ws(card_type)
+
+    variants: List[str] = []
+    # Strict
+    base_parts = [name]
+    if sn and sn.lower() not in name.lower():
+        base_parts.append(sn)
+    if num:
+        base_parts.append(num)
+    variants.append(" ".join([p for p in base_parts if p]))
+
+    # Code-based
+    if sc:
+        parts = [name, sc]
+        if num:
+            parts.append(num)
+        variants.append(" ".join(parts))
+
+    # Relaxed set name (no number)
+    if sn:
+        variants.append(" ".join([name, sn]))
+
+    # Relaxed code (no number)
+    if sc:
+        variants.append(" ".join([name, sc]))
+
+    # Name only + type hint
+    if t and t.lower() not in name.lower():
+        variants.append(" ".join([name, t]))
+    variants.append(name)
+
+    # De-dupe preserving order
+    out: List[str] = []
+    seen = set()
+    for q in variants:
+        qn = _norm_ws(q)
+        if qn and qn.lower() not in seen:
+            out.append(qn)
+            seen.add(qn.lower())
+    return out
+
+
+async def _gather_market_samples(query_ladder: List[str]) -> Dict[str, Any]:
+    """
+    Try multiple query strings until we have at least some usable samples.
+    Returns raw + graded samples and meta urls for transparency.
+    """
+    meta_urls: Dict[str, str] = {}
+    used_query = ""
+    raw_prices: List[float] = []
+    raw_currency = ""
+    graded_prices: Dict[str, List[float]] = {"10": [], "9": [], "8": []}
+
+    # Thresholds: allow "something" (futureproof UX) but label liquidity accordingly.
+    target_raw = 3
+    target_graded_each = 2  # lower than before
+
+    for q in query_ladder:
+        used_query = q
+        # raw
+        raw_res = await _search_ebay_sold_prices(q, negate_terms=["graded", "psa", "bgs", "cgc", "slab"], limit=30)
+        meta_urls[f"ebay_raw::{q}"] = raw_res.get("url", "")
+        if raw_res["prices"]:
+            raw_prices = raw_res["prices"]
+            raw_currency = raw_res.get("currency", "") or raw_currency
+
+        # graded attempts (PSA 10/9/8)
+        for grade in ("10", "9", "8"):
+            gr_res = await _search_ebay_sold_prices(f"{q} PSA {grade}", negate_terms=[], limit=20)
+            meta_urls[f"ebay_psa_{grade}::{q}"] = gr_res.get("url", "")
+            if gr_res["prices"]:
+                graded_prices[grade] = gr_res["prices"]
+
+        # Stop early if we have enough
+        ok_raw = len(raw_prices) >= target_raw
+        ok_graded = sum(1 for g in ("10", "9", "8") if len(graded_prices[g]) >= target_graded_each) >= 2
+        if ok_raw or ok_graded:
+            break
+
+    return {
+        "used_query": used_query,
+        "raw_prices": raw_prices,
+        "raw_currency": raw_currency,
+        "graded_prices": graded_prices,
+        "meta_urls": meta_urls,
+    }
+
+
+
+@app.post("/api/market-context")
+async def market_context(
+    card_name: str = Form(...),
+    predicted_grade: str = Form(...),
+    confidence: float = Form(0.0),
+    card_number: Optional[str] = Form(None),
+    card_set: Optional[str] = Form(None),
+    set_code: Optional[str] = Form(None),
+    card_type: Optional[str] = Form(None),
+    grading_cost: float = Form(55.0),
+):
+    """
+    Click-only market context endpoint.
+
+    For Pokemon cards, this endpoint ALSO uses PokemonTCG.io to fetch:
+    - authoritative card metadata (hi-res images, set info)
+    - TCGplayer + Cardmarket price objects (when available)
+
+    eBay sold/completed remains as "observed recent sales" context.
+    """
+    clean_name = _norm_ws(card_name)
+    clean_set = _norm_ws(card_set or "")
+    clean_code = _norm_ws(set_code or "").upper()
+    clean_number = _norm_num(card_number or "")
+    clean_type = _norm_ws(card_type or "")
+
+    # Apply code map
+    set_info = _canonicalize_set(clean_code, clean_set)
+
+    conf = _clamp(_safe_float(confidence, 0.0), 0.0, 1.0)
+    g = _grade_bucket(predicted_grade) or 9
+
+    query_ladder = _build_query_ladder(
+        card_name=clean_name,
+        set_name=set_info["set_name"],
+        set_code=set_info["set_code"],
+        card_number=clean_number,
+        card_type=clean_type,
+    )
+
+    # Gather eBay samples via ladder
+    gathered = await _gather_market_samples(query_ladder)
+    used_query = gathered["used_query"]
+    raw_prices = gathered["raw_prices"]
+    raw_currency = gathered["raw_currency"]
+    graded_prices = gathered["graded_prices"]
+    meta_urls = gathered["meta_urls"]
+
+    sources: List[str] = []
+    if raw_prices or any(graded_prices.get(k) for k in ("10", "9", "8")):
+        sources.append("eBay (sold/completed)")
+
+    # PokemonTCG authoritative details + price anchors (Pokemon cards only)
+    pokemontcg_card: Optional[Dict[str, Any]] = None
+    pokemontcg_id: str = ""
+    ptcg_prices: Optional[Dict[str, Any]] = None
+    anchor_prices: List[float] = []
+    anchor_currencies: List[str] = []
+    anchor_currency: str = ""
+
+    if POKEMONTCG_API_KEY and ("pokemon" in clean_type.lower()):
+        pokemontcg_id = await _pokemontcg_resolve_card_id(
+            card_name=clean_name,
+            set_code=set_info["set_code"],
+            card_number=clean_number,
+            set_name=set_info["set_name"],
+        )
+        if pokemontcg_id:
+            pokemontcg_card = await _pokemontcg_card_by_id(pokemontcg_id)
+            ptcg_prices = _pokemontcg_extract_prices(pokemontcg_card or {})
+            anchor_prices = (ptcg_prices.get("anchor_values") or [])
+            anchor_currencies = (ptcg_prices.get("currencies") or [])
+            anchor_currency = anchor_currencies[0] if anchor_currencies else "USD"
+            sources.append("PokemonTCG API (details + prices)")
+
+    # Decide availability: if ANY samples exist, return available with liquidity label
+    has_any = bool(raw_prices) or any(len(v) > 0 for v in graded_prices.values()) or bool(anchor_prices)
+    if not has_any:
+        return JSONResponse(content={
+            "available": False,
+            "mode": "click_only",
+            "card": {
+                "name": clean_name,
+                "set": set_info["set_name"],
+                "set_code": set_info["set_code"],
+                "number": clean_number,
+                "type": clean_type,
+            },
+            "query_ladder": query_ladder,
+            "used_query": used_query,
+            "message": "No market samples found from the available sources for this item. Try adjusting the set name/code or card number.",
+            "sources": sources,
+            "pokemontcg": {"id": pokemontcg_id} if pokemontcg_id else None,
+            "meta": {"urls": meta_urls},
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "disclaimer": "Informational market context only. Not financial advice."
+        })
+
+    raw_stats = _stats(raw_prices)
+    anchor_stats = _stats(anchor_prices)
+    graded_stats: Dict[str, Any] = {k: _stats(v) for k, v in graded_prices.items() if v}
+
+    # Choose baseline:
+    # 1) eBay raw median/avg if enough samples
+    # 2) PokemonTCG price anchor if present
+    raw_baseline = 0.0
+    if raw_stats["sample_size"] >= 2:
+        raw_baseline = raw_stats["median"] or raw_stats["avg"]
+    elif anchor_stats["sample_size"] >= 1:
+        raw_baseline = anchor_stats["median"] or anchor_stats["avg"]
+
+    trend = _market_trend_from_recent(raw_prices) if raw_prices else "insufficient_data"
+    liquidity = _liquidity_label(max(raw_stats["sample_size"], anchor_stats["sample_size"]))
+
+    dist = _grade_distribution(g, conf)
+    expected_value = None
+
+    # Expected value only if we have at least SOME graded pricing
+    if graded_stats:
+        expected_value = 0.0
+        for grade, p in dist.items():
+            st = graded_stats.get(grade)
+            if not st:
+                continue
+            val = (st["median"] if st["sample_size"] < 10 else st["avg"]) or st["avg"] or 0.0
+            expected_value += p * val
+        expected_value = round(expected_value, 2) if expected_value > 0 else None
+
+    value_difference = None
+    if expected_value is not None and raw_baseline:
+        value_difference = round(expected_value - raw_baseline - float(grading_cost or 0.0), 2)
+
+    # Sensitivity PSA10 vs PSA9
+    sensitivity = "unknown"
+    if "10" in graded_stats and "9" in graded_stats and graded_stats["10"]["sample_size"] >= 2 and graded_stats["9"]["sample_size"] >= 2:
+        p10 = graded_stats["10"]["median"] or graded_stats["10"]["avg"]
+        p9 = graded_stats["9"]["median"] or graded_stats["9"]["avg"]
+        if p9 and p10:
+            ratio = p10 / p9
+            if ratio >= 1.8:
+                sensitivity = "very_high"
+            elif ratio >= 1.3:
+                sensitivity = "high"
+            elif ratio >= 1.1:
+                sensitivity = "moderate"
+            else:
+                sensitivity = "low"
+
+    currency = raw_currency or (anchor_currency if anchor_prices else "") or "unknown"
+
+    # Confidence label based on sample sizes
+    sample_total = raw_stats["sample_size"] + sum(st["sample_size"] for st in graded_stats.values()) + anchor_stats["sample_size"]
+    confidence_label = "high" if sample_total >= 20 else "moderate" if sample_total >= 8 else "low"
+
+    # Build PokemonTCG output (optional)
+    pokemontcg_out = None
+    if pokemontcg_id and pokemontcg_card:
+        pokemontcg_out = {
+            "id": pokemontcg_id,
+            "name": pokemontcg_card.get("name", ""),
+            "number": pokemontcg_card.get("number", ""),
+            "rarity": pokemontcg_card.get("rarity", ""),
+            "set": pokemontcg_card.get("set", {}) or {},
+            "images": pokemontcg_card.get("images", {}) or {},
+            "prices": ptcg_prices,
+        }
+
+    return JSONResponse(content={
+        "available": True,
+        "mode": "click_only",
+        "confidence": confidence_label,
+        "card": {
+            "name": clean_name,
+            "set": set_info["set_name"],
+            "set_code": set_info["set_code"],
+            "number": clean_number,
+            "type": clean_type,
+        },
+        "query_ladder": query_ladder,
+        "used_query": used_query,
+        "observed": {
+            "currency": currency,
+            "raw": raw_stats,
+            "pokemon_prices_anchor": anchor_stats if anchor_stats["sample_size"] else None,
+            "graded_psa": graded_stats,
+            "trend": trend,
+            "liquidity": liquidity,
+        },
+        "grade_impact": {
+            "predicted_grade": str(g),
+            "confidence_input": conf,
+            "grade_distribution": dist,
+            "expected_graded_value": expected_value,
+            "raw_baseline_value": round(raw_baseline, 2) if raw_baseline else None,
+            "grading_cost": round(float(grading_cost or 0.0), 2),
+            "estimated_value_difference": value_difference,
+            "sensitivity": sensitivity,
+        },
+        "pokemontcg": pokemontcg_out,
+        "sources": sources,
+        "meta": {"urls": meta_urls},
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "disclaimer": "Informational market context only. Figures are based on observed recent sales and/or third‑party price anchors and may vary. This is not financial advice or a guarantee of outcome."
+    })
+
+
+# Legacy alias
+# Legacy alias
+@app.post("/api/market-intelligence")
+async def market_intelligence_alias(
+    card_name: str = Form(...),
+    predicted_grade: str = Form(...),
+    confidence: float = Form(0.0),
+    card_number: Optional[str] = Form(None),
+    card_set: Optional[str] = Form(None),
+    set_code: Optional[str] = Form(None),
+    card_type: Optional[str] = Form(None),
+    grading_cost: float = Form(55.0),
+):
+    res = await market_context(
+        card_name=card_name,
+        predicted_grade=predicted_grade,
+        confidence=confidence,
+        card_number=card_number,
+        card_set=card_set,
+        set_code=set_code,
+        card_type=card_type,
+        grading_cost=grading_cost,
+    )
+    if isinstance(res, JSONResponse):
+        payload = json.loads(res.body.decode("utf-8"))
+        payload["deprecated"] = True
+        payload["deprecated_message"] = "Use /api/market-context (click-only) instead."
+        return JSONResponse(content=payload, status_code=res.status_code)
+    return res
 
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 10000))
+    port = int(os.getenv("PORT", "10000"))
     uvicorn.run("main:app", host="0.0.0.0", port=port)
