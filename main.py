@@ -1,15 +1,21 @@
 """
 The Collectors League Australia — Scan API
-Futureproof v6 (2026-01-31)
+Futureproof v6.2.2 (2026-01-31)
 
-Goals:
-- Canonical identification object (stable IDs)
-- Set-code aware identification (e.g., PFL -> Phantasmal Flames)
-- Richer grading detail (front/back + per-corner breakdown + detailed flags)
-- Click-only Market Context that is resilient (multi-pass query ladder + never "nothing" if any samples exist)
-- No financial advice framing; informational context only.
+Key fixes in this build:
+- CORS fixed (single middleware, configurable origins; works with WordPress fetch)
+- PokémonTCG.io integration strengthened:
+  - Resolve SET from set code via /v2/sets?q=ptcgoCode:XXX
+  - Resolve CARD via /v2/cards using set.id + number (handles leading zeros) + name ladder
+  - If set_name is missing, it is filled from PokémonTCG data (authoritative)
+- Card number handling:
+  - Keeps leading zeros for display ("006/165")
+  - Uses BOTH "006" and "6" variants when querying PokémonTCG
+- Market context:
+  - PokémonTCG price anchors (TCGplayer/Cardmarket via PokémonTCG API) are the primary source
+  - eBay scraping is OPTIONAL and OFF by default (ENABLE_EBAY=1 to turn on)
 
-NOTE: This file expects these dependencies in requirements.txt:
+Dependencies (requirements.txt):
 fastapi, uvicorn[standard], python-multipart, httpx, beautifulsoup4, lxml
 """
 
@@ -33,55 +39,67 @@ from bs4 import BeautifulSoup
 # ==============================
 app = FastAPI(title="Collectors League Scan API")
 
-# CORS: allow your site(s) to call Render directly.
-# (If you later proxy through WordPress via admin-ajax, you can tighten this further.)
-ALLOWED_ORIGINS = [
+APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-01-31-v6.2.2")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+POKEMONTCG_BASE = "https://api.pokemontcg.io/v2"
+
+# Market sources toggles
+ENABLE_EBAY = os.getenv("ENABLE_EBAY", "0").strip() in ("1", "true", "TRUE", "yes", "YES")
+
+# eBay region: AU by default (only if ENABLE_EBAY=1)
+EBAY_DOMAIN = os.getenv("EBAY_DOMAIN", "www.ebay.com.au").strip() or "www.ebay.com.au"
+
+UA = os.getenv(
+    "UA",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
+
+# ---- CORS ----
+# WordPress fetch does NOT need credentials here, so keep allow_credentials=False.
+# Provide allowed origins via env CL_ALLOWED_ORIGINS (comma-separated).
+# Default to your domains + localhost for testing; fallback to "*" if you prefer.
+_default_origins = [
     "https://collectors-league.com",
     "https://www.collectors-league.com",
+    "http://localhost",
+    "http://localhost:3000",
 ]
+origins_env = os.getenv("CL_ALLOWED_ORIGINS", "").strip()
+if origins_env:
+    allowed_origins = [o.strip() for o in origins_env.split(",") if o.strip()]
+else:
+    allowed_origins = _default_origins
+
+# If you really want wildcard CORS (not recommended generally), set CL_CORS_WILDCARD=1
+if os.getenv("CL_CORS_WILDCARD", "0").strip() in ("1", "true", "TRUE", "yes", "YES"):
+    allowed_origins = ["*"]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=False,  # keep False unless you are using cookies/sessions across domains
+    allow_origins=allowed_origins,
+    allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS", "HEAD"],
     allow_headers=["*"],
 )
 
-APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-01-31-v6.2.1")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
-
-POKEMONTCG_BASE = "https://api.pokemontcg.io/v2"
-
-# eBay region: AU by default
-EBAY_DOMAIN = os.getenv("EBAY_DOMAIN", "www.ebay.com.au").strip() or "www.ebay.com.au"
-
-# If you want to completely disable eBay scraping (recommended for stability), set:
-#   EBAY_ENABLED=0
-EBAY_ENABLED = os.getenv("EBAY_ENABLED", "1").strip() not in ("0", "false", "False", "no", "NO")
-
-# By default we DO NOT use eBay for Pokemon (PokemonTCG provides authoritative prices + images).
-# If you want it back for Pokemon, set:
-#   USE_EBAY_FOR_POKEMON=1
-USE_EBAY_FOR_POKEMON = os.getenv("USE_EBAY_FOR_POKEMON", "0").strip() in ("1", "true", "True", "yes", "YES")
-
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-
 if not OPENAI_API_KEY:
     print("WARNING: OPENAI_API_KEY not set!")
+if not POKEMONTCG_API_KEY:
+    print("WARNING: POKEMONTCG_API_KEY not set! (Pokémon lookups will be skipped)")
 
 # ==============================
-# Set Code Mapping (expand over time)
+# Set Code Mapping (optional overrides)
 # ==============================
-# Keep this conservative: only include codes you are certain about.
-# You can expand this safely as you see more items.
+# You can keep this small. PokémonTCG lookup should now fill set_name anyway.
 SET_CODE_MAP: Dict[str, str] = {
-    # Examples (replace/expand with your real catalog)
-    "PFL": "Phantasmal Flames",
+    # Examples only (safe to delete if you like)
     "OBF": "Obsidian Flames",
     "SVI": "Scarlet & Violet",
     "BS": "Base Set",
+    # NOTE: MEW is a PTCGO code for Pokémon 151; API will now resolve it via /sets.
 }
 
 # ==============================
@@ -133,58 +151,68 @@ def _norm_ws(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
 
-def _norm_printed_card_number(s: str) -> str:
+def _num_parts(raw: str) -> Tuple[str, str]:
     """
-    IMPORTANT: preserve the printed card number exactly as it appears on the card,
-    including leading zeros. Examples:
-      - '004/120' stays '004/120'
-      - '#004/120' -> '004/120'
-      - '  004  ' -> '004'
+    Split number like '006/165' into ('006', '165') and keep formatting.
+    If no '/', returns (raw, '').
     """
-    s = (s or "").strip().replace("#", "").strip()
-    # normalize whitespace but do NOT strip leading zeros
-    s = re.sub(r"\s+", "", s)  # card numbers should not have spaces
-    return s
-
-
-def _num_for_pokemontcg_query(printed: str) -> str:
-    """
-    PokemonTCG API typically stores number as '4' not '004/120'.
-    Convert printed number to best query number:
-      - '004/120' -> '4'
-      - '004' -> '4'
-      - '4/120' -> '4'
-    """
-    s = _norm_printed_card_number(printed)
-    if not s:
-        return ""
+    s = (raw or "").strip().replace("#", "").strip()
     if "/" in s:
-        s = s.split("/", 1)[0]
-    s = s.lstrip("0") or "0"
-    return s
+        a, b = s.split("/", 1)
+        return (a.strip(), b.strip())
+    return (s, "")
+
+
+def _num_display(raw: str) -> str:
+    """Keep leading zeros for display. '006/165' stays '006/165'."""
+    a, b = _num_parts(raw)
+    if b:
+        return f"{a}/{b}"
+    return a
+
+
+def _num_strip_leading_zeros(raw: str) -> str:
+    """
+    Strip leading zeros only from the FIRST part for matching on some data sources.
+    '006/165' -> '6/165', '004' -> '4'
+    """
+    a, b = _num_parts(raw)
+    a2 = a.lstrip("0") or "0"
+    if b:
+        return f"{a2}/{b}"
+    return a2
+
+
+def _num_variants(raw: str) -> List[str]:
+    """
+    Provide both display and normalized variants to maximize match probability.
+    Example: '006/165' -> ['006/165','6/165','006','6']
+    """
+    disp = _num_display(raw)
+    norm = _num_strip_leading_zeros(raw)
+    a_disp, b_disp = _num_parts(disp)
+    a_norm, b_norm = _num_parts(norm)
+    variants = []
+    for v in (disp, norm):
+        if v and v not in variants:
+            variants.append(v)
+    # also include just the first part variants
+    for v in (a_disp, a_norm):
+        if v and v not in variants:
+            variants.append(v)
+    return variants
 
 
 async def _openai_chat(messages: List[Dict[str, Any]], max_tokens: int = 1200, temperature: float = 0.1) -> Dict[str, Any]:
     """
-    Unified OpenAI Chat Completions call for text+image content payloads.
+    OpenAI Chat Completions call for text+image.
     """
     if not OPENAI_API_KEY:
         raise HTTPException(status_code=500, detail="OpenAI API key not configured")
 
     url = "https://api.openai.com/v1/chat/completions"
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    payload = {
-        "model": model,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    }
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    payload = {"model": OPENAI_MODEL, "messages": messages, "max_tokens": max_tokens, "temperature": temperature}
 
     try:
         async with httpx.AsyncClient(timeout=90.0) as client:
@@ -199,7 +227,7 @@ async def _openai_chat(messages: List[Dict[str, Any]], max_tokens: int = 1200, t
 
 
 def _grade_bucket(predicted_grade: str) -> Optional[int]:
-    m = re.search(r"(\d{1,2})", (predicted_grade or "").strip())
+    m = re.search(r"(10|[1-9])", (predicted_grade or "").strip())
     if not m:
         return None
     g = int(m.group(1))
@@ -209,9 +237,6 @@ def _grade_bucket(predicted_grade: str) -> Optional[int]:
 
 
 def _grade_distribution(predicted_grade: int, confidence: float) -> Dict[str, float]:
-    """
-    Conservative distribution over grades {10,9,8} around predicted_grade.
-    """
     c = _clamp(confidence, 0.05, 0.95)
     p_pred = 0.45 + 0.50 * c
     remainder = 1.0 - p_pred
@@ -223,9 +248,7 @@ def _grade_distribution(predicted_grade: int, confidence: float) -> Dict[str, fl
     else:
         dist = {"10": remainder * 0.10, "9": remainder * 0.30, "8": p_pred + remainder * 0.60}
 
-    total = sum(dist.values())
-    if total <= 0:
-        return {"10": 0.0, "9": 0.0, "8": 0.0}
+    total = sum(dist.values()) or 1.0
     for k in dist:
         dist[k] = round(dist[k] / total, 4)
     return dist
@@ -255,7 +278,6 @@ def _canonicalize_set(set_code: Optional[str], set_name: Optional[str]) -> Dict[
 # PokemonTCG.io helpers (authoritative card data + prices)
 # ==============================
 async def _pokemontcg_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """GET helper for PokemonTCG API. `path` may be full URL or relative like '/cards'."""
     if not POKEMONTCG_API_KEY:
         return {}
     url = path if path.startswith("http") else f"{POKEMONTCG_BASE}{path}"
@@ -270,71 +292,135 @@ async def _pokemontcg_get(path: str, params: Optional[Dict[str, Any]] = None) ->
         return {}
 
 
-async def _pokemontcg_set_by_ptcgo_code(ptcgo_code: str) -> Dict[str, Any]:
-    """Resolve set by ptcgoCode so we can query by set.id when available (more precise)."""
+async def _pokemontcg_resolve_set_by_code(ptcgo_code: str) -> Dict[str, Any]:
+    """
+    Resolve set object using /sets endpoint from ptcgoCode.
+    Returns dict: {"id","name","series","ptcgoCode","printedTotal","total"} (best-effort).
+    """
     code = (ptcgo_code or "").strip().upper()
     if not code:
         return {}
     data = await _pokemontcg_get("/sets", params={"q": f"ptcgoCode:{code}", "pageSize": 5})
     sets = data.get("data") or []
-    if sets:
-        return sets[0]
+    if not sets:
+        return {}
+    # Prefer exact ptcgoCode match if multiple
+    for s in sets:
+        if str(s.get("ptcgoCode", "")).strip().upper() == code:
+            return s
+    return sets[0]
+
+
+async def _pokemontcg_resolve_set_by_name(set_name: str) -> Dict[str, Any]:
+    name = _norm_ws(set_name)
+    if not name:
+        return {}
+    # Exact phrase match first, then relaxed
+    for q in (f'set.name:"{name}"', f'set.name:{name}'):
+        data = await _pokemontcg_get("/sets", params={"q": q, "pageSize": 5})
+        sets = data.get("data") or []
+        if sets:
+            return sets[0]
     return {}
 
 
-async def _pokemontcg_resolve_card_id(card_name: str, set_code: str, card_number_printed: str, set_name: str = "") -> str:
+def _ptcg_escape_phrase(s: str) -> str:
+    # very small sanitizer to avoid breaking the q string; PokémonTCG is fairly forgiving
+    return (s or "").replace('"', '\\"')
+
+
+async def _pokemontcg_resolve_card_id(
+    card_name: str,
+    set_code: str,
+    card_number: str,
+    set_name: str = ""
+) -> Tuple[str, Dict[str, Any]]:
     """
-    Resolve most likely PokemonTCG card id using a query ladder + set lookup.
-    IMPORTANT: Uses a derived number for PokemonTCG query (e.g. '004/120' -> '4')
-    but does NOT mutate the printed number stored in your system.
+    Resolve most likely PokemonTCG card id using a query ladder.
+    Returns (card_id, best_set_obj).
+    Strategy:
+    1) Resolve set via ptcgoCode (set_code) -> set.id
+    2) Query cards with set.id + number variants (handles leading zeros)
+    3) If that fails, query with set.name + number/name
+    4) Fallback to name-only
     """
     name = _norm_ws(card_name)
     sc = (set_code or "").strip().upper()
     sn = _norm_ws(set_name or "")
+    num_disp = _num_display(card_number or "")
+    num_variants = _num_variants(card_number or "")
 
-    printed = _norm_printed_card_number(card_number_printed or "")
-    qnum = _num_for_pokemontcg_query(printed)
+    set_obj = {}
+    set_id = ""
 
-    # If we have a set code, try to get set.id first (most precise)
-    set_obj = await _pokemontcg_set_by_ptcgo_code(sc) if sc else {}
-    set_id = str(set_obj.get("id", "")) if isinstance(set_obj, dict) else ""
+    if sc:
+        set_obj = await _pokemontcg_resolve_set_by_code(sc)
+        set_id = str(set_obj.get("id", "") or "").strip()
+
+    # If we don't have set from code but do have set name, try resolve it too
+    if not set_id and sn:
+        set_obj = await _pokemontcg_resolve_set_by_name(sn)
+        set_id = str(set_obj.get("id", "") or "").strip()
 
     queries: List[str] = []
-    if set_id and qnum:
-        queries.append(f"set.id:{set_id} number:{qnum}")
-    if sc and qnum:
-        queries.append(f"set.ptcgoCode:{sc} number:{qnum}")
-    if name and qnum and set_id:
-        queries.append(f'name:"{name}" set.id:{set_id} number:{qnum}')
-    if name and qnum and sn:
-        queries.append(f'name:"{name}" number:{qnum} set.name:"{sn}"')
-    if name and qnum:
-        queries.append(f'name:"{name}" number:{qnum}')
-    if name and set_id:
-        queries.append(f'name:"{name}" set.id:{set_id}')
-    if name and sn:
-        queries.append(f'name:"{name}" set.name:"{sn}"')
-    if name:
-        queries.append(f'name:"{name}"')
 
+    # ---- Strict: set.id + number (try both "006" and "6") ----
+    if set_id and num_variants:
+        # Build OR clause for number variants. Use quoted values to preserve leading zeros.
+        # Example: (number:"006" OR number:"6" OR number:"006/165" OR number:"6/165")
+        ors = " OR ".join([f'number:"{_ptcg_escape_phrase(v)}"' for v in num_variants])
+        queries.append(f"set.id:{set_id} ({ors})")
+
+    # Strict + name
+    if set_id and name and num_variants:
+        ors = " OR ".join([f'number:"{_ptcg_escape_phrase(v)}"' for v in num_variants])
+        queries.append(f'set.id:{set_id} name:"{_ptcg_escape_phrase(name)}" ({ors})')
+
+    # ---- Next: set.name + number ----
+    if sn and num_variants:
+        ors = " OR ".join([f'number:"{_ptcg_escape_phrase(v)}"' for v in num_variants])
+        queries.append(f'set.name:"{_ptcg_escape_phrase(sn)}" ({ors})')
+
+    if sn and name and num_variants:
+        ors = " OR ".join([f'number:"{_ptcg_escape_phrase(v)}"' for v in num_variants])
+        queries.append(f'set.name:"{_ptcg_escape_phrase(sn)}" name:"{_ptcg_escape_phrase(name)}" ({ors})')
+
+    # ---- Next: name + number only ----
+    if name and num_variants:
+        ors = " OR ".join([f'number:"{_ptcg_escape_phrase(v)}"' for v in num_variants])
+        queries.append(f'name:"{_ptcg_escape_phrase(name)}" ({ors})')
+
+    # ---- Fallback: name only ----
+    if name:
+        queries.append(f'name:"{_ptcg_escape_phrase(name)}"')
+        queries.append(f"name:{name}")
+
+    # Execute ladder
     for q in queries:
         data = await _pokemontcg_get("/cards", params={"q": q, "pageSize": 10, "orderBy": "number"})
-        cards = (data.get("data") or [])
+        cards = data.get("data") or []
         if not cards:
             continue
 
-        # Prefer exact number match when we have it
-        if qnum:
+        # Prefer exact number match (using our variants) if possible
+        if num_variants:
+            num_set = set(v.lower() for v in num_variants if v)
             for c in cards:
-                if str(c.get("number", "")).strip() == qnum:
-                    return str(c.get("id", "")) or ""
-        return str(cards[0].get("id", "")) or ""
+                cnum = str(c.get("number", "") or "").strip()
+                if cnum and cnum.lower() in num_set:
+                    return (str(c.get("id", "")) or "", set_obj or (c.get("set", {}) or {}))
 
-    return ""
+        # Otherwise take first result
+        best = cards[0]
+        # If we didn't have a set object, capture it from the card
+        if not set_obj and isinstance(best.get("set", {}), dict):
+            set_obj = best.get("set", {}) or {}
+        return (str(best.get("id", "")) or "", set_obj)
+
+    return ("", set_obj)
 
 
 async def _pokemontcg_card_by_id(card_id: str) -> Dict[str, Any]:
-    """Authoritative card record: GET /cards/<id>"""
     if not card_id:
         return {}
     data = await _pokemontcg_get(f"/cards/{card_id}")
@@ -343,7 +429,6 @@ async def _pokemontcg_card_by_id(card_id: str) -> Dict[str, Any]:
 
 
 def _pokemontcg_extract_prices(card: Dict[str, Any]) -> Dict[str, Any]:
-    """Return full price objects + a simple numeric anchor list for calculations."""
     tcg = (card or {}).get("tcgplayer", {}) or {}
     cm = (card or {}).get("cardmarket", {}) or {}
 
@@ -353,7 +438,6 @@ def _pokemontcg_extract_prices(card: Dict[str, Any]) -> Dict[str, Any]:
     anchor: List[float] = []
     currencies: List[str] = []
 
-    # TCGplayer markets (USD)
     if isinstance(tcg_prices, dict) and tcg_prices:
         currencies.append("USD")
         for _, obj in tcg_prices.items():
@@ -363,7 +447,6 @@ def _pokemontcg_extract_prices(card: Dict[str, Any]) -> Dict[str, Any]:
                 except Exception:
                     pass
 
-    # Cardmarket trend/avg (EUR)
     if isinstance(cm_prices, dict) and cm_prices:
         currencies.append("EUR")
         for k in ("trendPrice", "averageSellPrice"):
@@ -402,12 +485,14 @@ def health():
         "version": APP_VERSION,
         "has_openai_key": bool(OPENAI_API_KEY),
         "has_pokemontcg_key": bool(POKEMONTCG_API_KEY),
-        "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        "model": OPENAI_MODEL,
         "supports": ["cards", "memorabilia", "sealed_products", "market_context_click_only", "canonical_id", "detailed_grading"],
-        "ebay_domain": EBAY_DOMAIN,
-        "ebay_enabled": EBAY_ENABLED,
-        "use_ebay_for_pokemon": USE_EBAY_FOR_POKEMON,
-        "cors_allowed_origins": ALLOWED_ORIGINS,
+        "market_sources": {
+            "pokemontcg_prices": bool(POKEMONTCG_API_KEY),
+            "ebay_scrape_enabled": ENABLE_EBAY,
+            "ebay_domain": EBAY_DOMAIN if ENABLE_EBAY else None,
+        },
+        "cors": {"allowed_origins": allowed_origins},
     }
 
 
@@ -428,7 +513,10 @@ def head_health():
 async def identify(front: UploadFile = File(...)):
     """
     Identify a trading card from its front image using AI vision.
-    Returns canonical_id plus (for Pokemon) an optional authoritative PokemonTCG card resolution.
+    For Pokemon:
+      - resolve set via /sets (ptcgoCode)
+      - resolve card via /cards (set.id + number variants + name)
+      - return authoritative set + id + links
     """
     image_bytes = await front.read()
     if not image_bytes or len(image_bytes) < 200:
@@ -442,8 +530,8 @@ Return ONLY valid JSON with these exact fields:
   "card_name": "exact card name including variants (ex, V, VMAX, holo, first edition, etc.)",
   "card_type": "Pokemon/Magic/YuGiOh/Sports/OnePiece/Other",
   "year": "4 digit year if visible else empty string",
-  "card_number": "card number if visible (e.g. 4/102 or 004/120) else empty string",
-  "set_code": "2-4 letter/number set abbreviation printed on the card if visible (e.g. PFL, OBF, SVI, MEW). EMPTY if not visible",
+  "card_number": "card number if visible (e.g. 4/102 or 004 or 006/165) else empty string",
+  "set_code": "2-4 letter/number set abbreviation printed on the card if visible (e.g. MEW, OBF, SVI). EMPTY if not visible",
   "set_name": "set or series name (full name) if visible/known else empty string",
   "confidence": 0.0-1.0,
   "notes": "one short sentence about how you identified it"
@@ -452,6 +540,7 @@ Return ONLY valid JSON with these exact fields:
 Rules:
 - PRIORITIZE the set_code if you can see one.
 - Do not guess a set_code you cannot see.
+- KEEP LEADING ZEROS if they appear on the card number (e.g. 006/165).
 - If you cannot identify with confidence, set card_name to "Unknown" and confidence to 0.0.
 Respond ONLY with JSON, no extra text."""
 
@@ -483,10 +572,10 @@ Respond ONLY with JSON, no extra text."""
                 "set_code": "",
                 "set_name": "",
                 "confidence": 0.0,
-                "set_source": "unknown"
+                "set_source": "unknown",
             },
             "pokemontcg": None,
-            "error": "AI identification failed"
+            "error": "AI identification failed",
         })
 
     data = _parse_json_or_none(result.get("content", "")) or {}
@@ -494,10 +583,8 @@ Respond ONLY with JSON, no extra text."""
     card_name = _norm_ws(str(data.get("card_name", "Unknown")))
     card_type = _norm_ws(str(data.get("card_type", "Other")))
     year = _norm_ws(str(data.get("year", "")))
-
-    # Preserve printed number (leading zeros!)
-    card_number_printed = _norm_printed_card_number(str(data.get("card_number", "")))
-
+    card_number_raw = _norm_ws(str(data.get("card_number", "")))
+    card_number = _num_display(card_number_raw)  # KEEP ZEROS
     set_code = _norm_ws(str(data.get("set_code", ""))).upper()
     set_name = _norm_ws(str(data.get("set_name", "")))
     conf = _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0)
@@ -509,43 +596,61 @@ Respond ONLY with JSON, no extra text."""
         "card_name": card_name,
         "card_type": card_type,
         "year": year,
-        "card_number": card_number_printed,
+        "card_number": card_number,
         "set_code": set_info["set_code"],
         "set_name": set_info["set_name"],
         "set_source": set_info["set_source"],
         "confidence": conf,
     }
 
-    # Optional: resolve PokemonTCG card id for Pokemon items (authoritative metadata)
+    # Optional: resolve PokemonTCG card id + authoritative set details
     pokemontcg_payload = None
-    if POKEMONTCG_API_KEY and card_type.strip().lower() == "pokemon":
-        pid = await _pokemontcg_resolve_card_id(
+    if POKEMONTCG_API_KEY and card_type.strip().lower() == "pokemon" and card_name and card_name.lower() != "unknown":
+        pid, set_obj = await _pokemontcg_resolve_card_id(
             card_name=card_name,
             set_code=set_info["set_code"],
-            card_number_printed=card_number_printed,
+            card_number=card_number,
             set_name=set_info["set_name"],
         )
+
+        # Fill missing set_name from authoritative set object if we can
+        if set_obj and not set_info["set_name"]:
+            set_info = {
+                "set_code": set_info["set_code"],
+                "set_name": _norm_ws(str(set_obj.get("name", ""))),
+                "set_source": "pokemontcg_set",
+            }
+            canonical_id["set_name"] = set_info["set_name"]
+            canonical_id["set_source"] = set_info["set_source"]
+
         if pid:
             card = await _pokemontcg_card_by_id(pid)
             canonical_id["external_ids"] = {"pokemontcg_id": pid}
+            # If still missing, fill set name from card.set
+            if card and not canonical_id.get("set_name"):
+                cset = card.get("set", {}) or {}
+                if isinstance(cset, dict) and cset.get("name"):
+                    canonical_id["set_name"] = _norm_ws(str(cset.get("name", "")))
+                    canonical_id["set_source"] = "pokemontcg_card"
+
             pokemontcg_payload = {
                 "id": pid,
                 "name": card.get("name", ""),
                 "number": card.get("number", ""),
                 "rarity": card.get("rarity", ""),
-                "set": card.get("set", {}) or {},
+                "set": card.get("set", {}) or (set_obj or {}),
                 "images": card.get("images", {}) or {},
                 "links": {
                     "tcgplayer": (card.get("tcgplayer", {}) or {}).get("url", ""),
                     "cardmarket": (card.get("cardmarket", {}) or {}).get("url", ""),
-                }
+                },
             }
 
     return JSONResponse(content={
         "card_name": card_name,
         "card_type": card_type,
         "year": year,
-        "card_number": card_number_printed,
+        "card_number": card_number,
         "set_code": set_info["set_code"],
         "set_name": set_info["set_name"],
         "confidence": conf,
@@ -570,21 +675,15 @@ async def verify(
     card_type: Optional[str] = Form(None),
     set_code: Optional[str] = Form(None),
 ):
-    """
-    AI-powered card pre-assessment using front + back images.
-    Returns detailed grading: corners/edges/surface front+back + per-corner notes + flags.
-    Market estimates are NOT computed here (click-only endpoint).
-    """
     front_bytes = await front.read()
     back_bytes = await back.read()
 
     if (not front_bytes or not back_bytes or len(front_bytes) < 200 or len(back_bytes) < 200):
         raise HTTPException(status_code=400, detail="Images are too small or empty")
 
-    # Canonicalize provided ID context (if any)
     provided_name = _norm_ws(card_name or "")
     provided_set = _norm_ws(card_set or "")
-    provided_num = _norm_printed_card_number(card_number or "")
+    provided_num = _num_display(_norm_ws(card_number or ""))  # KEEP ZEROS
     provided_year = _norm_ws(card_year or "")
     provided_type = _norm_ws(card_type or "")
     provided_code = _norm_ws(set_code or "").upper()
@@ -601,7 +700,7 @@ async def verify(
         if set_info["set_code"]:
             context += f"- Set Code: {set_info['set_code']}\n"
         if provided_num:
-            context += f"- Card Number (printed): {provided_num}\n"
+            context += f"- Card Number: {provided_num}\n"
         if provided_year:
             context += f"- Year: {provided_year}\n"
         if provided_type:
@@ -616,7 +715,7 @@ You MUST provide:
 - Per-corner notes (top_left, top_right, bottom_left, bottom_right)
 - Separate edges and surface notes for front/back
 - Centering ratios for front/back (e.g. "55/45" and "60/40")
-- A clear, more detailed Assessment Summary (2-4 sentences) mentioning the specific issues you see.
+- A clear Assessment Summary (2-4 sentences) mentioning the specific issues you see.
 
 {context}
 
@@ -662,7 +761,7 @@ Return JSON with this EXACT structure:
     "card_name": "best-effort from images",
     "set_code": "best-effort from images (only if visible)",
     "set_name": "best-effort from images",
-    "card_number": "best-effort from images (keep leading zeros if visible)",
+    "card_number": "best-effort from images (KEEP LEADING ZEROS if shown)",
     "year": "best-effort from images",
     "card_type": "Pokemon/Magic/YuGiOh/Sports/OnePiece/Other"
   }}
@@ -696,17 +795,16 @@ Respond ONLY with JSON."""
             "flags": [],
             "assessment_summary": "Assessment failed.",
             "observed_id": {"card_name": "", "set_code": "", "set_name": "", "card_number": "", "year": "", "card_type": ""},
-            "error": "AI grading failed"
+            "error": "AI grading failed",
         })
 
     data = _parse_json_or_none(result.get("content", "")) or {}
 
-    # Normalize observed ID with code map (but preserve printed number)
     obs = data.get("observed_id", {}) if isinstance(data.get("observed_id", {}), dict) else {}
     obs_name = _norm_ws(str(obs.get("card_name", "")))
     obs_type = _norm_ws(str(obs.get("card_type", "")))
     obs_year = _norm_ws(str(obs.get("year", "")))
-    obs_num = _norm_printed_card_number(str(obs.get("card_number", "")))
+    obs_num = _num_display(_norm_ws(str(obs.get("card_number", ""))))  # KEEP ZEROS
     obs_code = _norm_ws(str(obs.get("set_code", ""))).upper()
     obs_set = _norm_ws(str(obs.get("set_name", "")))
     obs_set_info = _canonicalize_set(obs_code, obs_set)
@@ -722,7 +820,6 @@ Respond ONLY with JSON."""
         "confidence": _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0),
     }
 
-    # Normalize pregrade to a simple "1"-"10" string for downstream DB consistency
     raw_pregrade = str(data.get("pregrade", "")).strip()
     m_pg = re.search(r"(10|[1-9])", raw_pregrade)
     pregrade_norm = m_pg.group(1) if m_pg else (str(_grade_bucket(raw_pregrade) or "") if raw_pregrade else "")
@@ -753,9 +850,9 @@ Respond ONLY with JSON."""
 
 
 # ==============================
-# Market Context (Click-only, resilient)
+# Market Context (Click-only)
 # ==============================
-_PRICE_RE = re.compile(r"(?P<cur>AU\$|A\$|US\$|\$)?\s*(?P<num>[0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)")
+_PRICE_RE = re.compile(r"(?P<cur>AU\$|A\$|US\$|\$|EUR|€)?\s*(?P<num>[0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)")
 
 
 def _extract_prices(text: str) -> List[Tuple[float, str]]:
@@ -779,52 +876,6 @@ def _trim_outliers(values: List[float]) -> List[float]:
     k = max(1, len(v) // 10)
     trimmed = v[k:-k] if len(v) > 2 * k else v
     return trimmed if trimmed else v
-
-
-async def _fetch_html(url: str) -> str:
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.get(url, headers={"User-Agent": UA}, follow_redirects=True)
-        if r.status_code != 200:
-            return ""
-        return r.text or ""
-
-
-async def _search_ebay_sold_prices(query: str, negate_terms: Optional[List[str]] = None, limit: int = 25) -> Dict[str, Any]:
-    negate_terms = negate_terms or []
-    q = query.strip()
-    for t in negate_terms:
-        if t:
-            q += f" -{t}"
-    encoded = q.replace(" ", "+")
-    url = f"https://{EBAY_DOMAIN}/sch/i.html?_nkw={encoded}&_sacat=0&LH_Sold=1&LH_Complete=1&_sop=13"
-
-    html = await _fetch_html(url)
-    if not html:
-        return {"prices": [], "currency": "", "sample_size": 0, "url": url, "query": query}
-
-    soup = BeautifulSoup(html, "html.parser")
-    price_spans = soup.find_all("span", class_=re.compile(r"s-item__price"))
-    prices: List[float] = []
-    currencies: List[str] = []
-
-    for span in price_spans[: max(10, limit)]:
-        txt = span.get_text(" ", strip=True)
-        for val, cur in _extract_prices(txt):
-            prices.append(val)
-            currencies.append(cur)
-
-    currency = ""
-    if currencies:
-        au_count = sum(1 for c in currencies if c in ("AU$", "A$"))
-        us_count = sum(1 for c in currencies if c == "US$")
-        if au_count >= max(1, len(currencies) // 3):
-            currency = "AUD"
-        elif us_count >= max(1, len(currencies) // 3):
-            currency = "USD"
-
-    prices = [p for p in prices if 1 < p < 500000][:limit]
-
-    return {"prices": prices, "currency": currency, "sample_size": len(prices), "url": url, "query": query}
 
 
 def _market_trend_from_recent(prices: List[float]) -> str:
@@ -869,34 +920,78 @@ def _stats(values: List[float]) -> Dict[str, Any]:
     }
 
 
-def _build_query_ladder(card_name: str, set_name: str, set_code: str, card_number_printed: str, card_type: str) -> List[str]:
-    """
-    Build multiple query variants from strict -> relaxed.
-    IMPORTANT: keep printed number as-is (leading zeros), because it helps match humans.
-    """
+# ---- OPTIONAL eBay scraping (OFF by default) ----
+async def _fetch_html(url: str) -> str:
+    async with httpx.AsyncClient(timeout=12.0) as client:
+        r = await client.get(url, headers={"User-Agent": UA}, follow_redirects=True)
+        if r.status_code != 200:
+            return ""
+        return r.text or ""
+
+
+async def _search_ebay_sold_prices(query: str, negate_terms: Optional[List[str]] = None, limit: int = 25) -> Dict[str, Any]:
+    if not ENABLE_EBAY:
+        return {"prices": [], "currency": "", "sample_size": 0, "url": "", "query": query}
+
+    negate_terms = negate_terms or []
+    q = query.strip()
+    for t in negate_terms:
+        if t:
+            q += f" -{t}"
+    encoded = q.replace(" ", "+")
+    url = f"https://{EBAY_DOMAIN}/sch/i.html?_nkw={encoded}&_sacat=0&LH_Sold=1&LH_Complete=1&_sop=13"
+
+    html = await _fetch_html(url)
+    if not html:
+        return {"prices": [], "currency": "", "sample_size": 0, "url": url, "query": query}
+
+    soup = BeautifulSoup(html, "html.parser")
+    price_spans = soup.find_all("span", class_=re.compile(r"s-item__price"))
+    prices: List[float] = []
+    currencies: List[str] = []
+
+    for span in price_spans[: max(10, limit)]:
+        txt = span.get_text(" ", strip=True)
+        for val, cur in _extract_prices(txt):
+            prices.append(val)
+            currencies.append(cur)
+
+    currency = ""
+    if currencies:
+        au_count = sum(1 for c in currencies if c in ("AU$", "A$"))
+        us_count = sum(1 for c in currencies if c == "US$")
+        if au_count >= max(1, len(currencies) // 3):
+            currency = "AUD"
+        elif us_count >= max(1, len(currencies) // 3):
+            currency = "USD"
+
+    prices = [p for p in prices if 1 < p < 500000][:limit]
+    return {"prices": prices, "currency": currency, "sample_size": len(prices), "url": url, "query": query}
+
+
+def _build_query_ladder(card_name: str, set_name: str, set_code: str, card_number: str, card_type: str) -> List[str]:
     name = _norm_ws(card_name)
     sn = _norm_ws(set_name)
     sc = (set_code or "").strip().upper()
-    num_printed = _norm_printed_card_number(card_number_printed)
+    num = _num_display(card_number)
     t = _norm_ws(card_type)
 
     variants: List[str] = []
     base_parts = [name]
     if sn and sn.lower() not in name.lower():
         base_parts.append(sn)
-    if num_printed:
-        base_parts.append(num_printed)
+    if num:
+        base_parts.append(num)
     variants.append(" ".join([p for p in base_parts if p]))
 
     if sc:
         parts = [name, sc]
-        if num_printed:
-            parts.append(num_printed)
+        if num:
+            parts.append(num)
         variants.append(" ".join(parts))
 
     if sn:
         variants.append(" ".join([name, sn]))
-
     if sc:
         variants.append(" ".join([name, sc]))
 
@@ -915,39 +1010,34 @@ def _build_query_ladder(card_name: str, set_name: str, set_code: str, card_numbe
 
 
 async def _gather_market_samples(query_ladder: List[str]) -> Dict[str, Any]:
-    """
-    Try multiple query strings until we have at least some usable samples.
-    Returns raw + graded samples and meta urls for transparency.
-    """
     meta_urls: Dict[str, str] = {}
     used_query = ""
     raw_prices: List[float] = []
     raw_currency = ""
     graded_prices: Dict[str, List[float]] = {"10": [], "9": [], "8": []}
 
-    target_raw = 3
-    target_graded_each = 2
-
-    if not EBAY_ENABLED:
+    if not ENABLE_EBAY:
         return {
             "used_query": "",
             "raw_prices": [],
             "raw_currency": "",
             "graded_prices": graded_prices,
-            "meta_urls": meta_urls,
+            "meta_urls": {},
         }
+
+    target_raw = 3
+    target_graded_each = 2
 
     for q in query_ladder:
         used_query = q
-
-        raw_res = await _search_ebay_sold_prices(q, negate_terms=["graded", "psa", "bgs", "cgc", "slab"], limit=30)
+        raw_res = await _search_ebay_sold_prices(q, negate_terms=["graded", "psa", "bgs", "cgc", "slab"], limit=20)
         meta_urls[f"ebay_raw::{q}"] = raw_res.get("url", "")
         if raw_res["prices"]:
             raw_prices = raw_res["prices"]
             raw_currency = raw_res.get("currency", "") or raw_currency
 
         for grade in ("10", "9", "8"):
-            gr_res = await _search_ebay_sold_prices(f"{q} PSA {grade}", negate_terms=[], limit=20)
+            gr_res = await _search_ebay_sold_prices(f"{q} PSA {grade}", negate_terms=[], limit=12)
             meta_urls[f"ebay_psa_{grade}::{q}"] = gr_res.get("url", "")
             if gr_res["prices"]:
                 graded_prices[grade] = gr_res["prices"]
@@ -980,49 +1070,25 @@ async def market_context(
     """
     Click-only market context endpoint.
 
-    For Pokemon cards, this endpoint uses PokemonTCG.io to fetch:
-    - authoritative card metadata (hi-res images, set info)
-    - TCGplayer + Cardmarket price objects (when available)
-
-    eBay sold/completed is optional and disabled for Pokemon by default.
+    Primary source for Pokémon:
+      - PokémonTCG API (card details + TCGplayer/Cardmarket price objects)
+    Optional secondary source:
+      - eBay sold/completed scraping (ENABLE_EBAY=1)  [not recommended as "authoritative"]
     """
     clean_name = _norm_ws(card_name)
     clean_set = _norm_ws(card_set or "")
     clean_code = _norm_ws(set_code or "").upper()
-    clean_number_printed = _norm_printed_card_number(card_number or "")
+    clean_number = _num_display(_norm_ws(card_number or ""))  # KEEP ZEROS
     clean_type = _norm_ws(card_type or "")
 
     set_info = _canonicalize_set(clean_code, clean_set)
-
     conf = _clamp(_safe_float(confidence, 0.0), 0.0, 1.0)
     g = _grade_bucket(predicted_grade) or 9
 
-    is_pokemon = "pokemon" in clean_type.lower()
-
-    query_ladder = _build_query_ladder(
-        card_name=clean_name,
-        set_name=set_info["set_name"],
-        set_code=set_info["set_code"],
-        card_number_printed=clean_number_printed,
-        card_type=clean_type,
-    )
-
-    # Gather eBay samples via ladder (optional)
-    gathered = {"used_query": "", "raw_prices": [], "raw_currency": "", "graded_prices": {"10": [], "9": [], "8": []}, "meta_urls": {}}
-    if EBAY_ENABLED and (not is_pokemon or USE_EBAY_FOR_POKEMON):
-        gathered = await _gather_market_samples(query_ladder)
-
-    used_query = gathered["used_query"]
-    raw_prices = gathered["raw_prices"]
-    raw_currency = gathered["raw_currency"]
-    graded_prices = gathered["graded_prices"]
-    meta_urls = gathered["meta_urls"]
-
     sources: List[str] = []
-    if raw_prices or any(graded_prices.get(k) for k in ("10", "9", "8")):
-        sources.append("eBay (sold/completed)")
+    meta_urls: Dict[str, str] = {}
 
-    # PokemonTCG authoritative details + price anchors (Pokemon only)
+    # ---- PokémonTCG authoritative details + price anchors (Pokémon cards only) ----
     pokemontcg_card: Optional[Dict[str, Any]] = None
     pokemontcg_id: str = ""
     ptcg_prices: Optional[Dict[str, Any]] = None
@@ -1030,53 +1096,65 @@ async def market_context(
     anchor_currencies: List[str] = []
     anchor_currency: str = ""
 
-    if POKEMONTCG_API_KEY and is_pokemon:
-        pokemontcg_id = await _pokemontcg_resolve_card_id(
+    if POKEMONTCG_API_KEY and ("pokemon" in clean_type.lower()):
+        pokemontcg_id, set_obj = await _pokemontcg_resolve_card_id(
             card_name=clean_name,
             set_code=set_info["set_code"],
-            card_number_printed=clean_number_printed,
+            card_number=clean_number,
             set_name=set_info["set_name"],
         )
+        if set_obj and not set_info["set_name"]:
+            set_info = {"set_code": set_info["set_code"], "set_name": _norm_ws(str(set_obj.get("name", ""))), "set_source": "pokemontcg_set"}
+
         if pokemontcg_id:
             pokemontcg_card = await _pokemontcg_card_by_id(pokemontcg_id)
             ptcg_prices = _pokemontcg_extract_prices(pokemontcg_card or {})
             anchor_prices = (ptcg_prices.get("anchor_values") or [])
             anchor_currencies = (ptcg_prices.get("currencies") or [])
             anchor_currency = anchor_currencies[0] if anchor_currencies else "USD"
-            sources.append("PokemonTCG API (details + prices)")
+            sources.append("PokemonTCG API (details + TCGplayer/Cardmarket)")
 
-    # Decide availability: if ANY samples exist, return available with liquidity label
-    has_any = bool(raw_prices) or any(len(v) > 0 for v in graded_prices.values()) or bool(anchor_prices) or bool(pokemontcg_card)
+    # ---- Optional eBay observed sales ----
+    query_ladder = _build_query_ladder(clean_name, set_info["set_name"], set_info["set_code"], clean_number, clean_type)
+    gathered = await _gather_market_samples(query_ladder)
+    used_query = gathered["used_query"]
+    raw_prices = gathered["raw_prices"]
+    raw_currency = gathered["raw_currency"]
+    graded_prices = gathered["graded_prices"]
+    meta_urls.update(gathered["meta_urls"])
+
+    if ENABLE_EBAY and (raw_prices or any(graded_prices.get(k) for k in ("10", "9", "8"))):
+        sources.append("eBay (sold/completed)")
+
+    # Decide availability: if ANY samples exist (Pokemon anchors OR eBay)
+    has_any = bool(anchor_prices) or bool(raw_prices) or any(len(v) > 0 for v in graded_prices.values())
     if not has_any:
         return JSONResponse(content={
             "available": False,
             "mode": "click_only",
-            "card": {
-                "name": clean_name,
-                "set": set_info["set_name"],
-                "set_code": set_info["set_code"],
-                "number": clean_number_printed,
-                "type": clean_type,
-            },
+            "card": {"name": clean_name, "set": set_info["set_name"], "set_code": set_info["set_code"], "number": clean_number, "type": clean_type},
+            "pokemontcg": {"id": pokemontcg_id} if pokemontcg_id else None,
             "query_ladder": query_ladder,
             "used_query": used_query,
-            "message": "No market samples found from the available sources for this item. Try adjusting the set name/code or card number.",
+            "message": "No market samples found from the available sources. Confirm set code + number, or try again.",
             "sources": sources,
-            "pokemontcg": {"id": pokemontcg_id} if pokemontcg_id else None,
             "meta": {"urls": meta_urls},
             "timestamp": datetime.utcnow().isoformat() + "Z",
-            "disclaimer": "Informational market context only. Not financial advice."
+            "disclaimer": "Informational market context only. Not financial advice.",
         })
 
     raw_stats = _stats(raw_prices)
     anchor_stats = _stats(anchor_prices)
     graded_stats: Dict[str, Any] = {k: _stats(v) for k, v in graded_prices.items() if v}
 
+    # Baseline preference:
+    # 1) PokemonTCG anchor (more stable) if present
+    # 2) eBay raw if present
     raw_baseline = 0.0
-    if raw_stats["sample_size"] >= 2:
-        raw_baseline = raw_stats["median"] or raw_stats["avg"]
-    elif anchor_stats["sample_size"] >= 1:
+    if anchor_stats["sample_size"] >= 1:
         raw_baseline = anchor_stats["median"] or anchor_stats["avg"]
+    elif raw_stats["sample_size"] >= 2:
+        raw_baseline = raw_stats["median"] or raw_stats["avg"]
 
     trend = _market_trend_from_recent(raw_prices) if raw_prices else "insufficient_data"
     liquidity = _liquidity_label(max(raw_stats["sample_size"], anchor_stats["sample_size"]))
@@ -1098,23 +1176,7 @@ async def market_context(
     if expected_value is not None and raw_baseline:
         value_difference = round(expected_value - raw_baseline - float(grading_cost or 0.0), 2)
 
-    sensitivity = "unknown"
-    if "10" in graded_stats and "9" in graded_stats and graded_stats["10"]["sample_size"] >= 2 and graded_stats["9"]["sample_size"] >= 2:
-        p10 = graded_stats["10"]["median"] or graded_stats["10"]["avg"]
-        p9 = graded_stats["9"]["median"] or graded_stats["9"]["avg"]
-        if p9 and p10:
-            ratio = p10 / p9
-            if ratio >= 1.8:
-                sensitivity = "very_high"
-            elif ratio >= 1.3:
-                sensitivity = "high"
-            elif ratio >= 1.1:
-                sensitivity = "moderate"
-            else:
-                sensitivity = "low"
-
     currency = raw_currency or (anchor_currency if anchor_prices else "") or "unknown"
-
     sample_total = raw_stats["sample_size"] + sum(st["sample_size"] for st in graded_stats.values()) + anchor_stats["sample_size"]
     confidence_label = "high" if sample_total >= 20 else "moderate" if sample_total >= 8 else "low"
 
@@ -1125,47 +1187,44 @@ async def market_context(
             "name": pokemontcg_card.get("name", ""),
             "number": pokemontcg_card.get("number", ""),
             "rarity": pokemontcg_card.get("rarity", ""),
-            "set": pokemontcg_card.get("set", {}) or {},
+            "set": pokemontcg_out_set if (pokemontcg_out_set := (pokemontcg_card.get("set", {}) or {})) else {},
             "images": pokemontcg_card.get("images", {}) or {},
             "prices": ptcg_prices,
+            "links": {
+                "tcgplayer": (pokemontcg_card.get("tcgplayer", {}) or {}).get("url", ""),
+                "cardmarket": (pokemontcg_card.get("cardmarket", {}) or {}).get("url", ""),
+            },
         }
 
     return JSONResponse(content={
         "available": True,
         "mode": "click_only",
         "confidence": confidence_label,
-        "card": {
-            "name": clean_name,
-            "set": set_info["set_name"],
-            "set_code": set_info["set_code"],
-            "number": clean_number_printed,
-            "type": clean_type,
-        },
+        "card": {"name": clean_name, "set": set_info["set_name"], "set_code": set_info["set_code"], "number": clean_number, "type": clean_type},
         "query_ladder": query_ladder,
         "used_query": used_query,
         "observed": {
             "currency": currency,
-            "raw": raw_stats,
             "pokemon_prices_anchor": anchor_stats if anchor_stats["sample_size"] else None,
-            "graded_psa": graded_stats,
-            "trend": trend,
+            "raw_ebay": raw_stats if raw_stats["sample_size"] else None,
+            "graded_psa_ebay": graded_stats if graded_stats else None,
+            "trend_ebay": trend if ENABLE_EBAY else "disabled",
             "liquidity": liquidity,
         },
         "grade_impact": {
             "predicted_grade": str(g),
             "confidence_input": conf,
-            "grade_distribution": dist,
+            "grade_atomic_distribution": dist,
             "expected_graded_value": expected_value,
             "raw_baseline_value": round(raw_baseline, 2) if raw_baseline else None,
             "grading_cost": round(float(grading_cost or 0.0), 2),
             "estimated_value_difference": value_difference,
-            "sensitivity": sensitivity,
         },
         "pokemontcg": pokemontcg_out,
         "sources": sources,
         "meta": {"urls": meta_urls},
         "timestamp": datetime.utcnow().isoformat() + "Z",
-        "disclaimer": "Informational market context only. Figures are based on observed recent sales and/or third‑party price anchors and may vary. This is not financial advice or a guarantee of outcome."
+        "disclaimer": "Informational market context only. Figures are based on third‑party price anchors and/or observed sales and may vary. Not financial advice.",
     })
 
 
@@ -1280,6 +1339,162 @@ Respond ONLY with JSON, no extra text.
         "notable_features": _norm_ws(str(data.get("notable_features", ""))),
         "confidence": _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0),
         "identify_token": f"idt_{secrets.token_urlsafe(12)}",
+    })
+
+@app.post("/api/assess-memorabilia")
+async def assess_memorabilia(
+    image1: UploadFile = File(...),
+    image2: UploadFile = File(...),
+    image3: Optional[UploadFile] = File(None),
+    image4: Optional[UploadFile] = File(None),
+
+    # Optional context from the IDENTIFY step (send via FormData)
+    item_type: Optional[str] = Form(None),
+    description: Optional[str] = Form(None),
+    signatures: Optional[str] = Form(None),
+    seal_condition: Optional[str] = Form(None),
+):
+    """
+    Assess memorabilia / sealed products from up to 4 images.
+    Designed as the "step 2" after identify-memorabilia.
+    """
+
+    imgs: List[bytes] = []
+    for f in [image1, image2, image3, image4]:
+        if f is None:
+            continue
+        b = await f.read()
+        if b and len(b) >= 200:
+            imgs.append(b)
+
+    if len(imgs) < 2:
+        raise HTTPException(status_code=400, detail="Please provide at least 2 clear images")
+
+    # Clean provided context
+    ctx_item_type = _norm_ws(item_type or "")
+    ctx_desc = _norm_ws(description or "")
+    ctx_sigs = _norm_ws(signatures or "")
+    ctx_seal = _norm_ws(seal_condition or "")
+
+    context_block = ""
+    if ctx_item_type or ctx_desc or ctx_sigs or ctx_seal:
+        context_block = f"""
+KNOWN/PROVIDED DETAILS FROM STEP 1 (use as hints; do not invent):
+- item_type: {ctx_item_type}
+- description: {ctx_desc}
+- signatures: {ctx_sigs}
+- seal_condition: {ctx_seal}
+"""
+
+    prompt = f"""You are a professional collectibles authenticator and condition assessor with current market value experience.
+
+You are assessing a collectible item (memorabilia OR sealed product) from photos.
+Return ONLY valid JSON with this EXACT structure:
+
+{{
+  "assessment": {{
+    "overall_condition": "Mint/Near Mint/Excellent/Good/Fair/Poor",
+    "seal_assessment": {{
+      "status": "Sealed/Not sealed/Unclear",
+      "notes": "If sealed: describe wrap/tape integrity, holes, tears, loose wrap, reseal signs. If not sealed: 'Not applicable'."
+    }},
+    "signature_assessment": {{
+      "status": "No signature/Signature present/Unclear",
+      "notes": "If signed: what appears signed and any observations (ink consistency, placement). Do not guess identity."
+    }},
+    "authenticity_observations": [
+      "Bullet points: hologram/COA, sticker types, serial tags, stitching quality, print consistency, warning signs, etc."
+    ],
+    "defects": [
+      "Clear defect sentences with location (e.g., 'Front top edge: crease', 'Wrap: tear near right seam')"
+    ],
+    "notable_features": [
+      "Observable features: serial numbers (ONLY if visible), holograms, COA, inscriptions, limited edition markings"
+    ],
+    "risk_flags": [
+      "Short flags: possible reseal, inconsistent hologram, suspicious sticker, missing COA, heavy wear, etc."
+    ],
+    "confidence": 0.0-1.0,
+    "summary": "2-4 sentences describing condition + biggest risks/limiters based on what is visible."
+  }},
+  "recommended_action": {{
+    "decision": "approve_for_submission/needs_manual_review/decline",
+    "reasons": [
+      "Short reasons tied to what you can see"
+    ]
+  }}
+}}
+
+Rules:
+- Do NOT invent serial numbers, COA details, or signature identities you cannot clearly see.
+- If uncertain, lower confidence and choose needs_manual_review.
+- Focus on what is visible and verifiable from the images.
+
+{context_block}
+
+Respond ONLY with JSON, no extra text.
+"""
+
+    content = [{"type": "text", "text": prompt}]
+    for i, b in enumerate(imgs, start=1):
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{_b64(b)}", "detail": "high"}
+        })
+        if i < len(imgs):
+            content.append({"type": "text", "text": f"Image {i} above | Image {i+1} below"})
+
+    msg = [{"role": "user", "content": content}]
+
+    result = await _openai_chat(msg, max_tokens=1200, temperature=0.1)
+    if result.get("error"):
+        return JSONResponse(content={
+            "assessment": {
+                "overall_condition": "Unclear",
+                "seal_assessment": {"status": "Unclear", "notes": ""},
+                "signature_assessment": {"status": "Unclear", "notes": ""},
+                "authenticity_observations": [],
+                "defects": [],
+                "notable_features": [],
+                "risk_flags": ["ai_failed"],
+                "confidence": 0.0,
+                "summary": "Assessment failed."
+            },
+            "recommended_action": {
+                "decision": "needs_manual_review",
+                "reasons": ["AI assessment failed"]
+            },
+            "assess_token": f"asm_{secrets.token_urlsafe(12)}",
+            "error": "AI assessment failed"
+        })
+
+    data = _parse_json_or_none(result.get("content", "")) or {}
+    assessment = data.get("assessment", {}) if isinstance(data.get("assessment", {}), dict) else {}
+    rec = data.get("recommended_action", {}) if isinstance(data.get("recommended_action", {}), dict) else {}
+
+    # Normalize a few fields
+    conf = _clamp(_safe_float(assessment.get("confidence", 0.0)), 0.0, 1.0)
+    decision = _norm_ws(str(rec.get("decision", "needs_manual_review"))) or "needs_manual_review"
+    if decision not in ("approve_for_submission", "needs_manual_review", "decline"):
+        decision = "needs_manual_review"
+
+    return JSONResponse(content={
+        "assessment": {
+            "overall_condition": _norm_ws(str(assessment.get("overall_condition", "Unclear"))),
+            "seal_assessment": assessment.get("seal_assessment", {"status": "Unclear", "notes": ""}),
+            "signature_assessment": assessment.get("signature_assessment", {"status": "Unclear", "notes": ""}),
+            "authenticity_observations": assessment.get("authenticity_observations", []) if isinstance(assessment.get("authenticity_observations", []), list) else [],
+            "defects": assessment.get("defects", []) if isinstance(assessment.get("defects", []), list) else [],
+            "notable_features": assessment.get("notable_features", []) if isinstance(assessment.get("notable_features", []), list) else [],
+            "risk_flags": assessment.get("risk_flags", []) if isinstance(assessment.get("risk_flags", []), list) else [],
+            "confidence": conf,
+            "summary": _norm_ws(str(assessment.get("summary", ""))),
+        },
+        "recommended_action": {
+            "decision": decision,
+            "reasons": rec.get("reasons", []) if isinstance(rec.get("reasons", []), list) else [],
+        },
+        "assess_token": f"asm_{secrets.token_urlsafe(12)}",
     })
 
 if __name__ == "__main__":
