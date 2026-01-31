@@ -33,15 +33,22 @@ from bs4 import BeautifulSoup
 # ==============================
 app = FastAPI(title="Collectors League Scan API")
 
+# CORS: allow your site(s) to call Render directly.
+# (If you later proxy through WordPress via admin-ajax, you can tighten this further.)
+ALLOWED_ORIGINS = [
+    "https://collectors-league.com",
+    "https://www.collectors-league.com",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # WordPress
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,  # keep False unless you are using cookies/sessions across domains
+    allow_methods=["GET", "POST", "OPTIONS", "HEAD"],
     allow_headers=["*"],
 )
 
-APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-01-31-v6.1.1")
+APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-01-31-v6.2.1")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
 
@@ -49,6 +56,15 @@ POKEMONTCG_BASE = "https://api.pokemontcg.io/v2"
 
 # eBay region: AU by default
 EBAY_DOMAIN = os.getenv("EBAY_DOMAIN", "www.ebay.com.au").strip() or "www.ebay.com.au"
+
+# If you want to completely disable eBay scraping (recommended for stability), set:
+#   EBAY_ENABLED=0
+EBAY_ENABLED = os.getenv("EBAY_ENABLED", "1").strip() not in ("0", "false", "False", "no", "NO")
+
+# By default we DO NOT use eBay for Pokemon (PokemonTCG provides authoritative prices + images).
+# If you want it back for Pokemon, set:
+#   USE_EBAY_FOR_POKEMON=1
+USE_EBAY_FOR_POKEMON = os.getenv("USE_EBAY_FOR_POKEMON", "0").strip() in ("1", "true", "True", "yes", "YES")
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 
@@ -117,28 +133,35 @@ def _norm_ws(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
 
-def _norm_num(s: str) -> str:
-    """Normalize a card number string without destroying meaningful leading zeros.
-
-    Examples:
-    - "004/120" stays "004/120"
-    - "4/102" stays "4/102"
-    - "#004" -> "004"
+def _norm_printed_card_number(s: str) -> str:
     """
-    s = (s or "").strip()
-    s = s.replace("#", "").strip()
-    if "/" in s:
-        a, b = s.split("/", 1)
-        return f"{a.strip()}/{b.strip()}"
+    IMPORTANT: preserve the printed card number exactly as it appears on the card,
+    including leading zeros. Examples:
+      - '004/120' stays '004/120'
+      - '#004/120' -> '004/120'
+      - '  004  ' -> '004'
+    """
+    s = (s or "").strip().replace("#", "").strip()
+    # normalize whitespace but do NOT strip leading zeros
+    s = re.sub(r"\s+", "", s)  # card numbers should not have spaces
     return s
 
 
-def _pok_num(card_number: str) -> str:
-    """PokemonTCG expects the left-side card number without leading zeros (e.g. 004/120 -> 4)."""
-    s = _norm_num(card_number)
-    left = s.split('/', 1)[0].strip() if s else ''
-    left = left.lstrip('0') or '0' if left else ''
-    return left
+def _num_for_pokemontcg_query(printed: str) -> str:
+    """
+    PokemonTCG API typically stores number as '4' not '004/120'.
+    Convert printed number to best query number:
+      - '004/120' -> '4'
+      - '004' -> '4'
+      - '4/120' -> '4'
+    """
+    s = _norm_printed_card_number(printed)
+    if not s:
+        return ""
+    if "/" in s:
+        s = s.split("/", 1)[0]
+    s = s.lstrip("0") or "0"
+    return s
 
 
 async def _openai_chat(messages: List[Dict[str, Any]], max_tokens: int = 1200, temperature: float = 0.1) -> Dict[str, Any]:
@@ -218,7 +241,6 @@ def _canonicalize_set(set_code: Optional[str], set_name: Optional[str]) -> Dict[
     if sc and sn:
         return {"set_code": sc, "set_name": sn, "set_source": "ai+code"}
     if sn:
-        # attempt to infer code from map reverse (rare)
         rev = {v.lower(): k for k, v in SET_CODE_MAP.items()}
         maybe = rev.get(sn.lower())
         if maybe:
@@ -227,7 +249,6 @@ def _canonicalize_set(set_code: Optional[str], set_name: Optional[str]) -> Dict[
     if sc:
         return {"set_code": sc, "set_name": "", "set_source": "code_only"}
     return {"set_code": "", "set_name": "", "set_source": "unknown"}
-
 
 
 # ==============================
@@ -249,133 +270,71 @@ async def _pokemontcg_get(path: str, params: Optional[Dict[str, Any]] = None) ->
         return {}
 
 
-
-async def _pokemontcg_set_by_ptcgo(set_code: str) -> Dict[str, Any]:
-    """Fetch the most likely set object for a given ptcgoCode."""
-    sc = (set_code or "").strip().upper()
-    if not sc:
+async def _pokemontcg_set_by_ptcgo_code(ptcgo_code: str) -> Dict[str, Any]:
+    """Resolve set by ptcgoCode so we can query by set.id when available (more precise)."""
+    code = (ptcgo_code or "").strip().upper()
+    if not code:
         return {}
-    data = await _pokemontcg_get("/sets", params={"q": f"ptcgoCode:{sc}", "pageSize": 10})
-    sets = (data.get("data") or [])
-    if not sets:
-        return {}
-    # If multiple sets share a ptcgoCode (rare), return the most recently released.
-    def _rd(s):
-        return str((s.get("releaseDate") or ""))
-    sets_sorted = sorted([s for s in sets if isinstance(s, dict)], key=_rd, reverse=True)
-    return sets_sorted[0] if sets_sorted else {}
+    data = await _pokemontcg_get("/sets", params={"q": f"ptcgoCode:{code}", "pageSize": 5})
+    sets = data.get("data") or []
+    if sets:
+        return sets[0]
+    return {}
 
 
-
-async def _pokemontcg_resolve_card_id(
-    card_name: str,
-    set_code: str,
-    card_number_printed: str,
-    set_name: str = "",
-    year: str = "",
-    rarity: str = "",
-) -> str:
-    """Resolve the closest PokemonTCG card id using ALL known fields (query ladder + scoring).
-
-    Notes:
-    - Keep printed numbers exactly as seen on-card (e.g. '004/120') for storage/display.
-    - PokemonTCG's `number` is typically the left side without leading zeros (e.g. '4').
+async def _pokemontcg_resolve_card_id(card_name: str, set_code: str, card_number_printed: str, set_name: str = "") -> str:
+    """
+    Resolve most likely PokemonTCG card id using a query ladder + set lookup.
+    IMPORTANT: Uses a derived number for PokemonTCG query (e.g. '004/120' -> '4')
+    but does NOT mutate the printed number stored in your system.
     """
     name = _norm_ws(card_name)
     sc = (set_code or "").strip().upper()
     sn = _norm_ws(set_name or "")
-    yr = (str(year or "").strip())
-    rar = _norm_ws(rarity or "")
-    num_print = _norm_num(card_number_printed or "")
-    num_query = _pok_num(num_print)  # strips /total and leading zeros
 
-    # Resolve set object (gives set.id + official set.name)
-    set_obj: Dict[str, Any] = {}
-    set_id = ""
-    if sc:
-        set_obj = await _pokemontcg_set_by_ptcgo(sc)
-        set_id = str(set_obj.get("id") or "").strip()
+    printed = _norm_printed_card_number(card_number_printed or "")
+    qnum = _num_for_pokemontcg_query(printed)
 
-    # Build a strict-to-loose ladder
+    # If we have a set code, try to get set.id first (most precise)
+    set_obj = await _pokemontcg_set_by_ptcgo_code(sc) if sc else {}
+    set_id = str(set_obj.get("id", "")) if isinstance(set_obj, dict) else ""
+
     queries: List[str] = []
-
-    # Deterministic first: set.id / ptcgoCode + number
-    if set_id and num_query:
-        queries.append(f"set.id:{set_id} number:{num_query}")
-    if sc and num_query:
-        queries.append(f"set.ptcgoCode:{sc} number:{num_query}")
-
-    # Add name phrase as a further constraint
-    if name and set_id and num_query:
-        queries.append(f'set.id:{set_id} number:{num_query} name:"{name}"')
-    if name and sc and num_query:
-        queries.append(f'set.ptcgoCode:{sc} number:{num_query} name:"{name}"')
-
-    # Fallbacks using set name
-    if name and sn and num_query:
-        queries.append(f'name:"{name}" set.name:"{sn}" number:{num_query}')
-    if sn and num_query:
-        queries.append(f'set.name:"{sn}" number:{num_query}')
-
-    # Last resorts
-    if name and num_query:
-        queries.append(f'name:"{name}" number:{num_query}')
+    if set_id and qnum:
+        queries.append(f"set.id:{set_id} number:{qnum}")
+    if sc and qnum:
+        queries.append(f"set.ptcgoCode:{sc} number:{qnum}")
+    if name and qnum and set_id:
+        queries.append(f'name:"{name}" set.id:{set_id} number:{qnum}')
+    if name and qnum and sn:
+        queries.append(f'name:"{name}" number:{qnum} set.name:"{sn}"')
+    if name and qnum:
+        queries.append(f'name:"{name}" number:{qnum}')
+    if name and set_id:
+        queries.append(f'name:"{name}" set.id:{set_id}')
+    if name and sn:
+        queries.append(f'name:"{name}" set.name:"{sn}"')
     if name:
         queries.append(f'name:"{name}"')
 
-    def score_card(c: Dict[str, Any]) -> int:
-        score = 0
-        try:
-            cnum = _pok_num(str(c.get("number", "")))
-        except Exception:
-            cnum = ""
-        cset = c.get("set") if isinstance(c.get("set"), dict) else {}
-        c_ptcgo = str((cset or {}).get("ptcgoCode") or "").strip().upper()
-        c_setid = str((cset or {}).get("id") or "").strip()
-        cname = _norm_ws(str(c.get("name") or ""))
-        c_rar = _norm_ws(str(c.get("rarity") or ""))
-
-        if sc and c_ptcgo == sc:
-            score += 100
-        if set_id and c_setid == set_id:
-            score += 100
-        if num_query and cnum == num_query:
-            score += 80
-        if name and cname == name:
-            score += 60
-        elif name and name in cname:
-            score += 30
-        if sn:
-            c_setname = _norm_ws(str((cset or {}).get("name") or ""))
-            if c_setname == sn:
-                score += 30
-        if rar and c_rar and (c_rar == rar):
-            score += 15
-        # Year: compare against set.releaseDate prefix if available
-        if yr:
-            rd = str((cset or {}).get("releaseDate") or "")
-            if rd.startswith(yr):
-                score += 10
-        return score
-
-    # Execute ladder and pick best scored candidate
     for q in queries:
-        data = await _pokemontcg_get("/cards", params={"q": q, "pageSize": 20, "orderBy": "-set.releaseDate"})
-        cards = [c for c in (data.get("data") or []) if isinstance(c, dict)]
+        data = await _pokemontcg_get("/cards", params={"q": q, "pageSize": 10, "orderBy": "number"})
+        cards = (data.get("data") or [])
         if not cards:
             continue
-        best = max(cards, key=score_card)
-        best_score = score_card(best)
-        # If the best candidate is very weak, continue searching.
-        if best_score < 80 and q != queries[-1]:
-            continue
-        return str(best.get("id", "")) or ""
+
+        # Prefer exact number match when we have it
+        if qnum:
+            for c in cards:
+                if str(c.get("number", "")).strip() == qnum:
+                    return str(c.get("id", "")) or ""
+        return str(cards[0].get("id", "")) or ""
 
     return ""
 
 
-
 async def _pokemontcg_card_by_id(card_id: str) -> Dict[str, Any]:
+    """Authoritative card record: GET /cards/<id>"""
     if not card_id:
         return {}
     data = await _pokemontcg_get(f"/cards/{card_id}")
@@ -446,7 +405,11 @@ def health():
         "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
         "supports": ["cards", "memorabilia", "sealed_products", "market_context_click_only", "canonical_id", "detailed_grading"],
         "ebay_domain": EBAY_DOMAIN,
+        "ebay_enabled": EBAY_ENABLED,
+        "use_ebay_for_pokemon": USE_EBAY_FOR_POKEMON,
+        "cors_allowed_origins": ALLOWED_ORIGINS,
     }
+
 
 @app.head("/")
 def head_root():
@@ -458,11 +421,9 @@ def head_health():
     return Response(status_code=200)
 
 
-
 # ==============================
 # Card: Identify
 # ==============================
-
 @app.post("/api/identify")
 async def identify(front: UploadFile = File(...)):
     """
@@ -481,8 +442,8 @@ Return ONLY valid JSON with these exact fields:
   "card_name": "exact card name including variants (ex, V, VMAX, holo, first edition, etc.)",
   "card_type": "Pokemon/Magic/YuGiOh/Sports/OnePiece/Other",
   "year": "4 digit year if visible else empty string",
-  "card_number": "card number if visible (e.g. 4/102 or 004) else empty string",
-  "set_code": "2-4 letter/number set abbreviation printed on the card if visible (e.g. PFL, OBF, SVI). EMPTY if not visible",
+  "card_number": "card number if visible (e.g. 4/102 or 004/120) else empty string",
+  "set_code": "2-4 letter/number set abbreviation printed on the card if visible (e.g. PFL, OBF, SVI, MEW). EMPTY if not visible",
   "set_name": "set or series name (full name) if visible/known else empty string",
   "confidence": 0.0-1.0,
   "notes": "one short sentence about how you identified it"
@@ -533,7 +494,10 @@ Respond ONLY with JSON, no extra text."""
     card_name = _norm_ws(str(data.get("card_name", "Unknown")))
     card_type = _norm_ws(str(data.get("card_type", "Other")))
     year = _norm_ws(str(data.get("year", "")))
-    card_number = _norm_num(str(data.get("card_number", "")))
+
+    # Preserve printed number (leading zeros!)
+    card_number_printed = _norm_printed_card_number(str(data.get("card_number", "")))
+
     set_code = _norm_ws(str(data.get("set_code", ""))).upper()
     set_name = _norm_ws(str(data.get("set_name", "")))
     conf = _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0)
@@ -545,7 +509,7 @@ Respond ONLY with JSON, no extra text."""
         "card_name": card_name,
         "card_type": card_type,
         "year": year,
-        "card_number": card_number,
+        "card_number": card_number_printed,
         "set_code": set_info["set_code"],
         "set_name": set_info["set_name"],
         "set_source": set_info["set_source"],
@@ -558,9 +522,8 @@ Respond ONLY with JSON, no extra text."""
         pid = await _pokemontcg_resolve_card_id(
             card_name=card_name,
             set_code=set_info["set_code"],
-            card_number_printed=card_number,
+            card_number_printed=card_number_printed,
             set_name=set_info["set_name"],
-            year=(card_year or ""),
         )
         if pid:
             card = await _pokemontcg_card_by_id(pid)
@@ -582,7 +545,7 @@ Respond ONLY with JSON, no extra text."""
         "card_name": card_name,
         "card_type": card_type,
         "year": year,
-        "card_number": card_number,
+        "card_number": card_number_printed,
         "set_code": set_info["set_code"],
         "set_name": set_info["set_name"],
         "confidence": conf,
@@ -593,9 +556,6 @@ Respond ONLY with JSON, no extra text."""
     })
 
 
-# ==============================
-# Card: Verify (detailed grading)
-# ==============================
 # ==============================
 # Card: Verify (detailed grading)
 # ==============================
@@ -624,7 +584,7 @@ async def verify(
     # Canonicalize provided ID context (if any)
     provided_name = _norm_ws(card_name or "")
     provided_set = _norm_ws(card_set or "")
-    provided_num = _norm_num(card_number or "")
+    provided_num = _norm_printed_card_number(card_number or "")
     provided_year = _norm_ws(card_year or "")
     provided_type = _norm_ws(card_type or "")
     provided_code = _norm_ws(set_code or "").upper()
@@ -641,7 +601,7 @@ async def verify(
         if set_info["set_code"]:
             context += f"- Set Code: {set_info['set_code']}\n"
         if provided_num:
-            context += f"- Card Number: {provided_num}\n"
+            context += f"- Card Number (printed): {provided_num}\n"
         if provided_year:
             context += f"- Year: {provided_year}\n"
         if provided_type:
@@ -702,7 +662,7 @@ Return JSON with this EXACT structure:
     "card_name": "best-effort from images",
     "set_code": "best-effort from images (only if visible)",
     "set_name": "best-effort from images",
-    "card_number": "best-effort from images",
+    "card_number": "best-effort from images (keep leading zeros if visible)",
     "year": "best-effort from images",
     "card_type": "Pokemon/Magic/YuGiOh/Sports/OnePiece/Other"
   }}
@@ -741,12 +701,12 @@ Respond ONLY with JSON."""
 
     data = _parse_json_or_none(result.get("content", "")) or {}
 
-    # Normalize observed ID with code map
+    # Normalize observed ID with code map (but preserve printed number)
     obs = data.get("observed_id", {}) if isinstance(data.get("observed_id", {}), dict) else {}
     obs_name = _norm_ws(str(obs.get("card_name", "")))
     obs_type = _norm_ws(str(obs.get("card_type", "")))
     obs_year = _norm_ws(str(obs.get("year", "")))
-    obs_num = _norm_num(str(obs.get("card_number", "")))
+    obs_num = _norm_printed_card_number(str(obs.get("card_number", "")))
     obs_code = _norm_ws(str(obs.get("set_code", ""))).upper()
     obs_set = _norm_ws(str(obs.get("set_name", "")))
     obs_set_info = _canonicalize_set(obs_code, obs_set)
@@ -766,6 +726,7 @@ Respond ONLY with JSON."""
     raw_pregrade = str(data.get("pregrade", "")).strip()
     m_pg = re.search(r"(10|[1-9])", raw_pregrade)
     pregrade_norm = m_pg.group(1) if m_pg else (str(_grade_bucket(raw_pregrade) or "") if raw_pregrade else "")
+
     return JSONResponse(content={
         "pregrade": pregrade_norm or "N/A",
         "confidence": _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0),
@@ -866,37 +827,6 @@ async def _search_ebay_sold_prices(query: str, negate_terms: Optional[List[str]]
     return {"prices": prices, "currency": currency, "sample_size": len(prices), "url": url, "query": query}
 
 
-async def _tcgplayer_raw_anchor(card_name: str, card_set: Optional[str]) -> Dict[str, Any]:
-    if not POKEMONTCG_API_KEY:
-        return {"prices": [], "currency": "USD", "sample_size": 0}
-
-    try:
-        headers = {"X-Api-Key": POKEMONTCG_API_KEY}
-        q = f"name:{card_name}"
-        if card_set:
-            q += f" set.name:{card_set}"
-        url = f"https://api.pokemontcg.io/v2/cards?q={q}"
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.get(url, headers=headers)
-            if r.status_code != 200:
-                return {"prices": [], "currency": "USD", "sample_size": 0}
-            data = r.json()
-            cards = data.get("data") or []
-            if not cards:
-                return {"prices": [], "currency": "USD", "sample_size": 0}
-            card = cards[0]
-            prices = card.get("tcgplayer", {}).get("prices", {}) or {}
-            out: List[float] = []
-            for k in ("normal", "holofoil", "reverseHolofoil"):
-                if k in prices:
-                    v = prices[k].get("market")
-                    if v:
-                        out.append(float(v))
-            return {"prices": out, "currency": "USD", "sample_size": len(out)}
-    except Exception:
-        return {"prices": [], "currency": "USD", "sample_size": 0}
-
-
 def _market_trend_from_recent(prices: List[float]) -> str:
     if len(prices) < 10:
         return "insufficient_data"
@@ -939,46 +869,41 @@ def _stats(values: List[float]) -> Dict[str, Any]:
     }
 
 
-def _build_query_ladder(card_name: str, set_name: str, set_code: str, card_number: str, card_type: str) -> List[str]:
+def _build_query_ladder(card_name: str, set_name: str, set_code: str, card_number_printed: str, card_type: str) -> List[str]:
     """
     Build multiple query variants from strict -> relaxed.
+    IMPORTANT: keep printed number as-is (leading zeros), because it helps match humans.
     """
     name = _norm_ws(card_name)
     sn = _norm_ws(set_name)
     sc = (set_code or "").strip().upper()
-    num = _norm_num(card_number)
+    num_printed = _norm_printed_card_number(card_number_printed)
     t = _norm_ws(card_type)
 
     variants: List[str] = []
-    # Strict
     base_parts = [name]
     if sn and sn.lower() not in name.lower():
         base_parts.append(sn)
-    if num:
-        base_parts.append(num)
+    if num_printed:
+        base_parts.append(num_printed)
     variants.append(" ".join([p for p in base_parts if p]))
 
-    # Code-based
     if sc:
         parts = [name, sc]
-        if num:
-            parts.append(num)
+        if num_printed:
+            parts.append(num_printed)
         variants.append(" ".join(parts))
 
-    # Relaxed set name (no number)
     if sn:
         variants.append(" ".join([name, sn]))
 
-    # Relaxed code (no number)
     if sc:
         variants.append(" ".join([name, sc]))
 
-    # Name only + type hint
     if t and t.lower() not in name.lower():
         variants.append(" ".join([name, t]))
     variants.append(name)
 
-    # De-dupe preserving order
     out: List[str] = []
     seen = set()
     for q in variants:
@@ -1000,27 +925,33 @@ async def _gather_market_samples(query_ladder: List[str]) -> Dict[str, Any]:
     raw_currency = ""
     graded_prices: Dict[str, List[float]] = {"10": [], "9": [], "8": []}
 
-    # Thresholds: allow "something" (futureproof UX) but label liquidity accordingly.
     target_raw = 3
-    target_graded_each = 2  # lower than before
+    target_graded_each = 2
+
+    if not EBAY_ENABLED:
+        return {
+            "used_query": "",
+            "raw_prices": [],
+            "raw_currency": "",
+            "graded_prices": graded_prices,
+            "meta_urls": meta_urls,
+        }
 
     for q in query_ladder:
         used_query = q
-        # raw
+
         raw_res = await _search_ebay_sold_prices(q, negate_terms=["graded", "psa", "bgs", "cgc", "slab"], limit=30)
         meta_urls[f"ebay_raw::{q}"] = raw_res.get("url", "")
         if raw_res["prices"]:
             raw_prices = raw_res["prices"]
             raw_currency = raw_res.get("currency", "") or raw_currency
 
-        # graded attempts (PSA 10/9/8)
         for grade in ("10", "9", "8"):
             gr_res = await _search_ebay_sold_prices(f"{q} PSA {grade}", negate_terms=[], limit=20)
             meta_urls[f"ebay_psa_{grade}::{q}"] = gr_res.get("url", "")
             if gr_res["prices"]:
                 graded_prices[grade] = gr_res["prices"]
 
-        # Stop early if we have enough
         ok_raw = len(raw_prices) >= target_raw
         ok_graded = sum(1 for g in ("10", "9", "8") if len(graded_prices[g]) >= target_graded_each) >= 2
         if ok_raw or ok_graded:
@@ -1033,7 +964,6 @@ async def _gather_market_samples(query_ladder: List[str]) -> Dict[str, Any]:
         "graded_prices": graded_prices,
         "meta_urls": meta_urls,
     }
-
 
 
 @app.post("/api/market-context")
@@ -1050,34 +980,49 @@ async def market_context(
     """
     Click-only market context endpoint.
 
-    For Pokemon cards, this endpoint ALSO uses PokemonTCG.io to fetch:
+    For Pokemon cards, this endpoint uses PokemonTCG.io to fetch:
     - authoritative card metadata (hi-res images, set info)
     - TCGplayer + Cardmarket price objects (when available)
 
-    eBay sold/completed remains as "observed recent sales" context.
+    eBay sold/completed is optional and disabled for Pokemon by default.
     """
     clean_name = _norm_ws(card_name)
     clean_set = _norm_ws(card_set or "")
     clean_code = _norm_ws(set_code or "").upper()
-    clean_number = _norm_num(card_number or "")
+    clean_number_printed = _norm_printed_card_number(card_number or "")
     clean_type = _norm_ws(card_type or "")
 
-    # Apply code map
     set_info = _canonicalize_set(clean_code, clean_set)
 
     conf = _clamp(_safe_float(confidence, 0.0), 0.0, 1.0)
     g = _grade_bucket(predicted_grade) or 9
 
+    is_pokemon = "pokemon" in clean_type.lower()
+
     query_ladder = _build_query_ladder(
         card_name=clean_name,
         set_name=set_info["set_name"],
         set_code=set_info["set_code"],
-        card_number_printed=clean_number,
+        card_number_printed=clean_number_printed,
         card_type=clean_type,
     )
-    is_pokemon = ("pokemon" in clean_type.lower())
 
-    # PokemonTCG authoritative details + price anchors (Pokemon cards only)
+    # Gather eBay samples via ladder (optional)
+    gathered = {"used_query": "", "raw_prices": [], "raw_currency": "", "graded_prices": {"10": [], "9": [], "8": []}, "meta_urls": {}}
+    if EBAY_ENABLED and (not is_pokemon or USE_EBAY_FOR_POKEMON):
+        gathered = await _gather_market_samples(query_ladder)
+
+    used_query = gathered["used_query"]
+    raw_prices = gathered["raw_prices"]
+    raw_currency = gathered["raw_currency"]
+    graded_prices = gathered["graded_prices"]
+    meta_urls = gathered["meta_urls"]
+
+    sources: List[str] = []
+    if raw_prices or any(graded_prices.get(k) for k in ("10", "9", "8")):
+        sources.append("eBay (sold/completed)")
+
+    # PokemonTCG authoritative details + price anchors (Pokemon only)
     pokemontcg_card: Optional[Dict[str, Any]] = None
     pokemontcg_id: str = ""
     ptcg_prices: Optional[Dict[str, Any]] = None
@@ -1085,17 +1030,13 @@ async def market_context(
     anchor_currencies: List[str] = []
     anchor_currency: str = ""
 
-    sources: List[str] = []
-    meta_urls: Dict[str, str] = {}
-    used_query = ""
-    raw_prices: List[float] = []
-    raw_currency: str = ""
-    graded_prices: Dict[str, List[float]] = {"10": [], "9": [], "8": []}
-
-    # IMPORTANT: For Pokemon cards, prefer PokemonTCG.io data FIRST and do NOT
-    # block the UX on eBay scraping (which can be slow / rate-limited).
     if POKEMONTCG_API_KEY and is_pokemon:
-        pokemontcg_id = await _pokemontcg_resolve_card_id(card_name=clean_name, set_code=set_info['set_code'], card_number_printed=clean_number, set_name=set_info['set_name'], year='')
+        pokemontcg_id = await _pokemontcg_resolve_card_id(
+            card_name=clean_name,
+            set_code=set_info["set_code"],
+            card_number_printed=clean_number_printed,
+            set_name=set_info["set_name"],
+        )
         if pokemontcg_id:
             pokemontcg_card = await _pokemontcg_card_by_id(pokemontcg_id)
             ptcg_prices = _pokemontcg_extract_prices(pokemontcg_card or {})
@@ -1104,21 +1045,8 @@ async def market_context(
             anchor_currency = anchor_currencies[0] if anchor_currencies else "USD"
             sources.append("PokemonTCG API (details + prices)")
 
-    # eBay sold/completed (optional)
-    # Default: skip eBay for Pokemon cards to avoid timeouts.
-    use_ebay_for_pokemon = os.getenv("USE_EBAY_FOR_POKEMON", "0").strip() == "1"
-    if (not is_pokemon) or use_ebay_for_pokemon:
-        gathered = await _gather_market_samples(query_ladder)
-        used_query = gathered["used_query"]
-        raw_prices = gathered["raw_prices"]
-        raw_currency = gathered["raw_currency"]
-        graded_prices = gathered["graded_prices"]
-        meta_urls = gathered["meta_urls"]
-        if raw_prices or any(graded_prices.get(k) for k in ("10", "9", "8")):
-            sources.append("eBay (sold/completed)")
-
     # Decide availability: if ANY samples exist, return available with liquidity label
-    has_any = bool(raw_prices) or any(len(v) > 0 for v in graded_prices.values()) or bool(anchor_prices)
+    has_any = bool(raw_prices) or any(len(v) > 0 for v in graded_prices.values()) or bool(anchor_prices) or bool(pokemontcg_card)
     if not has_any:
         return JSONResponse(content={
             "available": False,
@@ -1127,7 +1055,7 @@ async def market_context(
                 "name": clean_name,
                 "set": set_info["set_name"],
                 "set_code": set_info["set_code"],
-                "number": clean_number,
+                "number": clean_number_printed,
                 "type": clean_type,
             },
             "query_ladder": query_ladder,
@@ -1144,9 +1072,6 @@ async def market_context(
     anchor_stats = _stats(anchor_prices)
     graded_stats: Dict[str, Any] = {k: _stats(v) for k, v in graded_prices.items() if v}
 
-    # Choose baseline:
-    # 1) eBay raw median/avg if enough samples
-    # 2) PokemonTCG price anchor if present
     raw_baseline = 0.0
     if raw_stats["sample_size"] >= 2:
         raw_baseline = raw_stats["median"] or raw_stats["avg"]
@@ -1159,7 +1084,6 @@ async def market_context(
     dist = _grade_distribution(g, conf)
     expected_value = None
 
-    # Expected value only if we have at least SOME graded pricing
     if graded_stats:
         expected_value = 0.0
         for grade, p in dist.items():
@@ -1174,7 +1098,6 @@ async def market_context(
     if expected_value is not None and raw_baseline:
         value_difference = round(expected_value - raw_baseline - float(grading_cost or 0.0), 2)
 
-    # Sensitivity PSA10 vs PSA9
     sensitivity = "unknown"
     if "10" in graded_stats and "9" in graded_stats and graded_stats["10"]["sample_size"] >= 2 and graded_stats["9"]["sample_size"] >= 2:
         p10 = graded_stats["10"]["median"] or graded_stats["10"]["avg"]
@@ -1192,11 +1115,9 @@ async def market_context(
 
     currency = raw_currency or (anchor_currency if anchor_prices else "") or "unknown"
 
-    # Confidence label based on sample sizes
     sample_total = raw_stats["sample_size"] + sum(st["sample_size"] for st in graded_stats.values()) + anchor_stats["sample_size"]
     confidence_label = "high" if sample_total >= 20 else "moderate" if sample_total >= 8 else "low"
 
-    # Build PokemonTCG output (optional)
     pokemontcg_out = None
     if pokemontcg_id and pokemontcg_card:
         pokemontcg_out = {
@@ -1217,7 +1138,7 @@ async def market_context(
             "name": clean_name,
             "set": set_info["set_name"],
             "set_code": set_info["set_code"],
-            "number": clean_number,
+            "number": clean_number_printed,
             "type": clean_type,
         },
         "query_ladder": query_ladder,
@@ -1249,7 +1170,6 @@ async def market_context(
 
 
 # Legacy alias
-# Legacy alias
 @app.post("/api/market-intelligence")
 async def market_intelligence_alias(
     card_name: str = Form(...),
@@ -1265,7 +1185,7 @@ async def market_intelligence_alias(
         card_name=card_name,
         predicted_grade=predicted_grade,
         confidence=confidence,
-        card_number_printed=card_number,
+        card_number=card_number,
         card_set=card_set,
         set_code=set_code,
         card_type=card_type,
