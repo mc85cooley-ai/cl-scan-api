@@ -1197,18 +1197,57 @@ Respond ONLY with JSON.
 @app.post("/api/market-context")
 @safe_endpoint
 async def market_context(
-    item_name: str = Form(...),
-    item_category: str = Form("Pokemon"),  # Pokemon/Magic/YuGiOh/Sports/OnePiece/Other
+    # Preferred keys (new)
+    item_name: Optional[str] = Form(None),
+    item_category: Optional[str] = Form("Pokemon"),  # Pokemon/Magic/YuGiOh/Sports/OnePiece/Other
     item_set: Optional[str] = Form(None),
     item_number: Optional[str] = Form(None),
-    predicted_grade: str = Form("9"),
+    predicted_grade: Optional[str] = Form("9"),
     confidence: float = Form(0.0),
-    currency: str = Form("USD"),
+    grading_cost: float = Form(55.0),
+
+    # Back-compat aliases from older frontends
+    card_name: Optional[str] = Form(None),
+    card_type: Optional[str] = Form(None),
+    card_set: Optional[str] = Form(None),
+    card_number: Optional[str] = Form(None),
+
+    # Extra loose aliases (some JS sends these)
+    name: Optional[str] = Form(None),
+    query: Optional[str] = Form(None),
 ):
-    clean_name = _norm_ws(item_name)
-    clean_cat = _norm_ws(item_category)
-    clean_set = _norm_ws(item_set or "")
-    clean_num_display = _clean_card_number_display(item_number or "")
+
+    # Accept multiple field names from different frontend builds
+    name_in = item_name or card_name or name or query or ""
+    cat_in = item_category or card_type or "Other"
+    set_in = item_set or card_set or ""
+    num_in = item_number or card_number or ""
+
+    clean_name = _norm_ws(str(name_in))
+    clean_cat = _norm_ws(str(cat_in))
+    clean_set = _norm_ws(str(set_in))
+    clean_num_display = _clean_card_number_display(str(num_in))
+
+    if not clean_name:
+        # Never 422 — return a helpful payload the UI can show
+        return JSONResponse(content={
+            "available": False,
+            "mode": "click_only",
+            "message": "Missing item name. Please re-run identification or pass item_name (or card_name).",
+            "received": {
+                "item_name": item_name,
+                "card_name": card_name,
+                "name": name,
+                "query": query,
+                "item_set": item_set,
+                "card_set": card_set,
+                "item_number": item_number,
+                "card_number": card_number,
+                "item_category": item_category,
+                "card_type": card_type,
+            },
+            "disclaimer": "Informational market context only. Not financial advice."
+        }, status_code=200)
 
     # Grade model (for UI only)
     conf = _clamp(_safe_float(confidence, 0.0), 0.0, 1.0)
