@@ -50,6 +50,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+from functools import wraps
+import traceback
+
+def safe_endpoint(func):
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await func(*args, **kwargs)
+        except Exception as e:
+            print(f"❌ {func.__name__} crashed: {e}")
+            traceback.print_exc()
+            return JSONResponse(
+                content={"error": True, "message": str(e)},
+                status_code=500
+            )
+    return wrapper
 APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-01-31-v6.2.2")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
@@ -252,7 +268,7 @@ async def _pokemontcg_get(path: str, params: Optional[Dict[str, Any]] = None) ->
     headers = {"X-Api-Key": POKEMONTCG_API_KEY}
 
     try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.get(url, headers=headers, params=params)
             if r.status_code != 200:
                 return {}
@@ -371,6 +387,163 @@ def _pokemontcg_extract_prices(card: Dict[str, Any]) -> Dict[str, Any]:
         "cardmarket": {"url": cm.get("url", ""), "prices": cm_prices} if isinstance(cm_prices, dict) and cm_prices else None,
     }
 
+# ========================================
+# Pokemon TCG Functions - From pokemon_api.py
+# Adapted for async FastAPI
+# ========================================
+
+async def fetch_pokemon_cards_async(
+    search_query: str,
+    page_size: int = 250,
+    max_pages: int = 10
+) -> List[Dict[str, Any]]:
+    """
+    Async version of fetch_pokemon_cards from pokemon_api.py
+    
+    Searches Pokemon TCG API with pagination.
+    
+    Parameters:
+    - search_query: Pokemon TCG query syntax
+      Examples:
+        "set.id:base*" - All Base Set cards
+        "set.id:sv3pt5" - All 151 set cards
+        "name:Charizard number:6 set.ptcgoCode:MEW" - Specific card
+        "set.ptcgoCode:MEW" - All cards from 151 set
+    
+    - page_size: Cards per page (max 250)
+    - max_pages: Max pages to fetch (prevent huge downloads)
+    
+    Returns:
+    - List of card dictionaries with full data
+    """
+    if not POKEMONTCG_API_KEY:
+        print("⚠️ POKEMONTCG_API_KEY not set!")
+        return []
+    
+    page_num = 1
+    all_cards = []
+    url = 'https://api.pokemontcg.io/v2/cards'
+    headers = {'X-Api-Key': POKEMONTCG_API_KEY}
+    
+    print(f"🔍 Searching Pokemon TCG: {search_query}")
+    
+    while page_num <= max_pages:
+        params = {
+            'q': search_query,
+            'page': page_num,
+            'pageSize': page_size
+        }
+        
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                response = await client.get(url, headers=headers, params=params)
+            
+            # If error return what we have so far
+            if response.status_code != 200:
+                print(f"❌ Pokemon TCG API error: {response.status_code}")
+                break
+            
+            data = response.json()
+            
+            if 'data' not in data or not isinstance(data['data'], list):
+                print("❌ Unexpected response format")
+                break
+            
+            cards = data["data"]
+            all_cards.extend(cards)
+            
+            total_count = data.get('totalCount', len(all_cards))
+            
+            print(f"📄 Page {page_num}: Got {len(cards)} cards (total: {len(all_cards)}/{total_count})")
+            
+            # Stop if we got all cards
+            if len(all_cards) >= total_count:
+                break
+            
+            page_num += 1
+            
+        except Exception as e:
+            print(f"❌ Error fetching page {page_num}: {e}")
+            break
+    
+    print(f"✅ Total retrieved: {len(all_cards)} cards")
+    return all_cards
+
+
+async def fetch_pokemon_card_async(card_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Async version of fetch_pokemon_card from pokemon_api.py
+    
+    Fetches a specific Pokemon card by ID.
+    
+    Parameters:
+    - card_id: Card ID (format: "set_id-card_number", e.g., "sv3pt5-6")
+    
+    Returns:
+    - Card dictionary with full data, or None if not found
+    """
+    if not POKEMONTCG_API_KEY:
+        return None
+    
+    url = f'https://api.pokemontcg.io/v2/cards/{card_id}'
+    headers = {'X-Api-Key': POKEMONTCG_API_KEY}
+    
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(url, headers=headers)
+        
+        if response.status_code != 200:
+            print(f"❌ Card {card_id} not found: {response.status_code}")
+            return None
+        
+        data = response.json()
+        
+        if 'data' not in data:
+            print("❌ Unexpected response format")
+            return None
+        
+        return data['data']
+        
+    except Exception as e:
+        print(f"❌ Error fetching card {card_id}: {e}")
+        return None
+
+
+def extract_card_essentials(card: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Extract the essential data from a Pokemon TCG card object.
+    Matches the structure from pokemon_api.py but simplified for backend use.
+    """
+    if not card:
+        return {}
+    
+    return {
+        "id": card.get("id", ""),
+        "name": card.get("name", ""),
+        "number": card.get("number", ""),
+        "supertype": card.get("supertype", ""),
+        "subtypes": card.get("subtypes", []),
+        "hp": card.get("hp", ""),
+        "types": card.get("types", []),
+        "rarity": card.get("rarity", ""),
+        "artist": card.get("artist", ""),
+        "set": {
+            "id": card.get("set", {}).get("id", ""),
+            "name": card.get("set", {}).get("name", ""),
+            "series": card.get("set", {}).get("series", ""),
+            "printedTotal": card.get("set", {}).get("printedTotal", 0),
+            "total": card.get("set", {}).get("total", 0),
+            "ptcgoCode": card.get("set", {}).get("ptcgoCode", ""),
+            "releaseDate": card.get("set", {}).get("releaseDate", ""),
+        },
+        "images": {
+            "small": card.get("images", {}).get("small", ""),
+            "large": card.get("images", {}).get("large", ""),
+        },
+        "tcgplayer": card.get("tcgplayer", {}),
+        "cardmarket": card.get("cardmarket", {}),
+    }
+
 # ==============================
 # Root & Health
 # ==============================
@@ -403,7 +576,11 @@ def head_health():
 # Card: Identify
 # ==============================
 @app.post("/api/identify")
+@safe_endpoint
 async def identify(front: UploadFile = File(...)):
+    """
+    Enhanced card identification using AI + Pokemon TCG Stock Market functions.
+    """
     image_bytes = await front.read()
     if not image_bytes or len(image_bytes) < 200:
         raise HTTPException(status_code=400, detail="Image is too small or empty")
@@ -467,6 +644,7 @@ Respond ONLY with JSON, no extra text.
 
     data = _parse_json_or_none(result.get("content", "")) or {}
 
+    # Extract AI results
     card_name = _norm_ws(str(data.get("card_name", "Unknown")))
     card_type = _norm_ws(str(data.get("card_type", "Other")))
     year = _norm_ws(str(data.get("year", "")))
@@ -476,62 +654,122 @@ Respond ONLY with JSON, no extra text.
     conf = _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0)
     notes = _norm_ws(str(data.get("notes", "")))
 
-    # If AI didn't provide set_name but did provide set_code, fetch set name from PokemonTCG sets endpoint
-    ptcg_set = {}
-    if POKEMONTCG_API_KEY and set_code and not set_name:
-        ptcg_set = await _pokemontcg_resolve_set_by_ptcgo(set_code)
-        if ptcg_set.get("name"):
-            set_name = _norm_ws(str(ptcg_set.get("name", "")))
+    print(f"🤖 AI identified: {card_name} | {card_number_display} | {set_code}")
 
-    set_info = _canonicalize_set(set_code, set_name)
+    # Step 2: Use Pokemon TCG Stock Market functions for enrichment
+    enriched = False
+    final_name = card_name
+    final_number = card_number_display
+    final_set_code = set_code
+    final_set_name = set_name
+    final_set_id = ""
+    final_year = year
+    ptcg_card = None
+    
+    if POKEMONTCG_API_KEY and card_type.strip().lower() == "pokemon" and card_name != "Unknown":
+        # Build search query (using pokemon_api.py pattern)
+        query_parts = []
+        
+        if card_name:
+            query_parts.append(f'name:"{card_name}"')
+        
+        # Normalize card number for query
+        card_number_normalized = _card_number_for_query(card_number_display)
+        if card_number_normalized:
+            # Extract just the number part (before /)
+            num_only = card_number_normalized.split("/")[0] if "/" in card_number_normalized else card_number_normalized
+            query_parts.append(f'number:{num_only}')
+        
+        if set_code:
+            query_parts.append(f'set.ptcgoCode:{set_code}')
+        
+        # Combine query
+        search_query = " ".join(query_parts)
+        
+        if search_query:
+            print(f"🔍 Pokemon TCG query: {search_query}")
+            
+            # Use fetch_pokemon_cards_async (from pokemon_api.py)
+            matching_cards = await fetch_pokemon_cards_async(
+                search_query=search_query,
+                page_size=10,
+                max_pages=1
+            )
+            
+            if matching_cards:
+                # Get best match
+                ptcg_card = matching_cards[0]
+                card_data = extract_card_essentials(ptcg_card)
+                
+                print(f"✅ Pokemon TCG match: {card_data.get('id')}")
+                
+                # Enrich with authoritative data
+                final_name = card_data.get("name", card_name)
+                final_number = card_data.get("number", card_number_display)
+                
+                if card_data.get("set"):
+                    final_set_name = card_data["set"].get("name", set_name)
+                    final_set_code = card_data["set"].get("ptcgoCode", set_code)
+                    final_set_id = card_data["set"].get("id", "")
+                    release_date = card_data["set"].get("releaseDate", "")
+                    final_year = release_date[:4] if release_date else year
+                
+                enriched = True
+                conf = min(1.0, conf + 0.2)  # Boost confidence
+                notes = f"Verified via Pokemon TCG API (ID: {card_data.get('id')})"
+                
+                print(f"✅ Enriched: {final_name} | {final_number} | {final_set_name}")
+            
+            # Fallback: If no card found but we have set code, try to resolve set name
+            elif set_code and not final_set_name:
+                print(f"🔍 Resolving set from code: {set_code}")
+                ptcg_set = await _pokemontcg_resolve_set_by_ptcgo(set_code)
+                if ptcg_set.get("name"):
+                    final_set_name = _norm_ws(str(ptcg_set.get("name", "")))
+                    final_set_id = str(ptcg_set.get("id", ""))
+                    final_year = ptcg_set.get("releaseDate", "")[:4] if ptcg_set.get("releaseDate") else year
+                    enriched = True
+                    notes = f"Set name resolved from code {set_code}"
+                    print(f"✅ Set resolved: {set_code} → {final_set_name}")
 
-    canonical_id: Dict[str, Any] = {
-        "card_name": card_name,
+    # Build canonical ID
+    set_info = _canonicalize_set(final_set_code, final_set_name)
+    
+    canonical_id = {
+        "card_name": final_name,
         "card_type": card_type,
-        "year": year,
-        "card_number": card_number_display,              # display-safe
-        "card_number_norm": _card_number_for_query(card_number_display),  # query-safe
+        "year": final_year,
+        "card_number": final_number,
         "set_code": set_info["set_code"],
         "set_name": set_info["set_name"],
-        "set_source": set_info["set_source"],
+        "set_id": final_set_id,
+        "set_source": "pokemontcg_api" if enriched else set_info["set_source"],
         "confidence": conf,
+        "pokemontcg_verified": enriched,
     }
 
+    # Build Pokemon TCG payload if card was found
     pokemontcg_payload = None
-    if POKEMONTCG_API_KEY and card_type.strip().lower() == "pokemon":
-        pid = await _pokemontcg_resolve_card_id(
-            card_name=card_name,
-            set_code=set_info["set_code"],
-            card_number_display=card_number_display,
-            set_name=set_info["set_name"],
-            set_id=str(ptcg_set.get("id", "")) if ptcg_set else "",
-        )
-        if pid:
-            card = await _pokemontcg_card_by_id(pid)
-            canonical_id["external_ids"] = {"pokemontcg_id": pid}
-            pokemontcg_payload = {
-                "id": pid,
-                "name": card.get("name", ""),
-                "number": card.get("number", ""),
-                "rarity": card.get("rarity", ""),
-                "set": card.get("set", {}) or {},
-                "images": card.get("images", {}) or {},
-                "prices": _pokemontcg_extract_prices(card or {}),
-                "links": {
-                    "tcgplayer": (card.get("tcgplayer", {}) or {}).get("url", ""),
-                    "cardmarket": (card.get("cardmarket", {}) or {}).get("url", ""),
-                }
+    if ptcg_card:
+        pokemontcg_payload = {
+            "id": ptcg_card.get("id", ""),
+            "name": ptcg_card.get("name", ""),
+            "number": ptcg_card.get("number", ""),
+            "rarity": ptcg_card.get("rarity", ""),
+            "set": ptcg_card.get("set", {}),
+            "images": ptcg_card.get("images", {}),
+            "prices": _pokemontcg_extract_prices(ptcg_card),
+            "links": {
+                "tcgplayer": (ptcg_card.get("tcgplayer", {}) or {}).get("url", ""),
+                "cardmarket": (ptcg_card.get("cardmarket", {}) or {}).get("url", ""),
             }
-            # If set_name still empty, backfill from card.set.name
-            if not canonical_id.get("set_name") and (card.get("set") or {}).get("name"):
-                canonical_id["set_name"] = _norm_ws(str((card.get("set") or {}).get("name", "")))
-                canonical_id["set_source"] = "pokemontcg_card"
+        }
 
     return JSONResponse(content={
-        "card_name": card_name,
+        "card_name": final_name,
         "card_type": card_type,
-        "year": year,
-        "card_number": card_number_display,
+        "year": final_year,
+        "card_number": final_number,
         "set_code": set_info["set_code"],
         "set_name": set_info["set_name"],
         "confidence": conf,
@@ -539,6 +777,7 @@ Respond ONLY with JSON, no extra text.
         "identify_token": f"idt_{secrets.token_urlsafe(12)}",
         "canonical_id": canonical_id,
         "pokemontcg": pokemontcg_payload,
+        "pokemontcg_enriched": enriched,
     })
 
 # ==============================
@@ -744,6 +983,233 @@ Respond ONLY with JSON.
         "verify_token": f"vfy_{secrets.token_urlsafe(12)}",
         "market_context_mode": "click_only",
     })
+# ==============================
+# Memorabilia & Sealed Products
+# ==============================
+
+@app.post("/api/identify-memorabilia")
+@safe_endpoint
+async def identify_memorabilia(
+    image1: UploadFile = File(...),
+    image2: Optional[UploadFile] = File(None),
+    image3: Optional[UploadFile] = File(None),
+    image4: Optional[UploadFile] = File(None),
+):
+    """
+    Identify memorabilia/sealed products from images using AI vision.
+    """
+    image1_bytes = await image1.read()
+    if not image1_bytes or len(image1_bytes) < 1000:
+        raise HTTPException(status_code=400, detail="Image 1 is too small or empty")
+    
+    images = [image1_bytes]
+    if image2:
+        img2 = await image2.read()
+        if img2 and len(img2) > 1000:
+            images.append(img2)
+    if image3:
+        img3 = await image3.read()
+        if img3 and len(img3) > 1000:
+            images.append(img3)
+    if image4:
+        img4 = await image4.read()
+        if img4 and len(img4) > 1000:
+            images.append(img4)
+    
+    prompt = """You are identifying a collectible item (memorabilia or sealed product) from photos.
+
+Return ONLY valid JSON with these exact fields:
+
+{
+  "item_type": "sealed booster box/sealed pack/autographed memorabilia/game-used memorabilia/graded item/other",
+  "description": "detailed description of the item",
+  "signatures": "names of any visible signatures or 'None visible'",
+  "seal_condition": "Factory Sealed/Opened/Resealed/Damaged/Not applicable",
+  "authenticity_notes": "any authenticity indicators visible (holograms, stickers, certificates)",
+  "notable_features": "unique features worth noting",
+  "confidence": 0.0-1.0,
+  "card_type": "Pokemon/Magic/YuGiOh/Sports/OnePiece/Other"
+}
+
+Rules:
+- Be specific about condition and authenticity markers
+- Note any visible damage to seals, packaging, or the item itself
+- Identify any certificate of authenticity visible
+Respond ONLY with JSON, no extra text."""
+    
+    # Build message with all images
+    content = [{"type": "text", "text": prompt}]
+    for i, img_bytes in enumerate(images):
+        content.append({
+            "type": "image_url", 
+            "image_url": {
+                "url": f"data:image/jpeg;base64,{_b64(img_bytes)}", 
+                "detail": "high"
+            }
+        })
+        if i < len(images) - 1:
+            content.append({"type": "text", "text": f"IMAGE {i+1} ABOVE ☝️ | IMAGE {i+2} BELOW 👇"})
+    
+    msg = [{"role": "user", "content": content}]
+    
+    result = await _openai_chat(msg, max_tokens=800, temperature=0.1)
+    if result.get("error"):
+        return JSONResponse(content={
+            "item_type": "Unknown",
+            "description": "Identification failed",
+            "signatures": "Unknown",
+            "seal_condition": "Unknown",
+            "authenticity_notes": "",
+            "notable_features": "",
+            "confidence": 0.0,
+            "card_type": "Other",
+            "error": "AI identification failed"
+        })
+    
+    data = _parse_json_or_none(result.get("content", "")) or {}
+    
+    return JSONResponse(content={
+        "item_type": _norm_ws(str(data.get("item_type", "Unknown"))),
+        "description": _norm_ws(str(data.get("description", ""))),
+        "signatures": _norm_ws(str(data.get("signatures", "None visible"))),
+        "seal_condition": _norm_ws(str(data.get("seal_condition", "Unknown"))),
+        "authenticity_notes": _norm_ws(str(data.get("authenticity_notes", ""))),
+        "notable_features": _norm_ws(str(data.get("notable_features", ""))),
+        "confidence": _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0),
+        "card_type": _norm_ws(str(data.get("card_type", "Other"))),
+        "identify_token": f"idt_{secrets.token_urlsafe(12)}",
+    })
+
+
+@app.post("/api/assess-memorabilia")
+@safe_endpoint
+async def assess_memorabilia(
+    image1: UploadFile = File(...),
+    image2: UploadFile = File(...),
+    image3: Optional[UploadFile] = File(None),
+    image4: Optional[UploadFile] = File(None),
+    item_type: Optional[str] = Form(None),
+    description: Optional[str] = Form(None),
+):
+    """
+    AI-powered memorabilia/sealed product assessment using multiple images.
+    """
+    image1_bytes = await image1.read()
+    image2_bytes = await image2.read()
+    
+    if not image1_bytes or not image2_bytes:
+        raise HTTPException(status_code=400, detail="Both images required")
+    
+    images = [image1_bytes, image2_bytes]
+    if image3:
+        img3 = await image3.read()
+        if img3 and len(img3) > 1000:
+            images.append(img3)
+    if image4:
+        img4 = await image4.read()
+        if img4 and len(img4) > 1000:
+            images.append(img4)
+    
+    context = ""
+    if item_type or description:
+        context = "\n\nKNOWN ITEM DETAILS:\n"
+        if item_type:
+            context += f"- Item Type: {item_type}\n"
+        if description:
+            context += f"- Description: {description}\n"
+    
+    prompt = f"""You are a professional memorabilia/collectibles grader.
+
+Analyze ALL images. Return ONLY valid JSON.
+
+You MUST provide:
+- Overall condition grade (Mint/Near Mint/Excellent/Good/Fair/Poor)
+- Seal integrity assessment (if applicable)
+- Packaging condition notes
+- Signature assessment (if applicable)
+- Value-affecting factors
+- Detailed assessment summary (2-4 sentences)
+
+{context}
+
+Return JSON with this EXACT structure:
+
+{{
+  "condition_grade": "Mint/Near Mint/Excellent/Good/Fair/Poor",
+  "confidence": 0.0-1.0,
+  "seal_integrity": {{
+    "status": "Factory Sealed/Opened/Resealed/Compromised/Not Applicable",
+    "notes": "detailed notes about seal condition"
+  }},
+  "packaging_condition": {{
+    "grade": "Mint/Near Mint/Excellent/Good/Fair/Poor",
+    "notes": "detailed notes about packaging"
+  }},
+  "signature_assessment": {{
+    "present": true/false,
+    "quality": "Clear/Faded/Smudged/Not Applicable",
+    "notes": "notes about signature condition if present"
+  }},
+  "value_factors": [
+    "List specific factors that affect value (positive or negative)"
+  ],
+  "defects": [
+    "Each defect as a clear sentence (e.g., 'Packaging: corner crease top-right')"
+  ],
+  "overall_assessment": "2-4 sentence narrative about condition and key factors",
+  "flags": [
+    "Important issues (damage, authenticity concerns, condition notes)"
+  ]
+}}
+
+Important:
+- If something doesn't apply, use "Not Applicable" or empty arrays.
+Respond ONLY with JSON."""
+    
+    # Build message with all images
+    content = [{"type": "text", "text": prompt}]
+    for i, img_bytes in enumerate(images):
+        content.append({
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/jpeg;base64,{_b64(img_bytes)}",
+                "detail": "high"
+            }
+        })
+        if i < len(images) - 1:
+            content.append({"type": "text", "text": f"IMAGE {i+1} ABOVE ☝️ | IMAGE {i+2} BELOW 👇"})
+    
+    msg = [{"role": "user", "content": content}]
+    
+    result = await _openai_chat(msg, max_tokens=2200, temperature=0.1)
+    if result.get("error"):
+        return JSONResponse(content={
+            "condition_grade": "Unable to assess",
+            "confidence": 0.0,
+            "seal_integrity": {"status": "Unknown", "notes": ""},
+            "packaging_condition": {"grade": "Unknown", "notes": ""},
+            "signature_assessment": {"present": False, "quality": "Not Applicable", "notes": ""},
+            "value_factors": [],
+            "defects": [],
+            "overall_assessment": "Assessment failed.",
+            "flags": [],
+            "error": "AI assessment failed"
+        })
+    
+    data = _parse_json_or_none(result.get("content", "")) or {}
+    
+    return JSONResponse(content={
+        "condition_grade": data.get("condition_grade", "N/A"),
+        "confidence": _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0),
+        "seal_integrity": data.get("seal_integrity", {"status": "Unknown", "notes": ""}),
+        "packaging_condition": data.get("packaging_condition", {"grade": "Unknown", "notes": ""}),
+        "signature_assessment": data.get("signature_assessment", {"present": False, "quality": "N/A", "notes": ""}),
+        "value_factors": data.get("value_factors", []) if isinstance(data.get("value_factors"), list) else [],
+        "defects": data.get("defects", []) if isinstance(data.get("defects"), list) else [],
+        "overall_assessment": _norm_ws(str(data.get("overall_assessment", ""))),
+        "flags": data.get("flags", []) if isinstance(data.get("flags"), list) else [],
+        "verify_token": f"vfy_{secrets.token_urlsafe(12)}",
+    })
 
 # ==============================
 # Market Context (Click-only)
@@ -793,7 +1259,7 @@ def _liquidity_label(n: int) -> str:
     return "insufficient"
 
 async def _fetch_html(url: str) -> str:
-    async with httpx.AsyncClient(timeout=20.0) as client:
+    async with httpx.AsyncClient(timeout=10.0) as client:
         r = await client.get(url, headers={"User-Agent": UA}, follow_redirects=True)
         if r.status_code != 200:
             return ""
@@ -834,21 +1300,34 @@ async def _search_ebay_sold_prices(query: str, negate_terms: Optional[List[str]]
     return {"prices": prices, "currency": currency, "sample_size": len(prices), "url": url, "query": query}
 
 @app.post("/api/market-context")
+@safe_endpoint
 async def market_context(
     card_name: str = Form(...),
     predicted_grade: str = Form(...),
-    confidence: float = Form(0.0),
-    card_number: Optional[str] = Form(None),
-    card_set: Optional[str] = Form(None),
-    set_code: Optional[str] = Form(None),
-    card_type: Optional[str] = Form(None),
-    grading_cost: float = Form(55.0),
+    # ... other params
 ):
-    clean_name = _norm_ws(card_name)
-    clean_set = _norm_ws(card_set or "")
-    clean_code = _norm_ws(set_code or "").upper()
-    clean_number_display = _clean_card_number_display(card_number or "")
-    clean_type = _norm_ws(card_type or "")
+    import asyncio
+    
+    # Wrap entire function in timeout
+    try:
+        return await asyncio.wait_for(
+            _market_context_impl(
+                card_name, predicted_grade, confidence, 
+                card_number, card_set, set_code, 
+                card_type, grading_cost
+            ),
+            timeout=35.0  # Max 35 seconds
+        )
+    except asyncio.TimeoutError:
+        return JSONResponse(content={
+            "available": False,
+            "error": "Timeout after 35 seconds",
+            "message": "Market context request took too long. Try again.",
+        })
+
+async def _market_context_impl(card_name, predicted_grade, confidence, 
+                               card_number, card_set, set_code, 
+                               card_type, grading_cost):
 
     # Backfill set name using PokemonTCG sets endpoint if code exists
     ptcg_set = {}
@@ -937,6 +1416,34 @@ async def market_context(
             "disclaimer": "Informational market context only. Not financial advice."
         })
 
+# Add comprehensive error handling wrapper
+from functools import wraps
+import traceback
+
+def safe_endpoint(func):
+    """Wrapper to catch all exceptions and return proper JSON + CORS headers"""
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await func(*args, **kwargs)
+        except Exception as e:
+            print(f"❌ Endpoint {func.__name__} crashed: {e}")
+            traceback.print_exc()
+            return JSONResponse(
+                content={
+                    "error": True,
+                    "message": str(e),
+                    "endpoint": func.__name__
+                },
+                status_code=500
+            )
+    return wrapper
+
+# Then add @safe_endpoint decorator to your endpoints:
+@app.post("/api/market-context")
+@safe_endpoint  # ← ADD THIS
+async def market_context(...):
+    # existing code
     raw_stats = _stats(raw_prices)
     liquidity = _liquidity_label(max(raw_stats["sample_size"], anchor_stats["sample_size"]))
     currency = raw_currency or currency
