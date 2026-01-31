@@ -331,6 +331,7 @@ Respond ONLY with JSON, no extra text."""
         "set_source": set_info["set_source"],
         "confidence": conf,
     }
+    pregrade_norm = pregrade_norm if pregrade_norm in [str(i) for i in range(1,11)] else (pregrade_norm if pregrade_norm == "10" else "")
 
     return JSONResponse(content={
         "card_name": card_name,
@@ -512,8 +513,14 @@ Respond ONLY with JSON."""
         "confidence": _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0),
     }
 
+    # Normalize pregrade to a simple "1"-"10" string for downstream DB consistency
+    raw_pregrade = str(data.get("pregrade", "")).strip()
+    m_pg = re.search(r"(10|[1-9])", raw_pregrade)
+    pregrade_norm = m_pg.group(1) if m_pg else (str(_grade_bucket(raw_pregrade) or "") if raw_pregrade else "")
+    pregrade_norm = pregrade_norm if pregrade_norm in [str(i) for i in range(1,11)] else (pregrade_norm if pregrade_norm == "10" else "")
+
     return JSONResponse(content={
-        "pregrade": data.get("pregrade", "N/A"),
+        "pregrade": pregrade_norm or "N/A",
         "confidence": _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0),
         "centering": data.get("centering", {"front": {"grade": "", "notes": ""}, "back": {"grade": "", "notes": ""}}),
         "corners": data.get("corners", {"front": {}, "back": {}}),
