@@ -251,7 +251,7 @@ async def identify(front: UploadFile = File(...)):
     Returns a canonical_id object that future-proofs downstream market + registry usage.
     """
     image_bytes = await front.read()
-    if not image_bytes or len(image_bytes) < 1000:
+    if not image_bytes or len(image_bytes) < 200:
         raise HTTPException(status_code=400, detail="Image is too small or empty")
 
     prompt = """You are identifying a trading card from a front photo.
