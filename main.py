@@ -1198,6 +1198,89 @@ async def market_intelligence_alias(
         return JSONResponse(content=payload, status_code=res.status_code)
     return res
 
+@app.post("/api/identify-memorabilia")
+async def identify_memorabilia(
+    image1: UploadFile = File(...),
+    image2: UploadFile = File(...),
+    image3: Optional[UploadFile] = File(None),
+    image4: Optional[UploadFile] = File(None),
+):
+    """
+    Identify memorabilia / sealed products from up to 4 images.
+    Returns fields expected by your WP front-end:
+      item_type, description, signatures, seal_condition, confidence,
+      authenticity_notes, notable_features, identify_token
+    """
+    imgs: List[bytes] = []
+    for f in [image1, image2, image3, image4]:
+        if f is None:
+            continue
+        b = await f.read()
+        if b and len(b) >= 200:
+            imgs.append(b)
+
+    if len(imgs) < 2:
+        raise HTTPException(status_code=400, detail="Please provide at least 2 clear images")
+
+    prompt = """You are identifying a collectible item (memorabilia OR sealed product) from photos.
+
+Return ONLY valid JSON with these exact fields:
+
+{
+  "item_type": "Memorabilia/Sealed Product/Other",
+  "description": "Concise but specific description of the item (what it is, brand/team/player/set, era if visible)",
+  "signatures": "List what is signed and by who if visible, otherwise 'None visible'",
+  "seal_condition": "If sealed: describe seal/wrap condition (tight, loose, tears, re-sealed concerns). If not sealed: 'Not applicable'",
+  "authenticity_notes": "Any authenticity observations or concerns based on what is visible (stickers, holograms, COA, inconsistencies, etc.)",
+  "notable_features": "Short list of notable features (serial #, hologram, COA, tags, inscriptions, limited edition markings)",
+  "confidence": 0.0-1.0
+}
+
+Rules:
+- Do NOT invent signatures or serial numbers you cannot see.
+- If unsure, be explicit in authenticity_notes and lower confidence.
+- Keep it factual, based only on the images.
+Respond ONLY with JSON, no extra text.
+"""
+
+    content = [{"type": "text", "text": prompt}]
+    # Use existing helper _b64() from your file
+    for i, b in enumerate(imgs, start=1):
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{_b64(b)}", "detail": "high"}
+        })
+        if i < len(imgs):
+            content.append({"type": "text", "text": f"Image {i} above | Image {i+1} below"})
+
+    msg = [{"role": "user", "content": content}]
+
+    result = await _openai_chat(msg, max_tokens=900, temperature=0.1)
+    if result.get("error"):
+        return JSONResponse(content={
+            "item_type": "Unknown Item",
+            "description": "",
+            "signatures": "None visible",
+            "seal_condition": "Not applicable",
+            "authenticity_notes": "AI identification failed",
+            "notable_features": "",
+            "confidence": 0.0,
+            "identify_token": f"idt_{secrets.token_urlsafe(12)}",
+            "error": "AI identification failed"
+        })
+
+    data = _parse_json_or_none(result.get("content", "")) or {}
+
+    return JSONResponse(content={
+        "item_type": _norm_ws(str(data.get("item_type", "Unknown Item"))),
+        "description": _norm_ws(str(data.get("description", ""))),
+        "signatures": _norm_ws(str(data.get("signatures", "None visible"))) or "None visible",
+        "seal_condition": _norm_ws(str(data.get("seal_condition", "Not applicable"))) or "Not applicable",
+        "authenticity_notes": _norm_ws(str(data.get("authenticity_notes", ""))),
+        "notable_features": _norm_ws(str(data.get("notable_features", ""))),
+        "confidence": _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0),
+        "identify_token": f"idt_{secrets.token_urlsafe(12)}",
+    })
 
 if __name__ == "__main__":
     import uvicorn
