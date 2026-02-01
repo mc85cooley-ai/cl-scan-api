@@ -1078,6 +1078,7 @@ Return ONLY valid JSON with this EXACT structure:
     "Short flags for important issues (crease, bend, edge chipping, etc.)"
   ],
   "assessment_summary": "Write 5-8 sentences in first person, conversational style. Start with: 'Looking at your [card name]...' Then describe specific observations, compare front vs back, explain what limits the grade, and give realistic grading expectations. Be honest but professional.",
+    "spoken_word": "A punchy spoken-word version of the assessment summary (about 20–45 seconds). First person, conversational. Mention the best features, the main grade limiters, and end with what grade you’d realistically expect.",
   "observed_id": {{
     "card_name": "best-effort from images",
     "set_code": "only if clearly visible",
@@ -1179,6 +1180,7 @@ Respond ONLY with JSON, no extra text.
         "defects": data.get("defects", []) if isinstance(data.get("defects", []), list) else [],
         "flags": data.get("flags", []) if isinstance(data.get("flags", []), list) else [],
         "assessment_summary": _norm_ws(str(data.get("assessment_summary", ""))) or summary or "",
+        "spoken_word": _norm_ws(str(data.get("spoken_word", ""))) or _norm_ws(str(data.get("assessment_summary", ""))) or summary or "",
         "observed_id": data.get("observed_id", {}) if isinstance(data.get("observed_id", {}), dict) else {},
         "verify_token": f"vfy_{secrets.token_urlsafe(12)}",
         "market_context_mode": "click_only",
@@ -1353,6 +1355,7 @@ Respond ONLY with JSON.
 # Secondary: PokemonTCG links (ID + marketplace links, not history)
 # eBay API: scaffold only (disabled)
 # ==============================
+
 @app.post("/api/market-context")
 @safe_endpoint
 async def market_context(
@@ -1375,169 +1378,412 @@ async def market_context(
     name: Optional[str] = Form(None),
     query: Optional[str] = Form(None),
 ):
+    """Click-only informational market context.
 
-    # Accept multiple field names from different frontend builds
+    Primary source: PriceCharting *custom CSV download* (your account token), cached for speed.
+    Output shape is kept compatible with your current frontend renderer.
+    """
+
+    # --------------------------
+    # Helpers (local to endpoint)
+    # --------------------------
+    async def _http_get_text(url: str) -> str:
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                r = await client.get(url, headers={"User-Agent": UA})
+                if r.status_code != 200:
+                    return ""
+                return r.text or ""
+        except Exception:
+            return ""
+
+    def _parse_money(v: Any) -> Optional[float]:
+        if v is None:
+            return None
+        s = str(v).strip()
+        if not s or s.lower() in ("nan", "none", "null", "-"):
+            return None
+        s = s.replace("$", "").replace(",", "").strip()
+        try:
+            return float(s)
+        except Exception:
+            return None
+
+    def _pc_csv_cache_path(category_slug: str) -> str:
+        safe = re.sub(r"[^a-z0-9\-]+", "-", (category_slug or "pokemon-cards").lower()).strip("-")
+        return os.path.join(PRICECHARTING_CACHE_DIR, f"pc_csv_{safe}_latest.csv")
+
+    def _pc_norm(s: str) -> str:
+        s = _norm_ws(str(s or "")).lower()
+        s = s.replace("—", "-").replace("–", "-")
+        s = re.sub(r"[^a-z0-9#\-/ ]+", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    def _extract_card_no_short(card_number_display: str) -> Optional[int]:
+        s = _pc_norm(card_number_display)
+        if not s:
+            return None
+        if "/" in s:
+            s = s.split("/", 1)[0]
+        s = s.replace("#", "").strip()
+        try:
+            return int(s)
+        except Exception:
+            return None
+
+    def _liquidity_label(sales_volume: Any) -> str:
+        try:
+            sv = int(str(sales_volume).strip() or "0")
+        except Exception:
+            sv = 0
+        if sv >= 100:
+            return "high"
+        if sv >= 25:
+            return "medium"
+        if sv > 0:
+            return "low"
+        return "—"
+
+    # --------------------------
+    # Normalize inputs
+    # --------------------------
     name_in = item_name or card_name or name or query or ""
     cat_in = item_category or card_type or "Other"
     set_in = item_set or card_set or ""
     num_in = item_number or card_number or ""
 
     clean_name = _norm_ws(str(name_in))
-    clean_cat = _norm_ws(str(cat_in))
+    clean_cat = _normalize_card_type(_norm_ws(str(cat_in)))
     clean_set = _norm_ws(str(set_in))
     clean_num_display = _clean_card_number_display(str(num_in))
 
     if not clean_name:
-        # Never 422 — return a helpful payload the UI can show
         return JSONResponse(content={
             "available": False,
             "mode": "click_only",
             "message": "Missing item name. Please re-run identification or pass item_name (or card_name).",
-            "received": {
-                "item_name": item_name,
-                "card_name": card_name,
-                "name": name,
-                "query": query,
-                "item_set": item_set,
-                "card_set": card_set,
-                "item_number": item_number,
-                "card_number": card_number,
-                "item_category": item_category,
-                "card_type": card_type,
-            },
+            "used_query": "",
+            "query_ladder": [],
+            "confidence": _clamp(_safe_float(confidence, 0.0), 0.0, 1.0),
             "disclaimer": "Informational market context only. Not financial advice."
         }, status_code=200)
 
-    # Grade model (for UI only)
-    conf = _clamp(_safe_float(confidence, 0.0), 0.0, 1.0)
-    g = _grade_bucket(predicted_grade) or 9
-    dist = _grade_distribution(g, conf)
+    # --------------------------
+    # Category -> PriceCharting CSV category slug
+    # --------------------------
+    cat_map = {
+        "Pokemon": "pokemon-cards",
+        "Magic": "magic-cards",
+        "YuGiOh": "yugioh-cards",
+        "OnePiece": "one-piece-",
+        "Sports": "sports-cards",
+        "Other": "pokemon-cards",  # fallback
+    }
+    pc_cat = cat_map.get(clean_cat, "pokemon-cards")
 
-    sources: List[str] = []
-    matched_products: List[Dict[str, Any]] = []
-
-    # --- PriceCharting search ---
-    pc_prices: Dict[str, Any] = {}
-    pc_best: Dict[str, Any] = {}
-    pc_url = ""
-    if PRICECHARTING_TOKEN and clean_name:
-        q_bits = [clean_name]
-        if clean_set and clean_set.lower() not in clean_name.lower():
-            q_bits.append(clean_set)
-        if clean_num_display:
-            q_bits.append(clean_num_display)
-        q = " ".join([b for b in q_bits if b]).strip()
-
-        # Category hint: PriceCharting uses category slugs; we keep it optional
-        products = await _pc_search(q, category=None, limit=8)
-        if products:
-            sources.append("PriceCharting API")
-            # Try to select the most relevant:
-            # Prefer exact-ish name match, else first
-            def _score(p: Dict[str, Any]) -> int:
-                name = (p.get("product-name") or p.get("product_name") or p.get("name") or "").lower()
-                sc = 0
-                if clean_name.lower() in name:
-                    sc += 3
-                if clean_set and clean_set.lower() in name:
-                    sc += 2
-                if clean_num_display and clean_num_display.replace("#","").lower() in name:
-                    sc += 2
-                return sc
-
-            products_sorted = sorted(products, key=_score, reverse=True)
-            top = products_sorted[0]
-            pid = str(top.get("id") or top.get("product-id") or "").strip()
-            pc_best = top
-            matched_products = products_sorted[:5]
-            if pid:
-                detail = await _pc_product(pid)
-                pc_url = detail.get("url") or top.get("url") or ""
-                pc_prices = _pc_extract_price_fields(detail or {})
-            else:
-                pc_prices = _pc_extract_price_fields(top)
-
-    # Currency best-effort (PriceCharting prices are usually USD unless your account is configured)
-    currency = (pc_best.get('currency') if isinstance(pc_best, dict) else None) or 'USD'
-
-    # Build useful "raw" vs graded extracts (best effort)
-    raw_candidates: List[float] = []
-    graded10: Optional[float] = None
-    graded9: Optional[float] = None
-    graded8: Optional[float] = None
-
-    # Known-ish keys seen on PriceCharting vary by category; we grab what exists.
-    for k, v in pc_prices.items():
-        if not isinstance(v, (int, float)):
-            continue
-        lk = k.lower()
-        # raw-ish
-        if any(t in lk for t in ["ungraded", "loose", "new", "raw", "complete", "cib"]):
-            raw_candidates.append(float(v))
-        # graded
-        if "psa-10" in lk or "grade-10" in lk or "10-price" in lk:
-            graded10 = float(v)
-        if "psa-9" in lk or "grade-9" in lk or "9-price" in lk:
-            graded9 = float(v)
-        if "psa-8" in lk or "grade-8" in lk or "8-price" in lk:
-            graded8 = float(v)
-
-    raw_value = round(mean(raw_candidates), 2) if raw_candidates else None
-
-    available = bool(pc_prices)
-    if not available:
+    if not PRICECHARTING_TOKEN:
         return JSONResponse(content={
             "available": False,
             "mode": "click_only",
-            "item": {"name": clean_name, "category": clean_cat, "set": clean_set, "number": clean_num_display},
-            "message": "No market data available (PriceCharting token missing or no match).",
-            "sources": sources,
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "disclaimer": "Informational market context only. Not financial advice.",
-        })
+            "message": "PRICECHARTING_TOKEN not configured on backend.",
+            "used_query": "",
+            "query_ladder": [],
+            "confidence": _clamp(_safe_float(confidence, 0.0), 0.0, 1.0),
+            "disclaimer": "Informational market context only. Not financial advice."
+        }, status_code=200)
 
-    # Gentle recommendation: only if graded delta exists (no ROI/profit language)
-    recommendation = "consider"
-    if graded10 and raw_value and graded10 >= raw_value * 2.0:
-        recommendation = "recommended"
-    if graded10 and raw_value and graded10 <= raw_value * 1.2:
-        recommendation = "not_recommended"
+    # --------------------------
+    # Cached CSV download
+    # --------------------------
+    cache_path = _pc_csv_cache_path(pc_cat)
+    max_age_hours = 24
+    try:
+        if os.path.exists(cache_path):
+            mtime = datetime.utcfromtimestamp(os.path.getmtime(cache_path))
+            if (datetime.utcnow() - mtime).total_seconds() < max_age_hours * 3600:
+                csv_text = Path(cache_path).read_text(encoding="utf-8", errors="ignore")
+            else:
+                csv_text = ""
+        else:
+            csv_text = ""
+    except Exception:
+        csv_text = ""
 
+    if not csv_text or len(csv_text) < 100:
+        url = f"https://www.pricecharting.com/price-guide/download-custom?t={PRICECHARTING_TOKEN}&category={pc_cat}"
+        csv_text = await _http_get_text(url)
+        if csv_text and len(csv_text) > 100:
+            try:
+                os.makedirs(PRICECHARTING_CACHE_DIR, exist_ok=True)
+                Path(cache_path).write_text(csv_text, encoding="utf-8")
+            except Exception:
+                pass
+
+    if not csv_text or len(csv_text) < 100:
+        return JSONResponse(content={
+            "available": False,
+            "mode": "click_only",
+            "message": "Failed to download PriceCharting CSV (empty response). Check token/category.",
+            "used_query": pc_cat,
+            "query_ladder": [pc_cat],
+            "confidence": _clamp(_safe_float(confidence, 0.0), 0.0, 1.0),
+            "disclaimer": "Informational market context only. Not financial advice."
+        }, status_code=200)
+
+    # --------------------------
+    # Parse + match best row
+    # --------------------------
+    rows = []
+    try:
+        reader = csv.DictReader(csv_text.splitlines())
+        for r in reader:
+            rows.append(r)
+    except Exception:
+        rows = []
+
+    n_norm = _pc_norm(clean_name)
+    s_norm = _pc_norm(clean_set)
+    num_short = _extract_card_no_short(clean_num_display)
+
+    name_tokens = [t for t in n_norm.split() if t not in ("pokemon", "card", "cards")]
+    set_tokens = [t for t in s_norm.split() if t not in ("pokemon", "card", "cards")]
+    set_tokens = set_tokens[:4]
+
+    best = None
+    best_score = -1
+
+    for r in rows:
+        pn = _pc_norm(r.get("product-name", ""))
+        cn = _pc_norm(r.get("console-name", ""))
+
+        score = 0
+        if num_short is not None:
+            if f"#{num_short}" in pn:
+                score += 12
+            elif str(num_short) in pn:
+                score += 5
+
+        for t in name_tokens:
+            if t and t in pn:
+                score += 3
+
+        for t in set_tokens:
+            if t and (t in cn or t in pn):
+                score += 2
+
+        if s_norm and s_norm in cn:
+            score += 6
+
+        if score > best_score:
+            best_score = score
+            best = r
+
+    if not best or best_score < 10:
+        return JSONResponse(content={
+            "available": True,
+            "mode": "click_only",
+            "message": "No strong PriceCharting CSV match found for this item yet.",
+            "used_query": f"{clean_name} {clean_set} {clean_num_display}".strip(),
+            "query_ladder": [clean_name, f"{clean_name} {clean_set}".strip(), f"{clean_name} {clean_set} {clean_num_display}".strip()],
+            "confidence": _clamp(_safe_float(confidence, 0.0), 0.0, 1.0),
+            "card": {"name": clean_name, "set": clean_set, "set_code": "", "year": "", "card_number": clean_num_display, "type": clean_cat},
+            "observed": {
+                "currency": "USD",
+                "liquidity": "—",
+                "trend": "—",
+                "raw": {"median": None, "avg": None, "range": None, "samples": 0},
+                "graded_psa": {"10": None, "9": None, "8": None},
+            },
+            "grade_impact": {
+                "expected_graded_value": None,
+                "raw_baseline_value": None,
+                "grading_cost": float(grading_cost or 0.0),
+                "estimated_value_difference": None,
+            },
+            "meta": {
+                "equivalency_note": "No match yet.",
+            },
+            "disclaimer": "Informational market context only. Figures are third-party estimates and may vary.",
+        }, status_code=200)
+
+    # --------------------------
+    # Extract prices (CSV format)
+    # --------------------------
+    loose = _parse_money(best.get("loose-price"))
+    newp = _parse_money(best.get("new-price"))
+    graded = _parse_money(best.get("graded-price"))
+
+    cond17 = _parse_money(best.get("condition-17-price"))  # commonly present in your CSV
+    cond18 = _parse_money(best.get("condition-18-price"))
+    bgs10 = _parse_money(best.get("bgs-10-price"))
+
+    retail_loose_buy = _parse_money(best.get(\"retail-loose-buy\"))
+    retail_loose_sell = _parse_money(best.get(\"retail-loose-sell\"))
+
+    # Raw baseline: prefer loose, else new
+    raw_val = loose if loose is not None else newp
+
+    # ---- "PSA-style" anchors (equivalency, not literal PSA comps) ----
+    # IMPORTANT: We keep the UI labels familiar but we do NOT pretend these are official PSA comps.
+    # Priority:
+    # - PSA 10 equiv: BGS 10 if present, else condition-18, else graded
+    # - PSA 9 equiv: condition-17, else graded
+    # - PSA 8 equiv: graded
+    psa10_equiv = bgs10 or graded
+    psa9_equiv = cond17 or graded
+    psa8_equiv = cond18 or graded
+
+    # --------------------------
+    # Liquidity & trend (if we have a product id + history)
+    # --------------------------
+    pid = (best.get("id") or "").strip()
+    liquidity = _liquidity_label(best.get("sales-volume"))
+    trend_label = "—"
+    try:
+        if pid:
+            tr = _pc_trend(pid, days=30)
+            if isinstance(tr, dict) and tr.get("available") and tr.get("label"):
+                trend_label = tr.get("label")
+    except Exception:
+        pass
+
+    # --------------------------
+    # Expected value (simple)
+    # --------------------------
+    conf_in = _clamp(_safe_float(confidence, 0.0), 0.0, 1.0)
+    g_pred = _grade_bucket(predicted_grade) or 9
+    dist = _grade_distribution(g_pred, conf_in)
+
+    price_map = {"10": psa10_equiv, "9": psa9_equiv, "8": psa8_equiv}
+    ev = 0.0
+    ev_samples = 0
+    for k, p in dist.items():
+        v = price_map.get(k)
+        if isinstance(v, (int, float)) and v > 0:
+            ev += float(p) * float(v)
+            ev_samples += 1
+    expected_val = round(ev, 2) if ev_samples else None
+
+    raw_base = raw_val if isinstance(raw_val, (int, float)) else None
+    diff = (round(expected_val - raw_base - float(grading_cost or 0.0), 2) if (expected_val is not None and raw_base is not None) else None)
+
+    # --------------------------
+    # Recommended purchase price
+    # --------------------------
+    try:
+        pg = float(str(predicted_grade or "").strip() or 0)
+    except Exception:
+        pg = 0.0
+
+    base_buy = retail_loose_buy
+    if base_buy is None and isinstance(raw_base, (int, float)) and raw_base > 0:
+        base_buy = round(raw_base * 0.70, 2)  # conservative fallback if retail buy not provided
+
+    # condition factor based on assessed grade (simple, explainable)
+    cond_factor = max(0.60, min(1.10, 0.40 + 0.07 * pg)) if pg else 0.85
+    conf_factor = max(0.0, min(1.0, float(conf_in or 0.0)))
+
+    assume_grading = bool(pg >= 8.5 and conf_factor >= 0.75 and expected_val is not None and float(grading_cost or 0.0) > 0)
+
+    rec_buy = None
+    note = []
+
+    if base_buy is not None:
+        rec_buy = float(base_buy) * float(cond_factor) * float(conf_factor)
+        note.append("Baseline uses retail-loose-buy adjusted by assessed grade & confidence.")
+
+    if assume_grading:
+        net_after_grading = float(expected_val) - float(grading_cost or 0.0)
+        if net_after_grading > 0:
+            # leave margin for fees/time/risk; confidence reduces aggression
+            max_buy_from_grading = net_after_grading * 0.75 * conf_factor
+            note.append("Grading upside considered: expected graded value minus grading cost, then margin.")
+            if rec_buy is None:
+                rec_buy = max_buy_from_grading
+            else:
+                rec_buy = max(rec_buy, max_buy_from_grading)
+
+    # cap recommended buy to observed raw value if we have one
+    if rec_buy is not None and raw_base is not None:
+        rec_buy = min(float(rec_buy), float(raw_base))
+
+    rec_buy = (round(float(rec_buy), 2) if rec_buy is not None else None)
+
+    # UI expects these keys
     return JSONResponse(content={
         "available": True,
         "mode": "click_only",
-        "item": {"name": clean_name, "category": clean_cat, "set": clean_set, "number": clean_num_display},
-        "pricecharting": {
-            "best_match": pc_best,
-            "url": pc_url,
-            "prices": pc_prices,
-            "alternatives": matched_products,
-            "note": "Prices are current estimates from PriceCharting (not historical).",
-        },
-        "observed": {
-            "currency": currency,
-            "raw_value_estimate": raw_value,
-            "graded": {"psa_8": graded8, "psa_9": graded9, "psa_10": graded10},
-        },
-        "grade_impact": {
-            "predicted_grade": str(g),
-            "confidence_input": conf,
-            "grade_distribution": dist,
-        },
-        "grading_recommendation": {
-            "label": recommendation,
-            "note": "Context only: compares raw vs available graded anchors. Final decision depends on fees, risks, and grading outcomes.",
-        },
-        "sources": sources,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "disclaimer": "Informational market context only. Figures are third-party estimates and may vary. Not financial advice.",
-    })
+        "message": "Market context loaded",
+        "used_query": f"{clean_name} {clean_set} {clean_num_display}".strip(),
+        "query_ladder": [clean_name, f"{clean_name} {clean_set}".strip(), f"{clean_name} {clean_set} {clean_num_display}".strip()],
+        "confidence": conf_in,
 
-# ==============================
-# Market Context (Click-only) — Memorabilia / Sealed
-# Uses PriceCharting search across categories; returns best-match price fields.
-# ==============================
+        "card": {
+            "name": clean_name,
+            "set": clean_set,
+            "set_code": "",
+            "year": "",
+            "card_number": clean_num_display,
+            "type": clean_cat,
+        },
+
+        "observed": {
+            "currency": "USD",
+            "liquidity": liquidity,
+            "trend": trend_label,
+            "raw": {
+                "median": raw_val,
+                "avg": raw_val,
+                "range": None,
+                "samples": 1 if raw_val is not None else 0,
+            },
+            "graded_psa": {
+                "10": psa10_equiv,
+                "9": psa9_equiv,
+                "8": psa8_equiv,
+            },
+        },
+
+        "grade_impact": {
+            "expected_graded_value": expected_val,
+            "raw_baseline_value": raw_base,
+            "grading_cost": float(grading_cost or 0.0),
+            "estimated_value_difference": diff,
+            "recommended_buy": {
+                "currency": "USD",
+                "retail_loose_buy": retail_loose_buy,
+                "retail_loose_sell": retail_loose_sell,
+                "recommended_purchase_price": rec_buy,
+                "assume_grading": assume_grading,
+                "notes": " ".join(note) if isinstance(note, list) else "",
+            },
+        },
+
+        "meta": {
+            "match": {
+                "id": pid,
+                "product_name": best.get("product-name"),
+                "console_name": best.get("console-name"),
+                "sales_volume": best.get("sales-volume"),
+            },
+            "equivalency_note": "Front-end labels use PSA-style equivalents (est.). Mapping: BGS 10 → PSA 10 (est.), condition-17 → PSA 9 (est.), condition-18 → PSA 8 (est.). Not official PSA comps.",
+            "sources": ["pricecharting_csv"],
+            "raw_fields": {
+                "loose_price": loose,
+                "new_price": newp,
+                "graded_price": graded,
+                "condition_17_price": cond17,
+                "condition_18_price": cond18,
+                "bgs_10_price": bgs10,
+            }
+        },
+
+        "disclaimer": "Informational market context only. Figures are third-party estimates and may vary. Not financial advice.",
+    }, status_code=200)
+
 @app.post("/api/market-context-item")
+
 @safe_endpoint
 async def market_context_item(
     query: str = Form(...),
