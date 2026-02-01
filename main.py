@@ -627,23 +627,48 @@ async def _pc_product(product_id: str) -> Dict[str, Any]:
 _FX_CACHE = {"ts": 0.0, "rate": None}
 
 async def _usd_to_aud_rate() -> Optional[float]:
-    """Fetch USD->AUD rate. Best-effort; returns None on failure."""
+    """Fetch USD->AUD rate. Best-effort; returns None on failure.
+    Tries multiple providers to avoid a single-point failure.
+    Caches for 1 hour.
+    """
     import time
     now = time.time()
     if _FX_CACHE.get("rate") and (now - _FX_CACHE.get("ts", 0.0) < 3600):
         return _FX_CACHE["rate"]
+    urls = [
+        # 1) exchangerate.host
+        ("https://api.exchangerate.host/latest", {"base": "USD", "symbols": "AUD"}, ("rates", "AUD")),
+        # 2) open.er-api.com
+        ("https://open.er-api.com/v6/latest/USD", None, ("rates", "AUD")),
+        # 3) frankfurter.app
+        ("https://api.frankfurter.app/latest", {"from": "USD", "to": "AUD"}, ("rates", "AUD")),
+    ]
     try:
         async with httpx.AsyncClient(timeout=8.0) as client:
-            # exchangerate.host is free and keyless (best-effort)
-            r = await client.get("https://api.exchangerate.host/latest", params={"base": "USD", "symbols": "AUD"})
-            if r.status_code != 200:
-                return None
-            data = r.json() if r.content else {}
-            rate = (data.get("rates") or {}).get("AUD")
-            if rate:
-                _FX_CACHE["ts"] = now
-                _FX_CACHE["rate"] = float(rate)
-                return float(rate)
+            for url, params, path in urls:
+                try:
+                    r = await client.get(url, params=params)
+                    if r.status_code != 200:
+                        continue
+                    data = r.json() if r.content else {}
+                    node = data
+                    for k in path:
+                        if isinstance(node, dict) and k in node:
+                            node = node[k]
+                        else:
+                            node = None
+                            break
+                    rate = None
+                    try:
+                        rate = float(node) if node else None
+                    except Exception:
+                        rate = None
+                    if rate and rate > 0:
+                        _FX_CACHE["ts"] = now
+                        _FX_CACHE["rate"] = rate
+                        return rate
+                except Exception:
+                    continue
     except Exception:
         return None
     return None
@@ -1217,54 +1242,58 @@ Respond ONLY with JSON, no extra text.
         pass
 
 
-# Additional conservative caps based on structured fields (corners/edges/surface).
-# Helps catch cases where obvious damage isn't captured in flags/defects.
-try:
-    corners = data.get("corners") if isinstance(data.get("corners"), dict) else {}
-    cfront = corners.get("front") if isinstance(corners.get("front"), dict) else {}
-    cback = corners.get("back") if isinstance(corners.get("back"), dict) else {}
+    # Additional conservative caps based on structured fields (corners/edges/surface).
+    # Helps catch cases where obvious damage isn't captured in flags/defects.
+    try:
+        corners = data.get("corners") if isinstance(data.get("corners"), dict) else {}
+        cfront = corners.get("front") if isinstance(corners.get("front"), dict) else {}
+        cback = corners.get("back") if isinstance(corners.get("back"), dict) else {}
 
-    def _corner_blob(side: dict) -> str:
-        parts = []
-        for k in ("top_left","top_right","bottom_left","bottom_right"):
-            v = side.get(k) if isinstance(side.get(k), dict) else {}
-            parts.append(str(v.get("condition","")))
-            parts.append(str(v.get("notes","")))
-        return " ".join(parts).lower()
+        def _corner_blob(side: dict) -> str:
+            parts = []
+            for k in ("top_left", "top_right", "bottom_left", "bottom_right"):
+                v = side.get(k) if isinstance(side.get(k), dict) else {}
+                parts.append(str(v.get("condition", "")))
+                parts.append(str(v.get("notes", "")))
+            return " ".join(parts).lower()
 
-    corner_txt = (_corner_blob(cfront) + " " + _corner_blob(cback)).strip()
+        corner_txt = (_corner_blob(cfront) + " " + _corner_blob(cback)).strip()
 
-    edges = data.get("edges") if isinstance(data.get("edges"), dict) else {}
-    ef = edges.get("front") if isinstance(edges.get("front"), dict) else {}
-    eb = edges.get("back") if isinstance(edges.get("back"), dict) else {}
-    edge_txt = (" ".join([str(ef.get("grade","")), str(ef.get("notes","")), str(eb.get("grade","")), str(eb.get("notes",""))])).lower()
+        edges = data.get("edges") if isinstance(data.get("edges"), dict) else {}
+        ef = edges.get("front") if isinstance(edges.get("front"), dict) else {}
+        eb = edges.get("back") if isinstance(edges.get("back"), dict) else {}
+        edge_txt = " ".join([
+            str(ef.get("grade", "")), str(ef.get("notes", "")),
+            str(eb.get("grade", "")), str(eb.get("notes", ""))
+        ]).lower()
 
-    surface = data.get("surface") if isinstance(data.get("surface"), dict) else {}
-    sf = surface.get("front") if isinstance(surface.get("front"), dict) else {}
-    sb = surface.get("back") if isinstance(surface.get("back"), dict) else {}
-    surf_txt = (" ".join([str(sf.get("grade","")), str(sf.get("notes","")), str(sb.get("grade","")), str(sb.get("notes",""))])).lower()
+        surface = data.get("surface") if isinstance(data.get("surface"), dict) else {}
+        sf = surface.get("front") if isinstance(surface.get("front"), dict) else {}
+        sb = surface.get("back") if isinstance(surface.get("back"), dict) else {}
+        surf_txt = " ".join([
+            str(sf.get("grade", "")), str(sf.get("notes", "")),
+            str(sb.get("grade", "")), str(sb.get("notes", ""))
+        ]).lower()
 
-    full_txt = " ".join([corner_txt, edge_txt, surf_txt]).strip()
+        full_txt = " ".join([corner_txt, edge_txt, surf_txt]).strip()
 
-    if g is not None:
-        if any(k in full_txt for k in ["tear", "ripped", "water damage", "mold", "major crease", "severe crease", "fold"]):
-            g = min(g, 3)
-        if any(k in full_txt for k in ["crease", "bent", "bend", "dent", "ding", "impression"]):
-            g = min(g, 4)
-        if ("poor" in edge_txt) or ("poor" in surf_txt):
-            g = min(g, 4)
-        if full_txt.count("whitening") >= 3 or any(k in full_txt for k in ["edge chipping", "rounded", "rounding", "heavy whitening"]):
-            g = min(g, 6)
-except Exception:
-    pass
+        if g is not None:
+            if any(k in full_txt for k in ["tear", "ripped", "water damage", "mold", "major crease", "severe crease", "fold"]):
+                g = min(g, 3)
+            if any(k in full_txt for k in ["crease", "bent", "bend", "dent", "ding", "impression"]):
+                g = min(g, 4)
+            if ("poor" in edge_txt) or ("poor" in surf_txt):
+                g = min(g, 4)
+            if full_txt.count("whitening") >= 3 or any(k in full_txt for k in ["edge chipping", "rounded", "rounding", "heavy whitening"]):
+                g = min(g, 6)
+    except Exception:
+        pass
 
     pregrade_norm = str(g) if g is not None else ""
-
 
     # Ensure assessment_summary is detailed enough (UI-friendly)
     summary = _norm_ws(str(data.get("assessment_summary", "")))
     if len(summary.split()) < 35:
-        # Build a fuller summary from structured fields (without inventing defects)
         flags_list = data.get("flags", []) if isinstance(data.get("flags", []), list) else []
         defects_list = data.get("defects", []) if isinstance(data.get("defects", []), list) else []
         cen = data.get("centering", {}) if isinstance(data.get("centering", {}), dict) else {}
@@ -1278,21 +1307,43 @@ except Exception:
         sb = (surf.get("back") or {}) if isinstance(surf.get("back") or {}, dict) else {}
 
         parts = []
-        parts.append(f"Overall, this looks like a PSA-style {pregrade_norm or raw_pregrade or 'N/A'} estimate based on what is visible in the photos.")
+        parts.append(
+            f"Overall, this looks like a PSA-style {pregrade_norm or raw_pregrade or 'N/A'} estimate based on what is visible in the photos."
+        )
         if cen_f.get("grade") or cen_b.get("grade"):
-            parts.append(f"Centering appears around Front {cen_f.get('grade','').strip() or 'N/A'} and Back {cen_b.get('grade','').strip() or 'N/A'}.")
+            parts.append(
+                f"Centering appears around Front {str(cen_f.get('grade','')).strip() or 'N/A'} and Back {str(cen_b.get('grade','')).strip() or 'N/A'}."
+            )
         if ef.get("grade") or eb.get("grade"):
-            parts.append(f"Edges read as Front {ef.get('grade','').strip() or 'N/A'} / Back {eb.get('grade','').strip() or 'N/A'}; notes: {_norm_ws(str(ef.get('notes','')))} {_norm_ws(str(eb.get('notes','')))}".strip())
+            parts.append(
+                f"Edges read as Front {str(ef.get('grade','')).strip() or 'N/A'} / Back {str(eb.get('grade','')).strip() or 'N/A'}; notes: "
+                f"{_norm_ws(str(ef.get('notes','')))} {_norm_ws(str(eb.get('notes','')))}"
+            )
         if sf.get("grade") or sb.get("grade"):
-            parts.append(f"Surface reads as Front {sf.get('grade','').strip() or 'N/A'} / Back {sb.get('grade','').strip() or 'N/A'}; notes: {_norm_ws(str(sf.get('notes','')))} {_norm_ws(str(sb.get('notes','')))}".strip())
+            parts.append(
+                f"Surface reads as Front {str(sf.get('grade','')).strip() or 'N/A'} / Back {str(sb.get('grade','')).strip() or 'N/A'}; notes: "
+                f"{_norm_ws(str(sf.get('notes','')))} {_norm_ws(str(sb.get('notes','')))}"
+            )
         if defects_list:
-            parts.append("Visible issues noted: " + "; ".join([_norm_ws(str(d)) for d in defects_list[:8]]) + ("" if len(defects_list) <= 8 else " (and more)."))
+            parts.append(
+                "Visible issues noted: "
+                + "; ".join([_norm_ws(str(d)) for d in defects_list[:8]])
+                + ("" if len(defects_list) <= 8 else " (and more).")
+            )
         if flags_list:
-            parts.append("Key flags: " + ", ".join([_norm_ws(str(f)) for f in flags_list[:10]]) + ("" if len(flags_list) <= 10 else ", …") + ".")
-        parts.append("Biggest grade limiters are the most severe corner/edge whitening/chipping, any surface scratches/print lines, and any bends/creases/dents if present.")
+            parts.append(
+                "Key flags: "
+                + ", ".join([_norm_ws(str(f)) for f in flags_list[:10]])
+                + ("" if len(flags_list) <= 10 else ", …")
+                + "."
+            )
+        parts.append(
+            "Biggest grade limiters are the most severe corner/edge whitening/chipping, any surface scratches/print lines, and any bends/creases/dents if present."
+        )
         summary = " ".join([p for p in parts if p]).strip()
-
         data["assessment_summary"] = summary
+
+    g_for_mult = _grade_bucket(pregrade_norm) if pregrade_norm else _grade_bucket(raw_pregrade)
     return JSONResponse(content={
         "pregrade": pregrade_norm or "N/A",
         "confidence": _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0),
@@ -1306,9 +1357,9 @@ except Exception:
         "assessment_summary": _norm_ws(str(data.get("assessment_summary", ""))) or summary or "",
         "spoken_word": _norm_ws(str(data.get("spoken_word", ""))) or _norm_ws(str(data.get("assessment_summary", ""))) or summary or "",
         "observed_id": data.get("observed_id", {}) if isinstance(data.get("observed_id", {}), dict) else {},
-                "condition_bucket": _condition_bucket_from_pregrade(_grade_bucket(pregrade_norm) if pregrade_norm else _grade_bucket(raw_pregrade)),
-        "condition_multiplier": _condition_multiplier_from_pregrade(_grade_bucket(pregrade_norm) if pregrade_norm else _grade_bucket(raw_pregrade)),
-"verify_token": f"vfy_{secrets.token_urlsafe(12)}",
+        "condition_bucket": _condition_bucket_from_pregrade(g_for_mult),
+        "condition_multiplier": _condition_multiplier_from_pregrade(g_for_mult),
+        "verify_token": f"vfy_{secrets.token_urlsafe(12)}",
         "market_context_mode": "click_only",
     })
 
@@ -1373,46 +1424,44 @@ Respond ONLY with JSON, no extra text.
     data = _parse_json_or_none(result.get("content", "")) if not result.get("error") else None
     data = data or {}
 
-    
-brand = _norm_ws(str(data.get("brand", "")))
-product_name = _norm_ws(str(data.get("product_name", "")))
-set_or_series = _norm_ws(str(data.get("set_or_series", "")))
-year = _norm_ws(str(data.get("year", "")))
-edition_or_language = _norm_ws(str(data.get("edition_or_language", "")))
-special_attributes = data.get("special_attributes", [])
-if not isinstance(special_attributes, list):
-    special_attributes = []
-special_attributes = [_norm_ws(str(x)) for x in special_attributes if _norm_ws(str(x))]
+    brand = _norm_ws(str(data.get("brand", "")))
+    product_name = _norm_ws(str(data.get("product_name", "")))
+    set_or_series = _norm_ws(str(data.get("set_or_series", "")))
+    year = _norm_ws(str(data.get("year", "")))
+    edition_or_language = _norm_ws(str(data.get("edition_or_language", "")))
+    special_attributes = data.get("special_attributes", [])
+    if not isinstance(special_attributes, list):
+        special_attributes = []
+    special_attributes = [_norm_ws(str(x)) for x in special_attributes if _norm_ws(str(x))]
 
-canonical_item_id = {
-    "category": "sealed/memorabilia",
-    "brand": brand,
-    "product_name": product_name,
-    "set_or_series": set_or_series,
-    "year": year,
-    "edition_or_language": edition_or_language,
-    "special_attributes": special_attributes,
-}
+    canonical_item_id = {
+        "category": "sealed/memorabilia",
+        "brand": brand,
+        "product_name": product_name,
+        "set_or_series": set_or_series,
+        "year": year,
+        "edition_or_language": edition_or_language,
+        "special_attributes": special_attributes,
+    }
 
-return JSONResponse(content={
-    "item_type": _norm_ws(str(data.get("item_type", "Unknown"))),
-    "brand": brand,
-    "product_name": product_name,
-    "set_or_series": set_or_series,
-    "year": year,
-    "edition_or_language": edition_or_language,
-    "special_attributes": special_attributes,
-    "canonical_item_id": canonical_item_id,
-    "description": _norm_ws(str(data.get("description", ""))),
-    "signatures": _norm_ws(str(data.get("signatures", "None visible"))),
-    "seal_condition": _norm_ws(str(data.get("seal_condition", "Not applicable"))),
-    "authenticity_notes": _norm_ws(str(data.get("authenticity_notes", ""))),
-    "notable_features": _norm_ws(str(data.get("notable_features", ""))),
-    "confidence": _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0),
-        "condition_distribution": data.get("condition_distribution", {}),
-    "category_hint": _norm_ws(str(data.get("category_hint", "Other"))),
-    "identify_token": f"idt_{secrets.token_urlsafe(12)}",
-})
+    return JSONResponse(content={
+        "item_type": _norm_ws(str(data.get("item_type", "Unknown"))),
+        "brand": brand,
+        "product_name": product_name,
+        "set_or_series": set_or_series,
+        "year": year,
+        "edition_or_language": edition_or_language,
+        "special_attributes": special_attributes,
+        "canonical_item_id": canonical_item_id,
+        "description": _norm_ws(str(data.get("description", ""))),
+        "signatures": _norm_ws(str(data.get("signatures", "None visible"))),
+        "seal_condition": _norm_ws(str(data.get("seal_condition", "Not applicable"))),
+        "authenticity_notes": _norm_ws(str(data.get("authenticity_notes", ""))),
+        "notable_features": _norm_ws(str(data.get("notable_features", ""))),
+        "confidence": _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0),
+        "category_hint": _norm_ws(str(data.get("category_hint", "Other"))),
+        "identify_token": f"idt_{secrets.token_urlsafe(12)}",
+    })
 
 
 @app.post("/api/assess-memorabilia")
@@ -1703,9 +1752,10 @@ async def market_context(
                 bucket = _condition_bucket_from_pregrade(g_ass)
 
                 aud_rate = None
+                aud_typical = None
                 aud_as_is = None
                 if typical is not None:
-                    _, aud_rate = await _usd_to_aud(typical)
+                    aud_typical, aud_rate = await _usd_to_aud(typical)
                     aud_as_is, _ = await _usd_to_aud(typical * mult)
 
                 return JSONResponse(content={
@@ -1717,9 +1767,10 @@ async def market_context(
                     "confidence": _clamp(_safe_float(confidence, 0.0), 0.0, 1.0),
                     "card": {"name": clean_name, "set": clean_set, "set_code": "", "year": "", "card_number": clean_num_display, "type": clean_cat},
                     "observed": {
-                        "currency": "USD",
+                        "currency": ("AUD" if aud_rate else "USD"),
                         "fx": {"aud_rate": aud_rate, "aud_timestamp": datetime.utcnow().isoformat() + "Z"} if aud_rate else {},
-                        "raw": {"median": typical, "avg": typical, "range": None, "samples": len(vals) if vals else 0},
+                        "usd_original": {"raw_median": typical, "as_is_value": _safe_money_mul(typical, mult)},
+                        "raw": {"median": (round(aud_typical, 2) if aud_rate and aud_typical is not None else typical), "avg": (round(aud_typical, 2) if aud_rate and aud_typical is not None else typical), "range": None, "samples": len(vals) if vals else 0},
                         "as_is": {"multiplier": mult, "bucket": bucket, "value": _safe_money_mul(typical, mult), "value_aud": round(aud_as_is,2) if aud_as_is is not None else None},
                         "pricecharting_prices": prices,
                     },
@@ -1848,7 +1899,7 @@ async def market_context(
             "confidence": _clamp(_safe_float(confidence, 0.0), 0.0, 1.0),
             "card": {"name": clean_name, "set": clean_set, "set_code": "", "year": "", "card_number": clean_num_display, "type": clean_cat},
             "observed": {
-                "currency": "USD",
+                "currency": ("AUD" if aud_rate else "USD"),
                 "liquidity": "—",
                 "trend": "—",
                 "raw": {"median": None, "avg": None, "range": None, "samples": 0},
@@ -1919,7 +1970,7 @@ async def market_context(
     g_pred = _grade_bucket(predicted_grade) or 9
     dist = _grade_distribution(g_pred, conf_in)
 
-    price_map = {"10": psa10_equiv, "9": psa9_equiv, "8": psa8_equiv}
+    price_map = {"10": (aud_psa10 if aud_rate and aud_psa10 is not None else psa10_equiv), "9": (aud_psa9 if aud_rate and aud_psa9 is not None else psa9_equiv), "8": psa8_equiv}
     ev = 0.0
     ev_samples = 0
     for k, p in dist.items():
@@ -2019,44 +2070,46 @@ async def market_context(
         },
 
         "observed": {
-            "currency": "USD",
+            "currency": ("AUD" if aud_rate else "USD"),
+            "usd_original": {"raw_median": raw_val, "psa10": psa10_equiv, "psa9": psa9_equiv, "psa8": psa8_equiv} if aud_rate else {},
             "fx": {"aud_rate": aud_rate, "aud_timestamp": datetime.utcnow().isoformat() + "Z"} if aud_rate else {},
             "aud": {"raw_median": aud_raw, "psa10": aud_psa10, "psa9": aud_psa9, "psa8": aud_psa8} if aud_rate else {},
             "liquidity": liquidity,
             "trend": trend_label,
             "raw": {
-                "median": raw_val,
-                "avg": raw_val,
+                "median": (aud_raw if aud_rate and aud_raw is not None else raw_val),
+                "avg": (aud_raw if aud_rate and aud_raw is not None else raw_val),
                 "range": None,
                 "samples": 1 if raw_val is not None else 0,
             },
             "graded_psa": {
-                "10": psa10_equiv,
-                "9": psa9_equiv,
-                "8": psa8_equiv,
+                "10": (aud_psa10 if aud_rate and aud_psa10 is not None else psa10_equiv),
+                "9": (aud_psa9 if aud_rate and aud_psa9 is not None else psa9_equiv),
+                "8": (aud_psa8 if aud_rate and aud_psa8 is not None else psa8_equiv),
             
             "as_is": {
                 "multiplier": mult,
                 "bucket": bucket,
-                "raw_median": _safe_money_mul(raw_val, mult),
-                "psa10_equiv": _safe_money_mul(psa10_equiv, mult),
-                "psa9_equiv": _safe_money_mul(psa9_equiv, mult),
-                "psa8_equiv": _safe_money_mul(psa8_equiv, mult)
+                "raw_median": _safe_money_mul((aud_raw if aud_rate and aud_raw is not None else raw_val), mult),
+                "psa10_equiv": _safe_money_mul((aud_psa10 if aud_rate and aud_psa10 is not None else psa10_equiv), mult),
+                "psa9_equiv": _safe_money_mul((aud_psa9 if aud_rate and aud_psa9 is not None else psa9_equiv), mult),
+                "psa8_equiv": _safe_money_mul((aud_psa8 if aud_rate and aud_psa8 is not None else psa8_equiv), mult)
             },
 },
         },
 
         "grade_impact": {
-            "expected_graded_value": expected_val,
+            "expected_graded_value": (aud_expected if aud_rate and aud_expected is not None else expected_val),
             "expected_graded_value_aud": aud_expected if aud_rate else None,
-            "raw_baseline_value": raw_base,
+            "raw_baseline_value": (aud_raw if aud_rate and aud_raw is not None else raw_base),
             "grading_cost": float(grading_cost or 0.0),
-            "estimated_value_difference": diff,
+            "estimated_value_difference": (round((aud_expected or 0) - (aud_raw or 0) - float(grading_cost or 0.0), 2) if (aud_rate and aud_expected is not None and aud_raw is not None) else diff),
             "recommended_buy": {
-                "currency": "USD",
+                "currency": ("AUD" if aud_rate else "USD"),
                 "retail_loose_buy": retail_loose_buy,
                 "retail_loose_sell": retail_loose_sell,
-                "recommended_purchase_price": rec_buy,
+                "usd_original": {"recommended_purchase_price": rec_buy} if aud_rate else {},
+                "recommended_purchase_price": (aud_rec_buy if aud_rate and aud_rec_buy is not None else rec_buy),
                 "recommended_purchase_price_aud": aud_rec_buy if aud_rate else None,
                 "assume_grading": assume_grading,
                 "notes": " ".join(note) if isinstance(note, list) else "",
