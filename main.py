@@ -1,6 +1,6 @@
 """
 The Collectors League Australia — Scan API
-Futureproof v6.4.0 (2026-01-31)
+Futureproof v6.4.1 (2026-01-31)
 
 What changed vs v6.3.x
 - ✅ Adds PriceCharting API as primary market source for cards + sealed/memorabilia (current prices).
@@ -32,6 +32,7 @@ import secrets
 import hashlib
 import re
 import traceback
+from pathlib import Path
 
 import httpx
 
@@ -618,6 +619,46 @@ async def _pc_product(product_id: str) -> Dict[str, Any]:
     if isinstance(data, dict):
         return data.get("product") or data
     return {}
+
+
+# ==============================
+# FX helper (USD -> AUD) with caching
+# ==============================
+_FX_CACHE = {"ts": 0.0, "rate": None}
+
+async def _usd_to_aud_rate() -> Optional[float]:
+    """Fetch USD->AUD rate. Best-effort; returns None on failure."""
+    import time
+    now = time.time()
+    if _FX_CACHE.get("rate") and (now - _FX_CACHE.get("ts", 0.0) < 3600):
+        return _FX_CACHE["rate"]
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            # exchangerate.host is free and keyless (best-effort)
+            r = await client.get("https://api.exchangerate.host/latest", params={"base": "USD", "symbols": "AUD"})
+            if r.status_code != 200:
+                return None
+            data = r.json() if r.content else {}
+            rate = (data.get("rates") or {}).get("AUD")
+            if rate:
+                _FX_CACHE["ts"] = now
+                _FX_CACHE["rate"] = float(rate)
+                return float(rate)
+    except Exception:
+        return None
+    return None
+
+async def _usd_to_aud(amount: Any) -> Tuple[Optional[float], Optional[float]]:
+    """Return (aud_amount, rate_used)."""
+    try:
+        amt = float(amount)
+    except Exception:
+        return (None, None)
+    rate = await _usd_to_aud_rate()
+    if not rate:
+        return (None, None)
+    return (round(amt * rate, 2), float(rate))
+
 
 def _stats(values: List[float]) -> Dict[str, Any]:
     if not values:
@@ -1208,24 +1249,31 @@ async def identify_memorabilia(
             if bb and len(bb) >= 200:
                 imgs.append(bb)
 
-    prompt = """You are identifying a collectible item (memorabilia or sealed product) from photos.
+    prompt = """You are identifying a collectible item (sealed product or memorabilia) from photos.
 
 Return ONLY valid JSON with these exact fields:
 
 {
-  "item_type": "sealed booster box/sealed pack/autographed memorabilia/game-used memorabilia/graded item/other",
-  "description": "detailed description of the item (brand, set/series, year if visible)",
+  "item_type": "sealed booster box/sealed pack/sealed tin/sealed case/autographed memorabilia/game-used memorabilia/graded item/other",
+  "brand": "brand/league/publisher if visible (e.g., Pokemon, Panini, Topps, Upper Deck) else empty string",
+  "product_name": "the main product name (e.g., 'Scarlet & Violet 151 Booster Box') else empty string",
+  "set_or_series": "set/series name if visible else empty string",
+  "year": "4 digit year if visible else empty string",
+  "edition_or_language": "e.g., English/Japanese/1st Edition/Unlimited if visible else empty string",
+  "special_attributes": ["e.g., Factory Sealed", "Pokemon Center", "Hobby Box", "1st Edition", "Shadowless"],
+  "description": "detailed one-paragraph description of the item in plain English",
   "signatures": "names of any visible signatures or 'None visible'",
   "seal_condition": "Factory Sealed/Opened/Resealed/Damaged/Not applicable",
-  "authenticity_notes": "any authenticity indicators visible (holograms, stickers, certificates) and red flags",
+  "authenticity_notes": "authenticity indicators visible (holograms, stickers, COA) and any red flags",
   "notable_features": "unique features worth noting",
   "confidence": 0.0-1.0,
   "category_hint": "Pokemon/Magic/YuGiOh/Sports/OnePiece/Other"
 }
 
 Rules:
-- Be specific about condition and authenticity markers.
-- Identify any COA/authentication labels if visible.
+- Be specific. Do not invent a year/edition if you cannot see it.
+- If it appears sealed, describe the wrap (tight/loose, tears, holes, bubbling) and label as Factory Sealed only if it looks consistent.
+- If you cannot identify confidently, keep product_name empty and set confidence low.
 Respond ONLY with JSON, no extra text.
 """
 
@@ -1282,37 +1330,55 @@ async def assess_memorabilia(
 
     prompt = f"""You are a professional memorabilia/collectibles grader.
 
-Analyze ALL images. Return ONLY valid JSON.
+Analyze ALL images with the same strictness a card grader would use. Be conservative and specific.
 
-Return JSON with this EXACT structure:
+Return ONLY valid JSON with this EXACT structure:
 
 {{
   "condition_grade": "Mint/Near Mint/Excellent/Good/Fair/Poor",
   "confidence": 0.0-1.0,
+  "condition_distribution": {{
+    "Mint": 0.0-1.0,
+    "Near Mint": 0.0-1.0,
+    "Excellent": 0.0-1.0,
+    "Good": 0.0-1.0,
+    "Fair": 0.0-1.0,
+    "Poor": 0.0-1.0
+  }},
   "seal_integrity": {{
     "status": "Factory Sealed/Opened/Resealed/Compromised/Not Applicable",
-    "notes": "detailed notes about seal condition"
+    "notes": "detailed notes about seal/wrap (tightness, tears, holes, bubbling, seams)"
   }},
   "packaging_condition": {{
     "grade": "Mint/Near Mint/Excellent/Good/Fair/Poor",
-    "notes": "detailed notes about packaging"
+    "notes": "detailed notes about box/packaging wear: corners, dents, crushing, scratches, scuffs, sticker residue"
   }},
   "signature_assessment": {{
     "present": true/false,
     "quality": "Clear/Faded/Smudged/Not Applicable",
-    "notes": "notes about signature condition if present"
+    "notes": "notes about signature placement/ink flow/bleeding and any authenticity concerns"
   }},
-  "value_factors": ["..."],
-  "defects": ["..."],
-  "overall_assessment": "5-8 sentence narrative about condition and key factors",
-  "flags": ["Important issues (damage, authenticity concerns, etc.)"]
+  "value_factors": ["short bullets: print run, desirability, era, sealed premium, athlete/popularity, etc."],
+  "defects": ["each defect as a full sentence with location + severity"],
+  "flags": ["short flags for important issues (reseal risk, crush damage, water, heavy dents, COA missing)"],
+  "overall_assessment": "5-8 sentences in first person (\"Looking at your item...\") explaining condition and what limits it.",
+  "spoken_word": "A 20–45 second spoken-word version: best features, main issues, realistic condition grade.",
+  "observed_id": {{
+    "brand": "best-effort",
+    "product_name": "best-effort",
+    "set_or_series": "best-effort",
+    "year": "best-effort",
+    "edition_or_language": "best-effort",
+    "item_type": "best-effort"
+  }}
 }}
 
 {ctx}
 
-Important:
-- If something doesn't apply, use "Not Applicable" or empty arrays.
-Respond ONLY with JSON.
+Rules:
+- Do NOT claim Factory Sealed unless the wrap/seal looks consistent.
+- If glare/blur prevents certainty, say so and reduce confidence.
+Respond ONLY with JSON, no extra text.
 """
 
     content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
@@ -1325,6 +1391,25 @@ Respond ONLY with JSON.
     result = await _openai_chat(msg, max_tokens=2000, temperature=0.1)
     data = _parse_json_or_none(result.get("content", "")) if not result.get("error") else None
     data = data or {}
+    # Ensure condition_distribution exists (confidence-weighted)
+    if not isinstance(data.get("condition_distribution"), dict):
+        cg = _norm_ws(str(data.get("condition_grade", ""))).title()
+        confv = _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0)
+        ladder = ["Mint", "Near Mint", "Excellent", "Good", "Fair", "Poor"]
+        try:
+            i = ladder.index(cg) if cg in ladder else 2
+        except Exception:
+            i = 2
+        # Put most weight on predicted bucket, spill to neighbors based on confidence
+        p_main = 0.45 + 0.50 * confv
+        rem = 1.0 - p_main
+        dist = {k: 0.0 for k in ladder}
+        dist[ladder[i]] = p_main
+        if i-1 >= 0: dist[ladder[i-1]] += rem * 0.55
+        if i+1 < len(ladder): dist[ladder[i+1]] += rem * 0.45
+        total = sum(dist.values()) or 1.0
+        data["condition_distribution"] = {k: round(v/total, 4) for k, v in dist.items()}
+
 
     # Ensure seal_integrity always has status (fixes UI "undefined" cases)
     seal = data.get("seal_integrity") if isinstance(data.get("seal_integrity"), dict) else {}
@@ -1708,6 +1793,31 @@ async def market_context(
     if rec_buy is not None and raw_base is not None:
         rec_buy = min(float(rec_buy), float(raw_base))
 
+    
+    # --- AUD conversion (best-effort) ---
+    aud_rate = None
+    aud_raw = None
+    aud_psa10 = None
+    aud_psa9 = None
+    aud_psa8 = None
+    aud_expected = None
+    aud_rec_buy = None
+    try:
+        if raw_val is not None:
+            aud_raw, aud_rate = await _usd_to_aud(raw_val)
+        if psa10_equiv is not None:
+            aud_psa10, aud_rate = await _usd_to_aud(psa10_equiv)
+        if psa9_equiv is not None:
+            aud_psa9, aud_rate = await _usd_to_aud(psa9_equiv)
+        if psa8_equiv is not None:
+            aud_psa8, aud_rate = await _usd_to_aud(psa8_equiv)
+        if expected_val is not None:
+            aud_expected, aud_rate = await _usd_to_aud(expected_val)
+        if rec_buy is not None:
+            aud_rec_buy, aud_rate = await _usd_to_aud(rec_buy)
+    except Exception:
+        pass
+
     rec_buy = (round(float(rec_buy), 2) if rec_buy is not None else None)
 
     # UI expects these keys
@@ -1730,6 +1840,8 @@ async def market_context(
 
         "observed": {
             "currency": "USD",
+            "fx": {"aud_rate": aud_rate, "aud_timestamp": datetime.utcnow().isoformat() + "Z"} if aud_rate else {},
+            "aud": {"raw_median": aud_raw, "psa10": aud_psa10, "psa9": aud_psa9, "psa8": aud_psa8} if aud_rate else {},
             "liquidity": liquidity,
             "trend": trend_label,
             "raw": {
@@ -1747,6 +1859,7 @@ async def market_context(
 
         "grade_impact": {
             "expected_graded_value": expected_val,
+            "expected_graded_value_aud": aud_expected if aud_rate else None,
             "raw_baseline_value": raw_base,
             "grading_cost": float(grading_cost or 0.0),
             "estimated_value_difference": diff,
@@ -1755,6 +1868,7 @@ async def market_context(
                 "retail_loose_buy": retail_loose_buy,
                 "retail_loose_sell": retail_loose_sell,
                 "recommended_purchase_price": rec_buy,
+                "recommended_purchase_price_aud": aud_rec_buy if aud_rate else None,
                 "assume_grading": assume_grading,
                 "notes": " ".join(note) if isinstance(note, list) else "",
             },
