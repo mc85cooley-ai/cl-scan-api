@@ -1494,6 +1494,58 @@ async def market_context(
         return "-"
 
 
+    def _condition_multiplier_from_pregrade(g: Optional[int]) -> float:
+        """Return a conservative 'as-is' value multiplier based on observed/assessed pregrade (1-10)."""
+        if g is None:
+            return 0.85
+        try:
+            gi = int(g)
+        except Exception:
+            return 0.85
+        # Simple, explainable ladder (kept conservative)
+        ladder = {
+            10: 1.00,
+            9: 0.92,
+            8: 0.82,
+            7: 0.72,
+            6: 0.62,
+            5: 0.52,
+            4: 0.42,
+            3: 0.36,
+            2: 0.33,
+            1: 0.30,
+        }
+        return float(ladder.get(max(1, min(10, gi)), 0.85))
+
+    def _condition_bucket_from_pregrade(g: Optional[int]) -> str:
+        """Human-friendly condition bucket for UI labels."""
+        if g is None:
+            return "unknown"
+        try:
+            gi = int(g)
+        except Exception:
+            return "unknown"
+        if gi >= 9:
+            return "mint_like"
+        if gi >= 7:
+            return "near_mint"
+        if gi >= 5:
+            return "excellent"
+        if gi >= 3:
+            return "good"
+        return "poor"
+
+    def _safe_money_mul(v: Optional[float], mult: Optional[float]) -> Optional[float]:
+        if v is None:
+            return None
+        try:
+            m = float(mult) if mult is not None else 1.0
+        except Exception:
+            m = 1.0
+        return round(float(v) * m, 2)
+
+
+
     def _holding_time(liquidity: str, trend: str) -> Tuple[str, str]:
         """Return (label, explanation). Labels: short/medium/long."""
         liq = (liquidity or "-").lower()
@@ -1906,7 +1958,10 @@ async def market_context(
 
     # --- Grading value summary (spoken word) ---
     card_label = f"your {clean_name}" if clean_name else "this card"
-    raw_as_is_aud = (_usd_to_aud_simple(raw_val) * float(mult)) if (raw_val is not None and mult is not None) else None
+
+    g_ass = _grade_bucket(assessed_pregrade or "") or _grade_bucket(predicted_grade or "")
+    mult = float(condition_multiplier) if isinstance(condition_multiplier, (int, float)) else _condition_multiplier_from_pregrade(g_ass)
+    raw_as_is_aud = (_usd_to_aud_simple(raw_val) * float(mult)) if (raw_val is not None) else None
     expected_graded_aud = _usd_to_aud_simple(expected_val) if expected_val is not None else None
     grading_value_summary = _grading_value_summary(
         card_label=card_label,
