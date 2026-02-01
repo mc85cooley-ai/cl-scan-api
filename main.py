@@ -809,43 +809,176 @@ async def pricecharting_history(product_id: str, limit: int = 52):
 @app.post("/api/identify")
 @safe_endpoint
 async def identify(front: UploadFile = File(...)):
-    img = await front.read()
-    if not img or len(img) < 200:
-        raise HTTPException(status_code=400, detail="Image is too small or empty")
+    """Identify a trading card from a single front photo.
 
-    prompt = """You are identifying a trading card from a front photo.
+    This endpoint powers the card workflow. To keep the frontend UX stable, we
+    return a safe "Unknown" payload (HTTP 200) for upstream/provider errors
+    (e.g., missing OpenAI key, transient API failures), rather than a hard 500.
+    """
+    try:
+            img = await front.read()
+            if not img or len(img) < 200:
+                raise HTTPException(status_code=400, detail="Image is too small or empty")
 
-Return ONLY valid JSON with these exact fields:
+            prompt = """You are identifying a trading card from a front photo.
 
-{
-  "card_name": "exact card name including variants (ex, V, VMAX, holo, first edition, etc.)",
-  "card_type": "Pokemon/Magic/YuGiOh/Sports/OnePiece/Other",
-  "year": "4 digit year if visible else empty string",
-  "card_number": "card number if visible (e.g. 006/165 or 004 or 4/102) else empty string",
-  "set_code": "set abbreviation printed on the card if visible (often 2-4 chars like MEW, OBF, SVI). EMPTY if not visible",
-  "set_name": "set or series name (full name) if visible/known else empty string",
-  "confidence": 0.0-1.0,
-  "notes": "one short sentence about how you identified it"
-}
+        Return ONLY valid JSON with these exact fields:
 
-Rules:
-- PRIORITIZE set_code if you can see it.
-- Do NOT guess a set_code you cannot see.
-- Preserve leading zeros in card_number if shown (e.g., 006/165).
-- If you cannot identify with confidence, set card_name to "Unknown" and confidence to 0.0.
-Respond ONLY with JSON, no extra text.
-"""
+        {
+          "card_name": "exact card name including variants (ex, V, VMAX, holo, first edition, etc.)",
+          "card_type": "Pokemon/Magic/YuGiOh/Sports/OnePiece/Other",
+          "year": "4 digit year if visible else empty string",
+          "card_number": "card number if visible (e.g. 006/165 or 004 or 4/102) else empty string",
+          "set_code": "set abbreviation printed on the card if visible (often 2-4 chars like MEW, OBF, SVI). EMPTY if not visible",
+          "set_name": "set or series name (full name) if visible/known else empty string",
+          "confidence": 0.0-1.0,
+          "notes": "one short sentence about how you identified it"
+        }
 
-    msg = [{
-        "role": "user",
-        "content": [
-            {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(img)}", "detail": "high"}},
-        ],
-    }]
+        Rules:
+        - PRIORITIZE set_code if you can see it.
+        - Do NOT guess a set_code you cannot see.
+        - Preserve leading zeros in card_number if shown (e.g., 006/165).
+        - If you cannot identify with confidence, set card_name to "Unknown" and confidence to 0.0.
+        Respond ONLY with JSON, no extra text.
+        """
 
-    result = await _openai_chat(msg, max_tokens=800, temperature=0.1)
-    if result.get("error"):
+            msg = [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(img)}", "detail": "high"}},
+                ],
+            }]
+
+            result = await _openai_chat(msg, max_tokens=800, temperature=0.1)
+            if result.get("error"):
+                return JSONResponse(content={
+                    "card_name": "Unknown",
+                    "card_type": "Other",
+                    "year": "",
+                    "card_number": "",
+                    "set_code": "",
+                    "set_name": "",
+                    "confidence": 0.0,
+                    "notes": "AI identification failed",
+                    "identify_token": f"idt_{secrets.token_urlsafe(12)}",
+                    "pokemontcg": None,
+                    "pokemontcg_enriched": False,
+                })
+
+            data = _parse_json_or_none(result.get("content", "")) or {}
+
+            card_name = _norm_ws(str(data.get("card_name", "Unknown")))
+            card_type = _norm_ws(str(data.get("card_type", "Other")))
+            card_type = _normalize_card_type(card_type)
+            year = _norm_ws(str(data.get("year", "")))
+            card_number_display = _clean_card_number_display(str(data.get("card_number", "")))
+            set_code = _norm_ws(str(data.get("set_code", ""))).upper()
+            set_name = _norm_ws(str(data.get("set_name", "")))
+            if _is_blankish(set_name):
+                set_name = ""
+            if set_name.strip().lower() in ("unknown","n/a","na","none"):
+                set_name = ""
+            conf = _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0)
+            notes = _norm_ws(str(data.get("notes", "")))
+
+            # If the model says "Unknown", force confidence low.
+            if card_name.strip().lower() == "unknown":
+                conf = 0.0
+                card_type = "Other"
+
+            # optional PokemonTCG enrichment (Pokemon only)
+            enriched = False
+            ptcg_payload = None
+            set_id = ""
+
+            if POKEMONTCG_API_KEY and card_type.lower() == "pokemon" and card_name != "Unknown":
+                ptcg_set = {}
+                if set_code and not set_name:
+                    ptcg_set = await _pokemontcg_resolve_set_by_ptcgo(set_code)
+                    if ptcg_set.get("name"):
+                        set_name = _norm_ws(str(ptcg_set.get("name", "")))
+                        set_id = str(ptcg_set.get("id", ""))
+
+                pid = await _pokemontcg_resolve_card_id(card_name, set_code, card_number_display, set_name=set_name, set_id=set_id)
+                if pid:
+                    card = await _pokemontcg_card_by_id(pid)
+                    if card:
+                        enriched = True
+                        conf = min(1.0, conf + 0.15)
+                        set_name = _norm_ws(str((card.get("set") or {}).get("name", set_name)))
+                        set_code = _norm_ws(str((card.get("set") or {}).get("ptcgoCode", set_code))).upper()
+                        set_id = _norm_ws(str((card.get("set") or {}).get("id", set_id)))
+                        release_date = _norm_ws(str((card.get("set") or {}).get("releaseDate", "")))
+                        if release_date and not year:
+                            year = release_date[:4]
+                        # keep the AI card_number display if present, else use API number
+                        if not card_number_display:
+                            card_number_display = _clean_card_number_display(str(card.get("number", "")))
+                        ptcg_payload = {
+                            "id": card.get("id", ""),
+                            "name": card.get("name", ""),
+                            "number": card.get("number", ""),
+                            "rarity": card.get("rarity", ""),
+                            "set": card.get("set", {}) or {},
+                            "images": card.get("images", {}) or {},
+                            "links": {
+                                "tcgplayer": (card.get("tcgplayer") or {}).get("url", ""),
+                                "cardmarket": (card.get("cardmarket") or {}).get("url", ""),
+                            },
+                        }
+                        notes = f"Verified via PokemonTCG API (id {pid})"
+
+    
+            # Canonicalize set (prefer map / resolved name) + build canonical id for frontend
+            set_info = _canonicalize_set(set_code, set_name)
+            canonical_id = {
+                "card_name": card_name,
+                "card_type": card_type,
+                "year": year,
+                "card_number": card_number_display,
+                "set_code": set_info["set_code"],
+                "set_name": set_info["set_name"],
+                "set_source": set_info.get("set_source", "unknown"),
+                "confidence": conf,
+            }
+
+            return JSONResponse(content={
+                "card_name": card_name,
+                "card_type": card_type,
+                "year": year,
+                "card_number": card_number_display,
+                "set_code": set_info["set_code"],
+                "set_name": set_info["set_name"],
+                "set_id": set_id,
+                "confidence": conf,
+                "notes": notes,
+                "canonical_id": canonical_id,
+                "identify_token": f"idt_{secrets.token_urlsafe(12)}",
+                "pokemontcg": ptcg_payload,
+                "pokemontcg_enriched": enriched,
+            })
+    except HTTPException as e:
+        # For server-side/config/provider issues, downgrade to a safe response
+        if int(getattr(e, "status_code", 500) or 500) >= 500:
+            notes = f"Identification unavailable: {getattr(e, 'detail', str(e))}"
+            return JSONResponse(content={
+            "card_name": "Unknown",
+            "card_type": "Other",
+            "year": "",
+            "card_number": "",
+            "set_code": "",
+            "set_name": "",
+            "confidence": 0.0,
+            "notes": notes,
+            "identify_token": f"idt_{secrets.token_urlsafe(12)}",
+            "pokemontcg": None,
+            "pokemontcg_enriched": False,
+        }, status_code=200)
+        raise
+    except Exception as e:
+        notes = f"Identification failed: {str(e)[:300]}"
         return JSONResponse(content={
             "card_name": "Unknown",
             "card_type": "Other",
@@ -854,104 +987,11 @@ Respond ONLY with JSON, no extra text.
             "set_code": "",
             "set_name": "",
             "confidence": 0.0,
-            "notes": "AI identification failed",
+            "notes": notes,
             "identify_token": f"idt_{secrets.token_urlsafe(12)}",
             "pokemontcg": None,
             "pokemontcg_enriched": False,
-        })
-
-    data = _parse_json_or_none(result.get("content", "")) or {}
-
-    card_name = _norm_ws(str(data.get("card_name", "Unknown")))
-    card_type = _norm_ws(str(data.get("card_type", "Other")))
-    card_type = _normalize_card_type(card_type)
-    year = _norm_ws(str(data.get("year", "")))
-    card_number_display = _clean_card_number_display(str(data.get("card_number", "")))
-    set_code = _norm_ws(str(data.get("set_code", ""))).upper()
-    set_name = _norm_ws(str(data.get("set_name", "")))
-    if _is_blankish(set_name):
-        set_name = ""
-    if set_name.strip().lower() in ("unknown","n/a","na","none"):
-        set_name = ""
-    conf = _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0)
-    notes = _norm_ws(str(data.get("notes", "")))
-
-    # If the model says "Unknown", force confidence low.
-    if card_name.strip().lower() == "unknown":
-        conf = 0.0
-        card_type = "Other"
-
-    # optional PokemonTCG enrichment (Pokemon only)
-    enriched = False
-    ptcg_payload = None
-    set_id = ""
-
-    if POKEMONTCG_API_KEY and card_type.lower() == "pokemon" and card_name != "Unknown":
-        ptcg_set = {}
-        if set_code and not set_name:
-            ptcg_set = await _pokemontcg_resolve_set_by_ptcgo(set_code)
-            if ptcg_set.get("name"):
-                set_name = _norm_ws(str(ptcg_set.get("name", "")))
-                set_id = str(ptcg_set.get("id", ""))
-
-        pid = await _pokemontcg_resolve_card_id(card_name, set_code, card_number_display, set_name=set_name, set_id=set_id)
-        if pid:
-            card = await _pokemontcg_card_by_id(pid)
-            if card:
-                enriched = True
-                conf = min(1.0, conf + 0.15)
-                set_name = _norm_ws(str((card.get("set") or {}).get("name", set_name)))
-                set_code = _norm_ws(str((card.get("set") or {}).get("ptcgoCode", set_code))).upper()
-                set_id = _norm_ws(str((card.get("set") or {}).get("id", set_id)))
-                release_date = _norm_ws(str((card.get("set") or {}).get("releaseDate", "")))
-                if release_date and not year:
-                    year = release_date[:4]
-                # keep the AI card_number display if present, else use API number
-                if not card_number_display:
-                    card_number_display = _clean_card_number_display(str(card.get("number", "")))
-                ptcg_payload = {
-                    "id": card.get("id", ""),
-                    "name": card.get("name", ""),
-                    "number": card.get("number", ""),
-                    "rarity": card.get("rarity", ""),
-                    "set": card.get("set", {}) or {},
-                    "images": card.get("images", {}) or {},
-                    "links": {
-                        "tcgplayer": (card.get("tcgplayer") or {}).get("url", ""),
-                        "cardmarket": (card.get("cardmarket") or {}).get("url", ""),
-                    },
-                }
-                notes = f"Verified via PokemonTCG API (id {pid})"
-
-    
-    # Canonicalize set (prefer map / resolved name) + build canonical id for frontend
-    set_info = _canonicalize_set(set_code, set_name)
-    canonical_id = {
-        "card_name": card_name,
-        "card_type": card_type,
-        "year": year,
-        "card_number": card_number_display,
-        "set_code": set_info["set_code"],
-        "set_name": set_info["set_name"],
-        "set_source": set_info.get("set_source", "unknown"),
-        "confidence": conf,
-    }
-
-    return JSONResponse(content={
-        "card_name": card_name,
-        "card_type": card_type,
-        "year": year,
-        "card_number": card_number_display,
-        "set_code": set_info["set_code"],
-        "set_name": set_info["set_name"],
-        "set_id": set_id,
-        "confidence": conf,
-        "notes": notes,
-        "canonical_id": canonical_id,
-        "identify_token": f"idt_{secrets.token_urlsafe(12)}",
-        "pokemontcg": ptcg_payload,
-        "pokemontcg_enriched": enriched,
-    })
+        }, status_code=200)
 
 # ==============================
 # Card: Verify (grading only)
