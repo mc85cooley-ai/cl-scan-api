@@ -1521,6 +1521,50 @@ async def market_context(
         """Human-friendly condition bucket for UI labels."""
         if g is None:
             return "unknown"
+
+
+    def _condition_bucket_from_pregrade(g: Optional[int]) -> str:
+        # UI-friendly buckets
+        if g is None:
+            return "unknown"
+        if g >= 10:
+            return "gem_mint"
+        if g == 9:
+            return "mint"
+        if g == 8:
+            return "near_mint"
+        if g == 7:
+            return "excellent"
+        if g == 6:
+            return "good"
+        return "fair_or_worse"
+
+    def _condition_multiplier_from_pregrade(g: Optional[int]) -> float:
+        # Conservative, explainable multipliers for "as-is" guidance.
+        # Keep in 0.60–1.10 range.
+        if g is None:
+            return 0.85
+        if g >= 10:
+            return 1.05
+        if g == 9:
+            return 1.00
+        if g == 8:
+            return 0.90
+        if g == 7:
+            return 0.80
+        if g == 6:
+            return 0.72
+        if g == 5:
+            return 0.66
+        return 0.60
+
+    def _safe_money_mul(v: Optional[float], m: Optional[float]) -> Optional[float]:
+        try:
+            if v is None or m is None:
+                return None
+            return round(float(v) * float(m), 2)
+        except Exception:
+            return None
         try:
             gi = int(g)
         except Exception:
@@ -1830,7 +1874,9 @@ async def market_context(
             best_score = score
             best = r
 
-    if not best or best_score < 10:
+    min_score = 6 if is_sealed_like else 10
+
+    if not best or best_score < min_score:
         return JSONResponse(content={
             "available": True,
             "mode": "click_only",
@@ -1917,6 +1963,20 @@ async def market_context(
     raw_base = raw_val if isinstance(raw_val, (int, float)) else None
     diff = (round(expected_val - raw_base - float(grading_cost or 0.0), 2) if (expected_val is not None and raw_base is not None) else None)
 
+
+    # --------------------------
+    # Condition-adjusted ("as-is") view
+    # --------------------------
+    g_ass = _grade_bucket(assessed_pregrade or "") or _grade_bucket(predicted_grade or "")
+    try:
+        mult = float(condition_multiplier) if condition_multiplier is not None else None
+    except Exception:
+        mult = None
+    if mult is None:
+        mult = _condition_multiplier_from_pregrade(g_ass)
+    # Clamp to a sane range to avoid UI weirdness if a bad multiplier is posted
+    mult = max(0.50, min(1.25, float(mult)))
+    bucket = _condition_bucket_from_pregrade(g_ass)
     # --------------------------
     # Recommended purchase price
     # --------------------------
@@ -2008,6 +2068,15 @@ async def market_context(
                 "9": psa9_equiv,
                 "8": psa8_equiv,
             },
+            "as_is": {
+                "multiplier": mult,
+                "bucket": bucket,
+                "raw_as_is_aud": _safe_money_mul(aud_raw, mult),
+                "psa10_equiv_as_is_aud": _safe_money_mul(aud_psa10, mult),
+                "psa9_equiv_as_is_aud": _safe_money_mul(aud_psa9, mult),
+                "psa8_equiv_as_is_aud": _safe_money_mul(aud_psa8, mult),
+                "recommended_buy_aud": aud_rec_buy,
+            },
         },
 
         "grade_impact": {
@@ -2041,6 +2110,8 @@ async def market_context(
                 "bgs_10_price": bgs10,
             }
         },
+
+        "grading_value_summary": grading_value_summary,
 
         "disclaimer": "Informational market context only. Figures are third-party estimates and may vary. Not financial advice.",
     }, status_code=200)
