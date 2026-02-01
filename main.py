@@ -1412,6 +1412,10 @@ async def market_context(
     confidence: float = Form(0.0),
     grading_cost: float = Form(35.0),
 
+    item_type: Optional[str] = Form(None),
+    assessed_pregrade: Optional[str] = Form(None),
+    condition_multiplier: Optional[float] = Form(None),
+
     # Back-compat aliases from older frontends
     card_name: Optional[str] = Form(None),
     card_type: Optional[str] = Form(None),
