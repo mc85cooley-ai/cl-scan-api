@@ -259,7 +259,7 @@ def _pc_trend(product_id: str, days: int = 30) -> dict:
     con.close()
 
     if not rows or len(rows) < 2:
-        return {"available": False, "samples": len(rows or [])}
+        return {"available": False}
 
     # Convert to (date, value)
     series = []
@@ -272,7 +272,7 @@ def _pc_trend(product_id: str, days: int = 30) -> dict:
         series.append((r["snap_date"], float(v)))
 
     if len(series) < 2:
-        return {"available": False, "samples": len(series)}
+        return {"available": False}
 
     # Use last value and value from ~days ago (closest earlier)
     last_date, last_val = series[-1]
@@ -313,7 +313,6 @@ def _pc_trend(product_id: str, days: int = 30) -> dict:
         "change": round(change, 2),
         "change_pct": round(pct, 4) if pct is not None else None,
         "label": label,
-        "samples": len(series),
     }
 
 
@@ -1411,7 +1410,7 @@ async def market_context(
     item_number: Optional[str] = Form(None),
     predicted_grade: Optional[str] = Form("9"),
     confidence: float = Form(0.0),
-    grading_cost: float = Form(55.0),
+    grading_cost: float = Form(35.0),
 
     # Back-compat aliases from older frontends
     card_name: Optional[str] = Form(None),
@@ -1547,7 +1546,7 @@ async def market_context(
                         "currency": "AUD",
                         "fx": {"usd_to_aud_multiplier": AUD_MULTIPLIER},
                         "usd_original": {"typical": typical_usd},
-                        "raw": {"median": typical_aud, "avg": typical_aud, "range": None, "samples": len(vals) if vals else 0},
+                        "raw": {"median": typical_aud, "avg": typical_aud, "range": None},
                         "graded_psa": {"10": None, "9": None, "8": None},
                         "as_is": {"multiplier": mult, "bucket": bucket, "recommended_buy_aud": rec_buy_aud},
                         "pricecharting_prices": prices,
@@ -1559,11 +1558,9 @@ async def market_context(
                         "grading_cost": float(grading_cost or 0.0),
                         "estimated_value_difference": None,
                         "recommended_buy": {
-                            "currency": "USD",
+                            "currency": "AUD",
                             "recommended_purchase_price": rec_buy_usd,
-                            "recommended_purchase_price_aud": rec_buy_aud,
-                            "assume_grading": False,
-                            "notes": "Sealed/memorabilia guidance uses PriceCharting API typical price and applies the condition multiplier only for the recommended buy value.",
+                            "recommended_purchase_price_aud": rec_buy_aud,                            "notes": "Sealed/memorabilia guidance uses PriceCharting API typical price and applies the condition multiplier only for the recommended buy value.",
                         },
                     },
                     "meta": {
@@ -1708,7 +1705,7 @@ async def market_context(
                 "currency": "AUD",
                 "liquidity": "—",
                 "trend": "—",
-                "raw": {"median": None, "avg": None, "range": None, "samples": 0},
+                "raw": {"median": None, "avg": None, "range": None},
                 "graded_psa": {"10": None, "9": None, "8": None},
             },
             "grade_impact": {
@@ -1717,9 +1714,7 @@ async def market_context(
                 "grading_cost": float(grading_cost or 0.0),
                 "estimated_value_difference": None,
             },
-            "meta": {
-                "equivalency_note": "No match yet.",
-            },
+            "meta": {            },
             "disclaimer": "Informational market context only. Figures are third-party estimates and may vary.",
         }, status_code=200)
 
@@ -1800,7 +1795,7 @@ async def market_context(
     cond_factor = max(0.60, min(1.10, 0.40 + 0.07 * pg)) if pg else 0.85
     conf_factor = max(0.0, min(1.0, float(conf_in or 0.0)))
 
-    assume_grading = bool(pg >= 8.5 and conf_factor >= 0.75 and expected_val is not None and float(grading_cost or 0.0) > 0)
+    assume_grading = False
 
     rec_buy = None
     note = []
@@ -1808,18 +1803,6 @@ async def market_context(
     if base_buy is not None:
         rec_buy = float(base_buy) * float(cond_factor) * float(conf_factor)
         note.append("Baseline uses retail-loose-buy adjusted by assessed grade & confidence.")
-
-    if assume_grading:
-        net_after_grading = float(expected_val) - float(grading_cost or 0.0)
-        if net_after_grading > 0:
-            # leave margin for fees/time/risk; confidence reduces aggression
-            max_buy_from_grading = net_after_grading * 0.75 * conf_factor
-            note.append("Grading upside considered: expected graded value minus grading cost, then margin.")
-            if rec_buy is None:
-                rec_buy = max_buy_from_grading
-            else:
-                rec_buy = max(rec_buy, max_buy_from_grading)
-
     # cap recommended buy to observed raw value if we have one
     if rec_buy is not None and raw_base is not None:
         rec_buy = min(float(rec_buy), float(raw_base))
@@ -1839,7 +1822,7 @@ async def market_context(
     return JSONResponse(content={
         "available": True,
         "mode": "click_only",
-        "message": "Market context loaded",
+        "message": "Market history loaded",
         "used_query": f"{clean_name} {clean_set} {clean_num_display}".strip(),
         "query_ladder": [clean_name, f"{clean_name} {clean_set}".strip(), f"{clean_name} {clean_set} {clean_num_display}".strip()],
         "confidence": conf_in,
@@ -1863,7 +1846,6 @@ async def market_context(
                 "median": raw_val,
                 "avg": raw_val,
                 "range": None,
-                "samples": 1 if raw_val is not None else 0,
             },
             "graded_psa": {
                 "10": psa10_equiv,
@@ -1883,9 +1865,7 @@ async def market_context(
                 "retail_loose_buy": retail_loose_buy,
                 "retail_loose_sell": retail_loose_sell,
                 "recommended_purchase_price": rec_buy,
-                "recommended_purchase_price_aud": aud_rec_buy,
-                "assume_grading": assume_grading,
-                "notes": " ".join(note) if isinstance(note, list) else "",
+                "recommended_purchase_price_aud": aud_rec_buy,                "notes": " ".join(note) if isinstance(note, list) else "",
             },
         },
 
@@ -1895,9 +1875,7 @@ async def market_context(
                 "product_name": best.get("product-name"),
                 "console_name": best.get("console-name"),
                 "sales_volume": best.get("sales-volume"),
-            },
-            "equivalency_note": "Front-end labels use PSA-style equivalents (est.). Mapping: BGS 10 → PSA 10 (est.), condition-17 → PSA 9 (est.), condition-18 → PSA 8 (est.). Not official PSA comps.",
-            "sources": ["pricecharting_csv"],
+            },            "sources": ["pricecharting_csv"],
             "raw_fields": {
                 "loose_price": loose,
                 "new_price": newp,
