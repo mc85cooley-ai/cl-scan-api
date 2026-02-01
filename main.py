@@ -37,6 +37,15 @@ from pathlib import Path
 import httpx
 import time
 
+# Optional image processing for 2-pass defect enhancement
+try:
+    from PIL import Image, ImageEnhance, ImageOps, ImageFilter
+except Exception:
+    Image = None
+    ImageEnhance = None
+    ImageOps = None
+    ImageFilter = None
+
 # Simple in-memory caches (per-process)
 _FX_CACHE = {"ts": 0, "usd_aud": None}
 _EBAY_CACHE = {}  # key -> {ts, data}
@@ -477,6 +486,38 @@ if USE_EBAY_API and not EBAY_APP_ID:
 # ==============================
 def _b64(img: bytes) -> str:
     return base64.b64encode(img).decode("utf-8")
+
+
+def _make_defect_filter_variants(img_bytes: bytes) -> Dict[str, bytes]:
+    """Create enhanced variants to help the second-pass detect print lines / scratches / whitening.
+    Uses PIL if available. Returns dict name->jpeg_bytes. If PIL missing, returns empty dict.
+    """
+    if not img_bytes or Image is None:
+        return {}
+    try:
+        from io import BytesIO
+        im = Image.open(BytesIO(img_bytes)).convert("RGB")
+        variants: Dict[str, bytes] = {}
+
+        # Variant 1: grayscale + autocontrast (good for print lines / scratches)
+        g = ImageOps.grayscale(im)
+        g = ImageOps.autocontrast(g)
+        g = g.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
+        buf = BytesIO()
+        g.save(buf, format="JPEG", quality=92)
+        variants["gray_autocontrast"] = buf.getvalue()
+
+        # Variant 2: boosted contrast + sharpness (good for edge wear and whitening)
+        c = ImageEnhance.Contrast(im).enhance(1.6)
+        c = ImageEnhance.Sharpness(c).enhance(1.8)
+        c = c.filter(ImageFilter.UnsharpMask(radius=1, percent=130, threshold=2))
+        buf = BytesIO()
+        c.save(buf, format="JPEG", quality=92)
+        variants["contrast_sharp"] = buf.getvalue()
+
+        return variants
+    except Exception:
+        return {}
 
 def _norm_ws(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
@@ -999,6 +1040,85 @@ Respond ONLY with JSON, no extra text.
 
     data = _parse_json_or_none(result.get("content", "")) or {}
 
+    # ------------------------------
+    # Second-pass (defect enhanced) analysis
+    # ------------------------------
+    second_pass = {"enabled": True, "ran": False, "skipped_reason": None, "glare_suspects": [], "defect_candidates": []}
+    try:
+        # Only run for cards; memorabilia uses a different endpoint.
+        front_vars = _make_defect_filter_variants(front_bytes)
+        back_vars = _make_defect_filter_variants(back_bytes)
+
+        if not front_vars and not back_vars:
+            second_pass["enabled"] = False
+            second_pass["skipped_reason"] = "image_filters_unavailable"
+        else:
+            sp_prompt = f"""You are a meticulous trading card defect inspector.
+You are analyzing ENHANCED/FILTERED variants created to make defects stand out (print lines, scratches, whitening, dents).
+You may also receive an ANGLED image used to rule out glare/light refraction.
+
+CRITICAL:
+- Do NOT treat holo sheen / glare as whitening. If the angled shot suggests the mark moves/disappears, flag it as glare_suspect.
+- Card texture is NOT damage unless there is a true crease/indent/paper break.
+- Print lines are typically straight and consistent; glare moves with angle.
+
+Return ONLY valid JSON:
+{{
+  "defect_candidates": [
+    {{"type":"print_line|scratch|whitening|dent|crease|tear|stain|other","severity":"minor|moderate|severe","note":"short plain description","confidence":0-1}}
+  ],
+  "glare_suspects": [
+    {{"type":"whitening|scratch|print_line|other","note":"why it looks like glare","confidence":0-1}}
+  ]
+}}
+"""
+
+            content_parts = [{"type": "text", "text": sp_prompt}]
+
+            # Include filtered variants first (strong signal)
+            if front_vars.get("gray_autocontrast"):
+                content_parts += [
+                    {"type":"text","text":"FRONT (filtered: gray_autocontrast)"},
+                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(front_vars['gray_autocontrast'])}", "detail":"high"}}
+                ]
+            if front_vars.get("contrast_sharp"):
+                content_parts += [
+                    {"type":"text","text":"FRONT (filtered: contrast_sharp)"},
+                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(front_vars['contrast_sharp'])}", "detail":"high"}}
+                ]
+            if back_vars.get("gray_autocontrast"):
+                content_parts += [
+                    {"type":"text","text":"BACK (filtered: gray_autocontrast)"},
+                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(back_vars['gray_autocontrast'])}", "detail":"high"}}
+                ]
+            if back_vars.get("contrast_sharp"):
+                content_parts += [
+                    {"type":"text","text":"BACK (filtered: contrast_sharp)"},
+                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(back_vars['contrast_sharp'])}", "detail":"high"}}
+                ]
+
+            # Include angled if available (glare check)
+            if angled_bytes and len(angled_bytes) > 200:
+                content_parts += [
+                    {"type":"text","text":"OPTIONAL ANGLED IMAGE (glare check)"},
+                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(angled_bytes)}", "detail":"high"}}
+                ]
+
+            sp_msg = [{"role":"user","content": content_parts}]
+            sp_result = await _openai_chat(sp_msg, max_tokens=900, temperature=0.1)
+            if not sp_result.get("error"):
+                sp_data = _parse_json_or_none(sp_result.get("content","")) or {}
+                if isinstance(sp_data, dict):
+                    second_pass["ran"] = True
+                    if isinstance(sp_data.get("glare_suspects"), list):
+                        second_pass["glare_suspects"] = sp_data.get("glare_suspects")[:10]
+                    if isinstance(sp_data.get("defect_candidates"), list):
+                        second_pass["defect_candidates"] = sp_data.get("defect_candidates")[:20]
+            else:
+                second_pass["skipped_reason"] = "second_pass_ai_failed"
+    except Exception:
+        second_pass["skipped_reason"] = "second_pass_exception"
+
     card_name = _norm_ws(str(data.get("card_name", "Unknown")))
     card_type = _norm_ws(str(data.get("card_type", "Other")))
     card_type = _normalize_card_type(card_type)
@@ -1282,6 +1402,85 @@ Respond ONLY with JSON, no extra text.
 
     data = _parse_json_or_none(result.get("content", "")) or {}
 
+    # ------------------------------
+    # Second-pass (defect enhanced) analysis
+    # ------------------------------
+    second_pass = {"enabled": True, "ran": False, "skipped_reason": None, "glare_suspects": [], "defect_candidates": []}
+    try:
+        # Only run for cards; memorabilia uses a different endpoint.
+        front_vars = _make_defect_filter_variants(front_bytes)
+        back_vars = _make_defect_filter_variants(back_bytes)
+
+        if not front_vars and not back_vars:
+            second_pass["enabled"] = False
+            second_pass["skipped_reason"] = "image_filters_unavailable"
+        else:
+            sp_prompt = f"""You are a meticulous trading card defect inspector.
+You are analyzing ENHANCED/FILTERED variants created to make defects stand out (print lines, scratches, whitening, dents).
+You may also receive an ANGLED image used to rule out glare/light refraction.
+
+CRITICAL:
+- Do NOT treat holo sheen / glare as whitening. If the angled shot suggests the mark moves/disappears, flag it as glare_suspect.
+- Card texture is NOT damage unless there is a true crease/indent/paper break.
+- Print lines are typically straight and consistent; glare moves with angle.
+
+Return ONLY valid JSON:
+{{
+  "defect_candidates": [
+    {{"type":"print_line|scratch|whitening|dent|crease|tear|stain|other","severity":"minor|moderate|severe","note":"short plain description","confidence":0-1}}
+  ],
+  "glare_suspects": [
+    {{"type":"whitening|scratch|print_line|other","note":"why it looks like glare","confidence":0-1}}
+  ]
+}}
+"""
+
+            content_parts = [{"type": "text", "text": sp_prompt}]
+
+            # Include filtered variants first (strong signal)
+            if front_vars.get("gray_autocontrast"):
+                content_parts += [
+                    {"type":"text","text":"FRONT (filtered: gray_autocontrast)"},
+                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(front_vars['gray_autocontrast'])}", "detail":"high"}}
+                ]
+            if front_vars.get("contrast_sharp"):
+                content_parts += [
+                    {"type":"text","text":"FRONT (filtered: contrast_sharp)"},
+                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(front_vars['contrast_sharp'])}", "detail":"high"}}
+                ]
+            if back_vars.get("gray_autocontrast"):
+                content_parts += [
+                    {"type":"text","text":"BACK (filtered: gray_autocontrast)"},
+                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(back_vars['gray_autocontrast'])}", "detail":"high"}}
+                ]
+            if back_vars.get("contrast_sharp"):
+                content_parts += [
+                    {"type":"text","text":"BACK (filtered: contrast_sharp)"},
+                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(back_vars['contrast_sharp'])}", "detail":"high"}}
+                ]
+
+            # Include angled if available (glare check)
+            if angled_bytes and len(angled_bytes) > 200:
+                content_parts += [
+                    {"type":"text","text":"OPTIONAL ANGLED IMAGE (glare check)"},
+                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(angled_bytes)}", "detail":"high"}}
+                ]
+
+            sp_msg = [{"role":"user","content": content_parts}]
+            sp_result = await _openai_chat(sp_msg, max_tokens=900, temperature=0.1)
+            if not sp_result.get("error"):
+                sp_data = _parse_json_or_none(sp_result.get("content","")) or {}
+                if isinstance(sp_data, dict):
+                    second_pass["ran"] = True
+                    if isinstance(sp_data.get("glare_suspects"), list):
+                        second_pass["glare_suspects"] = sp_data.get("glare_suspects")[:10]
+                    if isinstance(sp_data.get("defect_candidates"), list):
+                        second_pass["defect_candidates"] = sp_data.get("defect_candidates")[:20]
+            else:
+                second_pass["skipped_reason"] = "second_pass_ai_failed"
+    except Exception:
+        second_pass["skipped_reason"] = "second_pass_exception"
+
     # Normalize flags/defects and compute structural-damage indicator
     flags_raw = data.get("flags", [])
     if isinstance(flags_raw, list):
@@ -1294,6 +1493,39 @@ Respond ONLY with JSON, no extra text.
     defects_list_out = data.get("defects", [])
     if not isinstance(defects_list_out, list):
         defects_list_out = []
+
+    # Merge second-pass defect candidates (print lines / scratches / whitening) and glare suspects.
+    # - Add high-confidence print_line flags when detected.
+    # - If glare suspects exist, annotate rather than over-penalize.
+    if isinstance(second_pass, dict) and second_pass.get("ran"):
+        cand = second_pass.get("defect_candidates") or []
+        glare = second_pass.get("glare_suspects") or []
+
+        # Add candidates into defects list (dedup by (type,note))
+        seen = set((str(d.get("type","")).lower(), str(d.get("note","")).lower()) for d in defects_list_out if isinstance(d, dict))
+        for d in cand:
+            if not isinstance(d, dict): 
+                continue
+            t = str(d.get("type","")).lower().strip()
+            note = str(d.get("note","")).strip()
+            if not t or not note:
+                continue
+            key = (t, note.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            defects_list_out.append({"type": t, "severity": d.get("severity",""), "note": note, "confidence": d.get("confidence", None), "source": "second_pass"})
+
+            # Promote print line detection into flags if confidence is decent
+            try:
+                c = float(d.get("confidence", 0))
+            except Exception:
+                c = 0.0
+            if t == "print_line" and c >= 0.55 and "print_line" not in flags_list_out:
+                flags_list_out.append("print_line")
+
+        # Store glare suspects into data for frontend / summary
+        data["glare_suspects"] = glare[:10]
 
     has_structural_damage = any(
         f in ("crease", "tear", "paper break", "structural bend", "hole")
@@ -1351,6 +1583,8 @@ Respond ONLY with JSON, no extra text.
         "surface": data.get("surface", {"front": {"grade": "", "notes": ""}, "back": {"grade": "", "notes": ""}}),
         "defects": defects_list_out,
         "flags": flags_list_out,
+        "second_pass": second_pass,
+        "glare_suspects": data.get("glare_suspects", []) if isinstance(data.get("glare_suspects", []), list) else [],
         "assessment_summary": _norm_ws(str(data.get("assessment_summary", ""))) or summary or "",
         "spoken_word": _norm_ws(str(data.get("spoken_word", ""))) or _norm_ws(str(data.get("assessment_summary", ""))) or summary or "",
         "observed_id": data.get("observed_id", {}) if isinstance(data.get("observed_id", {}), dict) else {},
