@@ -1,6 +1,6 @@
 """
 The Collectors League Australia - Scan API
-Futureproof v6.4.2 (2026-01-31)
+Futureproof v6.4.1 (2026-01-31)
 
 What changed vs v6.3.x
 - ✅ Adds PriceCharting API as primary market source for cards + sealed/memorabilia (current prices).
@@ -35,10 +35,12 @@ import traceback
 from pathlib import Path
 
 import httpx
+import time
 
 # Simple in-memory caches (per-process)
 _FX_CACHE = {"ts": 0, "usd_aud": None}
 _EBAY_CACHE = {}  # key -> {ts, data}
+FX_CACHE_SECONDS = int(os.getenv("FX_CACHE_SECONDS", "3600"))
 
 # ==============================
 # App & CORS
@@ -467,7 +469,7 @@ if not POKEMONTCG_API_KEY:
     print("INFO: POKEMONTCG_API_KEY not set (Pokemon enrichment disabled).")
 if not PRICECHARTING_TOKEN:
     print("INFO: PRICECHARTING_TOKEN not set (PriceCharting pricing disabled).")
-if USE_EBAY_API and not (EBAY_APP_ID and EBAY_OAUTH_TOKEN):
+if USE_EBAY_API and not EBAY_APP_ID:
     print("INFO: USE_EBAY_API=1 set but eBay credentials are missing (will remain inactive).")
 
 # ==============================
@@ -586,6 +588,18 @@ async def _openai_chat(messages: List[Dict[str, Any]], max_tokens: int = 1200, t
             return {"error": False, "content": content}
     except Exception as e:
         return {"error": True, "status": 0, "message": str(e)}
+
+
+async def _fetch_html(url: str) -> str:
+    """Fetch text content from a URL (used for CSV downloads)."""
+    try:
+        async with httpx.AsyncClient(timeout=30.0, headers={"User-Agent": UA}) as client:
+            r = await client.get(url)
+            if r.status_code != 200:
+                return ""
+            return r.text or ""
+    except Exception:
+        return ""
 
 # ==============================
 # PokemonTCG helpers (ID/metadata only)
@@ -771,6 +785,25 @@ def _grade_distribution(predicted_grade: int, confidence: float) -> Dict[str, fl
     total = sum(dist.values()) or 1.0
     return {k: round(v / total, 4) for k, v in dist.items()}
 
+
+def _condition_bucket_from_pregrade(g: Optional[int]) -> str:
+    """Map numeric pregrade into a human-friendly condition bucket."""
+    if g is None:
+        return "unknown"
+    try:
+        gi = int(g)
+    except Exception:
+        return "unknown"
+    if gi >= 9:
+        return "mint_like"
+    if gi >= 7:
+        return "near_mint"
+    if gi >= 5:
+        return "excellent"
+    if gi >= 3:
+        return "good"
+    return "poor"
+
 # ==============================
 # Root & Health
 # ==============================
@@ -791,7 +824,7 @@ def health():
         "has_openai_key": bool(OPENAI_API_KEY),
         "has_pokemontcg_key": bool(POKEMONTCG_API_KEY),
         "has_pricecharting_token": bool(PRICECHARTING_TOKEN),
-        "use_ebay_api": bool(USE_EBAY_API and EBAY_APP_ID and EBAY_OAUTH_TOKEN),
+        "use_ebay_api": bool(USE_EBAY_API and EBAY_APP_ID),
         "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
         "allowed_origins": ALLOWED_ORIGINS,
         "supports": ["cards", "memorabilia", "sealed_products", "market_context_click_only"],
@@ -1249,6 +1282,26 @@ Respond ONLY with JSON, no extra text.
 
     data = _parse_json_or_none(result.get("content", "")) or {}
 
+    # Normalize flags/defects and compute structural-damage indicator
+    flags_raw = data.get("flags", [])
+    if isinstance(flags_raw, list):
+        flags_list_out = [str(f).lower().strip() for f in flags_raw if str(f).strip()]
+    else:
+        flags_list_out = []
+    # De-duplicate while preserving order
+    flags_list_out = list(dict.fromkeys(flags_list_out))
+
+    defects_list_out = data.get("defects", [])
+    if not isinstance(defects_list_out, list):
+        defects_list_out = []
+
+    has_structural_damage = any(
+        f in ("crease", "tear", "paper break", "structural bend", "hole")
+        for f in flags_list_out
+    )
+
+
+
     raw_pregrade = str(data.get("pregrade", "")).strip()
     g = _grade_bucket(raw_pregrade)
     # NOTE: We intentionally do NOT cap the AI-assessed pregrade here.
@@ -1296,7 +1349,7 @@ Respond ONLY with JSON, no extra text.
         "corners": data.get("corners", {"front": {}, "back": {}}),
         "edges": data.get("edges", {"front": {"grade": "", "notes": ""}, "back": {"grade": "", "notes": ""}}),
         "surface": data.get("surface", {"front": {"grade": "", "notes": ""}, "back": {"grade": "", "notes": ""}}),
-        "defects": data.get("defects", []) if isinstance(data.get("defects", []), list) else [],
+        "defects": defects_list_out,
         "flags": flags_list_out,
         "assessment_summary": _norm_ws(str(data.get("assessment_summary", ""))) or summary or "",
         "spoken_word": _norm_ws(str(data.get("spoken_word", ""))) or _norm_ws(str(data.get("assessment_summary", ""))) or summary or "",
@@ -1480,6 +1533,15 @@ Respond ONLY with JSON, no extra text.
     result = await _openai_chat(msg, max_tokens=2000, temperature=0.1)
     data = _parse_json_or_none(result.get("content", "")) if not result.get("error") else None
     data = data or {}
+
+    flags_raw = data.get("flags", [])
+    if isinstance(flags_raw, list):
+        flags_list_out = [str(f).lower().strip() for f in flags_raw if str(f).strip()]
+    else:
+        flags_list_out = []
+    flags_list_out = list(dict.fromkeys(flags_list_out))
+
+
     # Ensure condition_distribution exists (confidence-weighted)
     if not isinstance(data.get("condition_distribution"), dict):
         cg = _norm_ws(str(data.get("condition_grade", ""))).title()
@@ -2069,7 +2131,7 @@ async def market_context(
                 "estimated_value_difference": None,
             },
             "meta": {            },
-            "disclaimer": disclaimer,
+            "disclaimer": "Informational market context only. Figures are third-party estimates and may vary.",
         }, status_code=200)
 
     # --------------------------
@@ -2145,7 +2207,7 @@ async def market_context(
     if mult is None:
         mult = _condition_multiplier_from_pregrade(g_ass)
     # Clamp to a sane range to avoid UI weirdness if a bad multiplier is posted
-    mult = max(0.50, min(1.25, float(mult)))
+    mult = max(0.02, min(1.10, float(mult)))
     bucket = _condition_bucket_from_pregrade(g_ass)
     # --------------------------
     # Recommended purchase price
@@ -2177,7 +2239,7 @@ async def market_context(
 
     
         # --- AUD conversion (simple multiplier) ---
-    aud_raw = (await _fx_usd_to_aud()) * float(raw_val) if raw_val is not None else None
+    aud_raw = _usd_to_aud_simple(raw_val) if raw_val is not None else None
     aud_psa10 = _usd_to_aud_simple(psa10_equiv) if psa10_equiv is not None else None
     aud_psa9 = _usd_to_aud_simple(psa9_equiv) if psa9_equiv is not None else None
     aud_psa8 = _usd_to_aud_simple(psa8_equiv) if psa8_equiv is not None else None
@@ -2191,14 +2253,14 @@ async def market_context(
 
     g_ass = _grade_bucket(assessed_pregrade or "") or _grade_bucket(predicted_grade or "")
     mult = float(condition_multiplier) if isinstance(condition_multiplier, (int, float)) else _condition_multiplier_from_pregrade(g_ass)
-    raw_as_is_aud = ((await _fx_usd_to_aud()) * float(raw_val) * float(mult)) if (raw_val is not None) else None
+    raw_as_is_aud = (_usd_to_aud_simple(raw_val) * float(mult)) if (raw_val is not None and _usd_to_aud_simple(raw_val) is not None) else None
 
     # If structural damage is present, collapse values aggressively and disable graded EV math.
     if damage_flag:
         if isinstance(raw_as_is_aud, (int, float)):
             raw_as_is_aud = round(float(raw_as_is_aud) * 0.15, 2)  # damaged copies typically trade at a small fraction
         expected_graded_aud = None
-        delta = None
+
 
     expected_graded_aud = _usd_to_aud_simple(expected_val) if expected_val is not None else None
     grading_value_summary = _grading_value_summary(
