@@ -32,6 +32,7 @@ import secrets
 import hashlib
 import re
 import traceback
+from pathlib import Path
 
 import httpx
 
@@ -375,36 +376,6 @@ def _norm_ws(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
 
-def _is_blankish(s: str) -> bool:
-    s2 = _norm_ws(s or "").lower()
-    return (not s2) or s2 in ("unknown", "n/a", "na", "none", "null", "undefined")
-
-def _normalize_card_type(card_type: str) -> str:
-    """Force card_type into the allowed enum."""
-    s = _norm_ws(card_type or "").lower()
-    if not s:
-        return "Other"
-    # common variants
-    if "pokemon" in s or s in ("pkmn", "poke", "pokémon"):
-        return "Pokemon"
-    if "magic" in s or "mtg" in s:
-        return "Magic"
-    if "yug" in s or "yu-gi" in s or "yugi" in s:
-        return "YuGiOh"
-    if "one piece" in s or "onepiece" in s:
-        return "OnePiece"
-    if "sport" in s:
-        return "Sports"
-    if s in ("other", "other tcg", "tcg", "trading card", "tradingcard"):
-        return "Other"
-    # fallback: title-case but keep enum
-    return "Other"
-
-
-def _is_blankish(s: str) -> bool:
-    s=(s or "").strip().lower()
-    return s in ("", "unknown", "n/a", "na", "none", "not sure", "unsure")
-
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
@@ -651,6 +622,55 @@ def _grade_distribution(predicted_grade: int, confidence: float) -> Dict[str, fl
     total = sum(dist.values()) or 1.0
     return {k: round(v / total, 4) for k, v in dist.items()}
 
+def _condition_distribution(condition_grade: str, confidence: float) -> Dict[str, float]:
+    """Probability distribution over condition buckets for sealed/memorabilia items."""
+    c = _clamp(confidence, 0.05, 0.95)
+    cg = _norm_ws(condition_grade).lower()
+    buckets = ["Mint", "Near Mint", "Excellent", "Good", "Fair", "Poor"]
+
+    # Default center bucket
+    center = "Good"
+    if "mint" == cg or cg.startswith("mint"):
+        center = "Mint"
+    elif "near mint" in cg or cg.startswith("nm") or "near" in cg:
+        center = "Near Mint"
+    elif "excellent" in cg or cg.startswith("ex"):
+        center = "Excellent"
+    elif "good" in cg:
+        center = "Good"
+    elif "fair" in cg:
+        center = "Fair"
+    elif "poor" in cg:
+        center = "Poor"
+
+    # Concentration increases with confidence
+    p_center = 0.45 + 0.45 * c
+    rem = 1.0 - p_center
+
+    # Spread remaining mass to neighbors (more to adjacent)
+    idx = buckets.index(center)
+    dist = {b: 0.0 for b in buckets}
+    dist[center] = p_center
+
+    # allocate remainder
+    # neighbors get 70% of remainder, second neighbors get 25%, rest 5%
+    def add(i, w):
+        if 0 <= i < len(buckets):
+            dist[buckets[i]] += w
+
+    add(idx-1, rem * 0.35)
+    add(idx+1, rem * 0.35)
+    add(idx-2, rem * 0.125)
+    add(idx+2, rem * 0.125)
+    # any leftover due to edges
+    total = sum(dist.values())
+    if total < 0.999:
+        dist[center] += (1.0 - total)
+
+    # normalize
+    total = sum(dist.values()) or 1.0
+    return {k: round(v/total, 4) for k, v in dist.items()}
+
 # ==============================
 # Root & Health
 # ==============================
@@ -704,11 +724,7 @@ async def pricecharting_sync(
     if not ADMIN_TOKEN:
         raise HTTPException(status_code=403, detail="Admin sync disabled (CL_ADMIN_TOKEN not set)")
 
-    # accept token from form OR header
-    from fastapi import Request
-    request: Request = kwargs.get("request") if "kwargs" in locals() else None  # not used
-    # FastAPI doesn't inject Request here by default; read from header via dependency-free approach:
-    # We'll use httpx to get headers? not possible. So accept admin_token param.
+    # accept token from form param (keep it simple; do not accept via header in this endpoint)
     token = (admin_token or "").strip()
     if token != ADMIN_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid admin token")
@@ -1137,6 +1153,69 @@ Respond ONLY with JSON, no extra text.
 
     pregrade_norm = str(g) if g is not None else ""
 
+    # --------------------------
+    # "Looks like a 10" bump rule (conservative)
+    # --------------------------
+    # If the card is truly clean across the board (Mint grades, sharp corners, strong centering,
+    # no defects/flags) and confidence is high, allow a 10.
+    try:
+        conf_now = _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0)
+
+        def _mintish(grade_str: str) -> bool:
+            gs = _norm_ws(str(grade_str)).lower()
+            return (gs.startswith("mint") or "gem mint" in gs)
+
+        def _cent_ok(cent_str: str) -> bool:
+            # '55/45' -> 55
+            cs = _norm_ws(str(cent_str)).replace(" ", "")
+            if not cs or "/" not in cs:
+                return False
+            left = cs.split("/", 1)[0]
+            try:
+                return float(left) >= 55.0
+            except Exception:
+                return False
+
+        corners = data.get("corners", {}) if isinstance(data.get("corners", {}), dict) else {}
+        cf = corners.get("front", {}) if isinstance(corners.get("front", {}), dict) else {}
+        cb = corners.get("back", {}) if isinstance(corners.get("back", {}), dict) else {}
+        bad_corner = False
+        for side in (cf, cb):
+            for k in ("top_left", "top_right", "bottom_left", "bottom_right"):
+                obj = side.get(k, {}) if isinstance(side.get(k, {}), dict) else {}
+                cond = _norm_ws(str(obj.get("condition", ""))).lower()
+                if not cond:
+                    bad_corner = True
+                elif any(x in cond for x in ("whitening", "bend", "ding", "crease")):
+                    bad_corner = True
+
+        cent = data.get("centering", {}) if isinstance(data.get("centering", {}), dict) else {}
+        cen_f = (cent.get("front") or {}) if isinstance(cent.get("front") or {}, dict) else {}
+        cen_b = (cent.get("back") or {}) if isinstance(cent.get("back") or {}, dict) else {}
+
+        edges = data.get("edges", {}) if isinstance(data.get("edges", {}), dict) else {}
+        ef = (edges.get("front") or {}) if isinstance(edges.get("front") or {}, dict) else {}
+        eb = (edges.get("back") or {}) if isinstance(edges.get("back") or {}, dict) else {}
+
+        surf = data.get("surface", {}) if isinstance(data.get("surface", {}), dict) else {}
+        sf = (surf.get("front") or {}) if isinstance(surf.get("front") or {}, dict) else {}
+        sb = (surf.get("back") or {}) if isinstance(surf.get("back") or {}, dict) else {}
+
+        defects_list = data.get("defects", []) if isinstance(data.get("defects", []), list) else []
+        flags_list = data.get("flags", []) if isinstance(data.get("flags", []), list) else []
+
+        if conf_now >= 0.88 and (pregrade_norm in ("9", "10") or (g and g >= 9)):
+            if (
+                _mintish(ef.get("grade", "")) and _mintish(eb.get("grade", "")) and
+                _mintish(sf.get("grade", "")) and _mintish(sb.get("grade", "")) and
+                _cent_ok(cen_f.get("grade", "")) and _cent_ok(cen_b.get("grade", "")) and
+                not defects_list and not flags_list and not bad_corner
+            ):
+                pregrade_norm = "10"
+                data["pregrade"] = "10"
+    except Exception:
+        pass
+
 
     # Ensure assessment_summary is detailed enough (UI-friendly)
     summary = _norm_ws(str(data.get("assessment_summary", "")))
@@ -1213,14 +1292,28 @@ async def identify_memorabilia(
 Return ONLY valid JSON with these exact fields:
 
 {
-  "item_type": "sealed booster box/sealed pack/autographed memorabilia/game-used memorabilia/graded item/other",
-  "description": "detailed description of the item (brand, set/series, year if visible)",
+  "item_type": "sealed booster box/sealed pack/elite trainer box/collection box/single sealed pack/case/autographed memorabilia/game-used memorabilia/graded item/other",
+  "brand": "Pokemon/Panini/Topps/Upper Deck/NBA/NFL/etc or empty string",
+  "product_name": "best-effort product name (e.g. \"Scarlet & Violet 151 Booster Box\")",
+  "set_or_series": "set/series name if visible (e.g. \"Evolving Skies\") else empty string",
+  "year": "4 digit year if visible else empty string",
+  "edition_or_language": "English/Japanese/1st Edition/Unlimited/etc if visible else empty string",
+  "description": "one detailed sentence describing what it is (use brand + product + series + year)",
   "signatures": "names of any visible signatures or 'None visible'",
   "seal_condition": "Factory Sealed/Opened/Resealed/Damaged/Not applicable",
-  "authenticity_notes": "any authenticity indicators visible (holograms, stickers, certificates) and red flags",
+  "authenticity_notes": "authenticity indicators visible (holograms, stickers, certificates) and red flags",
   "notable_features": "unique features worth noting",
   "confidence": 0.0-1.0,
-  "category_hint": "Pokemon/Magic/YuGiOh/Sports/OnePiece/Other"
+  "category_hint": "Pokemon/Magic/YuGiOh/Sports/OnePiece/Other",
+  "canonical_item_id": {
+    "category": "sealed|memorabilia|other",
+    "brand": "brand if known else empty",
+    "product_name": "product_name",
+    "set_or_series": "set_or_series",
+    "year": "year",
+    "edition_or_language": "edition_or_language",
+    "special_attributes": ["Factory Sealed", "Signed", "COA", "Limited", "..."]
+  }
 }
 
 Rules:
@@ -1242,6 +1335,12 @@ Respond ONLY with JSON, no extra text.
 
     return JSONResponse(content={
         "item_type": _norm_ws(str(data.get("item_type", "Unknown"))),
+        "brand": _norm_ws(str(data.get("brand", ""))),
+        "product_name": _norm_ws(str(data.get("product_name", ""))),
+        "set_or_series": _norm_ws(str(data.get("set_or_series", ""))),
+        "year": _norm_ws(str(data.get("year", ""))),
+        "edition_or_language": _norm_ws(str(data.get("edition_or_language", ""))),
+        "canonical_item_id": data.get("canonical_item_id", {}) if isinstance(data.get("canonical_item_id", {}), dict) else {},
         "description": _norm_ws(str(data.get("description", ""))),
         "signatures": _norm_ws(str(data.get("signatures", "None visible"))),
         "seal_condition": _norm_ws(str(data.get("seal_condition", "Not applicable"))),
@@ -1280,33 +1379,55 @@ async def assess_memorabilia(
         if item_type: ctx += f"- Item Type: {_norm_ws(item_type)}\n"
         if description: ctx += f"- Description: {_norm_ws(description)}\n"
 
-    prompt = f"""You are a professional memorabilia/collectibles grader.
+    prompt = f"""You are a professional collectibles grader with 15+ years experience. You are assessing a sealed product or memorabilia item.
 
-Analyze ALL images. Return ONLY valid JSON.
+Analyze ALL images with extreme scrutiny and write as if you're examining the item in person for a collector. Be conservative: when in doubt, assume the worse condition.
 
-Return JSON with this EXACT structure:
+CRITICAL RULES:
+1) Be specific with locations (top edge, bottom-right corner, seal seam, shrink wrap folds, box corners, window dents, plastic scuffs).
+2) Condition must reflect the WORST visible defect (do not average).
+3) If you suspect reseal/tampering, flag it clearly and cap the condition at Fair unless images clearly disprove it.
+4) Your narrative must be 5–10 sentences in first person ("Looking at your item...").
 
-{{
+Return ONLY valid JSON with this EXACT structure:
+
+{
   "condition_grade": "Mint/Near Mint/Excellent/Good/Fair/Poor",
   "confidence": 0.0-1.0,
-  "seal_integrity": {{
+  "condition_distribution": {"Mint":0.0,"Near Mint":0.0,"Excellent":0.0,"Good":0.0,"Fair":0.0,"Poor":0.0},
+  "seal_integrity": {
     "status": "Factory Sealed/Opened/Resealed/Compromised/Not Applicable",
-    "notes": "detailed notes about seal condition"
-  }},
-  "packaging_condition": {{
+    "notes": "Seal/shrink specifics: seams, tears, holes, looseness, heat marks, glue lines, wrap type, suspicious folds. Include locations."
+  },
+  "packaging_condition": {
     "grade": "Mint/Near Mint/Excellent/Good/Fair/Poor",
-    "notes": "detailed notes about packaging"
-  }},
-  "signature_assessment": {{
+    "notes": "Box/packaging specifics: corner crush, edge wear, dents, scuffs, sticker residue, window creases, warping. Include locations."
+  },
+  "signature_assessment": {
     "present": true/false,
     "quality": "Clear/Faded/Smudged/Not Applicable",
-    "notes": "notes about signature condition if present"
-  }},
-  "value_factors": ["..."],
-  "defects": ["..."],
-  "overall_assessment": "5-8 sentence narrative about condition and key factors",
-  "flags": ["Important issues (damage, authenticity concerns, etc.)"]
-}}
+    "notes": "If signed: pen type, flow, skipping, smudging, placement, any fading or handling marks."
+  },
+  "authenticity_assessment": {
+    "signals": ["Visible hologram/COA/sticker/etc"],
+    "concerns": ["Any red flags or unknowns"],
+    "notes": "Short explanation of why you're confident or not."
+  },
+  "value_factors": ["Short bullets: edition, year, scarcity, demand, sealed status, signature subject, provenance."],
+  "defects": ["Each defect as a full sentence with location + severity."],
+  "flags": ["Short critical flags (reseal_suspected, heavy_dent, water_damage, COA_missing, etc.)"],
+  "overall_assessment": "5-10 sentences, first person, conversational. Explain what limits the grade and what photos you would want to confirm.",
+  "spoken_word": "20–45 sec spoken version in first person.",
+  "observed_id": {
+    "item_type": "best-effort",
+    "brand": "best-effort",
+    "product_name": "best-effort",
+    "set_or_series": "best-effort",
+    "year": "best-effort",
+    "edition_or_language": "best-effort",
+    "seal_condition": "best-effort"
+  }
+}
 
 {ctx}
 
@@ -1325,6 +1446,13 @@ Respond ONLY with JSON.
     result = await _openai_chat(msg, max_tokens=2000, temperature=0.1)
     data = _parse_json_or_none(result.get("content", "")) if not result.get("error") else None
     data = data or {}
+
+    # Build condition distribution (for UI parity with cards)
+    try:
+        if not isinstance(data.get("condition_distribution"), dict) or not data.get("condition_distribution"):
+            data["condition_distribution"] = _condition_distribution(str(data.get("condition_grade", "Good")), _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0))
+    except Exception:
+        pass
 
     # Ensure seal_integrity always has status (fixes UI "undefined" cases)
     seal = data.get("seal_integrity") if isinstance(data.get("seal_integrity"), dict) else {}
@@ -1345,6 +1473,9 @@ Respond ONLY with JSON.
         "value_factors": data.get("value_factors", []) if isinstance(data.get("value_factors", []), list) else [],
         "defects": data.get("defects", []) if isinstance(data.get("defects", []), list) else [],
         "overall_assessment": _norm_ws(str(data.get("overall_assessment", ""))),
+        "spoken_word": _norm_ws(str(data.get("spoken_word", ""))) or _norm_ws(str(data.get("overall_assessment", ""))),
+        "condition_distribution": data.get("condition_distribution", {}) if isinstance(data.get("condition_distribution", {}), dict) else {},
+        "observed_id": data.get("observed_id", {}) if isinstance(data.get("observed_id", {}), dict) else {},
         "flags": data.get("flags", []) if isinstance(data.get("flags", []), list) else [],
         "verify_token": f"vfy_{secrets.token_urlsafe(12)}",
     })
@@ -1364,6 +1495,9 @@ async def market_context(
     item_category: Optional[str] = Form("Pokemon"),  # Pokemon/Magic/YuGiOh/Sports/OnePiece/Other
     item_set: Optional[str] = Form(None),
     item_number: Optional[str] = Form(None),
+    item_type: Optional[str] = Form(None),
+    description: Optional[str] = Form(None),
+    seal_condition: Optional[str] = Form(None),
     predicted_grade: Optional[str] = Form("9"),
     confidence: float = Form(0.0),
     grading_cost: float = Form(55.0),
@@ -1444,6 +1578,43 @@ async def market_context(
         if sv > 0:
             return "low"
         return "—"
+
+    # --------------------------
+    # FX (USD -> AUD) cache
+    # --------------------------
+    # Cache in module globals if available, otherwise local fallback.
+    # We keep it very simple: refresh every 6 hours.
+    global _FX_USD_AUD_CACHE
+    try:
+        _FX_USD_AUD_CACHE
+    except Exception:
+        _FX_USD_AUD_CACHE = {"rate": None, "ts": None}
+
+    async def _usd_to_aud_rate() -> Optional[float]:
+        """Fetch USD->AUD rate and cache for ~6 hours."""
+        try:
+            ts = _FX_USD_AUD_CACHE.get("ts")
+            rate = _FX_USD_AUD_CACHE.get("rate")
+            if ts and rate:
+                if (datetime.utcnow() - ts).total_seconds() < 6 * 3600:
+                    return float(rate)
+        except Exception:
+            pass
+
+        # exchangerate.host is free and simple; if it ever fails, we fall back to no conversion.
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await client.get("https://api.exchangerate.host/latest", params={"base": "USD", "symbols": "AUD"})
+                if r.status_code == 200:
+                    j = r.json()
+                    rate = _safe_float(((j or {}).get("rates") or {}).get("AUD"), None)
+                    if rate and rate > 0:
+                        _FX_USD_AUD_CACHE["rate"] = float(rate)
+                        _FX_USD_AUD_CACHE["ts"] = datetime.utcnow()
+                        return float(rate)
+        except Exception:
+            pass
+        return None
 
     # --------------------------
     # Normalize inputs
@@ -1618,18 +1789,18 @@ async def market_context(
     cond18 = _parse_money(best.get("condition-18-price"))
     bgs10 = _parse_money(best.get("bgs-10-price"))
 
-    retail_loose_buy = _parse_money(best.get(\"retail-loose-buy\"))
-    retail_loose_sell = _parse_money(best.get(\"retail-loose-sell\"))
+    retail_loose_buy = _parse_money(best.get("retail-loose-buy"))
+    retail_loose_sell = _parse_money(best.get("retail-loose-sell"))
 
     # Raw baseline: prefer loose, else new
     raw_val = loose if loose is not None else newp
 
-    # ---- "PSA-style" anchors (equivalency, not literal PSA comps) ----
-    # IMPORTANT: We keep the UI labels familiar but we do NOT pretend these are official PSA comps.
-    # Priority:
-    # - PSA 10 equiv: BGS 10 if present, else condition-18, else graded
-    # - PSA 9 equiv: condition-17, else graded
-    # - PSA 8 equiv: graded
+    # ---- PSA-equivalent anchors (from YOUR CSV structure) ----
+    # MAPPING YOU SPECIFIED:
+    # - PSA 10 (est.)  <= bgs-10-price
+    # - PSA 9  (est.)  <= condition-17-price
+    # - PSA 8  (est.)  <= condition-18-price
+    # Fallbacks keep the UI populated if a column is blank.
     psa10_equiv = bgs10 or graded
     psa9_equiv = cond17 or graded
     psa8_equiv = cond18 or graded
@@ -1676,9 +1847,13 @@ async def market_context(
     except Exception:
         pg = 0.0
 
+    # Baseline buy anchor: prefer retail-loose-buy from CSV.
+    # If missing, fall back to a conservative fraction of observed raw value (or retail sell if available).
     base_buy = retail_loose_buy
+    if base_buy is None and isinstance(retail_loose_sell, (int, float)) and retail_loose_sell > 0:
+        base_buy = round(float(retail_loose_sell) * 0.75, 2)
     if base_buy is None and isinstance(raw_base, (int, float)) and raw_base > 0:
-        base_buy = round(raw_base * 0.70, 2)  # conservative fallback if retail buy not provided
+        base_buy = round(float(raw_base) * 0.85, 2)
 
     # condition factor based on assessed grade (simple, explainable)
     cond_factor = max(0.60, min(1.10, 0.40 + 0.07 * pg)) if pg else 0.85
@@ -1691,7 +1866,12 @@ async def market_context(
 
     if base_buy is not None:
         rec_buy = float(base_buy) * float(cond_factor) * float(conf_factor)
-        note.append("Baseline uses retail-loose-buy adjusted by assessed grade & confidence.")
+        if retail_loose_buy is not None:
+            note.append("Baseline uses retail-loose-buy adjusted by assessed grade & confidence.")
+        elif retail_loose_sell is not None:
+            note.append("Baseline uses retail-loose-sell (fallback) adjusted by assessed grade & confidence.")
+        else:
+            note.append("Baseline uses observed raw value (fallback) adjusted by assessed grade & confidence.")
 
     if assume_grading:
         net_after_grading = float(expected_val) - float(grading_cost or 0.0)
@@ -1709,6 +1889,48 @@ async def market_context(
         rec_buy = min(float(rec_buy), float(raw_base))
 
     rec_buy = (round(float(rec_buy), 2) if rec_buy is not None else None)
+
+    # --------------------------
+    # Convert USD -> AUD for display (uses current-ish fx at request time)
+    # --------------------------
+    fx_rate = await _usd_to_aud_rate()
+    out_currency = "USD"
+
+    def _conv(v: Any) -> Any:
+        if fx_rate is None:
+            return v
+        if isinstance(v, (int, float)):
+            return round(float(v) * float(fx_rate), 2)
+        return v
+
+    if fx_rate and fx_rate > 0:
+        out_currency = "AUD"
+
+        # convert key monetary values
+        raw_val_aud = _conv(raw_val)
+        psa10_aud = _conv(psa10_equiv)
+        psa9_aud = _conv(psa9_equiv)
+        psa8_aud = _conv(psa8_equiv)
+        expected_val_aud = _conv(expected_val)
+        raw_base_aud = _conv(raw_base)
+        grading_cost_aud = _conv(float(grading_cost or 0.0))
+        diff_aud = (round(float(expected_val_aud) - float(raw_base_aud) - float(grading_cost_aud), 2)
+                    if (expected_val_aud is not None and raw_base_aud is not None) else None)
+        retail_loose_buy_aud = _conv(retail_loose_buy)
+        retail_loose_sell_aud = _conv(retail_loose_sell)
+        rec_buy_aud = _conv(rec_buy)
+    else:
+        raw_val_aud = raw_val
+        psa10_aud = psa10_equiv
+        psa9_aud = psa9_equiv
+        psa8_aud = psa8_equiv
+        expected_val_aud = expected_val
+        raw_base_aud = raw_base
+        grading_cost_aud = float(grading_cost or 0.0)
+        diff_aud = diff
+        retail_loose_buy_aud = retail_loose_buy
+        retail_loose_sell_aud = retail_loose_sell
+        rec_buy_aud = rec_buy
 
     # UI expects these keys
     return JSONResponse(content={
@@ -1729,32 +1951,32 @@ async def market_context(
         },
 
         "observed": {
-            "currency": "USD",
+            "currency": out_currency,
             "liquidity": liquidity,
             "trend": trend_label,
             "raw": {
-                "median": raw_val,
-                "avg": raw_val,
+                "median": _conv(raw_val),
+                "avg": _conv(raw_val),
                 "range": None,
                 "samples": 1 if raw_val is not None else 0,
             },
             "graded_psa": {
-                "10": psa10_equiv,
-                "9": psa9_equiv,
-                "8": psa8_equiv,
+                "10": _conv(psa10_equiv),
+                "9": _conv(psa9_equiv),
+                "8": _conv(psa8_equiv),
             },
         },
 
         "grade_impact": {
-            "expected_graded_value": expected_val,
-            "raw_baseline_value": raw_base,
-            "grading_cost": float(grading_cost or 0.0),
-            "estimated_value_difference": diff,
+            "expected_graded_value": _conv(expected_val),
+            "raw_baseline_value": _conv(raw_base),
+            "grading_cost": _conv(float(grading_cost or 0.0)),
+            "estimated_value_difference": _conv(diff),
             "recommended_buy": {
-                "currency": "USD",
-                "retail_loose_buy": retail_loose_buy,
-                "retail_loose_sell": retail_loose_sell,
-                "recommended_purchase_price": rec_buy,
+                "currency": out_currency,
+                "retail_loose_buy": _conv(retail_loose_buy if retail_loose_buy is not None else base_buy),
+                "retail_loose_sell": _conv(retail_loose_sell),
+                "recommended_purchase_price": _conv(rec_buy),
                 "assume_grading": assume_grading,
                 "notes": " ".join(note) if isinstance(note, list) else "",
             },
@@ -1769,6 +1991,13 @@ async def market_context(
             },
             "equivalency_note": "Front-end labels use PSA-style equivalents (est.). Mapping: BGS 10 → PSA 10 (est.), condition-17 → PSA 9 (est.), condition-18 → PSA 8 (est.). Not official PSA comps.",
             "sources": ["pricecharting_csv"],
+            "fx": {
+                "converted": (out_currency == "AUD"),
+                "base": "USD",
+                "quote": out_currency,
+                "usd_to_aud": float(fx_rate) if (out_currency == "AUD") else None,
+                "fetched_at_utc": (_FX_USD_AUD_CACHE.get("ts").isoformat() + "Z") if (_FX_USD_AUD_CACHE.get("ts") and out_currency == "AUD") else None,
+            },
             "raw_fields": {
                 "loose_price": loose,
                 "new_price": newp,
@@ -1804,6 +2033,21 @@ async def market_context_item(
             "disclaimer": "Informational market context only. Not financial advice.",
         })
 
+
+    # Convert USD -> AUD for display (best-effort)
+    fx_rate = None
+    try:
+        # reuse the cached helper from /api/market-context if present in module globals
+        fx_rate = await _usd_to_aud_rate()  # type: ignore
+    except Exception:
+        fx_rate = None
+
+    def _conv_aud(v: Any) -> Any:
+        if fx_rate is None:
+            return v
+        if isinstance(v, (int, float)):
+            return round(float(v) * float(fx_rate), 2)
+        return v
     products = await _pc_search(q, category=category_hint or None, limit=10)
     if not products:
         return JSONResponse(content={
@@ -1833,11 +2077,12 @@ async def market_context_item(
         "pricecharting": {
             "best_match": top,
             "url": url,
-            "prices": prices,
+            "prices": {k: _conv_aud(v) for k, v in (prices or {}).items()},
             "alternatives": products[:5],
         },
-        "observed": {"typical_value_estimate": typical},
+        "observed": {"currency": ("AUD" if fx_rate else "USD"), "typical_value_estimate": _conv_aud(typical)},
         "sources": ["PriceCharting API"],
+        "fx": {"converted": bool(fx_rate), "usd_to_aud": float(fx_rate) if fx_rate else None},
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "disclaimer": "Informational market context only. Figures are third-party estimates and may vary. Not financial advice.",
     })
