@@ -1618,8 +1618,8 @@ async def market_context(
     cond18 = _parse_money(best.get("condition-18-price"))
     bgs10 = _parse_money(best.get("bgs-10-price"))
 
-    retail_loose_buy = _parse_money(best.get(\"retail-loose-buy\"))
-    retail_loose_sell = _parse_money(best.get(\"retail-loose-sell\"))
+    retail_loose_buy = _parse_money(best.get("retail-loose-buy"))
+    retail_loose_sell = _parse_money(best.get("retail-loose-sell"))
 
     # Raw baseline: prefer loose, else new
     raw_val = loose if loose is not None else newp
