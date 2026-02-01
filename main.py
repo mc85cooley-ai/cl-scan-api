@@ -627,48 +627,23 @@ async def _pc_product(product_id: str) -> Dict[str, Any]:
 _FX_CACHE = {"ts": 0.0, "rate": None}
 
 async def _usd_to_aud_rate() -> Optional[float]:
-    """Fetch USD->AUD rate. Best-effort; returns None on failure.
-    Tries multiple providers to avoid a single-point failure.
-    Caches for 1 hour.
-    """
+    """Fetch USD->AUD rate. Best-effort; returns None on failure."""
     import time
     now = time.time()
     if _FX_CACHE.get("rate") and (now - _FX_CACHE.get("ts", 0.0) < 3600):
         return _FX_CACHE["rate"]
-    urls = [
-        # 1) exchangerate.host
-        ("https://api.exchangerate.host/latest", {"base": "USD", "symbols": "AUD"}, ("rates", "AUD")),
-        # 2) open.er-api.com
-        ("https://open.er-api.com/v6/latest/USD", None, ("rates", "AUD")),
-        # 3) frankfurter.app
-        ("https://api.frankfurter.app/latest", {"from": "USD", "to": "AUD"}, ("rates", "AUD")),
-    ]
     try:
         async with httpx.AsyncClient(timeout=8.0) as client:
-            for url, params, path in urls:
-                try:
-                    r = await client.get(url, params=params)
-                    if r.status_code != 200:
-                        continue
-                    data = r.json() if r.content else {}
-                    node = data
-                    for k in path:
-                        if isinstance(node, dict) and k in node:
-                            node = node[k]
-                        else:
-                            node = None
-                            break
-                    rate = None
-                    try:
-                        rate = float(node) if node else None
-                    except Exception:
-                        rate = None
-                    if rate and rate > 0:
-                        _FX_CACHE["ts"] = now
-                        _FX_CACHE["rate"] = rate
-                        return rate
-                except Exception:
-                    continue
+            # exchangerate.host is free and keyless (best-effort)
+            r = await client.get("https://api.exchangerate.host/latest", params={"base": "USD", "symbols": "AUD"})
+            if r.status_code != 200:
+                return None
+            data = r.json() if r.content else {}
+            rate = (data.get("rates") or {}).get("AUD")
+            if rate:
+                _FX_CACHE["ts"] = now
+                _FX_CACHE["rate"] = float(rate)
+                return float(rate)
     except Exception:
         return None
     return None
@@ -1728,10 +1703,9 @@ async def market_context(
                 bucket = _condition_bucket_from_pregrade(g_ass)
 
                 aud_rate = None
-                aud_typical = None
                 aud_as_is = None
                 if typical is not None:
-                    aud_typical, aud_rate = await _usd_to_aud(typical)
+                    _, aud_rate = await _usd_to_aud(typical)
                     aud_as_is, _ = await _usd_to_aud(typical * mult)
 
                 return JSONResponse(content={
@@ -1743,10 +1717,9 @@ async def market_context(
                     "confidence": _clamp(_safe_float(confidence, 0.0), 0.0, 1.0),
                     "card": {"name": clean_name, "set": clean_set, "set_code": "", "year": "", "card_number": clean_num_display, "type": clean_cat},
                     "observed": {
-                        "currency": ("AUD" if aud_rate else "USD"),
+                        "currency": "USD",
                         "fx": {"aud_rate": aud_rate, "aud_timestamp": datetime.utcnow().isoformat() + "Z"} if aud_rate else {},
-                        "usd_original": {"raw_median": typical, "as_is_value": _safe_money_mul(typical, mult)},
-                        "raw": {"median": (round(aud_typical, 2) if aud_rate and aud_typical is not None else typical), "avg": (round(aud_typical, 2) if aud_rate and aud_typical is not None else typical), "range": None, "samples": len(vals) if vals else 0},
+                        "raw": {"median": typical, "avg": typical, "range": None, "samples": len(vals) if vals else 0},
                         "as_is": {"multiplier": mult, "bucket": bucket, "value": _safe_money_mul(typical, mult), "value_aud": round(aud_as_is,2) if aud_as_is is not None else None},
                         "pricecharting_prices": prices,
                     },
@@ -1875,7 +1848,7 @@ async def market_context(
             "confidence": _clamp(_safe_float(confidence, 0.0), 0.0, 1.0),
             "card": {"name": clean_name, "set": clean_set, "set_code": "", "year": "", "card_number": clean_num_display, "type": clean_cat},
             "observed": {
-                "currency": ("AUD" if aud_rate else "USD"),
+                "currency": "USD",
                 "liquidity": "—",
                 "trend": "—",
                 "raw": {"median": None, "avg": None, "range": None, "samples": 0},
@@ -1946,7 +1919,7 @@ async def market_context(
     g_pred = _grade_bucket(predicted_grade) or 9
     dist = _grade_distribution(g_pred, conf_in)
 
-    price_map = {"10": (aud_psa10 if aud_rate and aud_psa10 is not None else psa10_equiv), "9": (aud_psa9 if aud_rate and aud_psa9 is not None else psa9_equiv), "8": psa8_equiv}
+    price_map = {"10": psa10_equiv, "9": psa9_equiv, "8": psa8_equiv}
     ev = 0.0
     ev_samples = 0
     for k, p in dist.items():
@@ -2046,46 +2019,44 @@ async def market_context(
         },
 
         "observed": {
-            "currency": ("AUD" if aud_rate else "USD"),
-            "usd_original": {"raw_median": raw_val, "psa10": psa10_equiv, "psa9": psa9_equiv, "psa8": psa8_equiv} if aud_rate else {},
+            "currency": "USD",
             "fx": {"aud_rate": aud_rate, "aud_timestamp": datetime.utcnow().isoformat() + "Z"} if aud_rate else {},
             "aud": {"raw_median": aud_raw, "psa10": aud_psa10, "psa9": aud_psa9, "psa8": aud_psa8} if aud_rate else {},
             "liquidity": liquidity,
             "trend": trend_label,
             "raw": {
-                "median": (aud_raw if aud_rate and aud_raw is not None else raw_val),
-                "avg": (aud_raw if aud_rate and aud_raw is not None else raw_val),
+                "median": raw_val,
+                "avg": raw_val,
                 "range": None,
                 "samples": 1 if raw_val is not None else 0,
             },
             "graded_psa": {
-                "10": (aud_psa10 if aud_rate and aud_psa10 is not None else psa10_equiv),
-                "9": (aud_psa9 if aud_rate and aud_psa9 is not None else psa9_equiv),
-                "8": (aud_psa8 if aud_rate and aud_psa8 is not None else psa8_equiv),
+                "10": psa10_equiv,
+                "9": psa9_equiv,
+                "8": psa8_equiv,
             
             "as_is": {
                 "multiplier": mult,
                 "bucket": bucket,
-                "raw_median": _safe_money_mul((aud_raw if aud_rate and aud_raw is not None else raw_val), mult),
-                "psa10_equiv": _safe_money_mul((aud_psa10 if aud_rate and aud_psa10 is not None else psa10_equiv), mult),
-                "psa9_equiv": _safe_money_mul((aud_psa9 if aud_rate and aud_psa9 is not None else psa9_equiv), mult),
-                "psa8_equiv": _safe_money_mul((aud_psa8 if aud_rate and aud_psa8 is not None else psa8_equiv), mult)
+                "raw_median": _safe_money_mul(raw_val, mult),
+                "psa10_equiv": _safe_money_mul(psa10_equiv, mult),
+                "psa9_equiv": _safe_money_mul(psa9_equiv, mult),
+                "psa8_equiv": _safe_money_mul(psa8_equiv, mult)
             },
 },
         },
 
         "grade_impact": {
-            "expected_graded_value": (aud_expected if aud_rate and aud_expected is not None else expected_val),
+            "expected_graded_value": expected_val,
             "expected_graded_value_aud": aud_expected if aud_rate else None,
-            "raw_baseline_value": (aud_raw if aud_rate and aud_raw is not None else raw_base),
+            "raw_baseline_value": raw_base,
             "grading_cost": float(grading_cost or 0.0),
-            "estimated_value_difference": (round((aud_expected or 0) - (aud_raw or 0) - float(grading_cost or 0.0), 2) if (aud_rate and aud_expected is not None and aud_raw is not None) else diff),
+            "estimated_value_difference": diff,
             "recommended_buy": {
-                "currency": ("AUD" if aud_rate else "USD"),
+                "currency": "USD",
                 "retail_loose_buy": retail_loose_buy,
                 "retail_loose_sell": retail_loose_sell,
-                "usd_original": {"recommended_purchase_price": rec_buy} if aud_rate else {},
-                "recommended_purchase_price": (aud_rec_buy if aud_rate and aud_rec_buy is not None else rec_buy),
+                "recommended_purchase_price": rec_buy,
                 "recommended_purchase_price_aud": aud_rec_buy if aud_rate else None,
                 "assume_grading": assume_grading,
                 "notes": " ".join(note) if isinstance(note, list) else "",
