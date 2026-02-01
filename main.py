@@ -1881,7 +1881,7 @@ async def market_context(
             elif str(num_short) in pn:
                 score += 5
 
-        if sealed_like:
+        if is_sealed_like:
             # Sealed/memorabilia rows often swap "set" vs "product" wording between inputs,
             # so we score tokens against BOTH fields.
             for tkn in name_tokens:
