@@ -982,82 +982,120 @@ async def verify(
         if provided_year: context += f"- Year: {provided_year}\n"
         if provided_type: context += f"- Type: {provided_type}\n"
 
-    prompt = f"""You are a professional trading card grader.
+    prompt = f"""You are a professional trading card grader with 15+ years experience.
 
-Analyze BOTH images (front + back) at high scrutiny. Your job is to surface *everything visible* — do NOT be polite or optimistic.
+Analyze BOTH images (front + back) with EXTREME scrutiny. Write as if speaking directly to a collector who needs honest, specific feedback about their card.
 
-CRITICAL RULES (follow exactly):
-1) **Do not miss obvious damage.** If you see any of these, you MUST mention them explicitly with SIDE + precise location:
-   - bends / creases / folds / dents / dings / impressions
-   - peeling / lifted foil / surface gouges
-   - heavy whitening, corner rounding, edge chipping, tears
-   - stains / marks / writing / residue
-   - moisture warp / ripples / gloss loss / scuffs
-2) **Grade must reflect the worst visible defect.** Use conservative PSA-style logic:
-   - Any clear crease/fold, strong bend, tear, or major dent → pregrade MUST be **4 or lower**.
-   - Any visible bend/ding/impression, heavy corner rounding, or multiple heavy edge chips → pregrade MUST be **5 or lower**.
-   - Moderate whitening/edge wear across multiple edges/corners → pregrade typically **6–7** (not higher).
-   - Only call corners "sharp" if they are truly sharp with no rounding, whitening, or bend.
-3) **Be explicit and specific.** Write defects as clear sentences with side + location + severity (minor/moderate/severe).
-4) If something cannot be confirmed due to blur/glare, state it in notes and lower confidence.
+CRITICAL RULES:
+1) **Be conversational and specific.** Write like you're examining the card in person and describing what you see:
+   - BAD: "Minor edge wear present"
+   - GOOD: "Looking at the front, I can see some very slight edge wear along the top edge, approximately 2mm from the top-left corner. The right edge is notably cleaner."
+
+2) **Call out every single corner individually** with precise location and severity:
+   - For EACH of the 8 corners (4 front + 4 back), describe what you observe
+   - Examples: "Front top-left corner is perfectly sharp", "Back bottom-right shows minor whitening about 1mm deep"
+
+3) **Grade must reflect worst visible defect** (conservative PSA-style):
+   - Any crease/fold/tear/major dent → pregrade **4 or lower**
+   - Any bend/ding/impression, heavy rounding → pregrade **5 or lower**
+   - Moderate whitening across multiple corners/edges → pregrade **6-7**
+   - Only grade 9-10 if truly exceptional
+
+4) **Write the assessment summary in first person, conversational style** (5-8 sentences):
+   - Open with overall impression: "Looking at your card..."
+   - Discuss specific observations: "The front presents beautifully, with..."
+   - Compare front vs back: "While the front is near-perfect, the back shows..."
+   - Explain grade rationale: "The grade of X is primarily limited by..."
+   - End with realistic expectation: "If you're considering grading..."
 
 {context}
 
 Return ONLY valid JSON with this EXACT structure:
 
 {{
-  "pregrade": "estimated PSA-style grade 1-10 (e.g. 8, 9, 10)",
+  "pregrade": "1-10",
   "confidence": 0.0-1.0,
   "centering": {{
-    "front": {{"grade":"55/45","notes":"..."}} ,
-    "back":  {{"grade":"60/40","notes":"..."}}
+    "front": {{
+      "grade": "55/45",
+      "notes": "Detailed observation: slightly off-center towards [direction], approximately [measurement]. [Impact on grade]."
+    }},
+    "back": {{
+      "grade": "60/40", 
+      "notes": "Detailed observation: [specific description of centering quality]."
+    }}
   }},
   "corners": {{
     "front": {{
-      "top_left": {{"condition":"sharp/minor_whitening/whitening/bend/ding/crease","notes":"..."}}, 
-      "top_right": {{"condition":"sharp/minor_whitening/whitening/bend/ding/crease","notes":"..."}}, 
-      "bottom_left": {{"condition":"sharp/minor_whitening/whitening/bend/ding/crease","notes":"..."}}, 
-      "bottom_right": {{"condition":"sharp/minor_whitening/whitening/bend/ding/crease","notes":"..."}}
+      "top_left": {{
+        "condition": "sharp/minor_whitening/whitening/bend/ding/crease",
+        "notes": "Specific description: [exactly what you see, be detailed]"
+      }},
+      "top_right": {{
+        "condition": "sharp/minor_whitening/whitening/bend/ding/crease",
+        "notes": "Specific description: [exactly what you see]"
+      }},
+      "bottom_left": {{
+        "condition": "sharp/minor_whitening/whitening/bend/ding/crease",
+        "notes": "Specific description: [exactly what you see]"
+      }},
+      "bottom_right": {{
+        "condition": "sharp/minor_whitening/whitening/bend/ding/crease",
+        "notes": "Specific description: [exactly what you see]"
+      }}
     }},
     "back": {{
-      "top_left": {{"condition":"sharp/minor_whitening/whitening/bend/ding/crease","notes":"..."}}, 
-      "top_right": {{"condition":"sharp/minor_whitening/whitening/bend/ding/crease","notes":"..."}}, 
-      "bottom_left": {{"condition":"sharp/minor_whitening/whitening/bend/ding/crease","notes":"..."}}, 
-      "bottom_right": {{"condition":"sharp/minor_whitening/whitening/bend/ding/crease","notes":"..."}}
+      "top_left": {{"condition": "...", "notes": "..."}},
+      "top_right": {{"condition": "...", "notes": "..."}},
+      "bottom_left": {{"condition": "...", "notes": "..."}},
+      "bottom_right": {{"condition": "...", "notes": "..."}}
     }}
   }},
   "edges": {{
-    "front": {{"grade":"Mint/Near Mint/Excellent/Good/Poor","notes":"detailed notes"}}, 
-    "back":  {{"grade":"Mint/Near Mint/Excellent/Good/Poor","notes":"detailed notes"}}
+    "front": {{
+      "grade": "Mint/Near Mint/Excellent/Good/Poor",
+      "notes": "Walk around all 4 edges: top edge [description], right edge [description], bottom [description], left [description]. Be specific about location and severity."
+    }},
+    "back": {{
+      "grade": "Mint/Near Mint/Excellent/Good/Poor",
+      "notes": "Detailed edge-by-edge assessment with locations."
+    }}
   }},
   "surface": {{
-    "front": {{"grade":"Mint/Near Mint/Excellent/Good/Poor","notes":"detailed notes"}}, 
-    "back":  {{"grade":"Mint/Near Mint/Excellent/Good/Poor","notes":"detailed notes"}}
+    "front": {{
+      "grade": "Mint/Near Mint/Excellent/Good/Poor",
+      "notes": "Describe surface quality in detail: holographic pattern quality, any print lines, scratches (with location), scuffs, gloss level."
+    }},
+    "back": {{
+      "grade": "Mint/Near Mint/Excellent/Good/Poor",
+      "notes": "Detailed surface assessment."
+    }}
   }},
   "defects": [
-    "Each defect as a clear sentence with SIDE and location + severity (minor/moderate/severe)"
+    "Each defect as a complete sentence: [SIDE] [precise location] shows [type of defect] [severity]. Example: 'Front top-left corner shows moderate whitening extending approximately 2mm into the card surface.'"
   ],
   "flags": [
-    "Short bullet flags for important issues (crease, bend, dent, heavy whitening, edge chipping, peeling, stain, writing, warp)"
+    "Short flags for important issues (crease, bend, edge chipping, etc.)"
   ],
-  "assessment_summary": "5-8 sentence narrative. Mention front vs back differences, the worst defect(s), and why they cap the grade.",
+  "assessment_summary": "Write 5-8 sentences in first person, conversational style. Start with: 'Looking at your [card name]...' Then describe specific observations, compare front vs back, explain what limits the grade, and give realistic grading expectations. Be honest but professional.",
   "observed_id": {{
     "card_name": "best-effort from images",
-    "set_code": "best-effort from images (only if visible)",
-    "set_name": "best-effort from images",
-    "card_number": "best-effort from images (preserve leading zeros if shown)",
-    "year": "best-effort from images",
+    "set_code": "only if clearly visible",
+    "set_name": "best-effort",
+    "card_number": "preserve leading zeros",
+    "year": "best-effort",
     "card_type": "Pokemon/Magic/YuGiOh/Sports/OnePiece/Other"
   }}
 }}
 
-Important:
-- You MUST call out any obvious major damage: bends, creases/folds, warping, peeling, stains, writing, heavy whitening, edge chipping, dents.
-- If major damage is present, include it in BOTH "defects" and "flags", and describe it in "assessment_summary".
-- Do not downplay severe issues: if you see a crease/fold, say so clearly with SIDE + location.
-- If something cannot be determined, use empty string "" or empty arrays.
-- Do not include market values in this endpoint.
-Respond ONLY with JSON.
+CRITICAL REMINDERS:
+- Every corner needs a detailed note explaining what you observe
+- Every edge/surface needs location-specific observations  
+- Assessment summary must be conversational (first person, like talking to the owner)
+- Do NOT miss obvious damage - be brutally honest
+- If you can't see something clearly due to glare/blur, say so in notes
+
+Respond ONLY with JSON, no extra text.
 """
 
     msg = [{
