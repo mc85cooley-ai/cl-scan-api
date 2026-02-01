@@ -2046,7 +2046,8 @@ async def market_context(
         },
 
         "observed": {
-            "currency": "USD",
+            "currency": ("AUD" if aud_rate else "USD"),
+            "usd_original": {"raw_median": raw_val, "psa10": psa10_equiv, "psa9": psa9_equiv, "psa8": psa8_equiv} if aud_rate else {},
             "fx": {"aud_rate": aud_rate, "aud_timestamp": datetime.utcnow().isoformat() + "Z"} if aud_rate else {},
             "aud": {"raw_median": aud_raw, "psa10": aud_psa10, "psa9": aud_psa9, "psa8": aud_psa8} if aud_rate else {},
             "liquidity": liquidity,
@@ -2074,16 +2075,17 @@ async def market_context(
         },
 
         "grade_impact": {
-            "expected_graded_value": expected_val,
+            "expected_graded_value": (aud_expected if aud_rate and aud_expected is not None else expected_val),
             "expected_graded_value_aud": aud_expected if aud_rate else None,
-            "raw_baseline_value": raw_base,
+            "raw_baseline_value": (aud_raw if aud_rate and aud_raw is not None else raw_base),
             "grading_cost": float(grading_cost or 0.0),
-            "estimated_value_difference": diff,
+            "estimated_value_difference": (round((aud_expected or 0) - (aud_raw or 0) - float(grading_cost or 0.0), 2) if (aud_rate and aud_expected is not None and aud_raw is not None) else diff),
             "recommended_buy": {
-                "currency": "USD",
+                "currency": ("AUD" if aud_rate else "USD"),
                 "retail_loose_buy": retail_loose_buy,
                 "retail_loose_sell": retail_loose_sell,
-                "recommended_purchase_price": rec_buy,
+                "usd_original": {"recommended_purchase_price": rec_buy} if aud_rate else {},
+                "recommended_purchase_price": (aud_rec_buy if aud_rate and aud_rec_buy is not None else rec_buy),
                 "recommended_purchase_price_aud": aud_rec_buy if aud_rate else None,
                 "assume_grading": assume_grading,
                 "notes": " ".join(note) if isinstance(note, list) else "",
