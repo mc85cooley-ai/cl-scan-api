@@ -627,23 +627,48 @@ async def _pc_product(product_id: str) -> Dict[str, Any]:
 _FX_CACHE = {"ts": 0.0, "rate": None}
 
 async def _usd_to_aud_rate() -> Optional[float]:
-    """Fetch USD->AUD rate. Best-effort; returns None on failure."""
+    """Fetch USD->AUD rate. Best-effort; returns None on failure.
+    Tries multiple providers to avoid a single-point failure.
+    Caches for 1 hour.
+    """
     import time
     now = time.time()
     if _FX_CACHE.get("rate") and (now - _FX_CACHE.get("ts", 0.0) < 3600):
         return _FX_CACHE["rate"]
+    urls = [
+        # 1) exchangerate.host
+        ("https://api.exchangerate.host/latest", {"base": "USD", "symbols": "AUD"}, ("rates", "AUD")),
+        # 2) open.er-api.com
+        ("https://open.er-api.com/v6/latest/USD", None, ("rates", "AUD")),
+        # 3) frankfurter.app
+        ("https://api.frankfurter.app/latest", {"from": "USD", "to": "AUD"}, ("rates", "AUD")),
+    ]
     try:
         async with httpx.AsyncClient(timeout=8.0) as client:
-            # exchangerate.host is free and keyless (best-effort)
-            r = await client.get("https://api.exchangerate.host/latest", params={"base": "USD", "symbols": "AUD"})
-            if r.status_code != 200:
-                return None
-            data = r.json() if r.content else {}
-            rate = (data.get("rates") or {}).get("AUD")
-            if rate:
-                _FX_CACHE["ts"] = now
-                _FX_CACHE["rate"] = float(rate)
-                return float(rate)
+            for url, params, path in urls:
+                try:
+                    r = await client.get(url, params=params)
+                    if r.status_code != 200:
+                        continue
+                    data = r.json() if r.content else {}
+                    node = data
+                    for k in path:
+                        if isinstance(node, dict) and k in node:
+                            node = node[k]
+                        else:
+                            node = None
+                            break
+                    rate = None
+                    try:
+                        rate = float(node) if node else None
+                    except Exception:
+                        rate = None
+                    if rate and rate > 0:
+                        _FX_CACHE["ts"] = now
+                        _FX_CACHE["rate"] = rate
+                        return rate
+                except Exception:
+                    continue
     except Exception:
         return None
     return None
