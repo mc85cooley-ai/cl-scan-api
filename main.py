@@ -1,6 +1,6 @@
 """
 The Collectors League Australia - Scan API
-Futureproof v6.4.1 (2026-01-31)
+Futureproof v6.4.2 (2026-01-31)
 
 What changed vs v6.3.x
 - ✅ Adds PriceCharting API as primary market source for cards + sealed/memorabilia (current prices).
@@ -35,6 +35,10 @@ import traceback
 from pathlib import Path
 
 import httpx
+
+# Simple in-memory caches (per-process)
+_FX_CACHE = {"ts": 0, "usd_aud": None}
+_EBAY_CACHE = {}  # key -> {ts, data}
 
 # ==============================
 # App & CORS
@@ -79,6 +83,107 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
 PRICECHARTING_TOKEN = os.getenv("PRICECHARTING_TOKEN", "").strip()
 ADMIN_TOKEN = os.getenv("CL_ADMIN_TOKEN", "").strip()  # optional
+
+
+# ==============================
+# FX + eBay helpers
+# ==============================
+UA = "CollectorsLeagueScan/6.6 (+https://collectors-league.com)"
+
+async def _fx_usd_to_aud() -> float:
+    """Return live-ish USD->AUD rate with a short cache. Falls back to 1.50 if unavailable."""
+    try:
+        now = int(time.time())
+        if _FX_CACHE.get("usd_aud") and (now - int(_FX_CACHE.get("ts") or 0) < FX_CACHE_SECONDS):
+            return float(_FX_CACHE["usd_aud"])
+        # exchangerate.host is free and doesn't require an API key
+        url = "https://api.exchangerate.host/latest?base=USD&symbols=AUD"
+        async with httpx.AsyncClient(timeout=15.0, headers={"User-Agent": UA}) as client:
+            r = await client.get(url)
+            if r.status_code == 200:
+                j = r.json()
+                rate = float(((j.get("rates") or {}).get("AUD")) or 0.0)
+                if rate > 0.5:
+                    _FX_CACHE["usd_aud"] = rate
+                    _FX_CACHE["ts"] = now
+                    return rate
+    except Exception:
+        pass
+    return 1.50
+
+async def _ebay_completed_stats(keyword_query: str, limit: int = 50) -> dict:
+    """Fetch eBay completed/sold items stats using FindingService (AppID only).
+    Returns: {count, currency, prices(list), median, avg, trend_label}
+    """
+    q = _norm_ws(keyword_query or "")
+    if not (USE_EBAY_API and EBAY_APP_ID and q):
+        return {}
+    cache_key = f"ebay:{q}:{limit}"
+    now = int(time.time())
+    cached = _EBAY_CACHE.get(cache_key)
+    if cached and (now - int(cached.get("ts") or 0) < 900):  # 15 min cache
+        return cached.get("data") or {}
+
+    params = {
+        "OPERATION-NAME": "findCompletedItems",
+        "SERVICE-VERSION": "1.13.0",
+        "SECURITY-APPNAME": EBAY_APP_ID,
+        "RESPONSE-DATA-FORMAT": "JSON",
+        "REST-PAYLOAD": "true",
+        "keywords": q,
+        "paginationInput.entriesPerPage": str(max(10, min(100, int(limit)))),
+        "itemFilter(0).name": "SoldItemsOnly",
+        "itemFilter(0).value": "true",
+        "outputSelector(0)": "SellerInfo",
+    }
+    url = "https://svcs.ebay.com/services/search/FindingService/v1"
+    try:
+        async with httpx.AsyncClient(timeout=25.0, headers={"User-Agent": UA}) as client:
+            r = await client.get(url, params=params)
+            if r.status_code != 200:
+                return {}
+            j = r.json()
+        resp = (((j.get("findCompletedItemsResponse") or [{}])[0]).get("searchResult") or [{}])[0]
+        items = resp.get("item") or []
+        prices = []
+        currency = "USD"
+        for it in items:
+            try:
+                ss = (it.get("sellingStatus") or [{}])[0]
+                cp = (ss.get("currentPrice") or [{}])[0]
+                val = float(cp.get("__value__"))
+                cur = cp.get("@currencyId") or currency
+                currency = cur
+                if val and val > 0:
+                    prices.append(val)
+            except Exception:
+                continue
+        stats = {}
+        if prices:
+            prices_sorted = sorted(prices)
+            med = float(prices_sorted[len(prices_sorted)//2]) if prices_sorted else None
+            avg = float(sum(prices_sorted)/len(prices_sorted))
+            # rough trend: compare newest half vs oldest half (Finding API returns newest first typically)
+            half = max(1, len(prices)//2)
+            recent_avg = sum(prices[:half])/half
+            old_avg = sum(prices[half:])/(len(prices)-half) if len(prices)-half > 0 else recent_avg
+            trend_label = "stable"
+            if recent_avg > old_avg * 1.05:
+                trend_label = "increasing"
+            elif recent_avg < old_avg * 0.95:
+                trend_label = "decreasing"
+            stats = {
+                "count": len(prices),
+                "currency": currency,
+                "median": round(med, 2) if med is not None else None,
+                "avg": round(avg, 2),
+                "trend": trend_label,
+                "prices": prices_sorted[:200],
+            }
+        _EBAY_CACHE[cache_key] = {"ts": now, "data": stats}
+        return stats
+    except Exception:
+        return {}
 
 # ==============================
 # Local Data Store (PriceCharting history)
@@ -960,6 +1065,7 @@ Respond ONLY with JSON, no extra text.
 async def verify(
     front: UploadFile = File(...),
     back: UploadFile = File(...),
+    angled: Optional[UploadFile] = File(None),  # new: angled/glare-check shot
     card_name: Optional[str] = Form(None),
     card_set: Optional[str] = Form(None),
     card_number: Optional[str] = Form(None),
@@ -969,6 +1075,7 @@ async def verify(
 ):
     front_bytes = await front.read()
     back_bytes = await back.read()
+    angled_bytes = await angled.read() if angled is not None else b""
     if not front_bytes or not back_bytes or len(front_bytes) < 200 or len(back_bytes) < 200:
         raise HTTPException(status_code=400, detail="Images are too small or empty")
 
@@ -999,7 +1106,8 @@ async def verify(
 
     prompt = f"""You are a professional trading card grader with 15+ years experience.
 
-Analyze BOTH images (front + back) with EXTREME scrutiny. Write as if speaking directly to a collector who needs honest, specific feedback about their card.
+Analyze the provided images with EXTREME scrutiny.
+You will receive FRONT and BACK images, and MAY receive a third ANGLED image used to rule out glare / light refraction artifacts (holo sheen) vs true whitening / scratches / print lines. Write as if speaking directly to a collector who needs honest, specific feedback about their card.
 
 CRITICAL RULES:
 1) **Be conversational and specific.** Write like you're examining the card in person and describing what you see:
@@ -1015,6 +1123,12 @@ CRITICAL RULES:
    - Any bend/ding/impression, heavy rounding → pregrade **5 or lower**
    - Moderate whitening across multiple corners/edges → pregrade **6-7**
    - Only grade 9-10 if truly exceptional
+
+
+5) **Do NOT confuse holo sheen / light refraction / texture for damage**:
+   - If a mark disappears or changes drastically in the ANGLED shot, treat it as glare/reflection, NOT whitening/damage.
+   - Print lines are typically straight and consistent across lighting; glare moves with angle.
+   - Card texture (especially modern) is not damage unless there is a true crease, indentation, or paper break.
 
 4) **Write the assessment summary in first person, conversational style** (5-8 sentences):
    - Open with overall impression: "Looking at your card..."
@@ -1121,7 +1235,12 @@ Respond ONLY with JSON, no extra text.
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(front_bytes)}", "detail": "high"}},
             {"type": "text", "text": "FRONT IMAGE ABOVE ☝️ | BACK IMAGE BELOW 👇"},
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(back_bytes)}", "detail": "high"}},
-        ],
+        ] + (
+            [
+                {"type": "text", "text": "OPTIONAL ANGLED IMAGE BELOW (use to rule out glare vs true defects) 👇"},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(angled_bytes)}", "detail": "high"}},
+            ] if angled_bytes and len(angled_bytes) > 200 else []
+        ),
     }]
 
     result = await _openai_chat(msg, max_tokens=2200, temperature=0.1)
@@ -1178,12 +1297,13 @@ Respond ONLY with JSON, no extra text.
         "edges": data.get("edges", {"front": {"grade": "", "notes": ""}, "back": {"grade": "", "notes": ""}}),
         "surface": data.get("surface", {"front": {"grade": "", "notes": ""}, "back": {"grade": "", "notes": ""}}),
         "defects": data.get("defects", []) if isinstance(data.get("defects", []), list) else [],
-        "flags": data.get("flags", []) if isinstance(data.get("flags", []), list) else [],
+        "flags": flags_list_out,
         "assessment_summary": _norm_ws(str(data.get("assessment_summary", ""))) or summary or "",
         "spoken_word": _norm_ws(str(data.get("spoken_word", ""))) or _norm_ws(str(data.get("assessment_summary", ""))) or summary or "",
         "observed_id": data.get("observed_id", {}) if isinstance(data.get("observed_id", {}), dict) else {},
         "verify_token": f"vfy_{secrets.token_urlsafe(12)}",
         "market_context_mode": "click_only",
+        "has_structural_damage": bool(has_structural_damage),
     })
 
 # ==============================
@@ -1401,7 +1521,7 @@ Respond ONLY with JSON, no extra text.
         "overall_assessment": _norm_ws(str(data.get("overall_assessment", ""))),
         "spoken_word": _norm_ws(str(data.get("spoken_word", ""))) or _norm_ws(str(data.get("overall_assessment", ""))),
         "observed_id": data.get("observed_id", {}) if isinstance(data.get("observed_id", {}), dict) else {},
-        "flags": data.get("flags", []) if isinstance(data.get("flags", []), list) else [],
+        "flags": flags_list_out,
         "verify_token": f"vfy_{secrets.token_urlsafe(12)}",
     })
 
@@ -1424,6 +1544,7 @@ async def market_context(
     predicted_grade: Optional[str] = Form("9"),
     confidence: float = Form(0.0),
     grading_cost: float = Form(35.0),
+    has_structural_damage: Optional[bool] = Form(False),  # new: hard gate for damaged cards
 
     item_type: Optional[str] = Form(None),
     assessed_pregrade: Optional[str] = Form(None),
@@ -1507,69 +1628,30 @@ async def market_context(
         return "-"
 
 
+    
     def _condition_multiplier_from_pregrade(g: Optional[int]) -> float:
-        """Return a conservative 'as-is' value multiplier based on observed/assessed pregrade (1-10)."""
+        """Conservative 'as-is' multiplier from observed/assessed pregrade.
+
+        IMPORTANT: This is intentionally harsh for low grades. A PSA 1–4 copy is often worth a small
+        fraction of a near-mint reference sale.
+        """
         if g is None:
-            return 0.85
+            return 0.80
         try:
             gi = int(g)
         except Exception:
-            return 0.85
-        # Simple, explainable ladder (kept conservative)
-        ladder = {
-            10: 1.00,
-            9: 0.92,
-            8: 0.82,
-            7: 0.72,
-            6: 0.62,
-            5: 0.52,
-            4: 0.42,
-            3: 0.36,
-            2: 0.33,
-            1: 0.30,
-        }
-        return float(ladder.get(max(1, min(10, gi)), 0.85))
-
-    def _condition_bucket_from_pregrade(g: Optional[int]) -> str:
-        """Human-friendly condition bucket for UI labels."""
-        if g is None:
-            return "unknown"
-
-
-    def _condition_bucket_from_pregrade(g: Optional[int]) -> str:
-        # UI-friendly buckets
-        if g is None:
-            return "unknown"
-        if g >= 10:
-            return "gem_mint"
-        if g == 9:
-            return "mint"
-        if g == 8:
-            return "near_mint"
-        if g == 7:
-            return "excellent"
-        if g == 6:
-            return "good"
-        return "fair_or_worse"
-
-    def _condition_multiplier_from_pregrade(g: Optional[int]) -> float:
-        # Conservative, explainable multipliers for "as-is" guidance.
-        # Keep in 0.60–1.10 range.
-        if g is None:
-            return 0.85
-        if g >= 10:
-            return 1.05
-        if g == 9:
-            return 1.00
-        if g == 8:
-            return 0.90
-        if g == 7:
             return 0.80
-        if g == 6:
-            return 0.72
-        if g == 5:
-            return 0.66
-        return 0.60
+        gi = max(1, min(10, gi))
+        if gi >= 10: return 1.00
+        if gi == 9:  return 0.90
+        if gi == 8:  return 0.78
+        if gi == 7:  return 0.65
+        if gi == 6:  return 0.52
+        if gi == 5:  return 0.35
+        if gi == 4:  return 0.18
+        if gi == 3:  return 0.10
+        if gi == 2:  return 0.06
+        return 0.03
 
     def _safe_money_mul(v: Optional[float], m: Optional[float]) -> Optional[float]:
         try:
@@ -1617,6 +1699,8 @@ async def market_context(
         card_label: str,
         predicted_grade_str: str,
         conf_in: float,
+        assessed_grade_int: Optional[int],
+        has_structural_damage: bool,
         grading_cost_aud: float,
         raw_as_is_aud: Optional[float],
         expected_graded_aud: Optional[float],
@@ -1630,6 +1714,33 @@ async def market_context(
         except Exception:
             g = 0.0
         c = _clamp(_safe_float(conf_in, 0.0), 0.0, 1.0)
+
+        # Hard gates: structural damage or very low assessed grade => do NOT recommend grading for value
+        if has_structural_damage:
+            return {
+                "spoken_word": (
+                    f"Because {card_label or 'this card'} shows structural damage like creasing or tearing, "
+                    "high-grade market values do not apply to this specific copy. Grading for value is not recommended. "
+                    "Treat market history below as general reference only for the title, not this condition."
+                ),
+                "recommendation": "do_not_grade",
+                "grading_cost_aud": float(grading_cost_aud or 0.0),
+                "suggested_holding_time": "long",
+            }
+
+        if isinstance(assessed_grade_int, int) and assessed_grade_int <= 4:
+            # Low-grade condition: cap expectations and avoid high-grade anchors
+            return {
+                "spoken_word": (
+                    f"Based on the visible condition, {card_label or 'this card'} looks like a low-grade copy. "
+                    "In this range, grading rarely increases value unless the card is exceptionally rare, and it can reduce liquidity. "
+                    "Market history for high grades is not applicable to this condition. If you grade, do it for protection or authenticity, not value."
+                ),
+                "recommendation": "do_not_grade",
+                "grading_cost_aud": float(grading_cost_aud or 0.0),
+                "suggested_holding_time": "long",
+            }
+
 
         # Determine recommendation
         recommendation = "borderline"
@@ -1692,8 +1803,26 @@ async def market_context(
     clean_set = _norm_ws(str(set_in))
     clean_num_display = _clean_card_number_display(str(num_in))
 
+    damage_flag = str(has_structural_damage).strip().lower() in ("1","true","yes","y","on")
 
+
+
+    
     # --------------------------
+    # Hard gate: structural damage lock
+    # --------------------------
+    try:
+        g_ass = _grade_bucket(str(assessed_pregrade or predicted_grade or "").strip())
+    except Exception:
+        g_ass = None
+
+    if damage_flag:
+        # We still return market history, but we DO NOT compute high-grade projections or ROI-style deltas.
+        # Any high-grade values are not applicable to this specific damaged copy.
+        # We'll continue to load market history later in the function and then override the grading summary.
+        pass
+
+# --------------------------
     # Sealed / memorabilia quick-path (PriceCharting API search)
     # --------------------------
     # Your CSV download is strongest for singles. Sealed/memorabilia often matches better via API search.
@@ -1754,6 +1883,7 @@ async def market_context(
                         },
                     },
                     "meta": {
+            "damage_locked": bool(damage_flag),
                         "match": {"id": pid, "product_name": (detail or top).get("product-name") or top.get("product-name"), "console_name": (detail or top).get("console-name") or top.get("console-name")},
                         "sources": ["pricecharting_api"],
                     },
@@ -1939,7 +2069,7 @@ async def market_context(
                 "estimated_value_difference": None,
             },
             "meta": {            },
-            "disclaimer": "Informational market context only. Figures are third-party estimates and may vary.",
+            "disclaimer": disclaimer,
         }, status_code=200)
 
     # --------------------------
@@ -1987,7 +2117,7 @@ async def market_context(
     # Expected value (simple)
     # --------------------------
     conf_in = _clamp(_safe_float(confidence, 0.0), 0.0, 1.0)
-    g_pred = _grade_bucket(predicted_grade) or 9
+    g_pred = _grade_bucket(assessed_pregrade) or _grade_bucket(predicted_grade) or 9
     dist = _grade_distribution(g_pred, conf_in)
 
     price_map = {"10": psa10_equiv, "9": psa9_equiv, "8": psa8_equiv}
@@ -2047,7 +2177,7 @@ async def market_context(
 
     
         # --- AUD conversion (simple multiplier) ---
-    aud_raw = _usd_to_aud_simple(raw_val) if raw_val is not None else None
+    aud_raw = (await _fx_usd_to_aud()) * float(raw_val) if raw_val is not None else None
     aud_psa10 = _usd_to_aud_simple(psa10_equiv) if psa10_equiv is not None else None
     aud_psa9 = _usd_to_aud_simple(psa9_equiv) if psa9_equiv is not None else None
     aud_psa8 = _usd_to_aud_simple(psa8_equiv) if psa8_equiv is not None else None
@@ -2061,12 +2191,22 @@ async def market_context(
 
     g_ass = _grade_bucket(assessed_pregrade or "") or _grade_bucket(predicted_grade or "")
     mult = float(condition_multiplier) if isinstance(condition_multiplier, (int, float)) else _condition_multiplier_from_pregrade(g_ass)
-    raw_as_is_aud = (_usd_to_aud_simple(raw_val) * float(mult)) if (raw_val is not None) else None
+    raw_as_is_aud = ((await _fx_usd_to_aud()) * float(raw_val) * float(mult)) if (raw_val is not None) else None
+
+    # If structural damage is present, collapse values aggressively and disable graded EV math.
+    if damage_flag:
+        if isinstance(raw_as_is_aud, (int, float)):
+            raw_as_is_aud = round(float(raw_as_is_aud) * 0.15, 2)  # damaged copies typically trade at a small fraction
+        expected_graded_aud = None
+        delta = None
+
     expected_graded_aud = _usd_to_aud_simple(expected_val) if expected_val is not None else None
     grading_value_summary = _grading_value_summary(
         card_label=card_label,
         predicted_grade_str=str(predicted_grade or ""),
         conf_in=conf_in,
+        assessed_grade_int=g_ass,
+        has_structural_damage=bool(damage_flag),
         grading_cost_aud=float(grading_cost or 0.0),
         raw_as_is_aud=raw_as_is_aud,
         expected_graded_aud=expected_graded_aud,
@@ -2074,10 +2214,14 @@ async def market_context(
         trend=trend_label,
     )
 
+
+    mode = "damage_locked" if damage_flag else "click_only"
+    disclaimer = "Damaged-condition informational context only. High-grade values do not apply to this copy." if damage_flag else "Informational market context only. Figures are third-party estimates and may vary."
+
     # UI expects these keys
     return JSONResponse(content={
         "available": True,
-        "mode": "click_only",
+        "mode": mode,
         "message": "Market history loaded",
         "used_query": f"{clean_name} {clean_set} {clean_num_display}".strip(),
         "query_ladder": [clean_name, f"{clean_name} {clean_set}".strip(), f"{clean_name} {clean_set} {clean_num_display}".strip()],
