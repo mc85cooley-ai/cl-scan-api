@@ -36,6 +36,7 @@ from pathlib import Path
 
 import httpx
 import time
+import math
 
 # Optional image processing for 2-pass defect enhancement
 try:
@@ -122,96 +123,143 @@ async def _fx_usd_to_aud() -> float:
         pass
     return 1.50
 
-async def _ebay_completed_stats(keyword_query: str, limit: int = 50) -> dict:
-    """Fetch eBay completed/sold items stats using FindingService (AppID only).
-    Returns: {count, currency, prices(list), median, avg, trend_label}
+async 
+def _ebay_completed_stats(keyword_query: str, limit: int = 120, days_lookback: int = 120) -> dict:
+    """
+    Fetch eBay completed/sold items stats using FindingService (AppID only).
+    Returns:
+      {
+        count, currency,
+        prices(list),
+        low, high, median, avg,
+        p20, p80,
+        min, max,
+        query
+      }
+    Notes:
+      - low/high are p20/p80 (trim outliers)
+      - prices are returned in the listing currency (usually USD/AUD)
     """
     q = _norm_ws(keyword_query or "")
     if not (USE_EBAY_API and EBAY_APP_ID and q):
         return {}
-    cache_key = f"ebay:{q}:{limit}"
+
+    # Cache per query+limit
+    cache_key = f"ebay:{q}:{limit}:{days_lookback}"
     now = int(time.time())
     cached = _EBAY_CACHE.get(cache_key)
     if cached and (now - int(cached.get("ts") or 0) < 900):  # 15 min cache
         return cached.get("data") or {}
 
-    params = {
-        "OPERATION-NAME": "findCompletedItems",
-        "SERVICE-VERSION": "1.13.0",
-        "SECURITY-APPNAME": EBAY_APP_ID,
-        "RESPONSE-DATA-FORMAT": "JSON",
-        "REST-PAYLOAD": "true",
-        "keywords": q,
-        "paginationInput.entriesPerPage": str(max(10, min(100, int(limit)))),
-        "itemFilter(0).name": "SoldItemsOnly",
-        "itemFilter(0).value": "true",
-        "outputSelector(0)": "SellerInfo",
-    }
-    url = "https://svcs.ebay.com/services/search/FindingService/v1"
-    try:
-        async with httpx.AsyncClient(timeout=25.0, headers={"User-Agent": UA}) as client:
-            r = await client.get(url, params=params)
-            if r.status_code != 200:
-                return {}
+    # Finding API pagination
+    per_page = min(100, max(10, int(limit)))
+    max_pages = max(1, int(math.ceil(float(limit) / float(per_page))))
+    max_pages = min(max_pages, 5)  # safety cap
+
+    all_prices: list[float] = []
+    currency = None
+    total_count = 0
+
+    # Use last N days if requested (Finding doesn't support absolute sold date filter cleanly),
+    # but we can lightly prefer recency by sorting order and limiting pages.
+    for page in range(1, max_pages + 1):
+        params = {
+            "OPERATION-NAME": "findCompletedItems",
+            "SERVICE-VERSION": "1.13.0",
+            "SECURITY-APPNAME": EBAY_APP_ID,
+            "RESPONSE-DATA-FORMAT": "JSON",
+            "REST-PAYLOAD": "true",
+            "keywords": q,
+            "itemFilter(0).name": "SoldItemsOnly",
+            "itemFilter(0).value": "true",
+            "paginationInput.entriesPerPage": str(per_page),
+            "paginationInput.pageNumber": str(page),
+            "sortOrder": "EndTimeSoonest",
+        }
+
+        try:
+            url = "https://svcs.ebay.com/services/search/FindingService/v1"
+            r = httpx.get(url, params=params, timeout=20.0)
+            r.raise_for_status()
             j = r.json()
-        resp = (((j.get("findCompletedItemsResponse") or [{}])[0]).get("searchResult") or [{}])[0]
-        items = resp.get("item") or []
-        prices = []
-        currency = "USD"
+        except Exception:
+            continue
+
+        try:
+            resp = (j.get("findCompletedItemsResponse") or [{}])[0]
+            sr = (resp.get("searchResult") or [{}])[0]
+            items = sr.get("item") or []
+        except Exception:
+            items = []
+
+        if not items:
+            break
+
         for it in items:
             try:
-                ss = (it.get("sellingStatus") or [{}])[0]
-                cp = (ss.get("currentPrice") or [{}])[0]
-                val = float(cp.get("__value__"))
-                cur = cp.get("@currencyId") or currency
-                currency = cur
-                if val and val > 0:
-                    prices.append(val)
+                selling = (it.get("sellingStatus") or [{}])[0]
+                cur_price = (selling.get("currentPrice") or [{}])[0]
+                val = float(cur_price.get("__value__"))
+                cur = cur_price.get("@currencyId")
+                if currency is None and cur:
+                    currency = str(cur)
+                if val > 0:
+                    all_prices.append(val)
             except Exception:
                 continue
-        stats = {}
-        if prices:
-            prices_sorted = sorted(prices)
-            med = float(prices_sorted[len(prices_sorted)//2]) if prices_sorted else None
-            avg = float(sum(prices_sorted)/len(prices_sorted))
-            # rough trend: compare newest half vs oldest half (Finding API returns newest first typically)
-            half = max(1, len(prices)//2)
-            recent_avg = sum(prices[:half])/half
-            old_avg = sum(prices[half:])/(len(prices)-half) if len(prices)-half > 0 else recent_avg
-            trend_label = "stable"
-            if recent_avg > old_avg * 1.05:
-                trend_label = "increasing"
-            elif recent_avg < old_avg * 0.95:
-                trend_label = "decreasing"
-            stats = {
-                "count": len(prices),
-                "currency": currency,
-                "median": round(med, 2) if med is not None else None,
-                "avg": round(avg, 2),
-                "trend": trend_label,
-                "prices": prices_sorted[:200],
-            }
-        _EBAY_CACHE[cache_key] = {"ts": now, "data": stats}
-        return stats
-    except Exception:
-        return {}
 
-# ==============================
-# Local Data Store (PriceCharting history)
-# ==============================
-# Use Render persistent disk (recommended) or any writable path.
-# Configure in Render: add a Disk and set CL_DATA_DIR to that mount (e.g. /var/data).
-CL_DATA_DIR = os.getenv("CL_DATA_DIR", "/var/data/cl-scan-api").strip() or "/var/data/cl-scan-api"
-try:
-    os.makedirs(CL_DATA_DIR, exist_ok=True)
-except Exception:
-    # Fallback to /tmp (ephemeral) if filesystem is locked
-    CL_DATA_DIR = "/tmp/cl-scan-api"
-    os.makedirs(CL_DATA_DIR, exist_ok=True)
+        total_count = len(all_prices)
+        if total_count >= limit:
+            break
 
-PRICECHARTING_DB_PATH = os.path.join(CL_DATA_DIR, "pricecharting.sqlite")
-PRICECHARTING_CACHE_DIR = os.path.join(CL_DATA_DIR, "pricecharting")
-os.makedirs(PRICECHARTING_CACHE_DIR, exist_ok=True)
+    # Trim to limit
+    if len(all_prices) > limit:
+        all_prices = all_prices[:limit]
+
+    if not all_prices:
+        data = {}
+        _EBAY_CACHE[cache_key] = {"ts": now, "data": data}
+        return data
+
+    # Robust stats
+    prices_sorted = sorted(all_prices)
+    n = len(prices_sorted)
+    def pct(p: float) -> float:
+        if n == 1:
+            return float(prices_sorted[0])
+        i = (n - 1) * p
+        lo = int(math.floor(i))
+        hi = int(math.ceil(i))
+        if lo == hi:
+            return float(prices_sorted[lo])
+        w = i - lo
+        return float(prices_sorted[lo] * (1 - w) + prices_sorted[hi] * w)
+
+    p20 = pct(0.20)
+    p80 = pct(0.80)
+    med = pct(0.50)
+    avg = float(sum(prices_sorted) / n)
+    mn = float(prices_sorted[0])
+    mx = float(prices_sorted[-1])
+
+    data = {
+        "query": q,
+        "count": n,
+        "currency": currency or "USD",
+        "prices": prices_sorted,
+        "p20": round(p20, 2),
+        "p80": round(p80, 2),
+        "low": round(p20, 2),
+        "high": round(p80, 2),
+        "median": round(med, 2),
+        "avg": round(avg, 2),
+        "min": round(mn, 2),
+        "max": round(mx, 2),
+    }
+
+    _EBAY_CACHE[cache_key] = {"ts": now, "data": data}
+    return data
+
 
 def _pc_db():
     con = sqlite3.connect(PRICECHARTING_DB_PATH)
@@ -1494,7 +1542,20 @@ Return ONLY valid JSON:
     if not isinstance(defects_list_out, list):
         defects_list_out = []
 
-    # Merge second-pass defect candidates (print lines / scratches / whitening) and glare suspects.
+    
+    # Normalize defects to strings (avoid [object Object] in frontend)
+    _norm_def = []
+    for d in defects_list_out:
+        if isinstance(d, str):
+            s = d.strip()
+            if s:
+                _norm_def.append(s)
+        elif isinstance(d, dict):
+            note = str(d.get("note") or d.get("text") or d.get("issue") or "").strip()
+            if note:
+                _norm_def.append(note)
+    defects_list_out = list(dict.fromkeys(_norm_def))
+# Merge second-pass defect candidates (print lines / scratches / whitening) and glare suspects.
     # - Add high-confidence print_line flags when detected.
     # - If glare suspects exist, annotate rather than over-penalize.
     if isinstance(second_pass, dict) and second_pass.get("ran"):
@@ -1502,7 +1563,7 @@ Return ONLY valid JSON:
         glare = second_pass.get("glare_suspects") or []
 
         # Add candidates into defects list (dedup by (type,note))
-        seen = set((str(d.get("type","")).lower(), str(d.get("note","")).lower()) for d in defects_list_out if isinstance(d, dict))
+        seen = set(str(d).lower().strip() for d in defects_list_out if isinstance(d, str))
         for d in cand:
             if not isinstance(d, dict): 
                 continue
@@ -1510,11 +1571,11 @@ Return ONLY valid JSON:
             note = str(d.get("note","")).strip()
             if not t or not note:
                 continue
-            key = (t, note.lower())
+            key = note.lower().strip()
             if key in seen:
                 continue
             seen.add(key)
-            defects_list_out.append({"type": t, "severity": d.get("severity",""), "note": note, "confidence": d.get("confidence", None), "source": "second_pass"})
+            defects_list_out.append(note)
 
             # Promote print line detection into flags if confidence is decent
             try:
@@ -2099,6 +2160,165 @@ async def market_context(
     clean_set = _norm_ws(str(set_in))
     clean_num_display = _clean_card_number_display(str(num_in))
 
+
+    # -----------------------------------------
+    # eBay SOLD listings as PRIMARY pricing data
+    # -----------------------------------------
+    # We build a conservative "low/avg/high" from sold comps (p20/median/p80).
+    # This is informational context only.
+    base_query = " ".join([clean_name, clean_set, clean_num_display]).strip()
+    if not base_query:
+        base_query = " ".join([clean_name, clean_set]).strip() or clean_name
+
+    # Fetch RAW sold stats first (always)
+    raw_stats = _ebay_completed_stats(base_query, limit=120)
+    # Determine an assessed grade bucket to pull graded comps around the *observed* condition
+    g_ass = _grade_bucket(assessed_pregrade or "") or _grade_bucket(predicted_grade or "")
+    g_ass = int(g_ass or 0) if str(g_ass).isdigit() else int(g_ass or 0)
+    if g_ass <= 0:
+        g_ass = 0
+
+    graded_stats: Dict[str, Any] = {}
+    # Only pull a small set of graded buckets to keep API calls sane
+    grades_to_pull: List[int] = []
+    if clean_cat.lower() in ("pokemon", "magic", "yugioh", "sports", "onepiece", "other"):
+        if g_ass >= 8:
+            grades_to_pull = [10, 9, 8]
+        elif g_ass >= 5:
+            grades_to_pull = [g_ass + 1, g_ass, 8]
+        elif g_ass >= 1:
+            grades_to_pull = [g_ass + 1, g_ass]
+        else:
+            grades_to_pull = [10, 9, 8]
+
+        # de-dup + clamp
+        grades_to_pull = sorted({max(1, min(10, int(x))) for x in grades_to_pull}, reverse=True)
+
+        for g in grades_to_pull:
+            qg = f"{base_query} PSA {g}"
+            st = _ebay_completed_stats(qg, limit=90)
+            if st:
+                graded_stats[str(g)] = st
+
+    # Convert to AUD (if needed) and compute a compact observed object
+    def _to_aud_stats(st: dict) -> dict:
+        if not st:
+            return {"median": None, "avg": None, "low": None, "high": None, "count": 0, "currency": "AUD"}
+        cur = str(st.get("currency") or "USD").upper()
+        fx = 1.0
+        if cur == "USD":
+            fx = _usd_to_aud_rate()
+        elif cur == "AUD":
+            fx = 1.0
+        # If other currency, treat as USD for now (rare)
+        def conv(v):
+            try:
+                return round(float(v) * fx, 2) if v is not None else None
+            except Exception:
+                return None
+        return {
+            "median": conv(st.get("median")),
+            "avg": conv(st.get("avg")),
+            "low": conv(st.get("low")),
+            "high": conv(st.get("high")),
+            "count": int(st.get("count") or 0),
+            "currency": "AUD",
+        }
+
+    raw_aud = _to_aud_stats(raw_stats)
+    graded_aud = {k: _to_aud_stats(v) for k, v in (graded_stats or {}).items()}
+
+    # If we have enough sold comps, return eBay-driven context immediately.
+    # (PriceCharting remains as fallback if eBay has no data.)
+    if raw_aud.get("count", 0) >= 6:
+        # Damage lock: if verify flagged structural damage, kill EV/high-grade language
+        damage_flag = bool(has_structural_damage or (str(assessed_pregrade or "").strip() in ("1", "2", "3") ))
+        if damage_flag:
+            return JSONResponse(content={
+                "available": True,
+                "mode": "damage_locked",
+                "message": "This copy appears to have structural damage / heavy wear. High-grade values do not apply.",
+                "used_query": base_query,
+                "card": {"name": clean_name, "set": clean_set, "set_code": "", "year": "", "card_number": clean_num_display, "type": clean_cat},
+                "observed": {
+                    "currency": "AUD",
+                    "liquidity": "-",
+                    "trend": "-",
+                    "raw": raw_aud,
+                    "graded_psa": graded_aud,
+                },
+                "grade_impact": {
+                    "expected_graded_value": None,
+                    "raw_baseline_value": raw_aud.get("median"),
+                    "grading_cost": float(grading_cost or 0.0),
+                    "estimated_value_difference": None,
+                },
+                "grading_value_summary": {
+                    "spoken_word": (
+                        "Because this card shows heavy wear or possible structural damage, grading for value usually doesn't make sense. "
+                        "The market prices for high grades don't apply to this specific copy. Treat these numbers as general reference only."
+                    ),
+                    "recommendation": "do_not_grade",
+                },
+                "meta": {"pricing_source": "ebay"},
+                "disclaimer": "Informational market context only. Sold listings vary by platform, timing, and condition.",
+            }, status_code=200)
+
+        # Build a grade-aware summary using the observed grade (NOT a default 9)
+        g_for_summary = g_ass if g_ass else None
+        conf_in = _clamp(_safe_float(confidence, 0.0), 0.0, 1.0)
+
+        # Choose a graded reference price closest to the assessed grade if we have it
+        graded_ref = None
+        if g_for_summary and str(g_for_summary) in graded_aud:
+            graded_ref = graded_aud[str(g_for_summary)].get("median")
+        elif graded_aud:
+            # pick the lowest grade we fetched (closest to the assessed if below 8)
+            pick = sorted([int(k) for k in graded_aud.keys()])[-1]
+            graded_ref = graded_aud[str(pick)].get("median")
+
+        raw_med = raw_aud.get("median")
+        grading_fee = float(grading_cost or 0.0)
+        expected = graded_ref
+        diff = (expected - raw_med - grading_fee) if (expected and raw_med) else None
+
+        spoken = (
+            f"Here's our take based on recent sold listings. Your observed condition looks around a {g_for_summary or 'N/A'} "
+            f"with confidence at {int(conf_in*100)} percent. "
+        )
+        if expected and raw_med:
+            spoken += (
+                f"Using that condition as-is, the raw baseline is roughly {raw_med:.2f} AUD. "
+                f"A comparable graded copy around that level has a median near {expected:.2f} AUD. "
+                f"After the {grading_fee:.0f} AUD fee, the headroom is {diff:.2f} AUD — but it's not guaranteed."
+            )
+        else:
+            spoken += "We couldn't form a reliable graded comparison for this condition level yet. Use the raw sold range as your best guide for now."
+
+        return JSONResponse(content={
+            "available": True,
+            "mode": "click_only",
+            "message": "Market History Loaded",
+            "used_query": base_query,
+            "confidence": conf_in,
+            "card": {"name": clean_name, "set": clean_set, "set_code": "", "year": "", "card_number": clean_num_display, "type": clean_cat},
+            "observed": {
+                "currency": "AUD",
+                "liquidity": "-",
+                "trend": "-",
+                "raw": raw_aud,
+                "graded_psa": graded_aud,
+            },
+            "grading_value_summary": {"spoken_word": spoken, "recommendation": "grade" if (g_for_summary and g_for_summary >= 8) else "consider"},
+            "grade_impact": {
+                "expected_graded_value": expected,
+                "raw_baseline_value": raw_med,
+                "grading_cost": grading_fee,
+                "estimated_value_difference": diff,
+            },
+            "meta": {"pricing_source": "ebay", "counts": {"raw": raw_aud.get("count"), "graded": {k: v.get("count") for k, v in graded_aud.items()}}},
+            "disclaimer": "Informational market context only. Sold listings vary by platform, timing, and condition.",
+        }, status_code=200)
     damage_flag = str(has_structural_damage).strip().lower() in ("1","true","yes","y","on")
 
 
@@ -2375,7 +2595,8 @@ async def market_context(
     newp = _parse_money(best.get("new-price"))
     graded = _parse_money(best.get("graded-price"))
 
-    cond17 = _parse_money(best.get("condition-17-price"))  # commonly present in your CSV
+    cond17 = _parse_money(best.get("condition-17-price"))
+    cond16 = _parse_money(best.get("condition-16-price"))  # commonly present in your CSV
     cond18 = _parse_money(best.get("condition-18-price"))
     bgs10 = _parse_money(best.get("bgs-10-price"))
 
@@ -2499,7 +2720,7 @@ async def market_context(
     expected_graded_aud = _usd_to_aud_simple(expected_val) if expected_val is not None else None
     grading_value_summary = _grading_value_summary(
         card_label=card_label,
-        predicted_grade_str=str(predicted_grade or ""),
+        predicted_grade_str=str(g_pred or assessed_pregrade or predicted_grade or ""),
         conf_in=conf_in,
         assessed_grade_int=g_ass,
         has_structural_damage=bool(damage_flag),
