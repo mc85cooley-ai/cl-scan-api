@@ -1210,29 +1210,32 @@ async def identify_memorabilia(
 
     prompt = """You are identifying a collectible item (sealed product or memorabilia) from photos.
 
+Goal: be SPECIFIC. Name the exact product when possible, including brand/TCG, series/set, configuration, and any visible edition or language.
+
 Return ONLY valid JSON with these exact fields:
 
 {
-  "item_type": "sealed booster box/sealed pack/sealed tin/sealed case/autographed memorabilia/game-used memorabilia/graded item/other",
-  "brand": "brand/league/publisher if visible (e.g., Pokemon, Panini, Topps, Upper Deck) else empty string",
-  "product_name": "the main product name (e.g., 'Scarlet & Violet 151 Booster Box') else empty string",
-  "set_or_series": "set/series name if visible else empty string",
+  "item_type": "sealed booster box/sealed booster bundle/sealed pack/sealed tin/sealed case/elite trainer box/collection box/autographed memorabilia/game-used memorabilia/graded item/other",
+  "brand": "brand/league/publisher if visible (e.g., Pokemon TCG, Panini, Topps, Upper Deck, Wizards of the Coast) else empty string",
+  "product_name": "exact product name if visible (e.g., 'Scarlet & Violet—151 Booster Bundle') else best-effort specific name",
+  "set_or_series": "set/series/expansion name if visible (e.g., 'Scarlet & Violet—151') else empty string",
   "year": "4 digit year if visible else empty string",
-  "edition_or_language": "e.g., English/Japanese/1st Edition/Unlimited if visible else empty string",
-  "special_attributes": ["e.g., Factory Sealed", "Pokemon Center", "Hobby Box", "1st Edition", "Shadowless"],
-  "description": "detailed one-paragraph description of the item in plain English",
+  "edition_or_language": "e.g., English/Japanese/1st Edition/Unlimited/Collector's Edition if visible else empty string",
+  "special_attributes": ["short tags like Factory Sealed", "Pokemon Center", "Hobby Box", "1st Edition", "Case Fresh"],
+  "description": "one clear paragraph describing exactly what it is and what can be seen (packaging, labels, markings)",
   "signatures": "names of any visible signatures or 'None visible'",
   "seal_condition": "Factory Sealed/Opened/Resealed/Damaged/Not applicable",
   "authenticity_notes": "authenticity indicators visible (holograms, stickers, COA) and any red flags",
-  "notable_features": "unique features worth noting",
+  "notable_features": "unique features worth noting (promo contents, special print, chase set, serial numbering, COA, etc.)",
   "confidence": 0.0-1.0,
   "category_hint": "Pokemon/Magic/YuGiOh/Sports/OnePiece/Other"
 }
 
 Rules:
-- Be specific. Do not invent a year/edition if you cannot see it.
-- If it appears sealed, describe the wrap (tight/loose, tears, holes, bubbling) and label as Factory Sealed only if it looks consistent.
-- If you cannot identify confidently, keep product_name empty and set confidence low.
+- If multiple products are plausible, choose the best match and explain uncertainty in authenticity_notes (briefly).
+- Do NOT invent a year/edition/language if you cannot see it.
+- If it appears sealed, describe the wrap (tight/loose, tears, holes, seams, bubbling). Use 'Factory Sealed' only if it looks consistent.
+- If you cannot identify confidently, keep product_name generic and set confidence low.
 Respond ONLY with JSON, no extra text.
 """
 
@@ -1249,6 +1252,12 @@ Respond ONLY with JSON, no extra text.
 
     return JSONResponse(content={
         "item_type": _norm_ws(str(data.get("item_type", "Unknown"))),
+        "brand": _norm_ws(str(data.get("brand", ""))),
+        "product_name": _norm_ws(str(data.get("product_name", ""))),
+        "set_or_series": _norm_ws(str(data.get("set_or_series", ""))),
+        "year": _norm_ws(str(data.get("year", ""))),
+        "edition_or_language": _norm_ws(str(data.get("edition_or_language", ""))),
+        "special_attributes": data.get("special_attributes", []) if isinstance(data.get("special_attributes", []), list) else [],
         "description": _norm_ws(str(data.get("description", ""))),
         "signatures": _norm_ws(str(data.get("signatures", "None visible"))),
         "seal_condition": _norm_ws(str(data.get("seal_condition", "Not applicable"))),
@@ -1289,7 +1298,7 @@ async def assess_memorabilia(
 
     prompt = f"""You are a professional memorabilia/collectibles grader.
 
-Analyze ALL images with the same strictness a card grader would use. Be conservative and specific.
+You MUST identify what the item is (brand + product name + series/set) as specifically as the images allow, then grade condition conservatively.
 
 Return ONLY valid JSON with this EXACT structure:
 
@@ -1306,22 +1315,22 @@ Return ONLY valid JSON with this EXACT structure:
   }},
   "seal_integrity": {{
     "status": "Factory Sealed/Opened/Resealed/Compromised/Not Applicable",
-    "notes": "detailed notes about seal/wrap (tightness, tears, holes, bubbling, seams)"
+    "notes": "detailed notes about seal/wrap (tightness, tears, holes, seams, bubbling). Mention exact locations."
   }},
   "packaging_condition": {{
     "grade": "Mint/Near Mint/Excellent/Good/Fair/Poor",
-    "notes": "detailed notes about box/packaging wear: corners, dents, crushing, scratches, scuffs, sticker residue"
+    "notes": "detailed notes about packaging wear: corners, dents, crushing, scratches, scuffs, sticker residue, window plastic, edges. Mention exact locations."
   }},
   "signature_assessment": {{
     "present": true/false,
     "quality": "Clear/Faded/Smudged/Not Applicable",
     "notes": "notes about signature placement/ink flow/bleeding and any authenticity concerns"
   }},
-  "value_factors": ["short bullets: print run, desirability, era, sealed premium, athlete/popularity, etc."],
+  "value_factors": ["short bullets: print run, desirability, era, sealed premium, athlete/popularity, scarcity, set demand"],
   "defects": ["each defect as a full sentence with location + severity"],
   "flags": ["short flags for important issues (reseal risk, crush damage, water, heavy dents, COA missing)"],
-  "overall_assessment": "5-8 sentences in first person (\"Looking at your item...\") explaining condition and what limits it.",
-  "spoken_word": "A 20-45 second spoken-word version: best features, main issues, realistic condition grade.",
+  "overall_assessment": "5-8 sentences in first person (start with: 'Looking at your [brand] [product_name]...'). Mention what it is, what looks strong, what issues you see, and what limits the condition grade.",
+  "spoken_word": "A 20–45 second spoken-word script in first person. Format it like: Hook (1 line) → What it is (1–2 lines) → Best features (1–2 lines) → Biggest concerns (1–3 lines) → Bottom line grade + confidence (1 line). No hype, no guarantees.",
   "observed_id": {{
     "brand": "best-effort",
     "product_name": "best-effort",
@@ -1335,8 +1344,9 @@ Return ONLY valid JSON with this EXACT structure:
 {ctx}
 
 Rules:
-- Do NOT claim Factory Sealed unless the wrap/seal looks consistent.
+- Do NOT claim Factory Sealed unless the wrap/seal looks consistent. If uncertain, say so and reduce confidence.
 - If glare/blur prevents certainty, say so and reduce confidence.
+- Be specific with locations and avoid generic statements.
 Respond ONLY with JSON, no extra text.
 """
 
@@ -1389,6 +1399,8 @@ Respond ONLY with JSON, no extra text.
         "value_factors": data.get("value_factors", []) if isinstance(data.get("value_factors", []), list) else [],
         "defects": data.get("defects", []) if isinstance(data.get("defects", []), list) else [],
         "overall_assessment": _norm_ws(str(data.get("overall_assessment", ""))),
+        "spoken_word": _norm_ws(str(data.get("spoken_word", ""))) or _norm_ws(str(data.get("overall_assessment", ""))),
+        "observed_id": data.get("observed_id", {}) if isinstance(data.get("observed_id", {}), dict) else {},
         "flags": data.get("flags", []) if isinstance(data.get("flags", []), list) else [],
         "verify_token": f"vfy_{secrets.token_urlsafe(12)}",
     })
@@ -1408,6 +1420,7 @@ async def market_context(
     item_category: Optional[str] = Form("Pokemon"),  # Pokemon/Magic/YuGiOh/Sports/OnePiece/Other
     item_set: Optional[str] = Form(None),
     item_number: Optional[str] = Form(None),
+    product_id: Optional[str] = Form(None),
     predicted_grade: Optional[str] = Form("9"),
     confidence: float = Form(0.0),
     grading_cost: float = Form(35.0),
@@ -1672,6 +1685,7 @@ async def market_context(
     cat_in = item_category or card_type or "Other"
     set_in = item_set or card_set or ""
     num_in = item_number or card_number or ""
+    pid_in = _norm_ws(str(product_id or ""))
 
     clean_name = _norm_ws(str(name_in))
     clean_cat = _normalize_card_type(_norm_ws(str(cat_in)))
@@ -1849,6 +1863,14 @@ async def market_context(
     best_score = -1
 
     for r in rows:
+        # Exact match by product id if provided (CSV column "id")
+        if pid_in:
+            rid = _norm_ws(str(r.get("id", "")))
+            if rid and rid == pid_in:
+                best = r
+                best_score = 999
+                break
+
         pn = _pc_norm(r.get("product-name", ""))
         cn = _pc_norm(r.get("console-name", ""))
 
@@ -1859,16 +1881,34 @@ async def market_context(
             elif str(num_short) in pn:
                 score += 5
 
-        for t in name_tokens:
-            if t and t in pn:
-                score += 3
+        if sealed_like:
+            # Sealed/memorabilia rows often swap "set" vs "product" wording between inputs,
+            # so we score tokens against BOTH fields.
+            for tkn in name_tokens:
+                if tkn and (tkn in pn or tkn in cn):
+                    score += 3
 
-        for t in set_tokens:
-            if t and (t in cn or t in pn):
-                score += 2
+            for tkn in set_tokens:
+                if tkn and (tkn in pn or tkn in cn):
+                    score += 2
 
-        if s_norm and s_norm in cn:
-            score += 6
+            if s_norm and (s_norm in cn or s_norm in pn):
+                score += 6
+
+            # Extra boost if inputs look swapped (set appears in product-name and name appears in console-name)
+            if n_norm and (n_norm in cn) and s_norm and (s_norm in pn):
+                score += 6
+        else:
+            for tkn in name_tokens:
+                if tkn and tkn in pn:
+                    score += 3
+
+            for tkn in set_tokens:
+                if tkn and (tkn in cn or tkn in pn):
+                    score += 2
+
+            if s_norm and s_norm in cn:
+                score += 6
 
         if score > best_score:
             best_score = score
@@ -1925,9 +1965,9 @@ async def market_context(
     # - PSA 10 equiv: BGS 10 if present, else condition-18, else graded
     # - PSA 9 equiv: condition-17, else graded
     # - PSA 8 equiv: graded
-    psa10_equiv = bgs10 or graded
-    psa9_equiv = cond17 or graded
-    psa8_equiv = cond18 or graded
+    psa10_equiv = bgs10 or cond18 or graded or newp or loose
+    psa9_equiv = cond17 or graded or newp or loose
+    psa8_equiv = cond18 or graded or newp or loose
 
     # --------------------------
     # Liquidity & trend (if we have a product id + history)
