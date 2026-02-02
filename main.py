@@ -2535,7 +2535,20 @@ async def market_context(
                 "_dbg": dbg,
             })
 
-        scored.sort(key=lambda x: (x["score"], x["price"]), reverse=True)
+        # Sort primarily by relevance score. To avoid "top priced" drift when many items tie on score,
+        # we lightly prefer prices closer to the median of the best-scoring candidates.
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        head = scored[:20]  # use a wider head to compute a stable median
+        head_prices = [x["price"] for x in head if isinstance(x.get("price"), (int, float)) and x["price"] > 0]
+        head_med = float(median(sorted(head_prices))) if head_prices else None
+
+        def _dist(p: float) -> float:
+            if not head_med or head_med <= 0 or not p:
+                return 0.0
+            return abs(float(p) - head_med) / head_med
+
+        # Re-rank: score desc, then closer-to-median first
+        scored.sort(key=lambda x: (x["score"], -_dist(x.get("price") or 0.0)), reverse=True)
         top = scored[:5]
 
         prices = [x["price"] for x in top if isinstance(x.get("price"), (int, float)) and x["price"] > 0]
@@ -2565,6 +2578,107 @@ async def market_context(
             x.pop("_dbg", None)
 
         return top, stats, debug
+
+    # --------------------------
+    # Graded (PSA) comp helpers (optional display)
+    # --------------------------
+    async def _collect_psa_grade_top5(psa_grade: int) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Collect top-5 graded comps for a specific PSA grade (sold first, fallback to active)."""
+
+        def _grade_score_boost(title: str) -> int:
+            t = (title or "").lower()
+            # Must mention PSA and the exact grade
+            if f"psa {psa_grade}" in t or f"psa{psa_grade}" in t:
+                return 40
+            if "psa" in t:
+                # other PSA grade -> discourage hard
+                return -50
+            return -60
+
+        # Build a small query ladder specific to this grade
+        base_bits = [n, sname, num_display]
+        base = _norm_ws(" ".join([b for b in base_bits if b])).strip()
+        grade_ladder = []
+        if base:
+            grade_ladder.append(f"{base} PSA {psa_grade}")
+        grade_ladder.append(_norm_ws(f"{n} {num_display} PSA {psa_grade}").strip())
+        grade_ladder.append(_norm_ws(f"{n} PSA {psa_grade}").strip())
+        grade_ladder = [q for q in grade_ladder if q]
+
+        # Try SOLD (completed) first
+        sold_by_id: Dict[str, Dict[str, Any]] = {}
+        for q in grade_ladder[:4]:
+            cand = await _finding_completed(q, limit=120)
+            for c in cand:
+                iid = str(c.get("itemId") or "")
+                if iid and iid not in sold_by_id:
+                    sold_by_id[iid] = c
+
+        # Score with graded allowed, but require the grade keyword
+        graded_scored = []
+        for c in sold_by_id.values():
+            title = str(c.get("title") or "")
+            sc, dbg = _score_candidate(title)
+            sc += _grade_score_boost(title)
+            # Reject if not clearly the right grade
+            if sc < 10:
+                continue
+            graded_scored.append({
+                "title": title,
+                "price": float(c.get("price_aud") or 0.0),
+                "currency": "AUD",
+                "condition": str(c.get("condition") or ""),
+                "url": str(c.get("url") or ""),
+                "itemId": str(c.get("itemId") or ""),
+                "score": int(sc),
+            })
+
+        graded_scored.sort(key=lambda x: x["score"], reverse=True)
+        top = graded_scored[:5]
+
+        prices = [x["price"] for x in top if x.get("price") and x["price"] > 0]
+        if prices:
+            prices_sorted = sorted(prices)
+            stats = {
+                "count": len(top),
+                "median": round(float(median(prices_sorted)), 2),
+                "low": round(float(prices_sorted[0]), 2),
+                "high": round(float(prices_sorted[-1]), 2),
+                "currency": "AUD",
+            }
+        else:
+            stats = {"count": 0, "median": None, "low": None, "high": None, "currency": "AUD"}
+
+        return top, stats
+
+    def _build_market_summary(sold_stats: Dict[str, Any], active_stats: Dict[str, Any], valuation: Dict[str, Any]) -> str:
+        """Spoken-word summary for the Market History block."""
+        s_cnt = int(sold_stats.get("count") or 0)
+        a_cnt = int(active_stats.get("count") or 0)
+        s_med = sold_stats.get("median")
+        a_med = active_stats.get("median")
+        v = valuation.get("value_aud")
+
+        parts = []
+        if s_cnt >= 3 and s_med:
+            parts.append(f"Recent sold results suggest a typical paid price around ${s_med:.2f} AUD.")
+        elif a_cnt >= 3 and a_med:
+            parts.append(f"Not many sold results were found, so we're leaning on current listings. Typical asking prices are around ${a_med:.2f} AUD.")
+        else:
+            parts.append("Market data is limited for this exact match, so treat these numbers as indicative only.")
+
+        if s_med and a_med:
+            if a_med > s_med * 1.10:
+                parts.append("Active listings are currently priced above recent sold levels, which can indicate seller optimism or tight supply.")
+            elif a_med < s_med * 0.90:
+                parts.append("Active listings are currently under recent sold levels, which can indicate softer demand or quick-sale pricing.")
+            else:
+                parts.append("Active listings and recent sold levels are broadly aligned.")
+
+        if isinstance(v, (int, float)) and v:
+            parts.append(f"Based on the assessed condition, the condition-aware valuation anchor lands around ${float(v):.2f} AUD.")
+
+        return " ".join(parts).strip()
 
     # Build candidate pools across ladder
     sold_pool_by_id: Dict[str, Dict[str, Any]] = {}
@@ -2602,6 +2716,17 @@ async def market_context(
 
     sold_matches, sold_stats, sold_debug = _collect_top5(sold_pool)
     active_matches, active_stats, active_debug = _collect_top5(active_pool)
+
+    # Graded reference points (PSA 8/9/10) — used for UI context only
+    psa10_matches, psa10_stats = await _collect_psa_grade_top5(10)
+    psa9_matches, psa9_stats = await _collect_psa_grade_top5(9)
+    psa8_matches, psa8_stats = await _collect_psa_grade_top5(8)
+
+    graded = {
+        "psa10": {"matches": psa10_matches, "stats": psa10_stats},
+        "psa9": {"matches": psa9_matches, "stats": psa9_stats},
+        "psa8": {"matches": psa8_matches, "stats": psa8_stats},
+    }
 
     if not sold_matches and not active_matches:
         return {
@@ -2652,6 +2777,8 @@ async def market_context(
         "value_aud": anchored_value,
         "note": "Valuation is condition-aware and anchored ONLY to SOLD comps (buyers actually paid). ACTIVE listings are context only.",
     }
+    market_summary = _build_market_summary(sold_stats, active_stats, valuation)
+
 
     # --------------------------
     # Assemble response (frontend friendly)
@@ -2665,6 +2792,9 @@ async def market_context(
         "has_structural_damage": structural,
         "assessed_pregrade": resolved_grade,
         "valuation": valuation,
+
+        "market_summary": market_summary,
+        "graded": graded,
 
         # Requested output
         "sold": sold_stats,
