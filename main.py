@@ -1,6 +1,6 @@
 """
 The Collectors League Australia - Scan API
-Futureproof v6.4.1 (2026-01-31)
+Futureproof v7.0.1 (2026-02-02)
 
 What changed vs v6.3.x
 - ✅ Adds PriceCharting API as primary market source for cards + sealed/memorabilia (current prices).
@@ -519,6 +519,12 @@ def _canonicalize_set(set_code: Optional[str], set_name: Optional[str]) -> Dict[
 USE_EBAY_API = os.getenv("USE_EBAY_API", "0").strip() in ("1", "true", "TRUE", "yes", "YES")
 EBAY_APP_ID = os.getenv("EBAY_APP_ID", "").strip()
 EBAY_OAUTH_TOKEN = os.getenv("EBAY_OAUTH_TOKEN", "").strip()
+
+# eBay marketplace + display defaults
+EBAY_MARKETPLACE_ID = os.getenv("EBAY_MARKETPLACE_ID", os.getenv("EBAY_MARKETPLACE", "EBAY_AU")).strip() or "EBAY_AU"
+DEFAULT_CURRENCY = os.getenv("DEFAULT_CURRENCY", "AUD").strip().upper() or "AUD"
+EXCLUDE_GRADED_DEFAULT = os.getenv("EXCLUDE_GRADED_DEFAULT", "1").strip() in ("1","true","TRUE","yes","YES")
+
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -2022,7 +2028,6 @@ async def market_context(
     # Trust gates / coupling
     has_structural_damage: Optional[bool] = Form(False),
     assessed_pregrade: Optional[str] = Form(None),
-    condition_multiplier: Optional[float] = Form(None),
 
     # Back-compat aliases from older frontends
     card_name: Optional[str] = Form(None),
@@ -2036,21 +2041,45 @@ async def market_context(
     item_type: Optional[str] = Form(None),
     description: Optional[str] = Form(None),
     seal_condition: Optional[str] = Form(None),
+
+    # Controls (optional)
+    exclude_graded: Optional[bool] = Form(None),   # if None, uses EXCLUDE_GRADED_DEFAULT
 ):
-    """Market context (informational).
+    """
+    Market context (SOLD + ACTIVE) with:
+      - Top-5 closest SOLD comps (FindingService findCompletedItems)
+      - Top-5 closest ACTIVE comps (Browse API item_summary/search)
+      - Low/median/high computed from those top-5
+      - Condition-aware valuation anchored to SOLD comps (prevents PSA10 fantasy on damaged cards)
 
-    PRIMARY pricing source: eBay SOLD (completed) listings.
-    Secondary context: eBay ACTIVE (current) listings.
-
-    Key principle:
-      - SOLD = what buyers actually paid (historic truth)
-      - ACTIVE = what sellers are asking now (pressure), never a valuation anchor
-
-    Output is compatible with your frontend renderer while adding clear sold-vs-active history.
+    Output remains broadly compatible with existing frontend (observed.sold/active stats),
+    while adding:
+      - sold_matches / active_matches (comps used lists)
+      - match_debug (transparency / tuning)
     """
 
     # --------------------------
-    # Helpers
+    # Identity resolution
+    # --------------------------
+    n = _norm_ws(item_name or card_name or name or "").strip()
+    sname = _norm_ws(item_set or card_set or "").strip()
+    num_display = _clean_card_number_display(item_number or card_number or "").strip()
+    ctype = _normalize_card_type(_norm_ws(card_type or item_category or "").strip())
+
+    # Memorabilia/sealed fallback query
+    if _is_blankish(n):
+        n = _norm_ws(description or query or "").strip()
+
+    if not n:
+        return {
+            "available": False,
+            "message": "No item details available yet. Please run Identify/Verify first.",
+            "used_query": "",
+            "query_ladder": [],
+        }
+
+    # --------------------------
+    # Condition anchor mapping (exactly as requested)
     # --------------------------
     def _as_int_grade(s: Optional[str]) -> Optional[int]:
         if s is None:
@@ -2058,213 +2087,483 @@ async def market_context(
         ss = str(s).strip()
         if not ss:
             return None
-        # allow "9.0"
         try:
             return int(round(float(ss)))
         except Exception:
             return None
 
-    def _anchor(pregrade: Optional[int], structural: bool) -> str:
-        g = pregrade if pregrade is not None else None
-        if structural or (g is not None and g <= 4):
-            return "damaged"
-        if g is not None and g <= 6:
-            return "low"
-        if g is not None and g <= 8:
-            return "mid"
-        return "high" if g is not None else "mid"
-
-    def _pick_value_from_sold(sold_stats: dict, anchor: str) -> Optional[float]:
-        if not sold_stats:
-            return None
-        p20 = sold_stats.get("p20") or sold_stats.get("low")
-        p50 = sold_stats.get("median") or sold_stats.get("p50")
-        if p20 is None and p50 is None:
-            return None
-        if anchor == "damaged":
-            return float(p20 or p50)
-        if anchor == "low":
-            if p20 is not None and p50 is not None:
-                return float((float(p20) + float(p50)) / 2.0)
-            return float(p50 or p20)
-        # mid/high: median
-        return float(p50 or p20)
-
-    def _fmt_anchor(a: str) -> str:
-        return {"damaged":"Damaged Raw","low":"Low Grade Raw","mid":"Mid Grade Raw","high":"High Grade / Near Mint"}.get(a, a)
-
-    # --------------------------
-    # Identity resolution
-    # --------------------------
-    # Prefer card fields when available
-    n = _norm_ws(item_name or card_name or name or "").strip()
-    sname = _norm_ws(item_set or card_set or "").strip()
-    num = _clean_card_number_display(item_number or card_number or "").strip()
-    ctype = _normalize_card_type(_norm_ws(card_type or item_category or "").strip())
-
-    # Memorabilia/sealed fallback query
-    if _is_blankish(n):
-        n = _norm_ws(description or query or "").strip()
-
-    # Compose query
-    parts = []
-    if n: parts.append(n)
-    if sname: parts.append(sname)
-    if num: parts.append(num)
-    if ctype and ctype.lower() not in ("other","unknown"): parts.append(ctype)
-    keyword_query = " ".join([p for p in parts if p]).strip()
-
-    if not keyword_query:
-        return {
-            "available": False,
-            "message": "No identity provided. Please run Identify/Verify first.",
-            "used_query": "",
-            "query_ladder": [],
-        }
-
-    # --------------------------
-    # Coupling: grade, anchor, gates
-    # --------------------------
     g_ass = _as_int_grade(assessed_pregrade)
     g_pred = _as_int_grade(predicted_grade)
-    resolved_grade = g_ass or g_pred  # assessed overrides predicted
+    resolved_grade = g_ass if g_ass is not None else g_pred
     structural = bool(has_structural_damage)
+
+    def _anchor(pregrade: Optional[int], structural_damage: bool) -> str:
+        g = pregrade
+        if structural_damage or (g is not None and g <= 4):
+            return "sold_low"
+        if g is not None and 5 <= g <= 6:
+            return "sold_mid_low"
+        if g is not None and 7 <= g <= 8:
+            return "sold_median"
+        if g is not None and 9 <= g <= 10:
+            return "sold_median_high"
+        return "sold_median"
+
     anchor = _anchor(resolved_grade, structural)
 
-    # Hard lock for damaged items (structural or <=4)
-    damage_locked = (anchor == "damaged")
+    # --------------------------
+    # Query ladder (Google-like)
+    # --------------------------
+    set_code_hint = _norm_ws((item_set or "")).strip()
+    ladder = _build_ebay_query_ladder(n, sname, set_code_hint, num_display, ctype)
+    # Keep ladder sane (avoid rate limits)
+    ladder = ladder[:12] if ladder else [_norm_ws(n)]
 
     # --------------------------
-    # Pull eBay SOLD + ACTIVE
+    # Matching + filters
     # --------------------------
-    sold = await _ebay_completed_stats(keyword_query, limit=120, days_lookback=120)
-    active = await _ebay_active_stats(keyword_query, limit=120)
+    exclude_graded_effective = EXCLUDE_GRADED_DEFAULT if exclude_graded is None else bool(exclude_graded)
 
-    # normalize shapes
-    sold_count = int(sold.get("count", 0) or 0) if isinstance(sold, dict) else 0
-    active_count = int(active.get("count", 0) or 0) if isinstance(active, dict) else 0
+    NEGATIVE_TERMS = [
+        "proxy", "reprint", "custom", "fake", "fan made", "fanmade", "replica",
+        "digital", "print", "download", "art", "poster",
+    ]
+    LOT_TERMS = ["lot", "bundle", "collection", "job lot", "joblot", "bulk", "assorted"]
+    GRADED_TERMS = ["psa", "bgs", "cgc", "sgc", "beckett", "graded", "slab", "gem mint"]
 
-    # If eBay disabled or empty, return informative empty state
-    if not sold_count and not active_count:
+    def _tokenize(s: str) -> List[str]:
+        s = re.sub(r"[^a-z0-9/#]+", " ", (s or "").lower())
+        toks = [t for t in s.split() if t and len(t) > 1]
+        return toks
+
+    expected = {
+        "name": n,
+        "name_tokens": set(_tokenize(n)),
+        "set": sname,
+        "set_tokens": set(_tokenize(sname)),
+        "num": num_display,
+        "num_variants": _normalize_num_variants(num_display),
+        "year": "",
+        "type": ctype,
+    }
+
+    def _contains_any(hay: str, needles: List[str]) -> bool:
+        h = (hay or "").lower()
+        return any(x in h for x in needles)
+
+    def _score_candidate(title: str) -> Tuple[int, Dict[str, Any]]:
+        """Return (score, debug) for a candidate title."""
+        t = (title or "").lower()
+        toks = set(_tokenize(t))
+        score = 0
+        dbg = {"pos": [], "neg": []}
+
+        # Strong negatives
+        if _contains_any(t, NEGATIVE_TERMS):
+            score -= 80
+            dbg["neg"].append("negative_term")
+        if _contains_any(t, LOT_TERMS):
+            score -= 25
+            dbg["neg"].append("lot_bundle")
+        is_graded = _contains_any(t, GRADED_TERMS)
+        if is_graded:
+            score -= 35
+            dbg["neg"].append("graded_listing")
+
+        # Wrong game (basic)
+        if expected["type"] == "Pokemon":
+            if any(x in t for x in ["mtg", "magic the gathering", "yu-gi-oh", "yugioh", "one piece", "panini", "topps"]):
+                score -= 40
+                dbg["neg"].append("wrong_game")
+        if expected["type"] == "Magic":
+            if any(x in t for x in ["pokemon", "yu-gi-oh", "yugioh", "one piece"]):
+                score -= 40
+                dbg["neg"].append("wrong_game")
+        if expected["type"] == "YuGiOh":
+            if any(x in t for x in ["pokemon", "mtg", "magic the gathering", "one piece"]):
+                score -= 40
+                dbg["neg"].append("wrong_game")
+        if expected["type"] == "OnePiece":
+            if any(x in t for x in ["pokemon", "mtg", "magic the gathering", "yu-gi-oh", "yugioh"]):
+                score -= 40
+                dbg["neg"].append("wrong_game")
+
+        # Positives
+        # +30 exact-ish name token match: count intersection (cap)
+        name_hits = len(expected["name_tokens"].intersection(toks))
+        if name_hits:
+            add = min(30, 10 + name_hits * 5)
+            score += add
+            dbg["pos"].append(f"name_tokens:{name_hits}")
+
+        # +25 number match (# / x/y)
+        if expected["num_variants"]:
+            for nv in expected["num_variants"]:
+                if nv and nv.lower() in t:
+                    score += 25
+                    dbg["pos"].append("number_match")
+                    break
+
+        # +20 set match (token overlap)
+        set_hits = len(expected["set_tokens"].intersection(toks)) if expected["set_tokens"] else 0
+        if set_hits:
+            add = min(20, 8 + set_hits * 4)
+            score += add
+            dbg["pos"].append(f"set_tokens:{set_hits}")
+
+        # +10 "holo" / "reverse holo" cues if expected contains it
+        if "holo" in expected["name"].lower():
+            if "holo" in t:
+                score += 10
+                dbg["pos"].append("holo_match")
+
+        return score, dbg
+
+    # --------------------------
+    # eBay fetchers
+    # --------------------------
+    async def _price_to_aud(amount: Any, currency: str) -> Optional[float]:
+        try:
+            v = float(amount)
+        except Exception:
+            return None
+        cur = (currency or "").upper().strip()
+        if not cur:
+            cur = DEFAULT_CURRENCY
+        if cur == "AUD":
+            return round(v, 2)
+        if cur == "USD":
+            rate = await _fx_usd_to_aud()
+            return round(v * float(rate), 2)
+        # fallback: leave as-is if unknown
+        return round(v, 2)
+
+    async def _browse_active(query_str: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Browse API item_summary/search for ACTIVE listings (OAuth)."""
+        qs = _norm_ws(query_str)
+        if not qs or not USE_EBAY_API or not EBAY_OAUTH_TOKEN:
+            return []
+        url = "https://api.ebay.com/buy/browse/v1/item_summary/search"
+        params = {
+            "q": qs,
+            "limit": str(max(1, min(50, int(limit or 50)))),
+        }
+        headers = {
+            "Authorization": f"Bearer {EBAY_OAUTH_TOKEN}",
+            "X-EBAY-C-MARKETPLACE-ID": EBAY_MARKETPLACE_ID,
+            "User-Agent": UA,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                r = await client.get(url, params=params, headers=headers)
+                if r.status_code != 200:
+                    return []
+                j = r.json()
+        except Exception:
+            return []
+
+        out = []
+        for it in (j.get("itemSummaries") or []):
+            try:
+                item_id = str(it.get("itemId") or "")
+                title = str(it.get("title") or "")
+                web_url = str(it.get("itemWebUrl") or "")
+                price = (it.get("price") or {})
+                pv = price.get("value")
+                pc = price.get("currency")
+                cond = str(it.get("condition") or it.get("conditionId") or "")
+                # Convert currency to AUD for consistent stats
+                aud = await _price_to_aud(pv, pc)
+                if aud is None or aud <= 0:
+                    continue
+                out.append({
+                    "itemId": item_id,
+                    "title": title,
+                    "url": web_url,
+                    "condition": cond,
+                    "price_aud": aud,
+                    "currency": "AUD",
+                    "raw_currency": pc,
+                })
+            except Exception:
+                continue
+        return out
+
+    async def _finding_completed(query_str: str, limit: int = 120) -> List[Dict[str, Any]]:
+        """FindingService findCompletedItems for SOLD comps (AppID)."""
+        qs = _norm_ws(query_str)
+        if not qs or not USE_EBAY_API or not EBAY_APP_ID:
+            return []
+        target = max(1, int(limit or 120))
+        pages = min(3, max(1, (target + 99) // 100))
+        url = "https://svcs.ebay.com/services/search/FindingService/v1"
+        headers = {"User-Agent": UA}
+        out = []
+
+        async with httpx.AsyncClient(timeout=25.0, headers=headers) as client:
+            for page in range(1, pages + 1):
+                params = {
+                    "OPERATION-NAME": "findCompletedItems",
+                    "SERVICE-VERSION": "1.13.0",
+                    "SECURITY-APPNAME": EBAY_APP_ID,
+                    "RESPONSE-DATA-FORMAT": "JSON",
+                    "REST-PAYLOAD": "true",
+                    "keywords": qs,
+                    "itemFilter(0).name": "SoldItemsOnly",
+                    "itemFilter(0).value": "true",
+                    "paginationInput.entriesPerPage": "100",
+                    "paginationInput.pageNumber": str(page),
+                }
+                try:
+                    r = await client.get(url, params=params)
+                    r.raise_for_status()
+                    j = r.json()
+                except Exception:
+                    continue
+
+                try:
+                    items = (
+                        j.get("findCompletedItemsResponse", [{}])[0]
+                         .get("searchResult", [{}])[0]
+                         .get("item", [])
+                    )
+                except Exception:
+                    items = []
+
+                for it in items or []:
+                    try:
+                        item_id = str(it.get("itemId", [""])[0] if isinstance(it.get("itemId"), list) else it.get("itemId") or "")
+                        title = str((it.get("title") or [""])[0] if isinstance(it.get("title"), list) else it.get("title") or "")
+                        web_url = str((it.get("viewItemURL") or [""])[0] if isinstance(it.get("viewItemURL"), list) else it.get("viewItemURL") or "")
+                        cond = ""
+                        try:
+                            cdn = (it.get("condition") or [{}])[0]
+                            cond = str(cdn.get("conditionDisplayName", [""])[0] if isinstance(cdn.get("conditionDisplayName"), list) else cdn.get("conditionDisplayName") or "")
+                        except Exception:
+                            cond = ""
+                        selling = (it.get("sellingStatus") or [{}])[0]
+                        cp = (selling.get("currentPrice") or [{}])[0]
+                        pv = cp.get("__value__", 0.0)
+                        pc = cp.get("@currencyId", "USD")
+                        aud = await _price_to_aud(pv, pc)
+                        if aud is None or aud <= 0 or aud > 1_000_000:
+                            continue
+                        out.append({
+                            "itemId": item_id,
+                            "title": title,
+                            "url": web_url,
+                            "condition": cond,
+                            "price_aud": aud,
+                            "currency": "AUD",
+                            "raw_currency": pc,
+                        })
+                    except Exception:
+                        continue
+
+                if len(out) >= target:
+                    break
+        return out[:target]
+
+    # --------------------------
+    # Candidate pooling + scoring
+    # --------------------------
+    def _collect_top5(candidates: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
+        """
+        Returns:
+          matches: top-5 list with title/price/condition/url/score
+          stats: low/median/high computed from those 5
+          debug: score diagnostics
+        """
+        scored = []
+        rejected = []
+        token_dbg = {
+            "name_tokens": sorted(list(expected["name_tokens"]))[:25],
+            "set_tokens": sorted(list(expected["set_tokens"]))[:25],
+            "num_variants": expected["num_variants"],
+        }
+
+        for c in candidates:
+            title = str(c.get("title") or "")
+            sc, dbg = _score_candidate(title)
+            # Apply graded exclusion hard-gate if enabled and graded detected
+            if exclude_graded_effective and "graded_listing" in dbg.get("neg", []):
+                rejected.append({"title": title[:120], "reason": "graded_excluded", "score": sc})
+                continue
+            # Reject very low relevance (protect against garbage)
+            if sc < -10:
+                rejected.append({"title": title[:120], "reason": "low_score", "score": sc})
+                continue
+
+            scored.append({
+                "title": title,
+                "price": float(c.get("price_aud") or 0.0),
+                "currency": "AUD",
+                "condition": str(c.get("condition") or ""),
+                "url": str(c.get("url") or ""),
+                "itemId": str(c.get("itemId") or ""),
+                "score": int(sc),
+                "_dbg": dbg,
+            })
+
+        scored.sort(key=lambda x: (x["score"], x["price"]), reverse=True)
+        top = scored[:5]
+
+        prices = [x["price"] for x in top if isinstance(x.get("price"), (int, float)) and x["price"] > 0]
+        prices_sorted = sorted(prices)
+        if prices_sorted:
+            low = prices_sorted[0]
+            med = float(median(prices_sorted))
+            high = prices_sorted[-1]
+        else:
+            low = med = high = None
+
+        stats = {
+            "count": len(top),
+            "low": round(low, 2) if low is not None else None,
+            "median": round(med, 2) if med is not None else None,
+            "high": round(high, 2) if high is not None else None,
+            "currency": "AUD",
+        }
+
+        debug = {
+            "tokens": token_dbg,
+            "rejected_examples": rejected[:12],
+        }
+
+        # Strip internal debug from matches for output
+        for x in top:
+            x.pop("_dbg", None)
+
+        return top, stats, debug
+
+    # Build candidate pools across ladder
+    sold_pool_by_id: Dict[str, Dict[str, Any]] = {}
+    active_pool_by_id: Dict[str, Dict[str, Any]] = {}
+
+    used_query = ""
+    for qstr in ladder:
+        if not used_query:
+            used_query = qstr
+
+        # SOLD
+        sold_candidates = await _finding_completed(qstr, limit=120)
+        for c in sold_candidates:
+            iid = str(c.get("itemId") or "")
+            if not iid:
+                continue
+            if iid not in sold_pool_by_id:
+                sold_pool_by_id[iid] = c
+
+        # ACTIVE
+        active_candidates = await _browse_active(qstr, limit=50)
+        for c in active_candidates:
+            iid = str(c.get("itemId") or "")
+            if not iid:
+                continue
+            if iid not in active_pool_by_id:
+                active_pool_by_id[iid] = c
+
+        # early stop: enough candidates to score well
+        if len(sold_pool_by_id) >= 180 and len(active_pool_by_id) >= 120:
+            break
+
+    sold_pool = list(sold_pool_by_id.values())
+    active_pool = list(active_pool_by_id.values())
+
+    sold_matches, sold_stats, sold_debug = _collect_top5(sold_pool)
+    active_matches, active_stats, active_debug = _collect_top5(active_pool)
+
+    if not sold_matches and not active_matches:
         return {
             "available": False,
             "message": "No sufficient eBay market data found for this item.",
-            "used_query": keyword_query,
-            "query_ladder": [keyword_query],
-            "card": {"name": n, "set": sname, "number": num, "set_code": _norm_ws((item_set or "")).strip()},
-            "observed": {"currency": "AUD", "sold": {"count": 0}, "active": {"count": 0}},
+            "used_query": used_query,
+            "query_ladder": ladder,
+            "match_debug": {"sold": sold_debug, "active": active_debug},
+            "card": {"name": n, "set": sname, "number": num_display, "set_code": set_code_hint},
         }
 
     # --------------------------
-    # Value selection (best indication for THIS item)
+    # Condition-aware valuation (anchored to SOLD top-5)
     # --------------------------
-    base_value = _pick_value_from_sold(sold, anchor)
+    def _anchor_value_from_top5(stats: Dict[str, Any], anchor_key: str) -> Optional[float]:
+        low = stats.get("low")
+        med = stats.get("median")
+        high = stats.get("high")
+        if low is None and med is None and high is None:
+            return None
+
+        if anchor_key == "sold_low":
+            return float(low if low is not None else (med if med is not None else high))
+        if anchor_key == "sold_mid_low":
+            # mid-low: average of low + median when available
+            if low is not None and med is not None:
+                return round((float(low) + float(med)) / 2.0, 2)
+            return float(med if med is not None else low)
+        if anchor_key == "sold_median":
+            return float(med if med is not None else (low if low is not None else high))
+        if anchor_key == "sold_median_high":
+            # "high-ish / median-high (still not max)": halfway between median and high
+            if med is not None and high is not None:
+                return round(float(med) + 0.5 * (float(high) - float(med)), 2)
+            return float(high if high is not None else med)
+        return float(med if med is not None else low)
+
+    anchored_value = _anchor_value_from_top5(sold_stats, anchor)
+
     valuation = {
         "anchor": anchor,
-        "anchor_label": _fmt_anchor(anchor),
-        "method": "ebay_sold_p20" if anchor == "damaged" else ("ebay_sold_blend" if anchor == "low" else "ebay_sold_median"),
-        "base_value": base_value,
-        "note": "SOLD prices anchor valuation; ACTIVE listings are context only.",
-    }
-
-    # Back-compat: keep observed.raw as SOLD stats for existing UI blocks
-    raw_stats = {
-        "source": "ebay_sold",
-        "count": sold.get("count"),
-        "median": sold.get("median"),
-        "avg": sold.get("avg"),
-        "low": sold.get("low") or sold.get("p20"),
-        "high": sold.get("high") or sold.get("p80"),
+        "anchor_label": {
+            "sold_low": "Sold low-end (damaged / grade ≤ 4)",
+            "sold_mid_low": "Sold mid-low (grade 5–6)",
+            "sold_median": "Sold median (grade 7–8)",
+            "sold_median_high": "Sold median-high (grade 9–10, not max)",
+        }.get(anchor, anchor),
+        "value_aud": anchored_value,
+        "note": "Valuation is condition-aware and anchored ONLY to SOLD comps (buyers actually paid). ACTIVE listings are context only.",
     }
 
     # --------------------------
-    # Grading value summary + grade impact
-    # --------------------------
-    # Grading economics disabled for damaged/low. (You can enable conservative low-grade later.)
-    grading_allowed = (anchor in ("mid", "high")) and not structural
-
-    grade_impact = {
-        "expected_graded_value": None,
-        "raw_baseline_value": base_value,
-        "grading_cost": grading_cost,
-        "estimated_value_difference": None,
-        "recommended_buy": {"retail_loose_buy": None, "recommended_buy": None},
-    }
-
-    # If grading is allowed, keep conservative placeholders (you may extend with PSA buckets later).
-    recommendation = "do_not_grade"
-    if grading_allowed:
-        recommendation = "consider_grading"
-
-    # Spoken summary must never claim PSA 9/10 when anchor is damaged/low
-    if damage_locked:
-        spoken = (
-            f"Because this item shows structural damage or very low condition (anchor: {_fmt_anchor(anchor)}), "
-            f"grading for value is not recommended. For price guidance, we anchor to recent SOLD listings "
-            f"for similar copies. Current ACTIVE listings are shown for context only."
-        )
-    elif anchor == "low":
-        spoken = (
-            f"This item appears low grade (anchor: {_fmt_anchor(anchor)}). Market guidance is anchored to SOLD results. "
-            f"Grading is generally not recommended purely for financial return at this condition, but may be considered "
-            f"for authentication or protection."
-        )
-    else:
-        spoken = (
-            f"Based on the current market, anchoring to SOLD results, this item looks more viable to grade. "
-            f"Treat ACTIVE listings as asking prices, not guarantees. Markets move quickly."
-        )
-
-    grading_value_summary = {
-        "spoken_word": spoken,
-        "recommendation": recommendation,
-        "anchor": anchor,
-        "grading_allowed": grading_allowed,
-    }
-
-    # --------------------------
-    # Assemble response
+    # Assemble response (frontend friendly)
     # --------------------------
     resp = {
         "available": True,
-        "mode": "damage_locked" if damage_locked else "ok",
+        "source": "ebay",
+        "used_query": used_query,
+        "query_ladder": ladder,
+        "card": {"name": n, "set": sname, "number": num_display, "set_code": set_code_hint, "type": ctype},
         "has_structural_damage": structural,
-        "confidence": confidence,
-        "card": {"name": n, "set": sname, "number": num, "set_code": _norm_ws((item_set or "")).strip()},
-        "used_query": keyword_query,
-        "query_ladder": [keyword_query],
+        "assessed_pregrade": resolved_grade,
         "valuation": valuation,
+
+        # Requested output
+        "sold": sold_stats,
+        "active": active_stats,
+        "sold_matches": sold_matches,
+        "active_matches": active_matches,
+        "match_debug": {"sold": sold_debug, "active": active_debug},
+
+        # Back-compat blocks used by current UI renderer
         "observed": {
             "currency": "AUD",
-            "raw": raw_stats,
-            "sold": {
-                "source": "ebay_sold",
-                "query": sold.get("query", keyword_query),
-                "count": sold.get("count"),
-                "low": sold.get("low") or sold.get("p20"),
-                "median": sold.get("median"),
-                "high": sold.get("high") or sold.get("p80"),
-                "avg": sold.get("avg"),
-            },
-            "active": {
-                "source": "ebay_active",
-                "query": active.get("query", keyword_query),
-                "count": active.get("count"),
-                "low": active.get("low") or active.get("p20"),
-                "median": active.get("median"),
-                "high": active.get("high") or active.get("p80"),
-                "avg": active.get("avg"),
+            "fx": {"usd_to_aud_rate": _FX_CACHE.get("usd_aud"), "cache_seconds": FX_CACHE_SECONDS},
+            "sold": sold_stats,
+            "active": active_stats,
+            "raw": {  # legacy: keep raw pointing at SOLD stream
+                "source": "ebay_sold_top5",
+                "count": sold_stats.get("count"),
+                "low": sold_stats.get("low"),
+                "median": sold_stats.get("median"),
+                "high": sold_stats.get("high"),
             },
         },
-        "graded_psa": {},  # reserved for future grade-bucket comps
-        "grade_impact": grade_impact,
-        "grading_value_summary": grading_value_summary,
         "disclaimer": (
             "Informational market context only. SOLD listings are historical; ACTIVE listings are current asks. "
             "Figures are third-party estimates and may vary. Not financial advice."
         ),
     }
     return resp
+
 @app.post("/api/market-context-item")
 
 @safe_endpoint
