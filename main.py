@@ -1348,8 +1348,8 @@ Respond ONLY with JSON, no extra text.
     angled_bytes = b""  # identify() has no angled image
     try:
         # Only run for cards; memorabilia uses a different endpoint.
-        front_vars = _make_defect_filter_variants(img)
-        back_vars = {}  # identify() only has a front image
+        front_vars = _make_defect_filter_variants(front_bytes)
+        back_vars = _make_defect_filter_variants(back_bytes)
 
         if not front_vars and not back_vars:
             second_pass["enabled"] = False
