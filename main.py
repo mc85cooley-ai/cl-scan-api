@@ -607,6 +607,7 @@ async def _get_ebay_app_token(force_refresh: bool = False) -> Tuple[Optional[str
 EBAY_MARKETPLACE_ID = os.getenv("EBAY_MARKETPLACE_ID", os.getenv("EBAY_MARKETPLACE", "EBAY_AU")).strip() or "EBAY_AU"
 DEFAULT_CURRENCY = os.getenv("DEFAULT_CURRENCY", "AUD").strip().upper() or "AUD"
 EXCLUDE_GRADED_DEFAULT = os.getenv("EXCLUDE_GRADED_DEFAULT", "1").strip() in ("1","true","TRUE","yes","YES")
+STRICT_CARD_NUMBER = os.getenv("STRICT_CARD_NUMBER", "1").strip() in ("1","true","TRUE","yes","YES")
 
 
 UA = (
@@ -2150,6 +2151,14 @@ async def market_context(
     n = _norm_ws(item_name or card_name or name or "").strip()
     sname = _norm_ws(item_set or card_set or "").strip()
     num_display = _clean_card_number_display(item_number or card_number or "").strip()
+    expected_num_pair = None
+    mnum = re.search(r"(\d+)\s*/\s*(\d+)", num_display)
+    if mnum:
+        try:
+            expected_num_pair = (int(mnum.group(1)), int(mnum.group(2)))
+        except Exception:
+            expected_num_pair = None
+
     ctype = _normalize_card_type(_norm_ws(card_type or item_category or "").strip())
 
     # Memorabilia/sealed fallback query
@@ -2228,10 +2237,13 @@ async def market_context(
         "set": sname,
         "set_tokens": set(_tokenize(sname)),
         "num": num_display,
+        "num_pair": expected_num_pair,
+        "strict_number": (STRICT_CARD_NUMBER and ctype == "Pokemon" and expected_num_pair is not None),
         "num_variants": _normalize_num_variants(num_display),
         "year": "",
         "type": ctype,
     }
+
 
     # eBay call debug (returned in match_debug for troubleshooting)
     ebay_call_debug = {
@@ -2288,13 +2300,33 @@ async def market_context(
             score += add
             dbg["pos"].append(f"name_tokens:{name_hits}")
 
-        # +25 number match (# / x/y)
-        if expected["num_variants"]:
-            for nv in expected["num_variants"]:
-                if nv and nv.lower() in t:
-                    score += 25
-                    dbg["pos"].append("number_match")
-                    break
+        # Card number matching (highest priority for Pokemon)
+        cand_pairs = re.findall(r"(\d{1,4})\s*/\s*(\d{1,4})", t)
+        cand_norm_pairs = [(str(int(a)), str(int(b))) for (a,b) in cand_pairs] if cand_pairs else []
+        exp_pair = expected.get("num_pair")
+
+        if exp_pair and expected.get("strict_number"):
+            # If a card number is present in the title and it's NOT the expected number, hard-penalize
+            if cand_norm_pairs:
+                if any((a == str(exp_pair[0]) and b == str(exp_pair[1])) for (a,b) in cand_norm_pairs):
+                    score += 35
+                    dbg["pos"].append("number_exact")
+                else:
+                    score -= 120
+                    dbg["neg"].append("number_mismatch")
+            else:
+                # Missing number is still allowed but deprioritized
+                score -= 25
+                dbg["neg"].append("number_missing")
+        else:
+            # Generic fallback: substring match against variants like '4/102' or '#4'
+            if expected["num_variants"]:
+                for nv in expected["num_variants"]:
+                    if nv and nv.lower() in t:
+                        score += 25
+                        dbg["pos"].append("number_match")
+                        break
+
 
         # +20 set match (token overlap)
         set_hits = len(expected["set_tokens"].intersection(toks)) if expected["set_tokens"] else 0
@@ -2518,6 +2550,10 @@ async def market_context(
             # Apply graded exclusion hard-gate if enabled and graded detected
             if exclude_graded_effective and "graded_listing" in dbg.get("neg", []):
                 rejected.append({"title": title[:120], "reason": "graded_excluded", "score": sc})
+                continue
+            # Apply strict card-number gate for Pokemon when we have an expected x/y number
+            if expected.get("strict_number") and "number_mismatch" in dbg.get("neg", []):
+                rejected.append({"title": title[:120], "reason": "number_mismatch", "score": sc})
                 continue
             # Reject very low relevance (protect against garbage)
             if sc < -10:
