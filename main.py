@@ -96,6 +96,14 @@ POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
 PRICECHARTING_TOKEN = os.getenv("PRICECHARTING_TOKEN", "").strip()
 ADMIN_TOKEN = os.getenv("CL_ADMIN_TOKEN", "").strip()  # optional
 
+# PriceCharting local storage (even if eBay is primary, some endpoints still reference these)
+PRICECHARTING_CACHE_DIR = os.getenv("PRICECHARTING_CACHE_DIR", "/tmp/pricecharting_cache").strip() or "/tmp/pricecharting_cache"
+PRICECHARTING_DB_PATH = os.getenv("PRICECHARTING_DB_PATH", "/tmp/pricecharting.db").strip() or "/tmp/pricecharting.db"
+try:
+    os.makedirs(PRICECHARTING_CACHE_DIR, exist_ok=True)
+except Exception:
+    pass
+
 
 # ==============================
 # FX + eBay helpers
@@ -210,7 +218,7 @@ async def _ebay_completed_stats(keyword_query: str, limit: int = 120, days_lookb
                     if val <= 0:
                         continue
                     if cur == "USD":
-                        val = float(_usd_to_aud(val))
+                        val = float(_usd_to_aud_simple(val) or 0.0)
                     # Ignore insane values (protect against parsing weird lots)
                     if val <= 0 or val > 1_000_000:
                         continue
@@ -294,7 +302,11 @@ def _pc_init_db():
     con.commit()
     con.close()
 
-_pc_init_db()
+try:
+    _pc_init_db()
+except Exception as _e:
+    print(f"INFO: PriceCharting DB init skipped: {_e}")
+
 
 def _pc_row_hash(row: dict) -> str:
     try:
@@ -2199,7 +2211,7 @@ async def market_context(
         cur = str(st.get("currency") or "USD").upper()
         fx = 1.0
         if cur == "USD":
-            fx = _usd_to_aud_rate()
+            fx = 1.0  # already converted earlier
         elif cur == "AUD":
             fx = 1.0
         # If other currency, treat as USD for now (rare)
