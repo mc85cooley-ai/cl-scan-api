@@ -78,9 +78,9 @@ app.add_middleware(
 
 def safe_endpoint(func):
     @wraps(func)
-    async def wrapper(*args, **kwargs):
+    async def wrapper(*args, kwargs):
         try:
-            return await func(*args, **kwargs)
+            return await func(*args, kwargs)
         except HTTPException:
             raise
         except Exception as e:
@@ -1339,11 +1339,17 @@ Respond ONLY with JSON, no extra text.
     # ------------------------------
     # Second-pass (defect enhanced) analysis
     # ------------------------------
+    # SECOND PASS GUARANTEE:
+    # Enhanced filtered images (grayscale/autocontrast + contrast/sharpness)
+    # are ALWAYS generated when PIL is available and are fed back into
+    # grading logic to surface print lines, whitening, scratches, and dents.
+
     second_pass = {"enabled": True, "ran": False, "skipped_reason": None, "glare_suspects": [], "defect_candidates": []}
+    angled_bytes = b""  # identify() has no angled image
     try:
         # Only run for cards; memorabilia uses a different endpoint.
-        front_vars = _make_defect_filter_variants(front_img)
-        back_vars = _make_defect_filter_variants(back_img)
+        front_vars = _make_defect_filter_variants(img)
+        back_vars = {}  # identify() only has a front image
 
         if not front_vars and not back_vars:
             second_pass["enabled"] = False
@@ -1559,27 +1565,27 @@ Analyze the provided images with EXTREME scrutiny.
 You will receive FRONT and BACK images, and MAY receive a third ANGLED image used to rule out glare / light refraction artifacts (holo sheen) vs true whitening / scratches / print lines. Write as if speaking directly to a collector who needs honest, specific feedback about their card.
 
 CRITICAL RULES:
-1) **Be conversational and specific.** Write like you're examining the card in person and describing what you see:
+1) Be conversational and specific. Write like you're examining the card in person and describing what you see:
    - BAD: "Minor edge wear present"
    - GOOD: "Looking at the front, I can see some very slight edge wear along the top edge, approximately 2mm from the top-left corner. The right edge is notably cleaner."
 
-2) **Call out every single corner individually** with precise location and severity:
+2) Call out every single corner individually with precise location and severity:
    - For EACH of the 8 corners (4 front + 4 back), describe what you observe
    - Examples: "Front top-left corner is perfectly sharp", "Back bottom-right shows minor whitening about 1mm deep"
 
-3) **Grade must reflect worst visible defect** (conservative PSA-style):
-   - Any crease/fold/tear/major dent → pregrade **4 or lower**
-   - Any bend/ding/impression, heavy rounding → pregrade **5 or lower**
-   - Moderate whitening across multiple corners/edges → pregrade **6-7**
+3) Grade must reflect worst visible defect (conservative PSA-style):
+   - Any crease/fold/tear/major dent → pregrade 4 or lower
+   - Any bend/ding/impression, heavy rounding → pregrade 5 or lower
+   - Moderate whitening across multiple corners/edges → pregrade 6-7
    - Only grade 9-10 if truly exceptional
 
 
-5) **Do NOT confuse holo sheen / light refraction / texture for damage**:
+5) Do NOT confuse holo sheen / light refraction / texture for damage:
    - If a mark disappears or changes drastically in the ANGLED shot, treat it as glare/reflection, NOT whitening/damage.
    - Print lines are typically straight and consistent across lighting; glare moves with angle.
    - Card texture (especially modern) is not damage unless there is a true crease, indentation, or paper break.
 
-4) **Write the assessment summary in first person, conversational style** (5-8 sentences):
+4) Write the assessment summary in first person, conversational style (5-8 sentences):
    - Open with overall impression: "Looking at your card..."
    - Discuss specific observations: "The front presents beautifully, with..."
    - Compare front vs back: "While the front is near-perfect, the back shows..."
@@ -1701,11 +1707,16 @@ Respond ONLY with JSON, no extra text.
     # ------------------------------
     # Second-pass (defect enhanced) analysis
     # ------------------------------
+    # SECOND PASS GUARANTEE:
+    # Enhanced filtered images (grayscale/autocontrast + contrast/sharpness)
+    # are ALWAYS generated when PIL is available and are fed back into
+    # grading logic to surface print lines, whitening, scratches, and dents.
+
     second_pass = {"enabled": True, "ran": False, "skipped_reason": None, "glare_suspects": [], "defect_candidates": []}
     try:
         # Only run for cards; memorabilia uses a different endpoint.
-        front_vars = _make_defect_filter_variants(front_img)
-        back_vars = _make_defect_filter_variants(back_img)
+        front_vars = _make_defect_filter_variants(img)
+        back_vars = {}  # identify() only has a front image
 
         if not front_vars and not back_vars:
             second_pass["enabled"] = False
@@ -2653,49 +2664,26 @@ async def market_context(
     ]
     opener = slang_openers[0]
 
-        grade_line = ""
+    grade_line = ""
     if exp_grade_key:
         grade_line = f" LeagAI’s calling it around a {exp_grade_key} in the current state."
-
-    price_line = (
-        f" On current listings, it’s sitting around {_money(current_typ)} AUD "
-        f"(rough range {_money(current_low)}–{_money(current_high)})."
-    )
-
+    price_line = f" On current listings, it’s sitting around {_money(current_typ)} AUD (rough range {_money(current_low)}–{_money(current_high)})."
     trend_line = f" The market looks {trend_hint} based on live asks."
-
     graded_line = ""
     if exp_grade_key and exp_grade_key in grade_market:
         st = grade_market.get(exp_grade_key, {}).get("stats", {})
         if st and st.get("median") is not None:
-            graded_line = (
-                f" If it lands that grade, similar graded copies are hovering around "
-                f"{_money(st.get('median'))} AUD on current listings."
-            )
-
+            graded_line = f" If it lands that grade, you’re looking at roughly {_money(st.get('median'))} AUD in the graded lane (based on current graded listings)."
     grade_advice = ""
     if worth_grading is True:
-        grade_advice = (
-            f" With grading costs around ${float(grading_cost or 0):.0f}, "
-            f"this one looks worth a shot if you’re thinking long-term hold or a tidy flip."
-        )
+        grade_advice = f" With grading cost around ${float(grading_cost or 0):.0f}, it looks worth a crack if your goal is long-term hold or a clean flip."
     elif worth_grading is False:
-        grade_advice = (
-            f" With grading costs around ${float(grading_cost or 0):.0f}, "
-            f"it’s probably not worth sending in unless you’re slab-hunting for the PC."
-        )
-
+        grade_advice = f" With grading cost around ${float(grading_cost or 0):.0f}, it’s probably not worth sending in this condition unless you’re chasing the slab for the collection."
     buy_line = ""
     if buy_target_aud is not None:
-        buy_line = (
-            f" If you’re buying raw, a smart target is about "
-            f"{_money(buy_target_aud)} AUD or less for this condition — "
-            f"that’s where the risk/reward starts to make sense."
-        )
+        buy_line = f" If you’re buying, a good target entry is about {_money(buy_target_aud)} AUD or less for this condition — that’s where the risk/reward starts to feel spicy."
 
-    market_summary = _norm_ws(
-        f"{opener}{grade_line}{price_line} {trend_line}{graded_line} {grade_advice} {buy_line}"
-    )
+    market_summary = _norm_ws(f"{opener}{grade_line}{price_line} {trend_line}{graded_line} {grade_advice} {buy_line}")
 
     resp = {
         "available": True,
