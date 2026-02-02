@@ -63,14 +63,16 @@ ALLOWED_ORIGINS = [
     "http://localhost",
     "http://localhost:3000",
     "http://localhost:5173",
+    "*",
 ]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS", "HEAD"],
+    allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 def safe_endpoint(func):
