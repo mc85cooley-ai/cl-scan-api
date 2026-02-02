@@ -78,16 +78,20 @@ app.add_middleware(
 
 def safe_endpoint(func):
     @wraps(func)
-    async def wrapper(*args, kwargs):
+    async def wrapper(*args, **kwargs):
         try:
-            return await func(*args, kwargs)
+            return await func(*args, **kwargs)
         except HTTPException:
             raise
         except Exception as e:
             print(f"❌ {func.__name__} crashed: {e}")
             traceback.print_exc()
-            return JSONResponse(content={"error": True, "endpoint": func.__name__, "message": str(e)}, status_code=500)
+            return JSONResponse(
+                content={"error": True, "endpoint": func.__name__, "message": str(e)},
+                status_code=500
+            )
     return wrapper
+
 
 # ==============================
 # Config
@@ -1193,12 +1197,7 @@ async def pricecharting_sync(
     """
     if not ADMIN_TOKEN:
         raise HTTPException(status_code=403, detail="Admin sync disabled (CL_ADMIN_TOKEN not set)")
-
-    # accept token from form OR header
-    from fastapi import Request
-    request: Request = kwargs.get("request") if "kwargs" in locals() else None  # not used
-    # FastAPI doesn't inject Request here by default; read from header via dependency-free approach:
-    # We'll use httpx to get headers? not possible. So accept admin_token param.
+    # Accept token from form body (admin_token). You can extend this to read headers via Request injection later.
     token = (admin_token or "").strip()
     if token != ADMIN_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid admin token")
@@ -1349,7 +1348,7 @@ Respond ONLY with JSON, no extra text.
     try:
         # Only run for cards; memorabilia uses a different endpoint.
         front_vars = _make_defect_filter_variants(img)
-        back_vars = {}  # identify() only has a front image
+        back_vars = {}
 
         if not front_vars and not back_vars:
             second_pass["enabled"] = False
