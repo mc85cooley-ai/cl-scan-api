@@ -1053,6 +1053,54 @@ def _stats(values: List[float]) -> Dict[str, Any]:
         "sample_size": len(v),
     }
 
+def _safe_end_time(item: dict) -> str:
+    """Extract end time (ISO-ish) from eBay Finding API item dict if present."""
+    try:
+        li = item.get("listingInfo") or item.get("listinginfo") or None
+        if isinstance(li, list) and li:
+            li0 = li[0] or {}
+        elif isinstance(li, dict):
+            li0 = li
+        else:
+            li0 = {}
+        et = li0.get("endTime") or li0.get("endtime") or ""
+        if isinstance(et, list):
+            return str(et[0] if et else "")
+        return str(et)
+    except Exception:
+        return ""
+
+def _parse_grade_from_title(title: str) -> Optional[float]:
+    """Best-effort parse of a numeric grade from a listing title (brand-agnostic)."""
+    t = (title or "").lower()
+    if any(x in t for x in ["ungraded", "not graded", "no grade", "no grading"]):
+        return None
+    patterns = [
+        r"\b(?:psa|bgs|cgc|sgc|beckett)\s*(10|9\.5|9|8|7|6|5|4|3|2|1)\b",
+        r"\b(?:grade|graded)\s*(10|9\.5|9|8|7|6|5|4|3|2|1)\b",
+        r"\b(?:gem\s*mint|gm)\s*(10)\b",
+        r"\b(?:pristine)\s*(10)\b",
+        r"\b(?:mint)\s*(9\.5|9)\b",
+        r"\b(?:near\s*mint)\s*(8|9)\b",
+    ]
+    for pat in patterns:
+        m = re.search(pat, t)
+        if m:
+            try:
+                return float(m.group(1))
+            except Exception:
+                pass
+    return None
+
+def _grade_bucket_key(g: Optional[float]) -> Optional[str]:
+    """Map parsed grade into display buckets (e.g., 10, 9, 8, 9.5)."""
+    if g is None:
+        return None
+    if abs(g - round(g)) < 1e-6:
+        return str(int(round(g)))
+    s = str(g).rstrip("0").rstrip(".")
+    return s if s else None
+
 def _grade_bucket(predicted_grade: str) -> Optional[int]:
     m = re.search(r"(10|[1-9])", (predicted_grade or "").strip())
     if not m:
@@ -1899,9 +1947,7 @@ Return ONLY valid JSON with these exact fields:
   "edition_or_language": "e.g., English/Japanese/1st Edition/Unlimited/Collector's Edition if visible else empty string",
   "special_attributes": ["short tags like Factory Sealed", "Pokemon Center", "Hobby Box", "1st Edition", "Case Fresh"],
   "description": "one clear paragraph describing exactly what it is and what can be seen (packaging, labels, markings)",
-  "signature_present": "Yes/No/Unclear",
-  "signature_text": "if legible, write the letters seen; otherwise empty string",
-  "signature_notes": "where it appears and whether it looks like ink vs printed",
+  "signatures": "names of any visible signatures or 'None visible'",
   "seal_condition": "Factory Sealed/Opened/Resealed/Damaged/Not applicable",
   "authenticity_notes": "authenticity indicators visible (holograms, stickers, COA) and any red flags",
   "notable_features": "unique features worth noting (promo contents, special print, chase set, serial numbering, COA, etc.)",
@@ -1937,10 +1983,7 @@ Respond ONLY with JSON, no extra text.
         "edition_or_language": _norm_ws(str(data.get("edition_or_language", ""))),
         "special_attributes": data.get("special_attributes", []) if isinstance(data.get("special_attributes", []), list) else [],
         "description": _norm_ws(str(data.get("description", ""))),
-        "signature_present": _norm_ws(str(data.get("signature_present", "Unclear"))),
-        "signature_text": _norm_ws(str(data.get("signature_text", ""))),
-        "signature_notes": _norm_ws(str(data.get("signature_notes", ""))),
-        "signatures": _norm_ws(str(data.get("signatures", data.get("signature_text", "None visible")))),
+        "signatures": _norm_ws(str(data.get("signatures", "None visible"))),
         "seal_condition": _norm_ws(str(data.get("seal_condition", "Not applicable"))),
         "authenticity_notes": _norm_ws(str(data.get("authenticity_notes", ""))),
         "notable_features": _norm_ws(str(data.get("notable_features", ""))),
@@ -2004,10 +2047,8 @@ Return ONLY valid JSON with this EXACT structure:
   }},
   "signature_assessment": {{
     "present": true/false,
-    "confidence": 0.0-1.0,
-    "type": "Ink/Printed/Unclear/Not Applicable",
-    "location": "best-effort location (e.g., 'top-right front', 'across center window') or 'Not Applicable'",
-    "notes": "notes about signature visibility (stroke consistency, ink pooling/bleeding), and any authenticity concerns. If you cannot confirm it's a real signature, say so."
+    "quality": "Clear/Faded/Smudged/Not Applicable",
+    "notes": "notes about signature placement/ink flow/bleeding and any authenticity concerns"
   }},
   "value_factors": ["short bullets: print run, desirability, era, sealed premium, athlete/popularity, scarcity, set demand"],
   "defects": ["each defect as a full sentence with location + severity"],
@@ -2167,29 +2208,6 @@ async def market_context(
             expected_num_pair = None
 
     ctype = _normalize_card_type(_norm_ws(card_type or item_category or "").strip())
-    # Resolve high-level item kind (card vs sealed vs memorabilia) to apply the right matching rules.
-    raw_item_type = _norm_ws(item_type or "").strip().lower()
-    raw_desc = _norm_ws(description or "").strip().lower()
-    raw_seal = _norm_ws(seal_condition or "").strip().lower()
-
-    def _resolve_item_kind(_t: str, _desc: str, _seal: str) -> str:
-        # Explicit selection wins
-        if _t in ("sealed", "seal", "sealed_product", "booster", "boosterbox", "booster_box", "etb", "bundle"):
-            return "sealed"
-        if _t in ("memorabilia", "mem", "signed", "autograph", "auto", "jersey", "photo", "card_memorabilia"):
-            return "memorabilia"
-        # Heuristics from description
-        if any(x in _desc for x in ["booster box", "booster bundle", "elite trainer box", "etb", "sealed", "factory sealed", "case", "tin", "blaster", "hobby box", "booster pack", "pack fresh", "booster display"]):
-            return "sealed"
-        if any(x in _desc for x in ["signature", "signed", "autograph", "auto", "jersey", "ball", "helmet", "bat", "photo", "poster", "ticket", "memorabilia"]):
-            return "memorabilia"
-        # Seal condition hint
-        if _seal in ("factory sealed", "sealed", "resealed", "opened", "compromised", "damaged"):
-            return "sealed"
-        # Default
-        return "card"
-
-    item_kind = _resolve_item_kind(raw_item_type, raw_desc, raw_seal)
 
     # Memorabilia/sealed fallback query
     if _is_blankish(n):
@@ -2240,10 +2258,7 @@ async def market_context(
     # Query ladder (Google-like)
     # --------------------------
     set_code_hint = _norm_ws((item_set or "")).strip()
-    if item_kind == "card":
-        ladder = _build_ebay_query_ladder(n, sname, set_code_hint, num_display, ctype)
-    else:
-        ladder = _build_ebay_query_ladder_item(n, sname, set_code_hint, num_display, ctype, item_kind, raw_seal)
+    ladder = _build_ebay_query_ladder(n, sname, set_code_hint, num_display, ctype)
     # Keep ladder sane (avoid rate limits)
     ladder = ladder[:12] if ladder else [_norm_ws(n)]
 
@@ -2271,7 +2286,7 @@ async def market_context(
         "set_tokens": set(_tokenize(sname)),
         "num": num_display,
         "num_pair": expected_num_pair,
-        "strict_number": (STRICT_CARD_NUMBER and item_kind == "card" and ctype == "Pokemon" and expected_num_pair is not None),
+        "strict_number": (STRICT_CARD_NUMBER and ctype == "Pokemon" and expected_num_pair is not None),
         "num_variants": _normalize_num_variants(num_display),
         "year": "",
         "type": ctype,
@@ -2295,59 +2310,7 @@ async def market_context(
         score = 0
         dbg = {"pos": [], "neg": []}
 
-        # Non-card matching (sealed / memorabilia) uses different rules.
-        if item_kind != "card":
-            # Universal negatives
-            if _contains_any(t, NEGATIVE_TERMS):
-                score -= 80; dbg["neg"].append("negative_term")
-            if _contains_any(t, LOT_TERMS):
-                score -= 20; dbg["neg"].append("lot_bundle")
-
-            # Sealed-specific negatives
-            if item_kind == "sealed":
-                if any(x in t for x in ["empty", "box only", "no packs", "pack only", "opened", "open box", "resealed", "re-sealed", "repack", "repak"]):
-                    score -= 60; dbg["neg"].append("not_sealed_or_incomplete")
-                # If user claims sealed, boost when title supports it
-                if raw_seal in ("factory sealed", "sealed"):
-                    if any(x in t for x in ["sealed", "factory sealed", "new"]):
-                        score += 15; dbg["pos"].append("sealed_cue")
-
-            # Memorabilia-specific cues
-            if item_kind == "memorabilia":
-                wants_signed = any(x in raw_desc for x in ["signed", "autograph", "signature", "auto"])
-                has_signed = any(x in t for x in ["signed", "autograph", "signature", "auto"])
-                if wants_signed and has_signed:
-                    score += 20; dbg["pos"].append("signed_match")
-                if wants_signed and not has_signed:
-                    score -= 25; dbg["neg"].append("signed_missing")
-
-            # Token overlap (product/name)
-            name_hits = len(expected["name_tokens"].intersection(toks))
-            if name_hits:
-                add = min(35, 12 + name_hits * 5)
-                score += add; dbg["pos"].append(f"name_tokens:{name_hits}")
-
-            set_hits = len(expected["set_tokens"].intersection(toks))
-            if set_hits:
-                add = min(20, 6 + set_hits * 4)
-                score += add; dbg["pos"].append(f"set_tokens:{set_hits}")
-
-            # Product-type gating (ETB/Booster/Bundle/etc) if user hints it
-            product_gate = []
-            for k in ["etb", "elite trainer box", "booster box", "booster", "bundle", "tin", "blaster", "hobby box", "case", "starter deck", "deck"]:
-                if k in raw_desc or k in expected["name"].lower():
-                    product_gate.append(k)
-            if product_gate:
-                if any(k in t for k in product_gate):
-                    score += 10; dbg["pos"].append("product_type_match")
-                else:
-                    score -= 18; dbg["neg"].append("product_type_missing")
-
-            # Done for non-card
-            return score, dbg
-
         # Strong negatives
-
         if _contains_any(t, NEGATIVE_TERMS):
             score -= 80
             dbg["neg"].append("negative_term")
@@ -2601,6 +2564,7 @@ async def market_context(
                             "price_aud": float(aud),
                             "currency": "AUD",
                             "raw_currency": pc,
+                            "end_time": _safe_end_time(it),
                         })
                     except Exception:
                         continue
@@ -2703,161 +2667,99 @@ async def market_context(
     # --------------------------
     # Graded (PSA) comp helpers (optional display)
     # --------------------------
-    async def _collect_psa_grade_top5(psa_grade: int) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        """Collect top-5 graded comps for a specific PSA grade (sold first, fallback to active)."""
+    # --------------------------
+    # Graded comp helpers (brand-agnostic; optional display)
+    # --------------------------
+    async def _collect_grade_market(
+        grade_targets: List[str],
+        sold_pool: List[Dict[str, Any]],
+        active_pool: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Build grade buckets (10/9/8 etc) with stats + top matches.
+        Brand-agnostic: parses any graded wording + numeric grade (PSA/BGS/CGC/SGC all OK).
+        Uses SOLD comps first for each bucket; falls back to ACTIVE if needed.
+        """
+        buckets: Dict[str, Dict[str, Any]] = {str(g): {"matches": [], "stats": {}, "trend": {}, "source": "sold"} for g in grade_targets}
 
-        def _grade_score_boost(title: str) -> int:
-            t = (title or "").lower()
-            # Must mention PSA and the exact grade
-            if f"psa {psa_grade}" in t or f"psa{psa_grade}" in t:
-                return 40
-            if "psa" in t:
-                # other PSA grade -> discourage hard
-                return -50
-            return -60
+        def _filter_pool(pool: List[Dict[str, Any]], bucket_key: str) -> List[Dict[str, Any]]:
+            out: List[Dict[str, Any]] = []
+            for it in pool:
+                pg = _parse_grade_from_title(str(it.get("title") or ""))
+                bk = _grade_bucket_key(pg)
+                if bk == bucket_key:
+                    out.append(it)
+            return out
 
-        # Build a small query ladder specific to this grade
-        base_bits = [n, sname, num_display]
-        base = _norm_ws(" ".join([b for b in base_bits if b])).strip()
-        grade_ladder = []
-        if base:
-            grade_ladder.append(f"{base} PSA {psa_grade}")
-        grade_ladder.append(_norm_ws(f"{n} {num_display} PSA {psa_grade}").strip())
-        grade_ladder.append(_norm_ws(f"{n} PSA {psa_grade}").strip())
-        grade_ladder = [q for q in grade_ladder if q]
+        def _top5(pool: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+            matches, stats, _dbg = _collect_top5(pool)
+            return matches, stats or {}
 
-        # Try SOLD (completed) first
-        sold_by_id: Dict[str, Dict[str, Any]] = {}
-        for q in grade_ladder[:4]:
-            cand = await _finding_completed(q, limit=120)
-            for c in cand:
-                iid = str(c.get("itemId") or "")
-                if iid and iid not in sold_by_id:
-                    sold_by_id[iid] = c
+        def _trend_from_matches(matches: List[Dict[str, Any]]) -> Dict[str, Any]:
+            # Trend uses SOLD end_time when available: compare last 30 days median vs previous 30 days.
+            try:
+                from datetime import datetime, timezone, timedelta
+                def _parse_dt(s: str) -> Optional[datetime]:
+                    if not s:
+                        return None
+                    try:
+                        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+                    except Exception:
+                        return None
 
-        # Score with graded allowed, but require the grade keyword
-        graded_scored = []
-        for c in sold_by_id.values():
-            title = str(c.get("title") or "")
-            sc, dbg = _score_candidate(title)
-            sc += _grade_score_boost(title)
-            # Reject if not clearly the right grade
-            if sc < 10:
-                continue
-            graded_scored.append({
-                "title": title,
-                "price": float(c.get("price_aud") or 0.0),
-                "currency": "AUD",
-                "condition": str(c.get("condition") or ""),
-                "url": str(c.get("url") or ""),
-                "itemId": str(c.get("itemId") or ""),
-                "score": int(sc),
-            })
+                now = datetime.now(timezone.utc)
+                w1_start = now - timedelta(days=30)
+                w2_start = now - timedelta(days=60)
 
-        graded_scored.sort(key=lambda x: x["score"], reverse=True)
-        top = graded_scored[:5]
+                w1: List[float] = []
+                w2: List[float] = []
+                for m in matches:
+                    et = _parse_dt(str(m.get("end_time") or ""))
+                    if not et:
+                        continue
+                    try:
+                        p = float(m.get("price_aud") or m.get("price") or 0)
+                    except Exception:
+                        continue
+                    if p <= 0:
+                        continue
+                    if et >= w1_start:
+                        w1.append(p)
+                    elif w2_start <= et < w1_start:
+                        w2.append(p)
 
-        prices = [x["price"] for x in top if x.get("price") and x["price"] > 0]
-        if prices:
-            prices_sorted = sorted(prices)
-            stats = {
-                "count": len(top),
-                "median": round(float(median(prices_sorted)), 2),
-                "low": round(float(prices_sorted[0]), 2),
-                "high": round(float(prices_sorted[-1]), 2),
-                "currency": "AUD",
-            }
-        else:
-            stats = {"count": 0, "median": None, "low": None, "high": None, "currency": "AUD"}
+                if len(w1) >= 3 and len(w2) >= 3:
+                    med1 = float(median(sorted(w1)))
+                    med2 = float(median(sorted(w2)))
+                    if med2 <= 0:
+                        return {"available": False}
+                    pct = (med1 - med2) / med2 * 100.0
+                    label = "up" if pct > 2 else ("down" if pct < -2 else "flat")
+                    return {"available": True, "pct_change": round(pct, 1), "label": label}
+            except Exception:
+                pass
+            return {"available": False}
 
-        return top, stats
-
-    def _build_market_summary(sold_stats: Dict[str, Any], active_stats: Dict[str, Any], valuation: Dict[str, Any]) -> str:
-        """Spoken-word summary for the Market History block."""
-        s_cnt = int(sold_stats.get("count") or 0)
-        a_cnt = int(active_stats.get("count") or 0)
-        s_med = sold_stats.get("median")
-        a_med = active_stats.get("median")
-        v = valuation.get("value_aud")
-
-        parts = []
-        if s_cnt >= 3 and s_med:
-            parts.append(f"Recent sold results suggest a typical paid price around ${s_med:.2f} AUD.")
-        elif a_cnt >= 3 and a_med:
-            parts.append(f"Not many sold results were found, so we're leaning on current listings. Typical asking prices are around ${a_med:.2f} AUD.")
-        else:
-            parts.append("Market data is limited for this exact match, so treat these numbers as indicative only.")
-
-        if s_med and a_med:
-            if a_med > s_med * 1.10:
-                parts.append("Active listings are currently priced above recent sold levels, which can indicate seller optimism or tight supply.")
-            elif a_med < s_med * 0.90:
-                parts.append("Active listings are currently under recent sold levels, which can indicate softer demand or quick-sale pricing.")
+        for g in grade_targets:
+            key = str(g)
+            sold_g = _filter_pool(sold_pool, key)
+            if sold_g:
+                m, st = _top5(sold_g)
+                buckets[key]["matches"] = m
+                buckets[key]["stats"] = st
+                buckets[key]["trend"] = _trend_from_matches(m)
+                buckets[key]["source"] = "sold"
             else:
-                parts.append("Active listings and recent sold levels are broadly aligned.")
+                act_g = _filter_pool(active_pool, key)
+                if act_g:
+                    m, st = _top5(act_g)
+                    buckets[key]["matches"] = m
+                    buckets[key]["stats"] = st
+                    buckets[key]["trend"] = {"available": False}
+                    buckets[key]["source"] = "active"
+                else:
+                    buckets[key]["source"] = "none"
 
-        if isinstance(v, (int, float)) and v:
-            parts.append(f"Based on the assessed condition, the condition-aware valuation anchor lands around ${float(v):.2f} AUD.")
-
-        return " ".join(parts).strip()
-
-    # Build candidate pools across ladder
-    sold_pool_by_id: Dict[str, Dict[str, Any]] = {}
-    active_pool_by_id: Dict[str, Dict[str, Any]] = {}
-
-    used_query = ""
-    for qstr in ladder:
-        if not used_query:
-            used_query = qstr
-
-        # SOLD
-        sold_candidates = await _finding_completed(qstr, limit=120)
-        for c in sold_candidates:
-            iid = str(c.get("itemId") or "")
-            if not iid:
-                continue
-            if iid not in sold_pool_by_id:
-                sold_pool_by_id[iid] = c
-
-        # ACTIVE
-        active_candidates = await _browse_active(qstr, limit=50)
-        for c in active_candidates:
-            iid = str(c.get("itemId") or "")
-            if not iid:
-                continue
-            if iid not in active_pool_by_id:
-                active_pool_by_id[iid] = c
-
-        # early stop: enough candidates to score well
-        if len(sold_pool_by_id) >= 180 and len(active_pool_by_id) >= 120:
-            break
-
-    sold_pool = list(sold_pool_by_id.values())
-    active_pool = list(active_pool_by_id.values())
-
-    sold_matches, sold_stats, sold_debug = _collect_top5(sold_pool)
-    active_matches, active_stats, active_debug = _collect_top5(active_pool)
-
-    # Graded reference points (PSA 8/9/10) — used for UI context only
-    psa10_matches, psa10_stats = await _collect_psa_grade_top5(10)
-    psa9_matches, psa9_stats = await _collect_psa_grade_top5(9)
-    psa8_matches, psa8_stats = await _collect_psa_grade_top5(8)
-
-    graded = {
-        "psa10": {"matches": psa10_matches, "stats": psa10_stats},
-        "psa9": {"matches": psa9_matches, "stats": psa9_stats},
-        "psa8": {"matches": psa8_matches, "stats": psa8_stats},
-    }
-
-    if not sold_matches and not active_matches:
-        return {
-            "available": False,
-            "message": "No sufficient eBay market data found for this item.",
-            "used_query": used_query,
-            "query_ladder": ladder,
-            "match_debug": {"sold": sold_debug, "active": active_debug, "ebay_calls": ebay_call_debug},
-            "card": {"name": n, "set": sname, "number": num_display, "set_code": set_code_hint},
-        }
+        return {k: v for k, v in buckets.items() if v.get("matches")}
 
     # --------------------------
     # Condition-aware valuation (anchored to SOLD top-5)
@@ -2900,6 +2802,61 @@ async def market_context(
     }
     market_summary = _build_market_summary(sold_stats, active_stats, valuation)
 
+    # --------------------------
+    # Graded buckets + expected value (brand-agnostic)
+    # --------------------------
+    grade_market = await _collect_grade_market(["10", "9", "8"], sold_pool, active_pool)
+
+    # Expected value if it lands the assessed grade (falls back to condition-aware anchor if no graded comps)
+    exp_grade_key = None
+    try:
+        exp_grade_key = str(int(round(float(resolved_grade or predicted_grade or ""))))
+    except Exception:
+        exp_grade_key = None
+
+    expected_value_aud = None
+    expected_source = "anchor"
+    if exp_grade_key and isinstance(grade_market, dict):
+        st = (grade_market.get(exp_grade_key) or {}).get("stats") or {}
+        mv = st.get("median") if isinstance(st, dict) else None
+        if mv is not None:
+            try:
+                expected_value_aud = float(mv)
+                expected_source = "graded_median"
+            except Exception:
+                expected_value_aud = None
+
+    if expected_value_aud is None:
+        try:
+            expected_value_aud = float((valuation or {}).get("value_aud") or 0) or None
+        except Exception:
+            expected_value_aud = None
+
+    # Build a short grade-aware summary extension (kept brand-agnostic)
+    grade_bits = []
+    for gk in ["10", "9", "8"]:
+        b = grade_market.get(gk) if isinstance(grade_market, dict) else None
+        st = (b or {}).get("stats") or {}
+        if st.get("median") is not None:
+            try:
+                grade_bits.append(f"grade {gk} median ~${float(st['median']):.0f} AUD")
+            except Exception:
+                pass
+
+    if exp_grade_key and expected_value_aud:
+        try:
+            market_summary = _norm_ws(market_summary + f" Based on the assessed grade ({exp_grade_key}), expected graded value is about ${float(expected_value_aud):.0f} AUD.")
+        except Exception:
+            pass
+    if grade_bits:
+        market_summary = _norm_ws(market_summary + " Graded references: " + ", ".join(grade_bits) + ".")
+
+    grade_outcome = {
+        "assessed_grade": exp_grade_key,
+        "expected_value_aud": expected_value_aud,
+        "expected_source": expected_source,
+    }
+
 
     # --------------------------
     # Assemble response (frontend friendly)
@@ -2907,7 +2864,6 @@ async def market_context(
     resp = {
         "available": True,
         "source": "ebay",
-        "item_kind": item_kind,
         "used_query": used_query,
         "query_ladder": ladder,
         "card": {"name": n, "set": sname, "number": num_display, "set_code": set_code_hint, "type": ctype},
@@ -2916,7 +2872,8 @@ async def market_context(
         "valuation": valuation,
 
         "market_summary": market_summary,
-        "graded": graded,
+        "grade_outcome": grade_outcome,
+        "graded": grade_market,
 
         # Requested output
         "sold": sold_stats,
