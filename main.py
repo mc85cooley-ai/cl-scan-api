@@ -123,142 +123,134 @@ async def _fx_usd_to_aud() -> float:
         pass
     return 1.50
 
+
 async def _ebay_completed_stats(keyword_query: str, limit: int = 120, days_lookback: int = 120) -> dict:
     """
     Fetch eBay completed/sold items stats using FindingService (AppID only).
+
     Returns:
       {
-        count, currency,
-        prices(list),
-        low, high, median, avg,
-        p20, p80,
-        min, max,
-        query
+        source: "ebay",
+        query: str,
+        count: int,
+        currency: "AUD",
+        prices: list[float],
+        low: float|None,   # p20
+        median: float|None,# p50
+        high: float|None,  # p80
+        avg: float|None,
+        p20: float|None,
+        p80: float|None,
+        min: float|None,
+        max: float|None
       }
+
     Notes:
-      - low/high are p20/p80 (trim outliers)
-      - prices are returned in the listing currency (usually USD/AUD)
+      - Uses SoldItemsOnly completed listings.
+      - Prices are converted to AUD when currency is USD.
+      - low/high are p20/p80 to reduce outlier impact.
     """
     q = _norm_ws(keyword_query or "")
-    if not (USE_EBAY_API and EBAY_APP_ID and q):
+    if not q or not USE_EBAY_API or not EBAY_APP_ID:
         return {}
 
-    # Cache per query+limit
+    # Cache per query+limit+lookback
     cache_key = f"ebay:{q}:{limit}:{days_lookback}"
     now = int(time.time())
     cached = _EBAY_CACHE.get(cache_key)
-    if cached and (now - int(cached.get("ts") or 0) < 900):  # 15 min cache
-        return cached.get("data") or {}
+    if cached and (now - int(cached.get("ts", 0))) < 1800:  # 30 min
+        return cached.get("data", {}) or {}
 
-    # Finding API pagination
-    per_page = min(100, max(10, int(limit)))
-    max_pages = max(1, int(math.ceil(float(limit) / float(per_page))))
-    max_pages = min(max_pages, 5)  # safety cap
+    # eBay FindingService pages: 1..N, 100 per page
+    target = max(1, int(limit))
+    pages = min(5, (target + 99) // 100)  # safety cap
 
-    all_prices: list[float] = []
-    currency = None
-    total_count = 0
+    prices: list[float] = []
 
-    # Use last N days if requested (Finding doesn't support absolute sold date filter cleanly),
-    # but we can lightly prefer recency by sorting order and limiting pages.
-    for page in range(1, max_pages + 1):
-        params = {
-            "OPERATION-NAME": "findCompletedItems",
-            "SERVICE-VERSION": "1.13.0",
-            "SECURITY-APPNAME": EBAY_APP_ID,
-            "RESPONSE-DATA-FORMAT": "JSON",
-            "REST-PAYLOAD": "true",
-            "keywords": q,
-            "itemFilter(0).name": "SoldItemsOnly",
-            "itemFilter(0).value": "true",
-            "paginationInput.entriesPerPage": str(per_page),
-            "paginationInput.pageNumber": str(page),
-            "sortOrder": "EndTimeSoonest",
-        }
+    url = "https://svcs.ebay.com/services/search/FindingService/v1"
+    headers = {"User-Agent": UA} if "UA" in globals() else None
 
-        try:
-            url = "https://svcs.ebay.com/services/search/FindingService/v1"
-            async with httpx.AsyncClient(timeout=20.0, headers={"User-Agent": UA}) as client:
-                r = await client.get(url, params=params)
-            r.raise_for_status()
-            j = r.json()
-        except Exception:
-            continue
+    async with httpx.AsyncClient(timeout=20.0, headers=headers) as client:
+        for page in range(1, pages + 1):
+            params = {
+                "OPERATION-NAME": "findCompletedItems",
+                "SERVICE-VERSION": "1.13.0",
+                "SECURITY-APPNAME": EBAY_APP_ID,
+                "RESPONSE-DATA-FORMAT": "JSON",
+                "REST-PAYLOAD": "true",
+                "keywords": q,
+                "itemFilter(0).name": "SoldItemsOnly",
+                "itemFilter(0).value": "true",
+                "paginationInput.entriesPerPage": "100",
+                "paginationInput.pageNumber": str(page),
+            }
 
-        try:
-            resp = (j.get("findCompletedItemsResponse") or [{}])[0]
-            sr = (resp.get("searchResult") or [{}])[0]
-            items = sr.get("item") or []
-        except Exception:
-            items = []
-
-        if not items:
-            break
-
-        for it in items:
             try:
-                selling = (it.get("sellingStatus") or [{}])[0]
-                cur_price = (selling.get("currentPrice") or [{}])[0]
-                val = float(cur_price.get("__value__"))
-                cur = cur_price.get("@currencyId")
-                if currency is None and cur:
-                    currency = str(cur)
-                if val > 0:
-                    all_prices.append(val)
+                r = await client.get(url, params=params)
+                r.raise_for_status()
+                j = r.json()
             except Exception:
                 continue
 
-        total_count = len(all_prices)
-        if total_count >= limit:
-            break
+            try:
+                items = (
+                    j.get("findCompletedItemsResponse", [{}])[0]
+                     .get("searchResult", [{}])[0]
+                     .get("item", [])
+                )
+            except Exception:
+                items = []
 
-    # Trim to limit
-    if len(all_prices) > limit:
-        all_prices = all_prices[:limit]
+            for it in items or []:
+                try:
+                    selling = it.get("sellingStatus", [{}])[0]
+                    cp = selling.get("currentPrice", [{}])[0]
+                    val = float(cp.get("__value__", 0.0))
+                    cur = str(cp.get("@currencyId", "")).upper()
+                    if val <= 0:
+                        continue
+                    if cur == "USD":
+                        val = float(_usd_to_aud(val))
+                    # Ignore insane values (protect against parsing weird lots)
+                    if val <= 0 or val > 1_000_000:
+                        continue
+                    prices.append(val)
+                except Exception:
+                    continue
 
-    if not all_prices:
-        data = {}
-        _EBAY_CACHE[cache_key] = {"ts": now, "data": data}
-        return data
+            if len(prices) >= target:
+                break
 
-    # Robust stats
-    prices_sorted = sorted(all_prices)
-    n = len(prices_sorted)
+    prices = sorted(prices)
+    count = len(prices)
+    if count == 0:
+        out = {"source": "ebay", "query": q, "count": 0, "currency": "AUD", "prices": []}
+        _EBAY_CACHE[cache_key] = {"ts": now, "data": out}
+        return out
+
     def pct(p: float) -> float:
-        if n == 1:
-            return float(prices_sorted[0])
-        i = (n - 1) * p
-        lo = int(math.floor(i))
-        hi = int(math.ceil(i))
-        if lo == hi:
-            return float(prices_sorted[lo])
-        w = i - lo
-        return float(prices_sorted[lo] * (1 - w) + prices_sorted[hi] * w)
+        # p in [0..1]
+        idx = int(round(p * (count - 1)))
+        idx = max(0, min(count - 1, idx))
+        return float(prices[idx])
 
-    p20 = pct(0.20)
-    p80 = pct(0.80)
-    med = pct(0.50)
-    avg = float(sum(prices_sorted) / n)
-    mn = float(prices_sorted[0])
-    mx = float(prices_sorted[-1])
-
-    data = {
+    out = {
+        "source": "ebay",
         "query": q,
-        "count": n,
-        "currency": currency or "USD",
-        "prices": prices_sorted,
-        "p20": round(p20, 2),
-        "p80": round(p80, 2),
-        "low": round(p20, 2),
-        "high": round(p80, 2),
-        "median": round(med, 2),
-        "avg": round(avg, 2),
-        "min": round(mn, 2),
-        "max": round(mx, 2),
+        "count": count,
+        "currency": "AUD",
+        "prices": prices[:target],
+        "low": pct(0.20),
+        "median": pct(0.50),
+        "high": pct(0.80),
+        "avg": float(sum(prices) / count),
+        "p20": pct(0.20),
+        "p80": pct(0.80),
+        "min": float(prices[0]),
+        "max": float(prices[-1]),
     }
-
-    _EBAY_CACHE[cache_key] = {"ts": now, "data": data}
-    return data
+    _EBAY_CACHE[cache_key] = {"ts": now, "data": out}
+    return out
 
 
 def _pc_db():
@@ -1088,6 +1080,84 @@ Respond ONLY with JSON, no extra text.
 
     data = _parse_json_or_none(result.get("content", "")) or {}
 
+    # ------------------------------
+    # Second-pass (defect enhanced) analysis
+    # ------------------------------
+    second_pass = {"enabled": True, "ran": False, "skipped_reason": None, "glare_suspects": [], "defect_candidates": []}
+    try:
+        # Only run for cards; memorabilia uses a different endpoint.
+        front_vars = _make_defect_filter_variants(front_bytes)
+        back_vars = _make_defect_filter_variants(back_bytes)
+
+        if not front_vars and not back_vars:
+            second_pass["enabled"] = False
+            second_pass["skipped_reason"] = "image_filters_unavailable"
+        else:
+            sp_prompt = f"""You are a meticulous trading card defect inspector.
+You are analyzing ENHANCED/FILTERED variants created to make defects stand out (print lines, scratches, whitening, dents).
+You may also receive an ANGLED image used to rule out glare/light refraction.
+
+CRITICAL:
+- Do NOT treat holo sheen / glare as whitening. If the angled shot suggests the mark moves/disappears, flag it as glare_suspect.
+- Card texture is NOT damage unless there is a true crease/indent/paper break.
+- Print lines are typically straight and consistent; glare moves with angle.
+
+Return ONLY valid JSON:
+{{
+  "defect_candidates": [
+    {{"type":"print_line|scratch|whitening|dent|crease|tear|stain|other","severity":"minor|moderate|severe","note":"short plain description","confidence":0-1}}
+  ],
+  "glare_suspects": [
+    {{"type":"whitening|scratch|print_line|other","note":"why it looks like glare","confidence":0-1}}
+  ]
+}}
+"""
+
+            content_parts = [{"type": "text", "text": sp_prompt}]
+
+            # Include filtered variants first (strong signal)
+            if front_vars.get("gray_autocontrast"):
+                content_parts += [
+                    {"type":"text","text":"FRONT (filtered: gray_autocontrast)"},
+                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(front_vars['gray_autocontrast'])}", "detail":"high"}}
+                ]
+            if front_vars.get("contrast_sharp"):
+                content_parts += [
+                    {"type":"text","text":"FRONT (filtered: contrast_sharp)"},
+                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(front_vars['contrast_sharp'])}", "detail":"high"}}
+                ]
+            if back_vars.get("gray_autocontrast"):
+                content_parts += [
+                    {"type":"text","text":"BACK (filtered: gray_autocontrast)"},
+                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(back_vars['gray_autocontrast'])}", "detail":"high"}}
+                ]
+            if back_vars.get("contrast_sharp"):
+                content_parts += [
+                    {"type":"text","text":"BACK (filtered: contrast_sharp)"},
+                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(back_vars['contrast_sharp'])}", "detail":"high"}}
+                ]
+
+            # Include angled if available (glare check)
+            if angled_bytes and len(angled_bytes) > 200:
+                content_parts += [
+                    {"type":"text","text":"OPTIONAL ANGLED IMAGE (glare check)"},
+                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(angled_bytes)}", "detail":"high"}}
+                ]
+
+            sp_msg = [{"role":"user","content": content_parts}]
+            sp_result = await _openai_chat(sp_msg, max_tokens=900, temperature=0.1)
+            if not sp_result.get("error"):
+                sp_data = _parse_json_or_none(sp_result.get("content","")) or {}
+                if isinstance(sp_data, dict):
+                    second_pass["ran"] = True
+                    if isinstance(sp_data.get("glare_suspects"), list):
+                        second_pass["glare_suspects"] = sp_data.get("glare_suspects")[:10]
+                    if isinstance(sp_data.get("defect_candidates"), list):
+                        second_pass["defect_candidates"] = sp_data.get("defect_candidates")[:20]
+            else:
+                second_pass["skipped_reason"] = "second_pass_ai_failed"
+    except Exception:
+        second_pass["skipped_reason"] = "second_pass_exception"
 
     card_name = _norm_ws(str(data.get("card_name", "Unknown")))
     card_type = _norm_ws(str(data.get("card_type", "Other")))
@@ -1372,6 +1442,84 @@ Respond ONLY with JSON, no extra text.
 
     data = _parse_json_or_none(result.get("content", "")) or {}
 
+    # ------------------------------
+    # Second-pass (defect enhanced) analysis
+    # ------------------------------
+    second_pass = {"enabled": True, "ran": False, "skipped_reason": None, "glare_suspects": [], "defect_candidates": []}
+    try:
+        # Only run for cards; memorabilia uses a different endpoint.
+        front_vars = _make_defect_filter_variants(front_bytes)
+        back_vars = _make_defect_filter_variants(back_bytes)
+
+        if not front_vars and not back_vars:
+            second_pass["enabled"] = False
+            second_pass["skipped_reason"] = "image_filters_unavailable"
+        else:
+            sp_prompt = f"""You are a meticulous trading card defect inspector.
+You are analyzing ENHANCED/FILTERED variants created to make defects stand out (print lines, scratches, whitening, dents).
+You may also receive an ANGLED image used to rule out glare/light refraction.
+
+CRITICAL:
+- Do NOT treat holo sheen / glare as whitening. If the angled shot suggests the mark moves/disappears, flag it as glare_suspect.
+- Card texture is NOT damage unless there is a true crease/indent/paper break.
+- Print lines are typically straight and consistent; glare moves with angle.
+
+Return ONLY valid JSON:
+{{
+  "defect_candidates": [
+    {{"type":"print_line|scratch|whitening|dent|crease|tear|stain|other","severity":"minor|moderate|severe","note":"short plain description","confidence":0-1}}
+  ],
+  "glare_suspects": [
+    {{"type":"whitening|scratch|print_line|other","note":"why it looks like glare","confidence":0-1}}
+  ]
+}}
+"""
+
+            content_parts = [{"type": "text", "text": sp_prompt}]
+
+            # Include filtered variants first (strong signal)
+            if front_vars.get("gray_autocontrast"):
+                content_parts += [
+                    {"type":"text","text":"FRONT (filtered: gray_autocontrast)"},
+                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(front_vars['gray_autocontrast'])}", "detail":"high"}}
+                ]
+            if front_vars.get("contrast_sharp"):
+                content_parts += [
+                    {"type":"text","text":"FRONT (filtered: contrast_sharp)"},
+                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(front_vars['contrast_sharp'])}", "detail":"high"}}
+                ]
+            if back_vars.get("gray_autocontrast"):
+                content_parts += [
+                    {"type":"text","text":"BACK (filtered: gray_autocontrast)"},
+                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(back_vars['gray_autocontrast'])}", "detail":"high"}}
+                ]
+            if back_vars.get("contrast_sharp"):
+                content_parts += [
+                    {"type":"text","text":"BACK (filtered: contrast_sharp)"},
+                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(back_vars['contrast_sharp'])}", "detail":"high"}}
+                ]
+
+            # Include angled if available (glare check)
+            if angled_bytes and len(angled_bytes) > 200:
+                content_parts += [
+                    {"type":"text","text":"OPTIONAL ANGLED IMAGE (glare check)"},
+                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(angled_bytes)}", "detail":"high"}}
+                ]
+
+            sp_msg = [{"role":"user","content": content_parts}]
+            sp_result = await _openai_chat(sp_msg, max_tokens=900, temperature=0.1)
+            if not sp_result.get("error"):
+                sp_data = _parse_json_or_none(sp_result.get("content","")) or {}
+                if isinstance(sp_data, dict):
+                    second_pass["ran"] = True
+                    if isinstance(sp_data.get("glare_suspects"), list):
+                        second_pass["glare_suspects"] = sp_data.get("glare_suspects")[:10]
+                    if isinstance(sp_data.get("defect_candidates"), list):
+                        second_pass["defect_candidates"] = sp_data.get("defect_candidates")[:20]
+            else:
+                second_pass["skipped_reason"] = "second_pass_ai_failed"
+    except Exception:
+        second_pass["skipped_reason"] = "second_pass_exception"
 
     # Normalize flags/defects and compute structural-damage indicator
     flags_raw = data.get("flags", [])
@@ -2045,15 +2193,13 @@ async def market_context(
                 graded_stats[str(g)] = st
 
     # Convert to AUD (if needed) and compute a compact observed object
-    fx_usd_aud = await _fx_usd_to_aud()
-
     def _to_aud_stats(st: dict) -> dict:
         if not st:
             return {"median": None, "avg": None, "low": None, "high": None, "count": 0, "currency": "AUD"}
         cur = str(st.get("currency") or "USD").upper()
         fx = 1.0
         if cur == "USD":
-            fx = fx_usd_aud
+            fx = _usd_to_aud_rate()
         elif cur == "AUD":
             fx = 1.0
         # If other currency, treat as USD for now (rare)
