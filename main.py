@@ -2181,16 +2181,18 @@ async def market_context(
     exclude_graded: Optional[bool] = Form(None),   # if None, uses EXCLUDE_GRADED_DEFAULT
 ):
     """
-    Market context (SOLD + ACTIVE) with:
-      - Top-5 closest SOLD comps (FindingService findCompletedItems)
-      - Top-5 closest ACTIVE comps (Browse API item_summary/search)
-      - Low/median/high computed from those top-5
-      - Condition-aware valuation anchored to SOLD comps (prevents PSA10 fantasy on damaged cards)
+    Market context (ACTIVE + GRADED comps) — SOLD history intentionally disabled.
 
-    Output remains broadly compatible with existing frontend (observed.sold/active stats),
-    while adding:
-      - sold_matches / active_matches (comps used lists)
-      - match_debug (transparency / tuning)
+    Why:
+      - SOLD endpoints were not returning consistent results in production.
+      - We keep the UX clean (no empty "Sold (historic)" tiles).
+      - We can re-introduce sold history later once a reliable source is confirmed.
+
+    Output:
+      - active: top-5 closest ACTIVE comps + low/median/high
+      - graded: grade buckets (10/9/8) from graded ACTIVE listings (brand-agnostic)
+      - grade_outcome: expected value if it lands the assessed grade (uses graded bucket median; falls back to active median)
+      - market_summary: a richer, Pokémon-enthusiast paragraph with buy-target guidance
     """
 
     # --------------------------
@@ -2199,13 +2201,6 @@ async def market_context(
     n = _norm_ws(item_name or card_name or name or "").strip()
     sname = _norm_ws(item_set or card_set or "").strip()
     num_display = _clean_card_number_display(item_number or card_number or "").strip()
-    expected_num_pair = None
-    mnum = re.search(r"(\d+)\s*/\s*(\d+)", num_display)
-    if mnum:
-        try:
-            expected_num_pair = (int(mnum.group(1)), int(mnum.group(2)))
-        except Exception:
-            expected_num_pair = None
 
     ctype = _normalize_card_type(_norm_ws(card_type or item_category or "").strip())
 
@@ -2222,7 +2217,7 @@ async def market_context(
         }
 
     # --------------------------
-    # Condition anchor mapping (exactly as requested)
+    # Simple numeric grade parsing
     # --------------------------
     def _as_int_grade(s: Optional[str]) -> Optional[int]:
         if s is None:
@@ -2240,189 +2235,43 @@ async def market_context(
     resolved_grade = g_ass if g_ass is not None else g_pred
     structural = bool(has_structural_damage)
 
-    def _anchor(pregrade: Optional[int], structural_damage: bool) -> str:
-        g = pregrade
-        if structural_damage or (g is not None and g <= 4):
-            return "sold_low"
-        if g is not None and 5 <= g <= 6:
-            return "sold_mid_low"
-        if g is not None and 7 <= g <= 8:
-            return "sold_median"
-        if g is not None and 9 <= g <= 10:
-            return "sold_median_high"
-        return "sold_median"
-
-    anchor = _anchor(resolved_grade, structural)
-
     # --------------------------
     # Query ladder (Google-like)
     # --------------------------
     set_code_hint = _norm_ws((item_set or "")).strip()
     ladder = _build_ebay_query_ladder(n, sname, set_code_hint, num_display, ctype)
-    # Keep ladder sane (avoid rate limits)
     ladder = ladder[:12] if ladder else [_norm_ws(n)]
 
-    # --------------------------
-    # Matching + filters
-    # --------------------------
     exclude_graded_effective = EXCLUDE_GRADED_DEFAULT if exclude_graded is None else bool(exclude_graded)
 
-    NEGATIVE_TERMS = [
-        "proxy", "reprint", "custom", "fake", "fan made", "fanmade", "replica",
-        "digital", "print", "download", "art", "poster",
-    ]
-    LOT_TERMS = ["lot", "bundle", "collection", "job lot", "joblot", "bulk", "assorted"]
-    GRADED_TERMS = ["psa", "bgs", "cgc", "sgc", "beckett", "graded", "slab", "gem mint"]
-
-    def _tokenize(s: str) -> List[str]:
-        s = re.sub(r"[^a-z0-9/#]+", " ", (s or "").lower())
-        toks = [t for t in s.split() if t and len(t) > 1]
-        return toks
-
-    expected = {
-        "name": n,
-        "name_tokens": set(_tokenize(n)),
-        "set": sname,
-        "set_tokens": set(_tokenize(sname)),
-        "num": num_display,
-        "num_pair": expected_num_pair,
-        "strict_number": (STRICT_CARD_NUMBER and ctype == "Pokemon" and expected_num_pair is not None),
-        "num_variants": _normalize_num_variants(num_display),
-        "year": "",
-        "type": ctype,
-    }
-
-
-    # eBay call debug (returned in match_debug for troubleshooting)
-    ebay_call_debug = {
-        "active": {"calls": 0, "non200": [], "token": {}, "marketplace": EBAY_MARKETPLACE_ID},
-        "sold": {"calls": 0, "non200": []},
-    }
-
-    def _contains_any(hay: str, needles: List[str]) -> bool:
-        h = (hay or "").lower()
-        return any(x in h for x in needles)
-
-    def _score_candidate(title: str) -> Tuple[int, Dict[str, Any]]:
-        """Return (score, debug) for a candidate title."""
-        t = (title or "").lower()
-        toks = set(_tokenize(t))
-        score = 0
-        dbg = {"pos": [], "neg": []}
-
-        # Strong negatives
-        if _contains_any(t, NEGATIVE_TERMS):
-            score -= 80
-            dbg["neg"].append("negative_term")
-        if _contains_any(t, LOT_TERMS):
-            score -= 25
-            dbg["neg"].append("lot_bundle")
-        is_graded = _contains_any(t, GRADED_TERMS)
-        if is_graded:
-            score -= 35
-            dbg["neg"].append("graded_listing")
-
-        # Wrong game (basic)
-        if expected["type"] == "Pokemon":
-            if any(x in t for x in ["mtg", "magic the gathering", "yu-gi-oh", "yugioh", "one piece", "panini", "topps"]):
-                score -= 40
-                dbg["neg"].append("wrong_game")
-        if expected["type"] == "Magic":
-            if any(x in t for x in ["pokemon", "yu-gi-oh", "yugioh", "one piece"]):
-                score -= 40
-                dbg["neg"].append("wrong_game")
-        if expected["type"] == "YuGiOh":
-            if any(x in t for x in ["pokemon", "mtg", "magic the gathering", "one piece"]):
-                score -= 40
-                dbg["neg"].append("wrong_game")
-        if expected["type"] == "OnePiece":
-            if any(x in t for x in ["pokemon", "mtg", "magic the gathering", "yu-gi-oh", "yugioh"]):
-                score -= 40
-                dbg["neg"].append("wrong_game")
-
-        # Positives
-        # +30 exact-ish name token match: count intersection (cap)
-        name_hits = len(expected["name_tokens"].intersection(toks))
-        if name_hits:
-            add = min(30, 10 + name_hits * 5)
-            score += add
-            dbg["pos"].append(f"name_tokens:{name_hits}")
-
-        # Card number matching (highest priority for Pokemon)
-        cand_pairs = re.findall(r"(\d{1,4})\s*/\s*(\d{1,4})", t)
-        cand_norm_pairs = [(str(int(a)), str(int(b))) for (a,b) in cand_pairs] if cand_pairs else []
-        exp_pair = expected.get("num_pair")
-
-        if exp_pair and expected.get("strict_number"):
-            # If a card number is present in the title and it's NOT the expected number, hard-penalize
-            if cand_norm_pairs:
-                if any((a == str(exp_pair[0]) and b == str(exp_pair[1])) for (a,b) in cand_norm_pairs):
-                    score += 35
-                    dbg["pos"].append("number_exact")
-                else:
-                    score -= 120
-                    dbg["neg"].append("number_mismatch")
-            else:
-                # Missing number is still allowed but deprioritized
-                score -= 25
-                dbg["neg"].append("number_missing")
-        else:
-            # Generic fallback: substring match against variants like '4/102' or '#4'
-            if expected["num_variants"]:
-                for nv in expected["num_variants"]:
-                    if nv and nv.lower() in t:
-                        score += 25
-                        dbg["pos"].append("number_match")
-                        break
-
-
-        # +20 set match (token overlap)
-        set_hits = len(expected["set_tokens"].intersection(toks)) if expected["set_tokens"] else 0
-        if set_hits:
-            add = min(20, 8 + set_hits * 4)
-            score += add
-            dbg["pos"].append(f"set_tokens:{set_hits}")
-
-        # +10 "holo" / "reverse holo" cues if expected contains it
-        if "holo" in expected["name"].lower():
-            if "holo" in t:
-                score += 10
-                dbg["pos"].append("holo_match")
-
-        return score, dbg
-
     # --------------------------
-    # eBay fetchers
+    # eBay active fetcher (Browse API)
     # --------------------------
     async def _price_to_aud(amount: Any, currency: str) -> Optional[float]:
         try:
             v = float(amount)
         except Exception:
             return None
-        cur = (currency or "").upper().strip()
-        if not cur:
-            cur = DEFAULT_CURRENCY
+        cur = (currency or "").upper().strip() or DEFAULT_CURRENCY
         if cur == "AUD":
             return round(v, 2)
         if cur == "USD":
             rate = await _fx_usd_to_aud()
             return round(v * float(rate), 2)
-        # fallback: leave as-is if unknown
         return round(v, 2)
 
+    ebay_call_debug = {
+        "active": {"calls": 0, "non200": [], "token": {}, "marketplace": EBAY_MARKETPLACE_ID},
+    }
+
     async def _browse_active(query_str: str, limit: int = 50) -> List[Dict[str, Any]]:
-        """Browse API item_summary/search for ACTIVE listings (OAuth application token)."""
         qs = _norm_ws(query_str)
         if not qs or not USE_EBAY_API:
             return []
 
         url = "https://api.ebay.com/buy/browse/v1/item_summary/search"
-        params = {
-            "q": qs,
-            "limit": str(max(1, min(50, int(limit or 50)))),
-        }
+        params = {"q": qs, "limit": str(max(1, min(50, int(limit or 50))))}
 
-        # Get/refresh token automatically (client credentials). Falls back to EBAY_OAUTH_TOKEN if provided.
         token, tok_dbg = await _get_ebay_app_token(force_refresh=False)
         ebay_call_debug["active"]["token"] = tok_dbg
         if not token:
@@ -2446,8 +2295,6 @@ async def market_context(
 
         ebay_call_debug["active"]["calls"] += 1
         status, j, errtxt = await _do_call(token)
-
-        # If token expired/invalid, refresh once and retry
         if status in (401, 403):
             token2, tok_dbg2 = await _get_ebay_app_token(force_refresh=True)
             ebay_call_debug["active"]["token"] = tok_dbg2
@@ -2456,10 +2303,7 @@ async def market_context(
                 status, j, errtxt = await _do_call(token2)
 
         if status != 200 or not isinstance(j, dict):
-            if status:
-                ebay_call_debug["active"]["non200"].append({"status": status, "err": errtxt, "q": qs})
-            else:
-                ebay_call_debug["active"]["non200"].append({"status": 0, "err": errtxt, "q": qs})
+            ebay_call_debug["active"]["non200"].append({"status": status, "err": errtxt, "q": qs})
             return []
 
         out: List[Dict[str, Any]] = []
@@ -2472,7 +2316,6 @@ async def market_context(
                 pv = price.get("value")
                 pc = price.get("currency")
                 cond = str(it.get("condition") or it.get("conditionId") or "")
-                # Convert currency to AUD for consistent stats
                 aud = await _price_to_aud(pv, pc)
                 if aud is None or aud <= 0:
                     continue
@@ -2489,158 +2332,138 @@ async def market_context(
                 continue
         return out
 
-    async def _finding_completed(query_str: str, limit: int = 120) -> List[Dict[str, Any]]:
-        """FindingService findCompletedItems for SOLD comps (AppID / Dev ID)."""
-        qs = _norm_ws(query_str)
-        if not qs or not USE_EBAY_API or not EBAY_APP_ID:
-            return []
-
-        target = max(1, int(limit or 120))
-        pages = min(3, max(1, (target + 99) // 100))
-        url = "https://svcs.ebay.com/services/search/FindingService/v1"
-        headers = {"User-Agent": UA}
-        out: List[Dict[str, Any]] = []
-
-        async with httpx.AsyncClient(timeout=25.0, headers=headers) as client:
-            for page in range(1, pages + 1):
-                params = {
-                    "OPERATION-NAME": "findCompletedItems",
-                    "SERVICE-VERSION": "1.13.0",
-                    "SECURITY-APPNAME": EBAY_APP_ID,
-                    "RESPONSE-DATA-FORMAT": "JSON",
-                    "REST-PAYLOAD": "true",
-                    "keywords": qs,
-                    "itemFilter(0).name": "SoldItemsOnly",
-                    "itemFilter(0).value": "true",
-                    "paginationInput.entriesPerPage": "100",
-                    "paginationInput.pageNumber": str(page),
-                }
-                ebay_call_debug["sold"]["calls"] += 1
-                try:
-                    r = await client.get(url, params=params)
-                    if r.status_code != 200:
-                        ebay_call_debug["sold"]["non200"].append({"status": r.status_code, "err": (r.text or "")[:300], "q": qs})
-                        continue
-                    j = r.json()
-                except Exception as e:
-                    ebay_call_debug["sold"]["non200"].append({"status": 0, "err": str(e)[:300], "q": qs})
-                    continue
-
-                try:
-                    items = (
-                        j.get("findCompletedItemsResponse", [{}])[0]
-                         .get("searchResult", [{}])[0]
-                         .get("item", [])
-                    )
-                except Exception:
-                    items = []
-
-                for it in items or []:
-                    try:
-                        item_id = str(it.get("itemId", [""])[0] if isinstance(it.get("itemId"), list) else it.get("itemId") or "")
-                        title = str((it.get("title") or [""])[0] if isinstance(it.get("title"), list) else it.get("title") or "")
-                        web_url = str((it.get("viewItemURL") or [""])[0] if isinstance(it.get("viewItemURL"), list) else it.get("viewItemURL") or "")
-                        cond = ""
-                        try:
-                            cdn = (it.get("condition") or [{}])[0]
-                            cond = str(cdn.get("conditionDisplayName", [""])[0] if isinstance(cdn.get("conditionDisplayName"), list) else cdn.get("conditionDisplayName") or "")
-                        except Exception:
-                            cond = ""
-
-                        selling = (it.get("sellingStatus") or [{}])[0]
-                        cp = (selling.get("currentPrice") or [{}])[0]
-                        pv = cp.get("__value__", 0.0)
-                        pc = cp.get("@currencyId", "USD")
-
-                        aud = await _price_to_aud(pv, pc)
-                        if aud is None or aud <= 0:
-                            continue
-
-                        out.append({
-                            "itemId": item_id,
-                            "title": title,
-                            "url": web_url,
-                            "condition": cond,
-                            "price_aud": float(aud),
-                            "currency": "AUD",
-                            "raw_currency": pc,
-                            "end_time": _safe_end_time(it),
-                        })
-                    except Exception:
-                        continue
-
-                if len(out) >= target:
-                    break
-
-        return out
-
-
     # --------------------------
     # Candidate pooling + scoring
     # --------------------------
-    def _collect_top5(candidates: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
-        """
-        Returns:
-          matches: top-5 list with title/price/condition/url/score
-          stats: low/median/high computed from those 5
-          debug: score diagnostics
-        """
-        scored = []
-        rejected = []
-        token_dbg = {
-            "name_tokens": sorted(list(expected["name_tokens"]))[:25],
-            "set_tokens": sorted(list(expected["set_tokens"]))[:25],
-            "num_variants": expected["num_variants"],
-        }
+    NEGATIVE_TERMS = [
+        "proxy", "reprint", "custom", "fake", "fan made", "fanmade", "replica",
+        "digital", "print", "download", "poster", "art",
+    ]
+    LOT_TERMS = ["lot", "bundle", "collection", "job lot", "joblot", "bulk", "assorted"]
+
+    def _tokenize(s: str) -> List[str]:
+        s = re.sub(r"[^a-z0-9/#]+", " ", (s or "").lower())
+        return [t for t in s.split() if t and len(t) > 1]
+
+    expected = {
+        "name": n,
+        "name_tokens": set(_tokenize(n)),
+        "set": sname,
+        "set_tokens": set(_tokenize(sname)),
+        "num": num_display,
+        "num_variants": _normalize_num_variants(num_display),
+        "type": ctype,
+    }
+
+    # strict Pokemon card number gate (optional)
+    expected_num_pair = None
+    mnum = re.search(r"(\d+)\s*/\s*(\d+)", num_display)
+    if mnum:
+        try:
+            expected_num_pair = (int(mnum.group(1)), int(mnum.group(2)))
+        except Exception:
+            expected_num_pair = None
+    strict_number = bool(STRICT_CARD_NUMBER and ctype == "Pokemon" and expected_num_pair is not None)
+
+    GRADED_TERMS = ["psa", "bgs", "cgc", "sgc", "beckett", "graded", "slab", "gem mint", "mint 10", "gm 10"]
+
+    def _contains_any(hay: str, needles: List[str]) -> bool:
+        h = (hay or "").lower()
+        return any(x in h for x in needles)
+
+    def _score_candidate(title: str, allow_graded: bool = False) -> Tuple[int, Dict[str, Any]]:
+        t = (title or "").lower()
+        toks = set(_tokenize(t))
+        score = 0
+        dbg = {"pos": [], "neg": []}
+
+        if _contains_any(t, NEGATIVE_TERMS):
+            score -= 80
+            dbg["neg"].append("negative_term")
+        if _contains_any(t, LOT_TERMS):
+            score -= 25
+            dbg["neg"].append("lot_bundle")
+
+        is_graded = _contains_any(t, GRADED_TERMS)
+        if is_graded and not allow_graded:
+            score -= 35
+            dbg["neg"].append("graded_listing")
+
+        # Name tokens
+        name_hits = len(expected["name_tokens"].intersection(toks))
+        if name_hits:
+            score += min(35, 10 + name_hits * 5)
+            dbg["pos"].append(f"name_tokens:{name_hits}")
+
+        # Set tokens
+        set_hits = len(expected["set_tokens"].intersection(toks)) if expected["set_tokens"] else 0
+        if set_hits:
+            score += min(22, 8 + set_hits * 4)
+            dbg["pos"].append(f"set_tokens:{set_hits}")
+
+        # Card number strictness for Pokémon singles
+        if strict_number:
+            cand_pairs = re.findall(r"(\d{1,4})\s*/\s*(\d{1,4})", t)
+            if cand_pairs:
+                try:
+                    ok = any((int(a) == expected_num_pair[0] and int(b) == expected_num_pair[1]) for (a, b) in cand_pairs)
+                except Exception:
+                    ok = False
+                if ok:
+                    score += 40
+                    dbg["pos"].append("number_exact")
+                else:
+                    score -= 120
+                    dbg["neg"].append("number_mismatch")
+            else:
+                score -= 20
+                dbg["neg"].append("number_missing")
+        else:
+            # soft variants
+            for nv in (expected.get("num_variants") or []):
+                if nv and nv.lower() in t:
+                    score += 20
+                    dbg["pos"].append("number_match")
+                    break
+
+        return score, dbg
+
+    def _collect_top5(candidates: List[Dict[str, Any]], allow_graded: bool = False) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
+        scored: List[Dict[str, Any]] = []
+        rejected: List[Dict[str, Any]] = []
 
         for c in candidates:
             title = str(c.get("title") or "")
-            sc, dbg = _score_candidate(title)
-            # Apply graded exclusion hard-gate if enabled and graded detected
-            if exclude_graded_effective and "graded_listing" in dbg.get("neg", []):
+            sc, dbg = _score_candidate(title, allow_graded=allow_graded)
+
+            if exclude_graded_effective and (not allow_graded) and ("graded_listing" in dbg.get("neg", [])):
                 rejected.append({"title": title[:120], "reason": "graded_excluded", "score": sc})
                 continue
-            # Apply strict card-number gate for Pokemon when we have an expected x/y number
-            if expected.get("strict_number") and "number_mismatch" in dbg.get("neg", []):
+            if strict_number and ("number_mismatch" in dbg.get("neg", [])):
                 rejected.append({"title": title[:120], "reason": "number_mismatch", "score": sc})
                 continue
-            # Reject very low relevance (protect against garbage)
-            if sc < -10:
+            if sc < 0:
                 rejected.append({"title": title[:120], "reason": "low_score", "score": sc})
                 continue
 
             scored.append({
                 "title": title,
-                "price": float(c.get("price_aud") or 0.0),
-                "currency": "AUD",
-                "condition": str(c.get("condition") or ""),
-                "url": str(c.get("url") or ""),
-                "itemId": str(c.get("itemId") or ""),
-                "score": int(sc),
+                "price": float(c.get("price_aud") or 0),
+                "price_aud": float(c.get("price_aud") or 0),
+                "url": c.get("url") or "",
+                "condition": c.get("condition") or "",
+                "score": sc,
                 "_dbg": dbg,
             })
 
-        # Sort primarily by relevance score. To avoid "top priced" drift when many items tie on score,
-        # we lightly prefer prices closer to the median of the best-scoring candidates.
         scored.sort(key=lambda x: x["score"], reverse=True)
-        head = scored[:20]  # use a wider head to compute a stable median
-        head_prices = [x["price"] for x in head if isinstance(x.get("price"), (int, float)) and x["price"] > 0]
-        head_med = float(median(sorted(head_prices))) if head_prices else None
-
-        def _dist(p: float) -> float:
-            if not head_med or head_med <= 0 or not p:
-                return 0.0
-            return abs(float(p) - head_med) / head_med
-
-        # Re-rank: score desc, then closer-to-median first
-        scored.sort(key=lambda x: (x["score"], -_dist(x.get("price") or 0.0)), reverse=True)
         top = scored[:5]
 
         prices = [x["price"] for x in top if isinstance(x.get("price"), (int, float)) and x["price"] > 0]
         prices_sorted = sorted(prices)
         if prices_sorted:
             low = prices_sorted[0]
-            med = float(median(prices_sorted))
+            med = float(statistics.median(prices_sorted))
             high = prices_sorted[-1]
         else:
             low = med = high = None
@@ -2653,251 +2476,231 @@ async def market_context(
             "currency": "AUD",
         }
 
-        debug = {
-            "tokens": token_dbg,
-            "rejected_examples": rejected[:12],
-        }
-
-        # Strip internal debug from matches for output
+        debug = {"rejected_examples": rejected[:12]}
         for x in top:
             x.pop("_dbg", None)
-
         return top, stats, debug
 
     # --------------------------
-    # Graded (PSA) comp helpers (optional display)
+    # Build ACTIVE pool + select best query
     # --------------------------
-    # --------------------------
-    # Graded comp helpers (brand-agnostic; optional display)
-    # --------------------------
-    async def _collect_grade_market(
-        grade_targets: List[str],
-        sold_pool: List[Dict[str, Any]],
-        active_pool: List[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-        """Build grade buckets (10/9/8 etc) with stats + top matches.
-        Brand-agnostic: parses any graded wording + numeric grade (PSA/BGS/CGC/SGC all OK).
-        Uses SOLD comps first for each bucket; falls back to ACTIVE if needed.
-        """
-        buckets: Dict[str, Dict[str, Any]] = {str(g): {"matches": [], "stats": {}, "trend": {}, "source": "sold"} for g in grade_targets}
+    used_query = ladder[0] if ladder else _norm_ws(n)
+    active_pool: List[Dict[str, Any]] = []
+    best_matches: List[Dict[str, Any]] = []
+    best_stats: Dict[str, Any] = {}
+    best_debug: Dict[str, Any] = {}
 
-        def _filter_pool(pool: List[Dict[str, Any]], bucket_key: str) -> List[Dict[str, Any]]:
-            out: List[Dict[str, Any]] = []
-            for it in pool:
-                pg = _parse_grade_from_title(str(it.get("title") or ""))
-                bk = _grade_bucket_key(pg)
-                if bk == bucket_key:
-                    out.append(it)
-            return out
+    for q in ladder:
+        cand = await _browse_active(q, limit=50)
+        if not cand:
+            continue
+        # merge pool
+        active_pool.extend(cand)
+        matches, stats, dbg = _collect_top5(cand, allow_graded=False)
+        if stats and stats.get("median") is not None and len(matches) >= 3:
+            used_query = q
+            best_matches, best_stats, best_debug = matches, stats, dbg
+            break
+        # keep first non-empty as fallback
+        if not best_matches:
+            used_query = q
+            best_matches, best_stats, best_debug = matches, stats, dbg
 
-        def _top5(pool: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-            matches, stats, _dbg = _collect_top5(pool)
-            return matches, stats or {}
-
-        def _trend_from_matches(matches: List[Dict[str, Any]]) -> Dict[str, Any]:
-            # Trend uses SOLD end_time when available: compare last 30 days median vs previous 30 days.
-            try:
-                from datetime import datetime, timezone, timedelta
-                def _parse_dt(s: str) -> Optional[datetime]:
-                    if not s:
-                        return None
-                    try:
-                        return datetime.fromisoformat(s.replace("Z", "+00:00"))
-                    except Exception:
-                        return None
-
-                now = datetime.now(timezone.utc)
-                w1_start = now - timedelta(days=30)
-                w2_start = now - timedelta(days=60)
-
-                w1: List[float] = []
-                w2: List[float] = []
-                for m in matches:
-                    et = _parse_dt(str(m.get("end_time") or ""))
-                    if not et:
-                        continue
-                    try:
-                        p = float(m.get("price_aud") or m.get("price") or 0)
-                    except Exception:
-                        continue
-                    if p <= 0:
-                        continue
-                    if et >= w1_start:
-                        w1.append(p)
-                    elif w2_start <= et < w1_start:
-                        w2.append(p)
-
-                if len(w1) >= 3 and len(w2) >= 3:
-                    med1 = float(median(sorted(w1)))
-                    med2 = float(median(sorted(w2)))
-                    if med2 <= 0:
-                        return {"available": False}
-                    pct = (med1 - med2) / med2 * 100.0
-                    label = "up" if pct > 2 else ("down" if pct < -2 else "flat")
-                    return {"available": True, "pct_change": round(pct, 1), "label": label}
-            except Exception:
-                pass
-            return {"available": False}
-
-        for g in grade_targets:
-            key = str(g)
-            sold_g = _filter_pool(sold_pool, key)
-            if sold_g:
-                m, st = _top5(sold_g)
-                buckets[key]["matches"] = m
-                buckets[key]["stats"] = st
-                buckets[key]["trend"] = _trend_from_matches(m)
-                buckets[key]["source"] = "sold"
-            else:
-                act_g = _filter_pool(active_pool, key)
-                if act_g:
-                    m, st = _top5(act_g)
-                    buckets[key]["matches"] = m
-                    buckets[key]["stats"] = st
-                    buckets[key]["trend"] = {"available": False}
-                    buckets[key]["source"] = "active"
-                else:
-                    buckets[key]["source"] = "none"
-
-        return {k: v for k, v in buckets.items() if v.get("matches")}
+    active_matches = best_matches
+    active_stats = best_stats or {"count": 0, "low": None, "median": None, "high": None, "currency": "AUD"}
+    active_debug = best_debug or {}
 
     # --------------------------
-    # Condition-aware valuation (anchored to SOLD top-5)
+    # Graded buckets (ACTIVE only; brand-agnostic)
     # --------------------------
-    def _anchor_value_from_top5(stats: Dict[str, Any], anchor_key: str) -> Optional[float]:
-        low = stats.get("low")
-        med = stats.get("median")
-        high = stats.get("high")
-        if low is None and med is None and high is None:
+    GRADE_RX = re.compile(r'(?:\bpsa\b|\bbgs\b|\bcgc\b|\bsgc\b|\bgraded\b|\bslab\b|\bgem\s*mint\b|\bpristine\b)?\s*([0-9]{1,2}(?:\.[05])?)\b', re.IGNORECASE)
+    PSA10_RX = re.compile(r'\bpsa\s*10\b|\bpsa10\b|\bgem\s*mint\s*10\b|\b10\s*gem\b', re.IGNORECASE)
+
+    def _parse_grade_from_title(title: str) -> Optional[float]:
+        t = (title or "").lower()
+        if PSA10_RX.search(t):
+            return 10.0
+        m = GRADE_RX.search(title or "")
+        if not m:
+            return None
+        try:
+            g = float(m.group(1))
+            if g < 1 or g > 10:
+                return None
+            return g
+        except Exception:
             return None
 
-        if anchor_key == "sold_low":
-            return float(low if low is not None else (med if med is not None else high))
-        if anchor_key == "sold_mid_low":
-            # mid-low: average of low + median when available
-            if low is not None and med is not None:
-                return round((float(low) + float(med)) / 2.0, 2)
-            return float(med if med is not None else low)
-        if anchor_key == "sold_median":
-            return float(med if med is not None else (low if low is not None else high))
-        if anchor_key == "sold_median_high":
-            # "high-ish / median-high (still not max)": halfway between median and high
-            if med is not None and high is not None:
-                return round(float(med) + 0.5 * (float(high) - float(med)), 2)
-            return float(high if high is not None else med)
-        return float(med if med is not None else low)
+    def _bucket_key(g: Optional[float]) -> Optional[str]:
+        if g is None:
+            return None
+        if g >= 9.5:
+            return "10"
+        if g >= 9.0:
+            return "9"
+        if g >= 8.0:
+            return "8"
+        return None
 
-    anchored_value = _anchor_value_from_top5(sold_stats, anchor)
+    # Pull a separate graded pool (do NOT exclude graded)
+    graded_query_base = " ".join([x for x in [n, sname] if x]).strip()
+    graded_query = _norm_ws(f"{graded_query_base} graded psa cgc bgs")
+    graded_pool = await _browse_active(graded_query, limit=50)
 
-    valuation = {
-        "anchor": anchor,
-        "anchor_label": {
-            "sold_low": "Sold low-end (damaged / grade ≤ 4)",
-            "sold_mid_low": "Sold mid-low (grade 5–6)",
-            "sold_median": "Sold median (grade 7–8)",
-            "sold_median_high": "Sold median-high (grade 9–10, not max)",
-        }.get(anchor, anchor),
-        "value_aud": anchored_value,
-        "note": "Valuation is condition-aware and anchored ONLY to SOLD comps (buyers actually paid). ACTIVE listings are context only.",
-    }
-    market_summary = _build_market_summary(sold_stats, active_stats, valuation)
+    graded_buckets = {"10": [], "9": [], "8": []}
+    for it in graded_pool:
+        g = _parse_grade_from_title(str(it.get("title") or ""))
+        bk = _bucket_key(g)
+        if not bk:
+            continue
+        graded_buckets[bk].append(it)
+
+    def _bucket_stats(pool: List[Dict[str, Any]]) -> Dict[str, Any]:
+        prices = [float(x.get("price_aud") or 0) for x in pool if float(x.get("price_aud") or 0) > 0]
+        prices_sorted = sorted(prices)
+        if not prices_sorted:
+            return {"count": 0, "low": None, "median": None, "high": None, "currency": "AUD"}
+        low = prices_sorted[0]
+        med = float(statistics.median(prices_sorted))
+        high = prices_sorted[-1]
+        return {"count": len(prices_sorted), "low": round(low, 2), "median": round(med, 2), "high": round(high, 2), "currency": "AUD"}
+
+    grade_market: Dict[str, Any] = {}
+    for k in ["10", "9", "8"]:
+        st = _bucket_stats(graded_buckets[k])
+        # Only include buckets with meaningful data
+        grade_market[k] = {
+            "stats": st,
+            "matches": [{"title": str(x.get("title") or ""), "price_aud": float(x.get("price_aud") or 0), "url": x.get("url") or ""} for x in graded_buckets[k][:5]],
+            "source": "active",
+        }
 
     # --------------------------
-    # Graded buckets + expected value (brand-agnostic)
+    # Expected value + buy target (ACTIVE + GRADED)
     # --------------------------
-    grade_market = await _collect_grade_market(["10", "9", "8"], sold_pool, active_pool)
-
-    # Expected value if it lands the assessed grade (falls back to condition-aware anchor if no graded comps)
-    exp_grade_key = None
-    try:
-        exp_grade_key = str(int(round(float(resolved_grade or predicted_grade or ""))))
-    except Exception:
-        exp_grade_key = None
-
+    exp_grade_key = str(int(resolved_grade)) if isinstance(resolved_grade, int) else (str(resolved_grade) if resolved_grade is not None else "")
     expected_value_aud = None
-    expected_source = "anchor"
-    if exp_grade_key and isinstance(grade_market, dict):
-        st = (grade_market.get(exp_grade_key) or {}).get("stats") or {}
-        mv = st.get("median") if isinstance(st, dict) else None
-        if mv is not None:
-            try:
-                expected_value_aud = float(mv)
-                expected_source = "graded_median"
-            except Exception:
-                expected_value_aud = None
+    expected_source = "active"
 
-    if expected_value_aud is None:
-        try:
-            expected_value_aud = float((valuation or {}).get("value_aud") or 0) or None
-        except Exception:
-            expected_value_aud = None
+    if exp_grade_key in grade_market and grade_market[exp_grade_key]["stats"].get("median") is not None:
+        expected_value_aud = float(grade_market[exp_grade_key]["stats"]["median"])
+        expected_source = "graded_active"
+    elif active_stats.get("median") is not None:
+        expected_value_aud = float(active_stats["median"])
+        expected_source = "active"
 
-    # Build a short grade-aware summary extension (kept brand-agnostic)
-    grade_bits = []
-    for gk in ["10", "9", "8"]:
-        b = grade_market.get(gk) if isinstance(grade_market, dict) else None
-        st = (b or {}).get("stats") or {}
-        if st.get("median") is not None:
-            try:
-                grade_bits.append(f"grade {gk} median ~${float(st['median']):.0f} AUD")
-            except Exception:
-                pass
+    # Buy target heuristic (conservative, depends on grade + confidence)
+    conf = float(confidence or 0.0)
+    conf = max(0.0, min(1.0, conf))
+    grade_tier = resolved_grade if isinstance(resolved_grade, int) else None
+    base_mult = 0.78 + 0.07 * conf  # 0.78..0.85
+    if grade_tier is not None:
+        if grade_tier >= 9:
+            base_mult = 0.82 + 0.06 * conf
+        elif grade_tier >= 7:
+            base_mult = 0.78 + 0.06 * conf
+        else:
+            base_mult = 0.70 + 0.06 * conf
 
-    if exp_grade_key and expected_value_aud:
-        try:
-            market_summary = _norm_ws(market_summary + f" Based on the assessed grade ({exp_grade_key}), expected graded value is about ${float(expected_value_aud):.0f} AUD.")
-        except Exception:
-            pass
-    if grade_bits:
-        market_summary = _norm_ws(market_summary + " Graded references: " + ", ".join(grade_bits) + ".")
+    buy_target_aud = None
+    if expected_value_aud is not None:
+        buy_target_aud = round(expected_value_aud * base_mult, 2)
 
     grade_outcome = {
-        "assessed_grade": exp_grade_key,
+        "assessed_grade": exp_grade_key or None,
         "expected_value_aud": expected_value_aud,
         "expected_source": expected_source,
+        "buy_target_aud": buy_target_aud,
     }
 
+    # --------------------------
+    # Build an enthusiast-style market summary (no fake sold-history claims)
+    # --------------------------
+    def _money(v: Optional[float]) -> str:
+        try:
+            if v is None:
+                return "—"
+            return f"${float(v):.0f}"
+        except Exception:
+            return "—"
 
-    # --------------------------
-    # Assemble response (frontend friendly)
-    # --------------------------
+    current_typ = active_stats.get("median")
+    current_low = active_stats.get("low")
+    current_high = active_stats.get("high")
+
+    # trend proxy (active-only; honest language)
+    trend_hint = "pretty steady right now"
+    if current_low is not None and current_high is not None and current_typ is not None:
+        spread = (float(current_high) - float(current_low)) / max(1.0, float(current_typ))
+        if spread > 0.6:
+            trend_hint = "kinda all over the shop (wide spread on asks)"
+        elif spread < 0.25:
+            trend_hint = "tight and steady (asks are clustering)"
+    # grading potential language
+    worth_grading = None
+    if expected_value_aud is not None and current_typ is not None:
+        try:
+            uplift = float(expected_value_aud) - float(current_typ)
+            worth_grading = (uplift > float(grading_cost or 0))
+        except Exception:
+            worth_grading = None
+
+    slang_openers = [
+        "Alright mate, here’s the vibe on this one:",
+        "Okay, Pokéfam — quick market check:",
+        "Righto, let’s suss the market real quick:",
+    ]
+    opener = slang_openers[0]
+
+    grade_line = ""
+    if exp_grade_key:
+        grade_line = f" LeagAI’s calling it around a **{exp_grade_key}** in the current state."
+    price_line = f" On current listings, it’s sitting around **{_money(current_typ)} AUD** (rough range {_money(current_low)}–{_money(current_high)})."
+    trend_line = f" The market looks **{trend_hint}** based on live asks."
+    graded_line = ""
+    if exp_grade_key and exp_grade_key in grade_market:
+        st = grade_market.get(exp_grade_key, {}).get("stats", {})
+        if st and st.get("median") is not None:
+            graded_line = f" If it lands that grade, you’re looking at roughly **{_money(st.get('median'))} AUD** in the graded lane (based on current graded listings)."
+    grade_advice = ""
+    if worth_grading is True:
+        grade_advice = f" With grading cost around **${float(grading_cost or 0):.0f}**, it **looks worth a crack** if your goal is long-term hold or a clean flip."
+    elif worth_grading is False:
+        grade_advice = f" With grading cost around **${float(grading_cost or 0):.0f}**, it’s **probably not worth sending** in this condition unless you’re chasing the slab for the collection."
+    buy_line = ""
+    if buy_target_aud is not None:
+        buy_line = f" If you’re buying, a **good target entry** is about **{_money(buy_target_aud)} AUD or less** for this condition — that’s where the risk/reward starts to feel spicy."
+
+    market_summary = _norm_ws(f"{opener}{grade_line}{price_line} {trend_line}{graded_line} {grade_advice} {buy_line}")
+
     resp = {
         "available": True,
-        "source": "ebay",
+        "source": "ebay_active",
         "used_query": used_query,
         "query_ladder": ladder,
         "card": {"name": n, "set": sname, "number": num_display, "set_code": set_code_hint, "type": ctype},
         "has_structural_damage": structural,
         "assessed_pregrade": resolved_grade,
-        "valuation": valuation,
-
         "market_summary": market_summary,
         "grade_outcome": grade_outcome,
         "graded": grade_market,
-
-        # Requested output
-        "sold": sold_stats,
         "active": active_stats,
-        "sold_matches": sold_matches,
         "active_matches": active_matches,
-        "match_debug": {"sold": sold_debug, "active": active_debug, "ebay_calls": ebay_call_debug},
-
-        # Back-compat blocks used by current UI renderer
+        "match_debug": {"active": active_debug, "ebay_calls": ebay_call_debug},
         "observed": {
             "currency": "AUD",
             "fx": {"usd_to_aud_rate": _FX_CACHE.get("usd_aud"), "cache_seconds": FX_CACHE_SECONDS},
-            "sold": sold_stats,
             "active": active_stats,
-            "raw": {  # legacy: keep raw pointing at SOLD stream
-                "source": "ebay_sold_top5",
-                "count": sold_stats.get("count"),
-                "low": sold_stats.get("low"),
-                "median": sold_stats.get("median"),
-                "high": sold_stats.get("high"),
+            "raw": {  # legacy: point raw to ACTIVE stream now
+                "source": "ebay_active_top5",
+                "count": active_stats.get("count"),
+                "low": active_stats.get("low"),
+                "median": active_stats.get("median"),
+                "high": active_stats.get("high"),
             },
         },
         "disclaimer": (
-            "Informational market context only. SOLD listings are historical; ACTIVE listings are current asks. "
+            "Informational market context only. ACTIVE listings are current asks and can differ from final sale prices. "
             "Figures are third-party estimates and may vary. Not financial advice."
         ),
     }
