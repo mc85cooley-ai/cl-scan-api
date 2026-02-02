@@ -1342,8 +1342,8 @@ Respond ONLY with JSON, no extra text.
     second_pass = {"enabled": True, "ran": False, "skipped_reason": None, "glare_suspects": [], "defect_candidates": []}
     try:
         # Only run for cards; memorabilia uses a different endpoint.
-        front_vars = _make_defect_filter_variants(front_bytes)
-        back_vars = _make_defect_filter_variants(back_bytes)
+        front_vars = _make_defect_filter_variants(front_img)
+        back_vars = _make_defect_filter_variants(back_img)
 
         if not front_vars and not back_vars:
             second_pass["enabled"] = False
@@ -1704,8 +1704,8 @@ Respond ONLY with JSON, no extra text.
     second_pass = {"enabled": True, "ran": False, "skipped_reason": None, "glare_suspects": [], "defect_candidates": []}
     try:
         # Only run for cards; memorabilia uses a different endpoint.
-        front_vars = _make_defect_filter_variants(front_bytes)
-        back_vars = _make_defect_filter_variants(back_bytes)
+        front_vars = _make_defect_filter_variants(front_img)
+        back_vars = _make_defect_filter_variants(back_img)
 
         if not front_vars and not back_vars:
             second_pass["enabled"] = False
@@ -2653,26 +2653,49 @@ async def market_context(
     ]
     opener = slang_openers[0]
 
-    grade_line = ""
+        grade_line = ""
     if exp_grade_key:
-        grade_line = f" LeagAI’s calling it around a **{exp_grade_key}** in the current state."
-    price_line = f" On current listings, it’s sitting around **{_money(current_typ)} AUD** (rough range {_money(current_low)}–{_money(current_high)})."
-    trend_line = f" The market looks **{trend_hint}** based on live asks."
+        grade_line = f" LeagAI’s calling it around a {exp_grade_key} in the current state."
+
+    price_line = (
+        f" On current listings, it’s sitting around {_money(current_typ)} AUD "
+        f"(rough range {_money(current_low)}–{_money(current_high)})."
+    )
+
+    trend_line = f" The market looks {trend_hint} based on live asks."
+
     graded_line = ""
     if exp_grade_key and exp_grade_key in grade_market:
         st = grade_market.get(exp_grade_key, {}).get("stats", {})
         if st and st.get("median") is not None:
-            graded_line = f" If it lands that grade, you’re looking at roughly **{_money(st.get('median'))} AUD** in the graded lane (based on current graded listings)."
+            graded_line = (
+                f" If it lands that grade, similar graded copies are hovering around "
+                f"{_money(st.get('median'))} AUD on current listings."
+            )
+
     grade_advice = ""
     if worth_grading is True:
-        grade_advice = f" With grading cost around **${float(grading_cost or 0):.0f}**, it **looks worth a crack** if your goal is long-term hold or a clean flip."
+        grade_advice = (
+            f" With grading costs around ${float(grading_cost or 0):.0f}, "
+            f"this one looks worth a shot if you’re thinking long-term hold or a tidy flip."
+        )
     elif worth_grading is False:
-        grade_advice = f" With grading cost around **${float(grading_cost or 0):.0f}**, it’s **probably not worth sending** in this condition unless you’re chasing the slab for the collection."
+        grade_advice = (
+            f" With grading costs around ${float(grading_cost or 0):.0f}, "
+            f"it’s probably not worth sending in unless you’re slab-hunting for the PC."
+        )
+
     buy_line = ""
     if buy_target_aud is not None:
-        buy_line = f" If you’re buying, a **good target entry** is about **{_money(buy_target_aud)} AUD or less** for this condition — that’s where the risk/reward starts to feel spicy."
+        buy_line = (
+            f" If you’re buying raw, a smart target is about "
+            f"{_money(buy_target_aud)} AUD or less for this condition — "
+            f"that’s where the risk/reward starts to make sense."
+        )
 
-    market_summary = _norm_ws(f"{opener}{grade_line}{price_line} {trend_line}{graded_line} {grade_advice} {buy_line}")
+    market_summary = _norm_ws(
+        f"{opener}{grade_line}{price_line} {trend_line}{graded_line} {grade_advice} {buy_line}"
+    )
 
     resp = {
         "available": True,
@@ -2880,4 +2903,3 @@ def _build_ebay_query_ladder(card_name: str, set_name: str, set_code: str, card_
         seen.add(q.lower())
         out.append(q)
     return out
-
