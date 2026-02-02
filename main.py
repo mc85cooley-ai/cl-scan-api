@@ -1,6 +1,6 @@
 """
 The Collectors League Australia - Scan API
-Futureproof v7.0.1 (2026-02-02)
+Futureproof v6.4.1 (2026-01-31)
 
 What changed vs v6.3.x
 - ✅ Adds PriceCharting API as primary market source for cards + sealed/memorabilia (current prices).
@@ -517,8 +517,91 @@ def _canonicalize_set(set_code: Optional[str], set_name: Optional[str]) -> Dict[
 
 # eBay API scaffolding (disabled by default)
 USE_EBAY_API = os.getenv("USE_EBAY_API", "0").strip() in ("1", "true", "TRUE", "yes", "YES")
+# Finding/Legacy (SOLD) uses "Dev ID" as AppID for FindingService
 EBAY_APP_ID = os.getenv("EBAY_APP_ID", "").strip()
+
+# Browse/Buy APIs (ACTIVE) use OAuth application token.
+# Prefer auto-fetch via client credentials; EBAY_OAUTH_TOKEN remains as a fallback/manual override.
+EBAY_CLIENT_ID = os.getenv("EBAY_CLIENT_ID", "").strip()
+EBAY_CLIENT_SECRET = os.getenv("EBAY_CLIENT_SECRET", "").strip()
 EBAY_OAUTH_TOKEN = os.getenv("EBAY_OAUTH_TOKEN", "").strip()
+
+# In-process OAuth cache (per Render instance). Tokens are short-lived; we refresh automatically.
+_EBAY_OAUTH_STATE = {"token": "", "exp": 0, "source": "none"}  # exp = epoch seconds
+_EBAY_OAUTH_LOCK = None  # created lazily to avoid event-loop issues
+
+def _ebay_oauth_lock():
+    global _EBAY_OAUTH_LOCK
+    if _EBAY_OAUTH_LOCK is None:
+        import asyncio
+        _EBAY_OAUTH_LOCK = asyncio.Lock()
+    return _EBAY_OAUTH_LOCK
+
+async def _get_ebay_app_token(force_refresh: bool = False) -> Tuple[Optional[str], Dict[str, Any]]:
+    """
+    Returns (token, debug). Uses client-credentials to fetch an *application* token for Buy/Browse.
+    Falls back to EBAY_OAUTH_TOKEN if client creds are not set.
+    """
+    now = int(time.time())
+    dbg: Dict[str, Any] = {"ok": False, "source": None, "status": None, "error": None}
+
+    # Manual override token (legacy) if provided and no client creds, or if caching is disabled.
+    if (not EBAY_CLIENT_ID or not EBAY_CLIENT_SECRET) and EBAY_OAUTH_TOKEN:
+        dbg.update({"ok": True, "source": "env:EBAY_OAUTH_TOKEN"})
+        return EBAY_OAUTH_TOKEN, dbg
+
+    if not EBAY_CLIENT_ID or not EBAY_CLIENT_SECRET:
+        dbg.update({"ok": False, "source": "none", "error": "missing EBAY_CLIENT_ID/EBAY_CLIENT_SECRET"})
+        return None, dbg
+
+    # Cached token still valid (60s safety window)
+    if not force_refresh and _EBAY_OAUTH_STATE.get("token") and now < int(_EBAY_OAUTH_STATE.get("exp", 0) - 60):
+        dbg.update({"ok": True, "source": _EBAY_OAUTH_STATE.get("source", "cache")})
+        return str(_EBAY_OAUTH_STATE["token"]), dbg
+
+    lock = _ebay_oauth_lock()
+    async with lock:
+        # Double-check after waiting
+        now2 = int(time.time())
+        if not force_refresh and _EBAY_OAUTH_STATE.get("token") and now2 < int(_EBAY_OAUTH_STATE.get("exp", 0) - 60):
+            dbg.update({"ok": True, "source": _EBAY_OAUTH_STATE.get("source", "cache")})
+            return str(_EBAY_OAUTH_STATE["token"]), dbg
+
+        token_url = "https://api.ebay.com/identity/v1/oauth2/token"
+        # Minimal scope for public data
+        scope = os.getenv("EBAY_OAUTH_SCOPE", "https://api.ebay.com/oauth/api_scope").strip() or "https://api.ebay.com/oauth/api_scope"
+
+        auth = base64.b64encode(f"{EBAY_CLIENT_ID}:{EBAY_CLIENT_SECRET}".encode("utf-8")).decode("ascii")
+        headers = {
+            "Authorization": f"Basic {auth}",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": UA,
+        }
+        data = {"grant_type": "client_credentials", "scope": scope}
+
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                r = await client.post(token_url, data=data, headers=headers)
+                dbg["status"] = r.status_code
+                if r.status_code != 200:
+                    dbg["error"] = (r.text or "")[:400]
+                    return None, dbg
+                j = r.json()
+        except Exception as e:
+            dbg["error"] = str(e)
+            return None, dbg
+
+        tok = str(j.get("access_token") or "").strip()
+        exp_in = int(j.get("expires_in") or 0)
+        if not tok or exp_in <= 0:
+            dbg["error"] = "token response missing access_token/expires_in"
+            return None, dbg
+
+        _EBAY_OAUTH_STATE["token"] = tok
+        _EBAY_OAUTH_STATE["exp"] = int(time.time()) + exp_in
+        _EBAY_OAUTH_STATE["source"] = "oauth:client_credentials"
+        dbg.update({"ok": True, "source": "oauth:client_credentials"})
+        return tok, dbg
 
 # eBay marketplace + display defaults
 EBAY_MARKETPLACE_ID = os.getenv("EBAY_MARKETPLACE_ID", os.getenv("EBAY_MARKETPLACE", "EBAY_AU")).strip() or "EBAY_AU"
@@ -538,8 +621,11 @@ if not POKEMONTCG_API_KEY:
     print("INFO: POKEMONTCG_API_KEY not set (Pokemon enrichment disabled).")
 if not PRICECHARTING_TOKEN:
     print("INFO: PRICECHARTING_TOKEN not set (PriceCharting pricing disabled).")
-if USE_EBAY_API and not EBAY_APP_ID:
-    print("INFO: USE_EBAY_API=1 set but eBay credentials are missing (will remain inactive).")
+if USE_EBAY_API:
+    if not EBAY_APP_ID:
+        print("INFO: USE_EBAY_API=1 set but EBAY_APP_ID is missing (SOLD comps via FindingService will be inactive).")
+    if not (EBAY_CLIENT_ID and EBAY_CLIENT_SECRET) and not EBAY_OAUTH_TOKEN:
+        print("INFO: USE_EBAY_API=1 set but OAuth credentials are missing (ACTIVE comps via Browse API will be inactive).")
 
 # ==============================
 # Generic helpers
@@ -2147,6 +2233,12 @@ async def market_context(
         "type": ctype,
     }
 
+    # eBay call debug (returned in match_debug for troubleshooting)
+    ebay_call_debug = {
+        "active": {"calls": 0, "non200": [], "token": {}, "marketplace": EBAY_MARKETPLACE_ID},
+        "sold": {"calls": 0, "non200": []},
+    }
+
     def _contains_any(hay: str, needles: List[str]) -> bool:
         h = (hay or "").lower()
         return any(x in h for x in needles)
@@ -2239,30 +2331,58 @@ async def market_context(
         return round(v, 2)
 
     async def _browse_active(query_str: str, limit: int = 50) -> List[Dict[str, Any]]:
-        """Browse API item_summary/search for ACTIVE listings (OAuth)."""
+        """Browse API item_summary/search for ACTIVE listings (OAuth application token)."""
         qs = _norm_ws(query_str)
-        if not qs or not USE_EBAY_API or not EBAY_OAUTH_TOKEN:
+        if not qs or not USE_EBAY_API:
             return []
+
         url = "https://api.ebay.com/buy/browse/v1/item_summary/search"
         params = {
             "q": qs,
             "limit": str(max(1, min(50, int(limit or 50)))),
         }
-        headers = {
-            "Authorization": f"Bearer {EBAY_OAUTH_TOKEN}",
-            "X-EBAY-C-MARKETPLACE-ID": EBAY_MARKETPLACE_ID,
-            "User-Agent": UA,
-        }
-        try:
-            async with httpx.AsyncClient(timeout=20.0) as client:
-                r = await client.get(url, params=params, headers=headers)
-                if r.status_code != 200:
-                    return []
-                j = r.json()
-        except Exception:
+
+        # Get/refresh token automatically (client credentials). Falls back to EBAY_OAUTH_TOKEN if provided.
+        token, tok_dbg = await _get_ebay_app_token(force_refresh=False)
+        ebay_call_debug["active"]["token"] = tok_dbg
+        if not token:
             return []
 
-        out = []
+        async def _do_call(tok: str) -> Tuple[int, Optional[Dict[str, Any]], str]:
+            headers = {
+                "Authorization": f"Bearer {tok}",
+                "X-EBAY-C-MARKETPLACE-ID": EBAY_MARKETPLACE_ID,
+                "User-Agent": UA,
+            }
+            try:
+                async with httpx.AsyncClient(timeout=20.0) as client:
+                    r = await client.get(url, params=params, headers=headers)
+                    txt = (r.text or "")
+                    if r.status_code != 200:
+                        return r.status_code, None, txt[:400]
+                    return r.status_code, r.json(), ""
+            except Exception as e:
+                return 0, None, str(e)[:400]
+
+        ebay_call_debug["active"]["calls"] += 1
+        status, j, errtxt = await _do_call(token)
+
+        # If token expired/invalid, refresh once and retry
+        if status in (401, 403):
+            token2, tok_dbg2 = await _get_ebay_app_token(force_refresh=True)
+            ebay_call_debug["active"]["token"] = tok_dbg2
+            if token2:
+                ebay_call_debug["active"]["calls"] += 1
+                status, j, errtxt = await _do_call(token2)
+
+        if status != 200 or not isinstance(j, dict):
+            if status:
+                ebay_call_debug["active"]["non200"].append({"status": status, "err": errtxt, "q": qs})
+            else:
+                ebay_call_debug["active"]["non200"].append({"status": 0, "err": errtxt, "q": qs})
+            return []
+
+        out: List[Dict[str, Any]] = []
         for it in (j.get("itemSummaries") or []):
             try:
                 item_id = str(it.get("itemId") or "")
@@ -2290,15 +2410,16 @@ async def market_context(
         return out
 
     async def _finding_completed(query_str: str, limit: int = 120) -> List[Dict[str, Any]]:
-        """FindingService findCompletedItems for SOLD comps (AppID)."""
+        """FindingService findCompletedItems for SOLD comps (AppID / Dev ID)."""
         qs = _norm_ws(query_str)
         if not qs or not USE_EBAY_API or not EBAY_APP_ID:
             return []
+
         target = max(1, int(limit or 120))
         pages = min(3, max(1, (target + 99) // 100))
         url = "https://svcs.ebay.com/services/search/FindingService/v1"
         headers = {"User-Agent": UA}
-        out = []
+        out: List[Dict[str, Any]] = []
 
         async with httpx.AsyncClient(timeout=25.0, headers=headers) as client:
             for page in range(1, pages + 1):
@@ -2314,11 +2435,15 @@ async def market_context(
                     "paginationInput.entriesPerPage": "100",
                     "paginationInput.pageNumber": str(page),
                 }
+                ebay_call_debug["sold"]["calls"] += 1
                 try:
                     r = await client.get(url, params=params)
-                    r.raise_for_status()
+                    if r.status_code != 200:
+                        ebay_call_debug["sold"]["non200"].append({"status": r.status_code, "err": (r.text or "")[:300], "q": qs})
+                        continue
                     j = r.json()
-                except Exception:
+                except Exception as e:
+                    ebay_call_debug["sold"]["non200"].append({"status": 0, "err": str(e)[:300], "q": qs})
                     continue
 
                 try:
@@ -2341,19 +2466,22 @@ async def market_context(
                             cond = str(cdn.get("conditionDisplayName", [""])[0] if isinstance(cdn.get("conditionDisplayName"), list) else cdn.get("conditionDisplayName") or "")
                         except Exception:
                             cond = ""
+
                         selling = (it.get("sellingStatus") or [{}])[0]
                         cp = (selling.get("currentPrice") or [{}])[0]
                         pv = cp.get("__value__", 0.0)
                         pc = cp.get("@currencyId", "USD")
+
                         aud = await _price_to_aud(pv, pc)
-                        if aud is None or aud <= 0 or aud > 1_000_000:
+                        if aud is None or aud <= 0:
                             continue
+
                         out.append({
                             "itemId": item_id,
                             "title": title,
                             "url": web_url,
                             "condition": cond,
-                            "price_aud": aud,
+                            "price_aud": float(aud),
                             "currency": "AUD",
                             "raw_currency": pc,
                         })
@@ -2362,7 +2490,9 @@ async def market_context(
 
                 if len(out) >= target:
                     break
-        return out[:target]
+
+        return out
+
 
     # --------------------------
     # Candidate pooling + scoring
@@ -2479,7 +2609,7 @@ async def market_context(
             "message": "No sufficient eBay market data found for this item.",
             "used_query": used_query,
             "query_ladder": ladder,
-            "match_debug": {"sold": sold_debug, "active": active_debug},
+            "match_debug": {"sold": sold_debug, "active": active_debug, "ebay_calls": ebay_call_debug},
             "card": {"name": n, "set": sname, "number": num_display, "set_code": set_code_hint},
         }
 
@@ -2541,7 +2671,7 @@ async def market_context(
         "active": active_stats,
         "sold_matches": sold_matches,
         "active_matches": active_matches,
-        "match_debug": {"sold": sold_debug, "active": active_debug},
+        "match_debug": {"sold": sold_debug, "active": active_debug, "ebay_calls": ebay_call_debug},
 
         # Back-compat blocks used by current UI renderer
         "observed": {
