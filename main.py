@@ -1899,7 +1899,9 @@ Return ONLY valid JSON with these exact fields:
   "edition_or_language": "e.g., English/Japanese/1st Edition/Unlimited/Collector's Edition if visible else empty string",
   "special_attributes": ["short tags like Factory Sealed", "Pokemon Center", "Hobby Box", "1st Edition", "Case Fresh"],
   "description": "one clear paragraph describing exactly what it is and what can be seen (packaging, labels, markings)",
-  "signatures": "names of any visible signatures or 'None visible'",
+  "signature_present": "Yes/No/Unclear",
+  "signature_text": "if legible, write the letters seen; otherwise empty string",
+  "signature_notes": "where it appears and whether it looks like ink vs printed",
   "seal_condition": "Factory Sealed/Opened/Resealed/Damaged/Not applicable",
   "authenticity_notes": "authenticity indicators visible (holograms, stickers, COA) and any red flags",
   "notable_features": "unique features worth noting (promo contents, special print, chase set, serial numbering, COA, etc.)",
@@ -1935,7 +1937,10 @@ Respond ONLY with JSON, no extra text.
         "edition_or_language": _norm_ws(str(data.get("edition_or_language", ""))),
         "special_attributes": data.get("special_attributes", []) if isinstance(data.get("special_attributes", []), list) else [],
         "description": _norm_ws(str(data.get("description", ""))),
-        "signatures": _norm_ws(str(data.get("signatures", "None visible"))),
+        "signature_present": _norm_ws(str(data.get("signature_present", "Unclear"))),
+        "signature_text": _norm_ws(str(data.get("signature_text", ""))),
+        "signature_notes": _norm_ws(str(data.get("signature_notes", ""))),
+        "signatures": _norm_ws(str(data.get("signatures", data.get("signature_text", "None visible")))),
         "seal_condition": _norm_ws(str(data.get("seal_condition", "Not applicable"))),
         "authenticity_notes": _norm_ws(str(data.get("authenticity_notes", ""))),
         "notable_features": _norm_ws(str(data.get("notable_features", ""))),
@@ -1999,8 +2004,10 @@ Return ONLY valid JSON with this EXACT structure:
   }},
   "signature_assessment": {{
     "present": true/false,
-    "quality": "Clear/Faded/Smudged/Not Applicable",
-    "notes": "notes about signature placement/ink flow/bleeding and any authenticity concerns"
+    "confidence": 0.0-1.0,
+    "type": "Ink/Printed/Unclear/Not Applicable",
+    "location": "best-effort location (e.g., 'top-right front', 'across center window') or 'Not Applicable'",
+    "notes": "notes about signature visibility (stroke consistency, ink pooling/bleeding), and any authenticity concerns. If you cannot confirm it's a real signature, say so."
   }},
   "value_factors": ["short bullets: print run, desirability, era, sealed premium, athlete/popularity, scarcity, set demand"],
   "defects": ["each defect as a full sentence with location + severity"],
@@ -2160,6 +2167,29 @@ async def market_context(
             expected_num_pair = None
 
     ctype = _normalize_card_type(_norm_ws(card_type or item_category or "").strip())
+    # Resolve high-level item kind (card vs sealed vs memorabilia) to apply the right matching rules.
+    raw_item_type = _norm_ws(item_type or "").strip().lower()
+    raw_desc = _norm_ws(description or "").strip().lower()
+    raw_seal = _norm_ws(seal_condition or "").strip().lower()
+
+    def _resolve_item_kind(_t: str, _desc: str, _seal: str) -> str:
+        # Explicit selection wins
+        if _t in ("sealed", "seal", "sealed_product", "booster", "boosterbox", "booster_box", "etb", "bundle"):
+            return "sealed"
+        if _t in ("memorabilia", "mem", "signed", "autograph", "auto", "jersey", "photo", "card_memorabilia"):
+            return "memorabilia"
+        # Heuristics from description
+        if any(x in _desc for x in ["booster box", "booster bundle", "elite trainer box", "etb", "sealed", "factory sealed", "case", "tin", "blaster", "hobby box", "booster pack", "pack fresh", "booster display"]):
+            return "sealed"
+        if any(x in _desc for x in ["signature", "signed", "autograph", "auto", "jersey", "ball", "helmet", "bat", "photo", "poster", "ticket", "memorabilia"]):
+            return "memorabilia"
+        # Seal condition hint
+        if _seal in ("factory sealed", "sealed", "resealed", "opened", "compromised", "damaged"):
+            return "sealed"
+        # Default
+        return "card"
+
+    item_kind = _resolve_item_kind(raw_item_type, raw_desc, raw_seal)
 
     # Memorabilia/sealed fallback query
     if _is_blankish(n):
@@ -2210,7 +2240,10 @@ async def market_context(
     # Query ladder (Google-like)
     # --------------------------
     set_code_hint = _norm_ws((item_set or "")).strip()
-    ladder = _build_ebay_query_ladder(n, sname, set_code_hint, num_display, ctype)
+    if item_kind == "card":
+        ladder = _build_ebay_query_ladder(n, sname, set_code_hint, num_display, ctype)
+    else:
+        ladder = _build_ebay_query_ladder_item(n, sname, set_code_hint, num_display, ctype, item_kind, raw_seal)
     # Keep ladder sane (avoid rate limits)
     ladder = ladder[:12] if ladder else [_norm_ws(n)]
 
@@ -2238,7 +2271,7 @@ async def market_context(
         "set_tokens": set(_tokenize(sname)),
         "num": num_display,
         "num_pair": expected_num_pair,
-        "strict_number": (STRICT_CARD_NUMBER and ctype == "Pokemon" and expected_num_pair is not None),
+        "strict_number": (STRICT_CARD_NUMBER and item_kind == "card" and ctype == "Pokemon" and expected_num_pair is not None),
         "num_variants": _normalize_num_variants(num_display),
         "year": "",
         "type": ctype,
@@ -2262,7 +2295,59 @@ async def market_context(
         score = 0
         dbg = {"pos": [], "neg": []}
 
+        # Non-card matching (sealed / memorabilia) uses different rules.
+        if item_kind != "card":
+            # Universal negatives
+            if _contains_any(t, NEGATIVE_TERMS):
+                score -= 80; dbg["neg"].append("negative_term")
+            if _contains_any(t, LOT_TERMS):
+                score -= 20; dbg["neg"].append("lot_bundle")
+
+            # Sealed-specific negatives
+            if item_kind == "sealed":
+                if any(x in t for x in ["empty", "box only", "no packs", "pack only", "opened", "open box", "resealed", "re-sealed", "repack", "repak"]):
+                    score -= 60; dbg["neg"].append("not_sealed_or_incomplete")
+                # If user claims sealed, boost when title supports it
+                if raw_seal in ("factory sealed", "sealed"):
+                    if any(x in t for x in ["sealed", "factory sealed", "new"]):
+                        score += 15; dbg["pos"].append("sealed_cue")
+
+            # Memorabilia-specific cues
+            if item_kind == "memorabilia":
+                wants_signed = any(x in raw_desc for x in ["signed", "autograph", "signature", "auto"])
+                has_signed = any(x in t for x in ["signed", "autograph", "signature", "auto"])
+                if wants_signed and has_signed:
+                    score += 20; dbg["pos"].append("signed_match")
+                if wants_signed and not has_signed:
+                    score -= 25; dbg["neg"].append("signed_missing")
+
+            # Token overlap (product/name)
+            name_hits = len(expected["name_tokens"].intersection(toks))
+            if name_hits:
+                add = min(35, 12 + name_hits * 5)
+                score += add; dbg["pos"].append(f"name_tokens:{name_hits}")
+
+            set_hits = len(expected["set_tokens"].intersection(toks))
+            if set_hits:
+                add = min(20, 6 + set_hits * 4)
+                score += add; dbg["pos"].append(f"set_tokens:{set_hits}")
+
+            # Product-type gating (ETB/Booster/Bundle/etc) if user hints it
+            product_gate = []
+            for k in ["etb", "elite trainer box", "booster box", "booster", "bundle", "tin", "blaster", "hobby box", "case", "starter deck", "deck"]:
+                if k in raw_desc or k in expected["name"].lower():
+                    product_gate.append(k)
+            if product_gate:
+                if any(k in t for k in product_gate):
+                    score += 10; dbg["pos"].append("product_type_match")
+                else:
+                    score -= 18; dbg["neg"].append("product_type_missing")
+
+            # Done for non-card
+            return score, dbg
+
         # Strong negatives
+
         if _contains_any(t, NEGATIVE_TERMS):
             score -= 80
             dbg["neg"].append("negative_term")
@@ -2822,6 +2907,7 @@ async def market_context(
     resp = {
         "available": True,
         "source": "ebay",
+        "item_kind": item_kind,
         "used_query": used_query,
         "query_ladder": ladder,
         "card": {"name": n, "set": sname, "number": num_display, "set_code": set_code_hint, "type": ctype},
