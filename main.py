@@ -683,6 +683,106 @@ async def _openai_chat(messages: List[Dict[str, Any]], max_tokens: int = 1200, t
         return {"error": True, "status": 0, "message": str(e)}
 
 
+async def _ebay_active_stats(keyword_query: str, limit: int = 120) -> dict:
+    """
+    Fetch eBay ACTIVE listings stats using FindingService (AppID only).
+    Returns same shape as _ebay_completed_stats but represents current asking prices.
+    """
+    q = _norm_ws(keyword_query or "")
+    if not q or not USE_EBAY_API or not EBAY_APP_ID:
+        return {}
+
+    cache_key = f"ebay_active:{q}:{limit}"
+    now = int(time.time())
+    cached = _EBAY_CACHE.get(cache_key)
+    if cached and (now - int(cached.get("ts", 0))) < 900:  # 15 min
+        return cached.get("data", {}) or {}
+
+    target = max(1, int(limit))
+    pages = min(5, max(1, (target + 99) // 100))
+    prices = []
+
+    url = "https://svcs.ebay.com/services/search/FindingService/v1"
+    headers = {"User-Agent": UA}
+
+    async with httpx.AsyncClient(timeout=20.0, headers=headers) as client:
+        for page in range(1, pages + 1):
+            params = {
+                "OPERATION-NAME": "findItemsAdvanced",
+                "SERVICE-VERSION": "1.13.0",
+                "SECURITY-APPNAME": EBAY_APP_ID,
+                "RESPONSE-DATA-FORMAT": "JSON",
+                "REST-PAYLOAD": "true",
+                "keywords": q,
+                "paginationInput.entriesPerPage": "100",
+                "paginationInput.pageNumber": str(page),
+                # Prefer fixed price + auction; don't restrict too hard.
+                "itemFilter(0).name": "HideDuplicateItems",
+                "itemFilter(0).value": "true",
+            }
+            try:
+                r = await client.get(url, params=params)
+                r.raise_for_status()
+                j = r.json()
+            except Exception:
+                continue
+
+            try:
+                items = (
+                    j.get("findItemsAdvancedResponse", [{}])[0]
+                     .get("searchResult", [{}])[0]
+                     .get("item", [])
+                )
+            except Exception:
+                items = []
+
+            for it in items:
+                try:
+                    selling = (it.get("sellingStatus") or [{}])[0]
+                    cp = (selling.get("currentPrice") or [{}])[0]
+                    p = float(cp.get("__value__", 0.0))
+                    cur = cp.get("@currencyId", "USD")
+                    if p <= 0:
+                        continue
+                    if str(cur).upper() == "USD":
+                        p = _usd_to_aud_simple(p)
+                    prices.append(p)
+                except Exception:
+                    continue
+
+            if len(prices) >= target:
+                break
+
+    prices = sorted(prices)
+    count = len(prices)
+    if count == 0:
+        out = {"source": "ebay", "query": q, "count": 0, "currency": "AUD", "prices": []}
+        _EBAY_CACHE[cache_key] = {"ts": now, "data": out}
+        return out
+
+    def pct(p: float) -> float:
+        idx = max(0, min(count - 1, int(round(p * (count - 1)))))
+        return float(prices[idx])
+
+    out = {
+        "source": "ebay",
+        "query": q,
+        "count": count,
+        "currency": "AUD",
+        "prices": prices,
+        "low": pct(0.20),
+        "median": pct(0.50),
+        "high": pct(0.80),
+        "avg": float(sum(prices) / count),
+        "p20": pct(0.20),
+        "p80": pct(0.80),
+        "min": float(prices[0]),
+        "max": float(prices[-1]),
+    }
+    _EBAY_CACHE[cache_key] = {"ts": now, "data": out}
+    return out
+
+
 async def _fetch_html(url: str) -> str:
     """Fetch text content from a URL (used for CSV downloads)."""
     try:
@@ -1606,6 +1706,14 @@ Return ONLY valid JSON:
 
     pregrade_norm = str(g) if g is not None else ""
 
+    # Condition anchor for downstream market logic (trust gate)
+    g_int = None
+    try:
+        g_int = int(round(float(pregrade_norm))) if pregrade_norm else None
+    except Exception:
+        g_int = None
+    condition_anchor = "damaged" if (has_structural_damage or (g_int is not None and g_int <= 4)) else ("low" if (g_int is not None and g_int <= 6) else ("mid" if (g_int is not None and g_int <= 8) else "high"))
+    
 
     # Ensure assessment_summary is detailed enough (UI-friendly)
     summary = _norm_ws(str(data.get("assessment_summary", "")))
@@ -1655,6 +1763,7 @@ Return ONLY valid JSON:
         "observed_id": data.get("observed_id", {}) if isinstance(data.get("observed_id", {}), dict) else {},
         "verify_token": f"vfy_{secrets.token_urlsafe(12)}",
         "market_context_mode": "click_only",
+        "condition_anchor": condition_anchor,
         "has_structural_damage": bool(has_structural_damage),
     })
 
@@ -1893,6 +2002,7 @@ Respond ONLY with JSON, no extra text.
 # eBay API: scaffold only (disabled)
 # ==============================
 
+
 @app.post("/api/market-context")
 @safe_endpoint
 async def market_context(
@@ -1902,12 +2012,13 @@ async def market_context(
     item_set: Optional[str] = Form(None),
     item_number: Optional[str] = Form(None),
     product_id: Optional[str] = Form(None),
-    predicted_grade: Optional[str] = Form("9"),
+
+    predicted_grade: Optional[str] = Form(None),
     confidence: float = Form(0.0),
     grading_cost: float = Form(35.0),
-    has_structural_damage: Optional[bool] = Form(False),  # new: hard gate for damaged cards
 
-    item_type: Optional[str] = Form(None),
+    # Trust gates / coupling
+    has_structural_damage: Optional[bool] = Form(False),
     assessed_pregrade: Optional[str] = Form(None),
     condition_multiplier: Optional[float] = Form(None),
 
@@ -1920,907 +2031,238 @@ async def market_context(
     # Extra loose aliases (some JS sends these)
     name: Optional[str] = Form(None),
     query: Optional[str] = Form(None),
+    item_type: Optional[str] = Form(None),
+    description: Optional[str] = Form(None),
+    seal_condition: Optional[str] = Form(None),
 ):
-    """Click-only informational market context.
+    """Market context (informational).
 
-    Primary source: PriceCharting *custom CSV download* (your account token), cached for speed.
-    Output shape is kept compatible with your current frontend renderer.
+    PRIMARY pricing source: eBay SOLD (completed) listings.
+    Secondary context: eBay ACTIVE (current) listings.
+
+    Key principle:
+      - SOLD = what buyers actually paid (historic truth)
+      - ACTIVE = what sellers are asking now (pressure), never a valuation anchor
+
+    Output is compatible with your frontend renderer while adding clear sold-vs-active history.
     """
 
     # --------------------------
-    # Helpers (local to endpoint)
+    # Helpers
     # --------------------------
-    async def _http_get_text(url: str) -> str:
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                r = await client.get(url, headers={"User-Agent": UA})
-                if r.status_code != 200:
-                    return ""
-                return r.text or ""
-        except Exception:
-            return ""
-
-    def _parse_money(v: Any) -> Optional[float]:
-        if v is None:
+    def _as_int_grade(s: Optional[str]) -> Optional[int]:
+        if s is None:
             return None
-        s = str(v).strip()
-        if not s or s.lower() in ("nan", "none", "null", "-"):
+        ss = str(s).strip()
+        if not ss:
             return None
-        s = s.replace("$", "").replace(",", "").strip()
+        # allow "9.0"
         try:
-            return float(s)
+            return int(round(float(ss)))
         except Exception:
             return None
 
-    def _pc_csv_cache_path(category_slug: str) -> str:
-        safe = re.sub(r"[^a-z0-9\-]+", "-", (category_slug or "pokemon-cards").lower()).strip("-")
-        return os.path.join(PRICECHARTING_CACHE_DIR, f"pc_csv_{safe}_latest.csv")
-
-    def _pc_norm(s: str) -> str:
-        s = _norm_ws(str(s or "")).lower()
-        s = s.replace("-", "-").replace("-", "-")
-        s = re.sub(r"[^a-z0-9#\-/ ]+", " ", s)
-        s = re.sub(r"\s+", " ", s).strip()
-        return s
-
-    def _extract_card_no_short(card_number_display: str) -> Optional[int]:
-        s = _pc_norm(card_number_display)
-        if not s:
-            return None
-        if "/" in s:
-            s = s.split("/", 1)[0]
-        s = s.replace("#", "").strip()
-        try:
-            return int(s)
-        except Exception:
-            return None
-
-    def _liquidity_label(sales_volume: Any) -> str:
-        try:
-            sv = int(str(sales_volume).strip() or "0")
-        except Exception:
-            sv = 0
-        if sv >= 100:
-            return "high"
-        if sv >= 25:
-            return "medium"
-        if sv > 0:
+    def _anchor(pregrade: Optional[int], structural: bool) -> str:
+        g = pregrade if pregrade is not None else None
+        if structural or (g is not None and g <= 4):
+            return "damaged"
+        if g is not None and g <= 6:
             return "low"
-        return "-"
+        if g is not None and g <= 8:
+            return "mid"
+        return "high" if g is not None else "mid"
 
-
-    
-    def _condition_multiplier_from_pregrade(g: Optional[int]) -> float:
-        """Conservative 'as-is' multiplier from observed/assessed pregrade.
-
-        IMPORTANT: This is intentionally harsh for low grades. A PSA 1–4 copy is often worth a small
-        fraction of a near-mint reference sale.
-        """
-        if g is None:
-            return 0.80
-        try:
-            gi = int(g)
-        except Exception:
-            return 0.80
-        gi = max(1, min(10, gi))
-        if gi >= 10: return 1.00
-        if gi == 9:  return 0.90
-        if gi == 8:  return 0.78
-        if gi == 7:  return 0.65
-        if gi == 6:  return 0.52
-        if gi == 5:  return 0.35
-        if gi == 4:  return 0.18
-        if gi == 3:  return 0.10
-        if gi == 2:  return 0.06
-        return 0.03
-
-    def _safe_money_mul(v: Optional[float], m: Optional[float]) -> Optional[float]:
-        try:
-            if v is None or m is None:
-                return None
-            return round(float(v) * float(m), 2)
-        except Exception:
+    def _pick_value_from_sold(sold_stats: dict, anchor: str) -> Optional[float]:
+        if not sold_stats:
             return None
-        try:
-            gi = int(g)
-        except Exception:
-            return "unknown"
-        if gi >= 9:
-            return "mint_like"
-        if gi >= 7:
-            return "near_mint"
-        if gi >= 5:
-            return "excellent"
-        if gi >= 3:
-            return "good"
-        return "poor"
-
-    def _safe_money_mul(v: Optional[float], mult: Optional[float]) -> Optional[float]:
-        if v is None:
+        p20 = sold_stats.get("p20") or sold_stats.get("low")
+        p50 = sold_stats.get("median") or sold_stats.get("p50")
+        if p20 is None and p50 is None:
             return None
-        try:
-            m = float(mult) if mult is not None else 1.0
-        except Exception:
-            m = 1.0
-        return round(float(v) * m, 2)
+        if anchor == "damaged":
+            return float(p20 or p50)
+        if anchor == "low":
+            if p20 is not None and p50 is not None:
+                return float((float(p20) + float(p50)) / 2.0)
+            return float(p50 or p20)
+        # mid/high: median
+        return float(p50 or p20)
 
+    def _fmt_anchor(a: str) -> str:
+        return {"damaged":"Damaged Raw","low":"Low Grade Raw","mid":"Mid Grade Raw","high":"High Grade / Near Mint"}.get(a, a)
 
+    # --------------------------
+    # Identity resolution
+    # --------------------------
+    # Prefer card fields when available
+    n = _norm_ws(item_name or card_name or name or "").strip()
+    sname = _norm_ws(item_set or card_set or "").strip()
+    num = _clean_card_number_display(item_number or card_number or "").strip()
+    ctype = _normalize_card_type(_norm_ws(card_type or item_category or "").strip())
 
-    def _holding_time(liquidity: str, trend: str) -> Tuple[str, str]:
-        """Return (label, explanation). Labels: short/medium/long."""
-        liq = (liquidity or "-").lower()
-        tr = (trend or "-").lower()
-        if liq == "high" and tr == "increasing":
-            return ("short", "Higher activity and upward momentum can shorten the wait for a stronger sale price.")
-        if liq in ("high", "medium") and tr in ("increasing", "stable"):
-            return ("medium", "Reasonable activity; meaningful movement is more likely over months than weeks.")
-        return ("long", "Lower activity and/or weaker momentum suggests a longer collector-style hold for meaningful movement.")
+    # Memorabilia/sealed fallback query
+    if _is_blankish(n):
+        n = _norm_ws(description or query or "").strip()
 
-    def _grading_value_summary(
-        card_label: str,
-        predicted_grade_str: str,
-        conf_in: float,
-        assessed_grade_int: Optional[int],
-        has_structural_damage: bool,
-        grading_cost_aud: float,
-        raw_as_is_aud: Optional[float],
-        expected_graded_aud: Optional[float],
-        liquidity: str,
-        trend: str,
-    ) -> Dict[str, Any]:
-        """Create a spoken-word grading/value summary (non-promissory)."""
-        # Parse grade
-        try:
-            g = float(str(predicted_grade_str or "").strip())
-        except Exception:
-            g = 0.0
-        c = _clamp(_safe_float(conf_in, 0.0), 0.0, 1.0)
+    # Compose query
+    parts = []
+    if n: parts.append(n)
+    if sname: parts.append(sname)
+    if num: parts.append(num)
+    if ctype and ctype.lower() not in ("other","unknown"): parts.append(ctype)
+    keyword_query = " ".join([p for p in parts if p]).strip()
 
-        # Hard gates: structural damage or very low assessed grade => do NOT recommend grading for value
-        if has_structural_damage:
-            return {
-                "spoken_word": (
-                    f"Because {card_label or 'this card'} shows structural damage like creasing or tearing, "
-                    "high-grade market values do not apply to this specific copy. Grading for value is not recommended. "
-                    "Treat market history below as general reference only for the title, not this condition."
-                ),
-                "recommendation": "do_not_grade",
-                "grading_cost_aud": float(grading_cost_aud or 0.0),
-                "suggested_holding_time": "long",
-            }
-
-        if isinstance(assessed_grade_int, int) and assessed_grade_int <= 4:
-            # Low-grade condition: cap expectations and avoid high-grade anchors
-            return {
-                "spoken_word": (
-                    f"Based on the visible condition, {card_label or 'this card'} looks like a low-grade copy. "
-                    "In this range, grading rarely increases value unless the card is exceptionally rare, and it can reduce liquidity. "
-                    "Market history for high grades is not applicable to this condition. If you grade, do it for protection or authenticity, not value."
-                ),
-                "recommendation": "do_not_grade",
-                "grading_cost_aud": float(grading_cost_aud or 0.0),
-                "suggested_holding_time": "long",
-            }
-
-
-        # Determine recommendation
-        recommendation = "borderline"
-        if g >= 9.0 and c >= 0.75:
-            recommendation = "grade"
-        elif g <= 7.5 and c >= 0.40:
-            recommendation = "do_not_grade"
-
-        # Compute net view (best-effort)
-        net = None
-        if isinstance(expected_graded_aud, (int, float)) and isinstance(raw_as_is_aud, (int, float)):
-            net = round(float(expected_graded_aud) - float(raw_as_is_aud) - float(grading_cost_aud or 0.0), 2)
-
-        hold_label, hold_reason = _holding_time(liquidity, trend)
-
-        # Build spoken word (avoid guarantees / ROI language)
-        parts = []
-        parts.append(f"Here’s our take on grading {card_label or 'this card'} based on the current market history.")
-        if g:
-            parts.append(f"With a projected grade around {g:.1f} and confidence at {int(round(c*100))} percent, grading is {('generally worth considering' if recommendation=='grade' else 'more of a borderline call' if recommendation=='borderline' else 'probably not worth it for value')}.")
-
-        if isinstance(raw_as_is_aud, (int, float)):
-            parts.append(f"Using the visible condition as-is, the raw baseline is roughly ${raw_as_is_aud:,.2f} AUD.")
-        if isinstance(expected_graded_aud, (int, float)):
-            parts.append(f"A reasonable graded estimate comes out around ${expected_graded_aud:,.2f} AUD.")
-        if net is not None:
-            if net > 0:
-                parts.append(f"After the ${grading_cost_aud:,.0f} AUD grading fee, there appears to be some headroom - but it’s not guaranteed.")
-            else:
-                parts.append(f"Once you include the ${grading_cost_aud:,.0f} AUD grading fee, the numbers look tight, so the value case for grading isn’t strong right now.")
-
-        parts.append(f"Market activity looks {liquidity or '-'} and the trend reads {trend or '-'}. {hold_reason}")
-        if hold_label == "short":
-            parts.append("If you grade, think in terms of a shorter hold - around 3 to 12 months - rather than expecting an immediate jump.")
-        elif hold_label == "medium":
-            parts.append("If you grade, a medium hold - roughly 6 to 18 months - is a more realistic window to see meaningful movement.")
-        else:
-            parts.append("If you grade, treat it as a longer hold - 12 months plus - where the benefit is credibility and protection, not a quick outcome.")
-
-        parts.append("This is informational only and markets can change quickly - use it as a guide, not a promise.")
-
+    if not keyword_query:
         return {
-            "spoken_word": " ".join(parts),
-            "recommendation": recommendation,
-            "grading_cost_aud": float(grading_cost_aud or 0.0),
-            "suggested_holding_time": hold_label,
-        }
-
-    # --------------------------
-    # Normalize inputs
-    # --------------------------
-    name_in = item_name or card_name or name or query or ""
-    cat_in = item_category or card_type or "Other"
-    set_in = item_set or card_set or ""
-    num_in = item_number or card_number or ""
-    pid_in = _norm_ws(str(product_id or ""))
-
-    clean_name = _norm_ws(str(name_in))
-    clean_cat = _normalize_card_type(_norm_ws(str(cat_in)))
-    clean_set = _norm_ws(str(set_in))
-    clean_num_display = _clean_card_number_display(str(num_in))
-
-
-    # -----------------------------------------
-    # eBay SOLD listings as PRIMARY pricing data
-    # -----------------------------------------
-    # We build a conservative "low/avg/high" from sold comps (p20/median/p80).
-    # This is informational context only.
-    base_query = " ".join([clean_name, clean_set, clean_num_display]).strip()
-    if not base_query:
-        base_query = " ".join([clean_name, clean_set]).strip() or clean_name
-
-    # Fetch RAW sold stats first (always)
-    raw_stats = await _ebay_completed_stats(base_query, limit=120)
-    # Determine an assessed grade bucket to pull graded comps around the *observed* condition
-    g_ass = _grade_bucket(assessed_pregrade or "") or _grade_bucket(predicted_grade or "")
-    g_ass = int(g_ass or 0) if str(g_ass).isdigit() else int(g_ass or 0)
-    if g_ass <= 0:
-        g_ass = 0
-
-    graded_stats: Dict[str, Any] = {}
-    # Only pull a small set of graded buckets to keep API calls sane
-    grades_to_pull: List[int] = []
-    if clean_cat.lower() in ("pokemon", "magic", "yugioh", "sports", "onepiece", "other"):
-        if g_ass >= 8:
-            grades_to_pull = [10, 9, 8]
-        elif g_ass >= 5:
-            grades_to_pull = [g_ass + 1, g_ass, 8]
-        elif g_ass >= 1:
-            grades_to_pull = [g_ass + 1, g_ass]
-        else:
-            grades_to_pull = [10, 9, 8]
-
-        # de-dup + clamp
-        grades_to_pull = sorted({max(1, min(10, int(x))) for x in grades_to_pull}, reverse=True)
-
-        for g in grades_to_pull:
-            qg = f"{base_query} PSA {g}"
-            st = await _ebay_completed_stats(qg, limit=90)
-            if st:
-                graded_stats[str(g)] = st
-
-    # Convert to AUD (if needed) and compute a compact observed object
-    def _to_aud_stats(st: dict) -> dict:
-        if not st:
-            return {"median": None, "avg": None, "low": None, "high": None, "count": 0, "currency": "AUD"}
-        cur = str(st.get("currency") or "USD").upper()
-        fx = 1.0
-        if cur == "USD":
-            fx = 1.0  # already converted earlier
-        elif cur == "AUD":
-            fx = 1.0
-        # If other currency, treat as USD for now (rare)
-        def conv(v):
-            try:
-                return round(float(v) * fx, 2) if v is not None else None
-            except Exception:
-                return None
-        return {
-            "median": conv(st.get("median")),
-            "avg": conv(st.get("avg")),
-            "low": conv(st.get("low")),
-            "high": conv(st.get("high")),
-            "count": int(st.get("count") or 0),
-            "currency": "AUD",
-        }
-
-    raw_aud = _to_aud_stats(raw_stats)
-    graded_aud = {k: _to_aud_stats(v) for k, v in (graded_stats or {}).items()}
-
-    # If we have enough sold comps, return eBay-driven context immediately.
-    # (PriceCharting remains as fallback if eBay has no data.)
-    if raw_aud.get("count", 0) >= 6:
-        # Damage lock: if verify flagged structural damage, kill EV/high-grade language
-        damage_flag = bool(has_structural_damage or (str(assessed_pregrade or "").strip() in ("1", "2", "3") ))
-        if damage_flag:
-            return JSONResponse(content={
-                "available": True,
-                "mode": "damage_locked",
-                "message": "This copy appears to have structural damage / heavy wear. High-grade values do not apply.",
-                "used_query": base_query,
-                "card": {"name": clean_name, "set": clean_set, "set_code": "", "year": "", "card_number": clean_num_display, "type": clean_cat},
-                "observed": {
-                    "currency": "AUD",
-                    "liquidity": "-",
-                    "trend": "-",
-                    "raw": raw_aud,
-                    "graded_psa": graded_aud,
-                },
-                "grade_impact": {
-                    "expected_graded_value": None,
-                    "raw_baseline_value": raw_aud.get("median"),
-                    "grading_cost": float(grading_cost or 0.0),
-                    "estimated_value_difference": None,
-                },
-                "grading_value_summary": {
-                    "spoken_word": (
-                        "Because this card shows heavy wear or possible structural damage, grading for value usually doesn't make sense. "
-                        "The market prices for high grades don't apply to this specific copy. Treat these numbers as general reference only."
-                    ),
-                    "recommendation": "do_not_grade",
-                },
-                "meta": {"pricing_source": "ebay"},
-                "disclaimer": "Informational market context only. Sold listings vary by platform, timing, and condition.",
-            }, status_code=200)
-
-        # Build a grade-aware summary using the observed grade (NOT a default 9)
-        g_for_summary = g_ass if g_ass else None
-        conf_in = _clamp(_safe_float(confidence, 0.0), 0.0, 1.0)
-
-        # Choose a graded reference price closest to the assessed grade if we have it
-        graded_ref = None
-        if g_for_summary and str(g_for_summary) in graded_aud:
-            graded_ref = graded_aud[str(g_for_summary)].get("median")
-        elif graded_aud:
-            # pick the lowest grade we fetched (closest to the assessed if below 8)
-            pick = sorted([int(k) for k in graded_aud.keys()])[-1]
-            graded_ref = graded_aud[str(pick)].get("median")
-
-        raw_med = raw_aud.get("median")
-        grading_fee = float(grading_cost or 0.0)
-        expected = graded_ref
-        diff = (expected - raw_med - grading_fee) if (expected and raw_med) else None
-
-        spoken = (
-            f"Here's our take based on recent sold listings. Your observed condition looks around a {g_for_summary or 'N/A'} "
-            f"with confidence at {int(conf_in*100)} percent. "
-        )
-        if expected and raw_med:
-            spoken += (
-                f"Using that condition as-is, the raw baseline is roughly {raw_med:.2f} AUD. "
-                f"A comparable graded copy around that level has a median near {expected:.2f} AUD. "
-                f"After the {grading_fee:.0f} AUD fee, the headroom is {diff:.2f} AUD — but it's not guaranteed."
-            )
-        else:
-            spoken += "We couldn't form a reliable graded comparison for this condition level yet. Use the raw sold range as your best guide for now."
-
-        return JSONResponse(content={
-            "available": True,
-            "mode": "click_only",
-            "message": "Market History Loaded",
-            "used_query": base_query,
-            "confidence": conf_in,
-            "card": {"name": clean_name, "set": clean_set, "set_code": "", "year": "", "card_number": clean_num_display, "type": clean_cat},
-            "observed": {
-                "currency": "AUD",
-                "liquidity": "-",
-                "trend": "-",
-                "raw": raw_aud,
-                "graded_psa": graded_aud,
-            },
-            "grading_value_summary": {"spoken_word": spoken, "recommendation": "grade" if (g_for_summary and g_for_summary >= 8) else "consider"},
-            "grade_impact": {
-                "expected_graded_value": expected,
-                "raw_baseline_value": raw_med,
-                "grading_cost": grading_fee,
-                "estimated_value_difference": diff,
-            },
-            "meta": {"pricing_source": "ebay", "counts": {"raw": raw_aud.get("count"), "graded": {k: v.get("count") for k, v in graded_aud.items()}}},
-            "disclaimer": "Informational market context only. Sold listings vary by platform, timing, and condition.",
-        }, status_code=200)
-    damage_flag = str(has_structural_damage).strip().lower() in ("1","true","yes","y","on")
-
-
-
-    
-    # --------------------------
-    # Hard gate: structural damage lock
-    # --------------------------
-    try:
-        g_ass = _grade_bucket(str(assessed_pregrade or predicted_grade or "").strip())
-    except Exception:
-        g_ass = None
-
-    if damage_flag:
-        # We still return market history, but we DO NOT compute high-grade projections or ROI-style deltas.
-        # Any high-grade values are not applicable to this specific damaged copy.
-        # We'll continue to load market history later in the function and then override the grading summary.
-        pass
-
-# --------------------------
-    # Sealed / memorabilia quick-path (PriceCharting API search)
-    # --------------------------
-    # Your CSV download is strongest for singles. Sealed/memorabilia often matches better via API search.
-    sealed_hint = _norm_ws(str(item_type or "")).lower()
-    sealed_keywords = ["booster box","booster bundle","bundle","display","sealed","tin","etb","elite trainer","case","box","pack","collection box","premium collection"]
-    hay = (" ".join([clean_name, clean_set, sealed_hint])).lower()
-    is_sealed_like = ("sealed" in sealed_hint) or ("memorabilia" in sealed_hint) or any(k in hay for k in sealed_keywords)
-
-    if is_sealed_like and PRICECHARTING_TOKEN:
-        try:
-            q_api = " ".join([clean_name, clean_set]).strip() or clean_name
-            products = await _pc_search(q_api, category=None, limit=8)
-            if products:
-                top = products[0]
-                pid = str(top.get("id") or top.get("product-id") or "").strip()
-                detail = await _pc_product(pid) if pid else {}
-                prices = _pc_extract_price_fields(detail or top)
-                vals = [v for v in prices.values() if isinstance(v, (int, float)) and v > 0]
-                typical_usd = round(sum(vals)/len(vals), 2) if vals else None
-                typical_aud = _usd_to_aud_simple(typical_usd) if typical_usd is not None else None
-
-                # Apply condition multiplier ONLY to recommended buy guidance (not the assessment itself)
-                g_ass = _grade_bucket(assessed_pregrade or "") or _grade_bucket(predicted_grade or "")
-                mult = float(condition_multiplier) if isinstance(condition_multiplier, (int, float)) else _condition_multiplier_from_pregrade(g_ass)
-                bucket = _condition_bucket_from_pregrade(g_ass)
-
-                # Recommended buy (very simple for sealed): apply multiplier to typical
-                rec_buy_usd = _safe_money_mul(typical_usd, mult) if typical_usd is not None else None
-                rec_buy_aud = _usd_to_aud_simple(rec_buy_usd) if rec_buy_usd is not None else None
-
-                return JSONResponse(content={
-                    "available": True,
-                    "mode": "click_only",
-                    "message": "Market history loaded (sealed/memorabilia match)",
-                    "used_query": q_api,
-                    "query_ladder": [q_api],
-                    "confidence": _clamp(_safe_float(confidence, 0.0), 0.0, 1.0),
-                    "card": {"name": clean_name, "set": clean_set, "set_code": "", "year": "", "card_number": clean_num_display, "type": clean_cat},
-                    "observed": {
-                        "currency": "AUD",
-                        "fx": {"usd_to_aud_multiplier": AUD_MULTIPLIER},
-                        "usd_original": {"typical": typical_usd},
-                        "raw": {"median": typical_aud, "avg": typical_aud, "range": None},
-                        "graded_psa": {"10": None, "9": None, "8": None},
-                        "as_is": {"multiplier": mult, "bucket": bucket, "recommended_buy_aud": rec_buy_aud},
-                        "pricecharting_prices": prices,
-                    },
-                    "grade_impact": {
-                        "expected_graded_value": None,
-                        "expected_graded_value_aud": None,
-                        "raw_baseline_value": typical_usd,
-                        "grading_cost": float(grading_cost or 0.0),
-                        "estimated_value_difference": None,
-                        "recommended_buy": {
-                            "currency": "AUD",
-                            "recommended_purchase_price": rec_buy_usd,
-                            "recommended_purchase_price_aud": rec_buy_aud,                            "notes": "Sealed/memorabilia guidance uses PriceCharting API typical price and applies the condition multiplier only for the recommended buy value.",
-                        },
-                    },
-                    "meta": {
-            "damage_locked": bool(damage_flag),
-                        "match": {"id": pid, "product_name": (detail or top).get("product-name") or top.get("product-name"), "console_name": (detail or top).get("console-name") or top.get("console-name")},
-                        "sources": ["pricecharting_api"],
-                    },
-                    "grading_value_summary": {
-                        "spoken_word": "For sealed and memorabilia items, grading isn’t usually the main decision point. The bigger drivers are seal integrity, packaging condition, and overall demand. If you’re holding for a meaningful price move, focus on keeping it protected and expect changes to play out over months rather than days.",
-                        "recommendation": "not_applicable",
-                        "grading_cost_aud": float(grading_cost or 0.0),
-                        "suggested_holding_time": "medium"
-                    },
-                    "disclaimer": "Informational market history only. Figures are third-party estimates and may vary. Not financial advice.",
-                }, status_code=200)
-        except Exception:
-            pass
-    if not clean_name:
-        return JSONResponse(content={
             "available": False,
-            "mode": "click_only",
-            "message": "Missing item name. Please re-run identification or pass item_name (or card_name).",
+            "message": "No identity provided. Please run Identify/Verify first.",
             "used_query": "",
             "query_ladder": [],
-            "confidence": _clamp(_safe_float(confidence, 0.0), 0.0, 1.0),
-            "disclaimer": "Informational market context only. Not financial advice."
-        }, status_code=200)
+        }
 
     # --------------------------
-    # Category -> PriceCharting CSV category slug
+    # Coupling: grade, anchor, gates
     # --------------------------
-    cat_map = {
-        "Pokemon": "pokemon-cards",
-        "Magic": "magic-cards",
-        "YuGiOh": "yugioh-cards",
-        "OnePiece": "one-piece-",
-        "Sports": "sports-cards",
-        "Other": "pokemon-cards",  # fallback
+    g_ass = _as_int_grade(assessed_pregrade)
+    g_pred = _as_int_grade(predicted_grade)
+    resolved_grade = g_ass or g_pred  # assessed overrides predicted
+    structural = bool(has_structural_damage)
+    anchor = _anchor(resolved_grade, structural)
+
+    # Hard lock for damaged items (structural or <=4)
+    damage_locked = (anchor == "damaged")
+
+    # --------------------------
+    # Pull eBay SOLD + ACTIVE
+    # --------------------------
+    sold = await _ebay_completed_stats(keyword_query, limit=120, days_lookback=120)
+    active = await _ebay_active_stats(keyword_query, limit=120)
+
+    # normalize shapes
+    sold_count = int(sold.get("count", 0) or 0) if isinstance(sold, dict) else 0
+    active_count = int(active.get("count", 0) or 0) if isinstance(active, dict) else 0
+
+    # If eBay disabled or empty, return informative empty state
+    if not sold_count and not active_count:
+        return {
+            "available": False,
+            "message": "No sufficient eBay market data found for this item.",
+            "used_query": keyword_query,
+            "query_ladder": [keyword_query],
+            "card": {"name": n, "set": sname, "number": num, "set_code": _norm_ws((item_set or "")).strip()},
+            "observed": {"currency": "AUD", "sold": {"count": 0}, "active": {"count": 0}},
+        }
+
+    # --------------------------
+    # Value selection (best indication for THIS item)
+    # --------------------------
+    base_value = _pick_value_from_sold(sold, anchor)
+    valuation = {
+        "anchor": anchor,
+        "anchor_label": _fmt_anchor(anchor),
+        "method": "ebay_sold_p20" if anchor == "damaged" else ("ebay_sold_blend" if anchor == "low" else "ebay_sold_median"),
+        "base_value": base_value,
+        "note": "SOLD prices anchor valuation; ACTIVE listings are context only.",
     }
-    pc_cat = cat_map.get(clean_cat, "pokemon-cards")
 
-    if not PRICECHARTING_TOKEN:
-        return JSONResponse(content={
-            "available": False,
-            "mode": "click_only",
-            "message": "PRICECHARTING_TOKEN not configured on backend.",
-            "used_query": "",
-            "query_ladder": [],
-            "confidence": _clamp(_safe_float(confidence, 0.0), 0.0, 1.0),
-            "disclaimer": "Informational market context only. Not financial advice."
-        }, status_code=200)
+    # Back-compat: keep observed.raw as SOLD stats for existing UI blocks
+    raw_stats = {
+        "source": "ebay_sold",
+        "count": sold.get("count"),
+        "median": sold.get("median"),
+        "avg": sold.get("avg"),
+        "low": sold.get("low") or sold.get("p20"),
+        "high": sold.get("high") or sold.get("p80"),
+    }
 
     # --------------------------
-    # Cached CSV download
+    # Grading value summary + grade impact
     # --------------------------
-    cache_path = _pc_csv_cache_path(pc_cat)
-    max_age_hours = 24
-    try:
-        if os.path.exists(cache_path):
-            mtime = datetime.utcfromtimestamp(os.path.getmtime(cache_path))
-            if (datetime.utcnow() - mtime).total_seconds() < max_age_hours * 3600:
-                csv_text = Path(cache_path).read_text(encoding="utf-8", errors="ignore")
-            else:
-                csv_text = ""
-        else:
-            csv_text = ""
-    except Exception:
-        csv_text = ""
+    # Grading economics disabled for damaged/low. (You can enable conservative low-grade later.)
+    grading_allowed = (anchor in ("mid", "high")) and not structural
 
-    if not csv_text or len(csv_text) < 100:
-        url = f"https://www.pricecharting.com/price-guide/download-custom?t={PRICECHARTING_TOKEN}&category={pc_cat}"
-        csv_text = await _http_get_text(url)
-        if csv_text and len(csv_text) > 100:
-            try:
-                os.makedirs(PRICECHARTING_CACHE_DIR, exist_ok=True)
-                Path(cache_path).write_text(csv_text, encoding="utf-8")
-            except Exception:
-                pass
+    grade_impact = {
+        "expected_graded_value": None,
+        "raw_baseline_value": base_value,
+        "grading_cost": grading_cost,
+        "estimated_value_difference": None,
+        "recommended_buy": {"retail_loose_buy": None, "recommended_buy": None},
+    }
 
-    if not csv_text or len(csv_text) < 100:
-        return JSONResponse(content={
-            "available": False,
-            "mode": "click_only",
-            "message": "Failed to download PriceCharting CSV (empty response). Check token/category.",
-            "used_query": pc_cat,
-            "query_ladder": [pc_cat],
-            "confidence": _clamp(_safe_float(confidence, 0.0), 0.0, 1.0),
-            "disclaimer": "Informational market context only. Not financial advice."
-        }, status_code=200)
+    # If grading is allowed, keep conservative placeholders (you may extend with PSA buckets later).
+    recommendation = "do_not_grade"
+    if grading_allowed:
+        recommendation = "consider_grading"
 
-    # --------------------------
-    # Parse + match best row
-    # --------------------------
-    rows = []
-    try:
-        reader = csv.DictReader(csv_text.splitlines())
-        for r in reader:
-            rows.append(r)
-    except Exception:
-        rows = []
+    # Spoken summary must never claim PSA 9/10 when anchor is damaged/low
+    if damage_locked:
+        spoken = (
+            f"Because this item shows structural damage or very low condition (anchor: {_fmt_anchor(anchor)}), "
+            f"grading for value is not recommended. For price guidance, we anchor to recent SOLD listings "
+            f"for similar copies. Current ACTIVE listings are shown for context only."
+        )
+    elif anchor == "low":
+        spoken = (
+            f"This item appears low grade (anchor: {_fmt_anchor(anchor)}). Market guidance is anchored to SOLD results. "
+            f"Grading is generally not recommended purely for financial return at this condition, but may be considered "
+            f"for authentication or protection."
+        )
+    else:
+        spoken = (
+            f"Based on the current market, anchoring to SOLD results, this item looks more viable to grade. "
+            f"Treat ACTIVE listings as asking prices, not guarantees. Markets move quickly."
+        )
 
-    n_norm = _pc_norm(clean_name)
-    s_norm = _pc_norm(clean_set)
-    num_short = _extract_card_no_short(clean_num_display)
-
-    name_tokens = [t for t in n_norm.split() if t not in ("pokemon", "card", "cards")]
-    set_tokens = [t for t in s_norm.split() if t not in ("pokemon", "card", "cards")]
-    set_tokens = set_tokens[:4]
-
-    best = None
-    best_score = -1
-
-    for r in rows:
-        # Exact match by product id if provided (CSV column "id")
-        if pid_in:
-            rid = _norm_ws(str(r.get("id", "")))
-            if rid and rid == pid_in:
-                best = r
-                best_score = 999
-                break
-
-        pn = _pc_norm(r.get("product-name", ""))
-        cn = _pc_norm(r.get("console-name", ""))
-
-        score = 0
-        if num_short is not None:
-            if f"#{num_short}" in pn:
-                score += 12
-            elif str(num_short) in pn:
-                score += 5
-
-        if is_sealed_like:
-            # Sealed/memorabilia rows often swap "set" vs "product" wording between inputs,
-            # so we score tokens against BOTH fields.
-            for tkn in name_tokens:
-                if tkn and (tkn in pn or tkn in cn):
-                    score += 3
-
-            for tkn in set_tokens:
-                if tkn and (tkn in pn or tkn in cn):
-                    score += 2
-
-            if s_norm and (s_norm in cn or s_norm in pn):
-                score += 6
-
-            # Extra boost if inputs look swapped (set appears in product-name and name appears in console-name)
-            if n_norm and (n_norm in cn) and s_norm and (s_norm in pn):
-                score += 6
-        else:
-            for tkn in name_tokens:
-                if tkn and tkn in pn:
-                    score += 3
-
-            for tkn in set_tokens:
-                if tkn and (tkn in cn or tkn in pn):
-                    score += 2
-
-            if s_norm and s_norm in cn:
-                score += 6
-
-        if score > best_score:
-            best_score = score
-            best = r
-
-    min_score = 6 if is_sealed_like else 10
-
-    if not best or best_score < min_score:
-        return JSONResponse(content={
-            "available": True,
-            "mode": "click_only",
-            "message": "No strong PriceCharting CSV match found for this item yet.",
-            "used_query": f"{clean_name} {clean_set} {clean_num_display}".strip(),
-            "query_ladder": [clean_name, f"{clean_name} {clean_set}".strip(), f"{clean_name} {clean_set} {clean_num_display}".strip()],
-            "confidence": _clamp(_safe_float(confidence, 0.0), 0.0, 1.0),
-            "card": {"name": clean_name, "set": clean_set, "set_code": "", "year": "", "card_number": clean_num_display, "type": clean_cat},
-            "observed": {
-                "currency": "AUD",
-                "liquidity": "-",
-                "trend": "-",
-                "raw": {"median": None, "avg": None, "range": None},
-                "graded_psa": {"10": None, "9": None, "8": None},
-            },
-            "grade_impact": {
-                "expected_graded_value": None,
-                "raw_baseline_value": None,
-                "grading_cost": float(grading_cost or 0.0),
-                "estimated_value_difference": None,
-            },
-            "meta": {            },
-            "disclaimer": "Informational market context only. Figures are third-party estimates and may vary.",
-        }, status_code=200)
+    grading_value_summary = {
+        "spoken_word": spoken,
+        "recommendation": recommendation,
+        "anchor": anchor,
+        "grading_allowed": grading_allowed,
+    }
 
     # --------------------------
-    # Extract prices (CSV format)
+    # Assemble response
     # --------------------------
-    loose = _parse_money(best.get("loose-price"))
-    newp = _parse_money(best.get("new-price"))
-    graded = _parse_money(best.get("graded-price"))
-
-    cond17 = _parse_money(best.get("condition-17-price"))
-    cond16 = _parse_money(best.get("condition-16-price"))  # commonly present in your CSV
-    cond18 = _parse_money(best.get("condition-18-price"))
-    bgs10 = _parse_money(best.get("bgs-10-price"))
-
-    retail_loose_buy = _parse_money(best.get("retail-loose-buy"))
-    retail_loose_sell = _parse_money(best.get("retail-loose-sell"))
-
-    # Raw baseline: prefer loose, else new
-    raw_val = loose if loose is not None else newp
-
-    # ---- "PSA-style" anchors (equivalency, not literal PSA comps) ----
-    # IMPORTANT: We keep the UI labels familiar but we do NOT pretend these are official PSA comps.
-    # Priority:
-    # - PSA 10 equiv: BGS 10 if present, else condition-18, else graded
-    # - PSA 9 equiv: condition-17, else graded
-    # - PSA 8 equiv: graded
-    psa10_equiv = bgs10 or cond18 or graded or newp or loose
-    psa9_equiv = cond17 or graded or newp or loose
-    psa8_equiv = cond18 or graded or newp or loose
-
-    # --------------------------
-    # Liquidity & trend (if we have a product id + history)
-    # --------------------------
-    pid = (best.get("id") or "").strip()
-    liquidity = _liquidity_label(best.get("sales-volume"))
-    trend_label = "-"
-    try:
-        if pid:
-            tr = _pc_trend(pid, days=30)
-            if isinstance(tr, dict) and tr.get("available") and tr.get("label"):
-                trend_label = tr.get("label")
-    except Exception:
-        pass
-
-    # --------------------------
-    # Expected value (simple)
-    # --------------------------
-    conf_in = _clamp(_safe_float(confidence, 0.0), 0.0, 1.0)
-    g_pred = _grade_bucket(assessed_pregrade) or _grade_bucket(predicted_grade) or 9
-    dist = _grade_distribution(g_pred, conf_in)
-
-    price_map = {"10": psa10_equiv, "9": psa9_equiv, "8": psa8_equiv}
-    ev = 0.0
-    ev_samples = 0
-    for k, p in dist.items():
-        v = price_map.get(k)
-        if isinstance(v, (int, float)) and v > 0:
-            ev += float(p) * float(v)
-            ev_samples += 1
-    expected_val = round(ev, 2) if ev_samples else None
-
-    raw_base = raw_val if isinstance(raw_val, (int, float)) else None
-    diff = (round(expected_val - raw_base - float(grading_cost or 0.0), 2) if (expected_val is not None and raw_base is not None) else None)
-
-
-    # --------------------------
-    # Condition-adjusted ("as-is") view
-    # --------------------------
-    g_ass = _grade_bucket(assessed_pregrade or "") or _grade_bucket(predicted_grade or "")
-    try:
-        mult = float(condition_multiplier) if condition_multiplier is not None else None
-    except Exception:
-        mult = None
-    if mult is None:
-        mult = _condition_multiplier_from_pregrade(g_ass)
-    # Clamp to a sane range to avoid UI weirdness if a bad multiplier is posted
-    mult = max(0.02, min(1.10, float(mult)))
-    bucket = _condition_bucket_from_pregrade(g_ass)
-    # --------------------------
-    # Recommended purchase price
-    # --------------------------
-    try:
-        pg = float(str(predicted_grade or "").strip() or 0)
-    except Exception:
-        pg = 0.0
-
-    base_buy = retail_loose_buy
-    if base_buy is None and isinstance(raw_base, (int, float)) and raw_base > 0:
-        base_buy = round(raw_base * 0.70, 2)  # conservative fallback if retail buy not provided
-
-    # condition factor based on assessed grade (simple, explainable)
-    cond_factor = max(0.60, min(1.10, 0.40 + 0.07 * pg)) if pg else 0.85
-    conf_factor = max(0.0, min(1.0, float(conf_in or 0.0)))
-
-    assume_grading = False
-
-    rec_buy = None
-    note = []
-
-    if base_buy is not None:
-        rec_buy = float(base_buy) * float(cond_factor) * float(conf_factor)
-        note.append("Baseline uses retail-loose-buy adjusted by assessed grade & confidence.")
-    # cap recommended buy to observed raw value if we have one
-    if rec_buy is not None and raw_base is not None:
-        rec_buy = min(float(rec_buy), float(raw_base))
-
-    
-        # --- AUD conversion (simple multiplier) ---
-    aud_raw = _usd_to_aud_simple(raw_val) if raw_val is not None else None
-    aud_psa10 = _usd_to_aud_simple(psa10_equiv) if psa10_equiv is not None else None
-    aud_psa9 = _usd_to_aud_simple(psa9_equiv) if psa9_equiv is not None else None
-    aud_psa8 = _usd_to_aud_simple(psa8_equiv) if psa8_equiv is not None else None
-    aud_expected = _usd_to_aud_simple(expected_val) if expected_val is not None else None
-    aud_rec_buy = _usd_to_aud_simple(rec_buy) if rec_buy is not None else None
-
-    rec_buy = (round(float(rec_buy), 2) if rec_buy is not None else None)
-
-    # --- Grading value summary (spoken word) ---
-    card_label = f"your {clean_name}" if clean_name else "this card"
-
-    g_ass = _grade_bucket(assessed_pregrade or "") or _grade_bucket(predicted_grade or "")
-    mult = float(condition_multiplier) if isinstance(condition_multiplier, (int, float)) else _condition_multiplier_from_pregrade(g_ass)
-    raw_as_is_aud = (_usd_to_aud_simple(raw_val) * float(mult)) if (raw_val is not None and _usd_to_aud_simple(raw_val) is not None) else None
-
-    # If structural damage is present, collapse values aggressively and disable graded EV math.
-    if damage_flag:
-        if isinstance(raw_as_is_aud, (int, float)):
-            raw_as_is_aud = round(float(raw_as_is_aud) * 0.15, 2)  # damaged copies typically trade at a small fraction
-        expected_graded_aud = None
-
-
-    expected_graded_aud = _usd_to_aud_simple(expected_val) if expected_val is not None else None
-    grading_value_summary = _grading_value_summary(
-        card_label=card_label,
-        predicted_grade_str=str(g_pred or assessed_pregrade or predicted_grade or ""),
-        conf_in=conf_in,
-        assessed_grade_int=g_ass,
-        has_structural_damage=bool(damage_flag),
-        grading_cost_aud=float(grading_cost or 0.0),
-        raw_as_is_aud=raw_as_is_aud,
-        expected_graded_aud=expected_graded_aud,
-        liquidity=liquidity,
-        trend=trend_label,
-    )
-
-
-    mode = "damage_locked" if damage_flag else "click_only"
-    disclaimer = "Damaged-condition informational context only. High-grade values do not apply to this copy." if damage_flag else "Informational market context only. Figures are third-party estimates and may vary."
-
-    # UI expects these keys
-    return JSONResponse(content={
+    resp = {
         "available": True,
-        "mode": mode,
-        "message": "Market history loaded",
-        "used_query": f"{clean_name} {clean_set} {clean_num_display}".strip(),
-        "query_ladder": [clean_name, f"{clean_name} {clean_set}".strip(), f"{clean_name} {clean_set} {clean_num_display}".strip()],
-        "confidence": conf_in,
-
-        "card": {
-            "name": clean_name,
-            "set": clean_set,
-            "set_code": "",
-            "year": "",
-            "card_number": clean_num_display,
-            "type": clean_cat,
-        },
-
+        "mode": "damage_locked" if damage_locked else "ok",
+        "has_structural_damage": structural,
+        "confidence": confidence,
+        "card": {"name": n, "set": sname, "number": num, "set_code": _norm_ws((item_set or "")).strip()},
+        "used_query": keyword_query,
+        "query_ladder": [keyword_query],
+        "valuation": valuation,
         "observed": {
             "currency": "AUD",
-            "fx": {"usd_to_aud_multiplier": AUD_MULTIPLIER},
-            "aud": {"raw_median": aud_raw, "psa10": aud_psa10, "psa9": aud_psa9, "psa8": aud_psa8},
-            "liquidity": liquidity,
-            "trend": trend_label,
-            "raw": {
-                "median": raw_val,
-                "avg": raw_val,
-                "range": None,
+            "raw": raw_stats,
+            "sold": {
+                "source": "ebay_sold",
+                "query": sold.get("query", keyword_query),
+                "count": sold.get("count"),
+                "low": sold.get("low") or sold.get("p20"),
+                "median": sold.get("median"),
+                "high": sold.get("high") or sold.get("p80"),
+                "avg": sold.get("avg"),
             },
-            "graded_psa": {
-                "10": psa10_equiv,
-                "9": psa9_equiv,
-                "8": psa8_equiv,
-            },
-            "as_is": {
-                "multiplier": mult,
-                "bucket": bucket,
-                "raw_as_is_aud": _safe_money_mul(aud_raw, mult),
-                "psa10_equiv_as_is_aud": _safe_money_mul(aud_psa10, mult),
-                "psa9_equiv_as_is_aud": _safe_money_mul(aud_psa9, mult),
-                "psa8_equiv_as_is_aud": _safe_money_mul(aud_psa8, mult),
-                "recommended_buy_aud": aud_rec_buy,
+            "active": {
+                "source": "ebay_active",
+                "query": active.get("query", keyword_query),
+                "count": active.get("count"),
+                "low": active.get("low") or active.get("p20"),
+                "median": active.get("median"),
+                "high": active.get("high") or active.get("p80"),
+                "avg": active.get("avg"),
             },
         },
-
-        "grade_impact": {
-            "expected_graded_value": expected_val,
-            "expected_graded_value_aud": aud_expected,
-            "raw_baseline_value": raw_base,
-            "grading_cost": float(grading_cost or 0.0),
-            "estimated_value_difference": diff,
-            "recommended_buy": {
-                "currency": "AUD",
-                "retail_loose_buy": retail_loose_buy,
-                "retail_loose_sell": retail_loose_sell,
-                "recommended_purchase_price": rec_buy,
-                "recommended_purchase_price_aud": aud_rec_buy,                "notes": " ".join(note) if isinstance(note, list) else "",
-            },
-        },
-
-        "meta": {
-            "match": {
-                "id": pid,
-                "product_name": best.get("product-name"),
-                "console_name": best.get("console-name"),
-                "sales_volume": best.get("sales-volume"),
-            },            "sources": ["pricecharting_csv"],
-            "raw_fields": {
-                "loose_price": loose,
-                "new_price": newp,
-                "graded_price": graded,
-                "condition_17_price": cond17,
-                "condition_18_price": cond18,
-                "bgs_10_price": bgs10,
-            }
-        },
-
+        "graded_psa": {},  # reserved for future grade-bucket comps
+        "grade_impact": grade_impact,
         "grading_value_summary": grading_value_summary,
-
-        "disclaimer": "Informational market context only. Figures are third-party estimates and may vary. Not financial advice.",
-    }, status_code=200)
-
+        "disclaimer": (
+            "Informational market context only. SOLD listings are historical; ACTIVE listings are current asks. "
+            "Figures are third-party estimates and may vary. Not financial advice."
+        ),
+    }
+    return resp
 @app.post("/api/market-context-item")
 
 @safe_endpoint
