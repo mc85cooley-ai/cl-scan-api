@@ -2339,3 +2339,103 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "10000"))
     uvicorn.run("main:app", host="0.0.0.0", port=port)
+
+
+def _normalize_num_variants(card_number: str) -> List[str]:
+    """
+    Return card number variants commonly used in listings:
+      "004/102" -> ["4/102","4","#4"]
+      "4/102"   -> ["4/102","4","#4"]
+      "4"       -> ["4","#4"]
+    """
+    s = _norm_ws(str(card_number or ""))
+    if not s:
+        return []
+    m = re.search(r"(\d+)\s*/\s*(\d+)", s)
+    out = []
+    if m:
+        left = str(int(m.group(1)))
+        right = str(int(m.group(2)))
+        out.append(f"{left}/{right}")
+        out.append(left)
+        out.append(f"#{left}")
+        return out
+    m2 = re.search(r"(\d+)", s)
+    if m2:
+        left = str(int(m2.group(1)))
+        return [left, f"#{left}"]
+    return [s]
+
+def _dedupe_tokens(q: str) -> str:
+    """Remove immediate duplicate phrases like 'Base Set Base Set' and collapse whitespace."""
+    q = _norm_ws(q)
+    # remove duplicated bigrams/phrases conservatively
+    q = re.sub(r"\b(Base Set)\s+\1\b", r"\1", q, flags=re.I)
+    q = re.sub(r"\b(Shadowless)\s+\1\b", r"\1", q, flags=re.I)
+    q = re.sub(r"\b(1st Edition)\s+\1\b", r"\1", q, flags=re.I)
+    q = re.sub(r"\s+", " ", q).strip()
+    return q
+
+def _build_ebay_query_ladder(card_name: str, set_name: str, set_code: str, card_number: str, card_type: str) -> List[str]:
+    """
+    Build a resilient eBay keyword ladder. Start specific, progressively relax:
+      1) name + set + number (number variants)
+      2) name + set (and 1st edition cues if present)
+      3) name + number
+      4) name + tcg + 'card'
+      5) name only
+    """
+    name = _norm_ws(card_name)
+    sname = _norm_ws(set_name)
+    scode = _norm_ws(set_code)
+    ctype = (_norm_ws(card_type) or "Pokemon")
+    nums = _normalize_num_variants(card_number)
+
+    # detect common variant cues in name/set
+    is_first = bool(re.search(r"\b1st\b|\bfirst\b", name, flags=re.I))
+    first_phrase = "1st Edition" if is_first else ""
+
+    # prefer set_name; set_code is usually not in listings, but keep as fallback rung
+    set_terms = [t for t in [sname, scode] if t]
+    ladder = []
+
+    # rung 1: name + set + number variants
+    for st in set_terms[:1] or [""]:
+        for nv in nums[:2] or [""]:
+            if st and nv:
+                ladder.append(_dedupe_tokens(f"{name} {st} {nv}"))
+                if first_phrase:
+                    ladder.append(_dedupe_tokens(f"{name} {first_phrase} {st} {nv}"))
+
+    # rung 2: name + set
+    for st in set_terms[:1] or [""]:
+        if st:
+            ladder.append(_dedupe_tokens(f"{name} {st}"))
+            if first_phrase:
+                ladder.append(_dedupe_tokens(f"{name} {first_phrase} {st}"))
+        if st and "Base Set" in st and first_phrase:
+            ladder.append(_dedupe_tokens(f"{name} {first_phrase} Base Set"))
+
+    # rung 3: name + number only (good when set noise hurts)
+    for nv in nums[:2]:
+        ladder.append(_dedupe_tokens(f"{name} {nv}"))
+
+    # rung 4: name + tcg card
+    ladder.append(_dedupe_tokens(f"{name} {ctype} card"))
+
+    # rung 5: name only
+    ladder.append(_dedupe_tokens(f"{name}"))
+
+    # remove empties + duplicates preserving order
+    seen = set()
+    out = []
+    for q in ladder:
+        q = _norm_ws(q)
+        if not q:
+            continue
+        if q.lower() in seen:
+            continue
+        seen.add(q.lower())
+        out.append(q)
+    return out
+
