@@ -2798,7 +2798,7 @@ Respond ONLY with JSON, no extra text.
         except Exception:
             pass
 
-defect_snaps.sort(key=lambda x: (0 if x.get("type") != "hotspot" else 1, -float(x.get("confidence") or 0.0)))
+    defect_snaps.sort(key=lambda x: (0 if x.get("type") != "hotspot" else 1, -float(x.get("confidence") or 0.0)))
     defect_snaps = defect_snaps[:8]
 
     def _snap_category(s: Dict[str, Any]) -> str:
