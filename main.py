@@ -2689,6 +2689,9 @@ Respond ONLY with JSON, no extra text.
             return True
         return False
 
+    # wanted_rois is used as an optional override (mainly for cards). For sealed/memorabilia we keep it empty unless we add a dedicated mapping.
+    wanted_rois: set = set()
+
     for i, r in enumerate((rois or [])[:10]):
         src = b1 if r.get("side") == "front" else b2
         if not src:
