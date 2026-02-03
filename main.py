@@ -69,35 +69,37 @@ def _make_thumb_from_bbox(img_bytes: bytes, bbox: Dict[str, Any], max_size: int 
         w, h = im.size
         x = float(bbox.get("x", 0.0)); y = float(bbox.get("y", 0.0))
         bw = float(bbox.get("w", 1.0)); bh = float(bbox.get("h", 1.0))
-        px1 = max(0, min(w-1, int(round(x * w))))
-        py1 = max(0, min(h-1, int(round(y * h))))
+
+        # Convert normalized bbox -> pixel bbox
+        px1 = max(0, min(w - 1, int(round(x * w))))
+        py1 = max(0, min(h - 1, int(round(y * h))))
         px2 = max(1, min(w, int(round((x + bw) * w))))
         py2 = max(1, min(h, int(round((y + bh) * h))))
         if px2 <= px1 or py2 <= py1:
             return ""
 
-        crop = im.crop((px1, py1, px2, py2))
+        # Focused square crop around the bbox (prevents long edge strips in thumbnails)
+        cx = (px1 + px2) / 2.0
+        cy = (py1 + py2) / 2.0
+        box_w = float(px2 - px1)
+        box_h = float(py2 - py1)
+        side = max(box_w, box_h) * 1.9  # padding factor
+        side = max(80.0, min(side, float(min(w, h))))
 
-        # Resize (preserve aspect) to fit within max_size
-        cw, ch = crop.size
-        if cw <= 0 or ch <= 0:
+        sx1 = int(round(cx - side / 2.0))
+        sy1 = int(round(cy - side / 2.0))
+        sx2 = int(round(cx + side / 2.0))
+        sy2 = int(round(cy + side / 2.0))
+        sx1 = max(0, sx1); sy1 = max(0, sy1)
+        sx2 = min(w, sx2); sy2 = min(h, sy2)
+        if sx2 <= sx1 or sy2 <= sy1:
             return ""
-        scale = min(1.0, float(max_size) / float(max(cw, ch)))
-        if scale < 1.0:
-            crop = crop.resize((max(1, int(cw * scale)), max(1, int(ch * scale))), resample=Image.BICUBIC)
 
-        # Letterbox to a square canvas (uniform tiles in UI)
-        tw, th = crop.size
-        side = max(tw, th)
-        canvas = Image.new("RGB", (side, side), (0, 0, 0))
-        canvas.paste(crop, ((side - tw)//2, (side - th)//2))
-
-        # Final downscale to max_size square (if needed)
-        if side > max_size:
-            canvas = canvas.resize((max_size, max_size), resample=Image.BICUBIC)
+        crop = im.crop((sx1, sy1, sx2, sy2))
+        crop = crop.resize((max_size, max_size), resample=Image.BICUBIC)
 
         buf = io.BytesIO()
-        canvas.save(buf, format="JPEG", quality=82, optimize=True)
+        crop.save(buf, format="JPEG", quality=82, optimize=True)
         return _b64(buf.getvalue())
     except Exception:
         return ""
@@ -2360,6 +2362,66 @@ Respond ONLY with JSON, no extra text.
         # Frontend may expect "grade" - mirror status for compatibility
         seal["grade"] = seal.get("status", "Not Applicable")
 
+    # ------------------------------
+    # CV-assisted defect closeups (defect_snaps) for sealed/memorabilia
+    # ------------------------------
+    # Use the first two images as "front/back" equivalents for CV ROI proposals.
+    rois: List[Dict[str, Any]] = []
+    try:
+        rois = _cv_candidate_bboxes(b1, "front") + _cv_candidate_bboxes(b2, "back")
+    except Exception:
+        rois = []
+
+    roi_labels: List[Dict[str, Any]] = []
+    try:
+        roi_labels = await _openai_label_rois(rois, b1, b2) if rois else []
+    except Exception:
+        roi_labels = []
+
+    defect_snaps: List[Dict[str, Any]] = []
+    label_by_idx = {int(x.get("crop_index", -1)): x for x in (roi_labels or []) if isinstance(x, dict)}
+    for i, r in enumerate((rois or [])[:10]):
+        src = b1 if r.get("side") == "front" else b2
+        if not src:
+            continue
+        bbox = r.get("bbox") or {}
+        thumb = _make_thumb_from_bbox(src, bbox, max_size=520)
+        if not thumb:
+            continue
+        lab = label_by_idx.get(i) or {}
+        is_def = bool(lab.get("is_defect", False))
+        dtype = lab.get("type") if is_def else "hotspot"
+        note = lab.get("note") if lab else f"CV hotspot: {r.get('roi')}"
+        conf = lab.get("confidence") if lab else 0.0
+        defect_snaps.append({
+            "side": r.get("side"),
+            "roi": r.get("roi"),
+            "type": dtype,
+            "note": _norm_ws(str(note))[:220],
+            "confidence": _clamp(_safe_float(conf, 0.0), 0.0, 1.0),
+            "bbox": bbox,
+            "thumbnail_b64": thumb,
+        })
+
+    defect_snaps.sort(key=lambda x: (0 if x.get("type") != "hotspot" else 1, -float(x.get("confidence") or 0.0)))
+    defect_snaps = defect_snaps[:8]
+
+    def _snap_category(s: Dict[str, Any]) -> str:
+        t = str(s.get("type") or "").lower()
+        roi = str(s.get("roi") or "").lower()
+        if "corner" in t or roi.startswith("corner_"):
+            return "packaging"
+        if "edge" in t or roi.startswith("edge_"):
+            return "packaging"
+        if "surface" in t:
+            return "packaging"
+        return "other"
+
+    for idx, s in enumerate(defect_snaps, start=1):
+        s["id"] = idx
+        s["ref"] = f"#{idx}"
+        s["category"] = _snap_category(s)
+
     return JSONResponse(content={
         "condition_grade": _norm_ws(str(data.get("condition_grade", "N/A"))),
         "confidence": _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0),
@@ -2372,6 +2434,7 @@ Respond ONLY with JSON, no extra text.
         "spoken_word": _norm_ws(str(data.get("spoken_word", ""))) or _norm_ws(str(data.get("overall_assessment", ""))),
         "observed_id": data.get("observed_id", {}) if isinstance(data.get("observed_id", {}), dict) else {},
         "flags": flags_list_out,
+        "defect_snaps": defect_snaps,
         "verify_token": f"vfy_{secrets.token_urlsafe(12)}",
     })
 
