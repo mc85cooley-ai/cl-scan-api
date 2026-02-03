@@ -1970,7 +1970,7 @@ Return ONLY valid JSON:
     defect_snaps: List[Dict[str, Any]] = []
     label_by_idx = {int(x.get("crop_index", -1)): x for x in (roi_labels or []) if isinstance(x, dict)}
     for i, r in enumerate((rois or [])[:10]):
-        src = b1 if r.get("side") == "front" else b2
+        src = front_bytes if r.get("side") == "front" else back_bytes
         if not src:
             continue
         bbox = r.get("bbox") or {}
