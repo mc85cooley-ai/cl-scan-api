@@ -54,8 +54,14 @@ except Exception:
 PIL_AVAILABLE = bool(Image)
 
 
-def _make_thumb_from_bbox(img_bytes: bytes, bbox: Dict[str, Any], max_size: int = 520) -> str:
-    """Crop a normalized bbox out of an image and return base64 JPEG."""
+def _make_thumb_from_bbox(img_bytes: bytes, bbox: Dict[str, Any], max_size: int = 360) -> str:
+    """
+    Crop a normalized bbox out of an image and return base64 JPEG.
+
+    Notes:
+      - Produces a consistent square thumbnail (letterboxed) so the UI grid stays uniform.
+      - Uses a slightly smaller max_size to reduce visual clutter + payload.
+    """
     if not PIL_AVAILABLE or not img_bytes or not bbox:
         return ""
     try:
@@ -69,14 +75,29 @@ def _make_thumb_from_bbox(img_bytes: bytes, bbox: Dict[str, Any], max_size: int 
         py2 = max(1, min(h, int(round((y + bh) * h))))
         if px2 <= px1 or py2 <= py1:
             return ""
+
         crop = im.crop((px1, py1, px2, py2))
-        # Resize to max_size while preserving aspect
+
+        # Resize (preserve aspect) to fit within max_size
         cw, ch = crop.size
-        scale = min(1.0, float(max_size) / max(cw, ch))
+        if cw <= 0 or ch <= 0:
+            return ""
+        scale = min(1.0, float(max_size) / float(max(cw, ch)))
         if scale < 1.0:
-            crop = crop.resize((max(1,int(cw*scale)), max(1,int(ch*scale))))
+            crop = crop.resize((max(1, int(cw * scale)), max(1, int(ch * scale))), resample=Image.BICUBIC)
+
+        # Letterbox to a square canvas (uniform tiles in UI)
+        tw, th = crop.size
+        side = max(tw, th)
+        canvas = Image.new("RGB", (side, side), (0, 0, 0))
+        canvas.paste(crop, ((side - tw)//2, (side - th)//2))
+
+        # Final downscale to max_size square (if needed)
+        if side > max_size:
+            canvas = canvas.resize((max_size, max_size), resample=Image.BICUBIC)
+
         buf = io.BytesIO()
-        crop.save(buf, format="JPEG", quality=85, optimize=True)
+        canvas.save(buf, format="JPEG", quality=82, optimize=True)
         return _b64(buf.getvalue())
     except Exception:
         return ""
@@ -84,6 +105,10 @@ def _make_thumb_from_bbox(img_bytes: bytes, bbox: Dict[str, Any], max_size: int 
 def _cv_candidate_bboxes(img_bytes: bytes, side: str) -> List[Dict[str, Any]]:
     """
     Light CV assist to propose 'hotspot' regions near borders where whitening/edge wear is likely.
+
+    Upgrade (Feb 2026):
+      - For edges, we *do not* return a full-length strip anymore (those thumbnails looked huge / unfocused).
+      - Instead, we sample multiple smaller segments along each edge and keep the highest-scoring segment.
     Returns normalized bboxes: {side, roi, score, bbox:{x,y,w,h}}
     """
     if not PIL_AVAILABLE or not img_bytes:
@@ -101,31 +126,63 @@ def _cv_candidate_bboxes(img_bytes: bytes, side: str) -> List[Dict[str, Any]]:
             be = ImageStat.Stat(ce).mean[0] / 255.0
             return 0.65 * be + 0.35 * bg
 
-        rois = []
-        t = max(6, int(0.08 * min(w, h)))  # edge strips
-        roi_defs = [
-            ("edge_top", (0, 0, w, t)),
-            ("edge_bottom", (0, h - t, w, h)),
-            ("edge_left", (0, 0, t, h)),
-            ("edge_right", (w - t, 0, w, h)),
-        ]
-        c = max(18, int(0.18 * min(w, h)))  # corners
-        roi_defs += [
+        rois: List[Dict[str, Any]] = []
+
+        # Edge strips (thin) + segmenting along the long axis
+        t = max(6, int(0.06 * min(w, h)))  # thinner than before
+        segs = 3  # number of segments per edge
+
+        def best_edge_segment(name: str, segments: List[tuple]) -> Optional[Dict[str, Any]]:
+            best = None
+            best_s = -1.0
+            for (px, py, px2, py2) in segments:
+                s = float(score_box(px, py, px2, py2))
+                if s > best_s:
+                    best_s = s
+                    best = (px, py, px2, py2)
+            if not best:
+                return None
+            px, py, px2, py2 = best
+            bbox = {"x": round(px / w, 4), "y": round(py / h, 4),
+                    "w": round((px2 - px) / w, 4), "h": round((py2 - py) / h, 4)}
+            return {"side": side, "roi": name, "score": round(best_s, 4), "bbox": bbox}
+
+        # Build segmented edges
+        step_x = max(1, w // segs)
+        step_y = max(1, h // segs)
+
+        top_segments = [(i * step_x, 0, min(w, (i + 1) * step_x), t) for i in range(segs)]
+        bottom_segments = [(i * step_x, h - t, min(w, (i + 1) * step_x), h) for i in range(segs)]
+        left_segments = [(0, i * step_y, t, min(h, (i + 1) * step_y)) for i in range(segs)]
+        right_segments = [(w - t, i * step_y, w, min(h, (i + 1) * step_y)) for i in range(segs)]
+
+        for nm, seg in [("edge_top", top_segments),
+                        ("edge_bottom", bottom_segments),
+                        ("edge_left", left_segments),
+                        ("edge_right", right_segments)]:
+            r = best_edge_segment(nm, seg)
+            if r:
+                rois.append(r)
+
+        # Corners (slightly smaller than before to keep close-up tight)
+        c = max(16, int(0.16 * min(w, h)))
+        corner_defs = [
             ("corner_top_left", (0, 0, c, c)),
             ("corner_top_right", (w - c, 0, w, c)),
             ("corner_bottom_left", (0, h - c, c, h)),
             ("corner_bottom_right", (w - c, h - c, w, h)),
         ]
-
-        for name, (px, py, px2, py2) in roi_defs:
+        for name, (px, py, px2, py2) in corner_defs:
             s = float(score_box(px, py, px2, py2))
             bbox = {"x": round(px / w, 4), "y": round(py / h, 4),
                     "w": round((px2 - px) / w, 4), "h": round((py2 - py) / h, 4)}
             rois.append({"side": side, "roi": name, "score": round(s, 4), "bbox": bbox})
 
+        # Rank & keep a small set
         rois.sort(key=lambda r: r.get("score", 0.0), reverse=True)
-        corners = [r for r in rois if str(r.get("roi","")).startswith("corner_")]
-        edges = [r for r in rois if str(r.get("roi","")).startswith("edge_")]
+        corners = [r for r in rois if str(r.get("roi", "")).startswith("corner_")]
+        edges = [r for r in rois if str(r.get("roi", "")).startswith("edge_")]
+
         out = (corners[:4] + edges[:2])
         seen = set()
         final = []
@@ -137,6 +194,7 @@ def _cv_candidate_bboxes(img_bytes: bytes, side: str) -> List[Dict[str, Any]]:
         return final
     except Exception:
         return []
+
 
 async def _openai_label_rois(rois: List[Dict[str, Any]], front_bytes: Optional[bytes], back_bytes: Optional[bytes]) -> List[Dict[str, Any]]:
     """
@@ -1924,6 +1982,7 @@ Return ONLY valid JSON:
         conf = lab.get("confidence") if lab else 0.0
         defect_snaps.append({
             "side": r.get("side"),
+            "roi": r.get("roi"),
             "type": dtype,
             "note": _norm_ws(str(note))[:220],
             "confidence": _clamp(_safe_float(conf, 0.0), 0.0, 1.0),
@@ -1933,6 +1992,25 @@ Return ONLY valid JSON:
 
     defect_snaps.sort(key=lambda x: (0 if x.get("type") != "hotspot" else 1, -float(x.get("confidence") or 0.0)))
     defect_snaps = defect_snaps[:8]
+
+    # Add stable IDs + coarse categories for UI linking (photos <-> bullet refs)
+    def _snap_category(s: Dict[str, Any]) -> str:
+        t = str(s.get("type") or "").lower()
+        roi = str(s.get("roi") or "").lower()
+        if "corner" in t or roi.startswith("corner_"):
+            return "corners"
+        if "edge" in t or roi.startswith("edge_"):
+            return "edges"
+        if "surface" in t:
+            return "surface"
+        if "cent" in t:
+            return "centering"
+        return "other"
+
+    for idx, s in enumerate(defect_snaps, start=1):
+        s["id"] = idx
+        s["ref"] = f"#{idx}"
+        s["category"] = _snap_category(s)
 
     # Normalize flags/defects and compute structural-damage indicator
     flags_raw = data.get("flags", [])
