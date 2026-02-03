@@ -58,7 +58,15 @@ FX_CACHE_SECONDS = int(os.getenv("FX_CACHE_SECONDS", "3600"))
 # ==============================
 app = FastAPI(title="Collectors League Scan API")
 
-ALLOWED_ORIGINS = ["*"]
+ALLOWED_ORIGINS = [
+    "https://collectors-league.com",
+    "https://www.collectors-league.com",
+    "http://localhost",
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "*",
+]
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
