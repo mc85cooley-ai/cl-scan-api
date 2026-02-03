@@ -2544,6 +2544,167 @@ async def market_context(
 
     exclude_graded_effective = EXCLUDE_GRADED_DEFAULT if exclude_graded is None else bool(exclude_graded)
 
+    
+    # --------------------------
+    # PriceCharting fallback (sealed / memorabilia + when eBay disabled)
+    # --------------------------
+    def _looks_like_memorabilia(it: Optional[str], desc: Optional[str]) -> bool:
+        s = " ".join([str(it or ""), str(desc or "")]).lower()
+        if not s.strip():
+            return False
+        # Heuristic keywords for non-single-card items
+        return any(k in s for k in [
+            "sealed", "booster box", "booster pack", "etb", "elite trainer", "tin", "collection box",
+            "blister", "case", "hobby box", "display", "starter deck", "theme deck",
+            "memorabilia", "autograph", "signed", "jersey", "patch", "slab", "graded",
+            "dvd", "vhs", "figure", "funko", "comic", "poster"
+        ])
+
+    async def _market_context_pricecharting(query_str: str, category_hint: str = "", pid: str = "") -> Dict[str, Any]:
+        qs = _norm_ws(query_str).strip()
+        if not qs:
+            return {"available": False, "message": "Empty query."}
+
+        if not PRICECHARTING_TOKEN:
+            return {
+                "available": False,
+                "message": "Market context is not configured (PriceCharting token missing).",
+                "used_query": qs,
+                "query_ladder": ladder,
+            }
+
+        # Light category mapping (PriceCharting categories vary; empty is ok)
+        cat_map = {
+            "pokemon": "pokemon-cards",
+            "magic": "magic-cards",
+            "yugioh": "yugioh-cards",
+            "sports": "sports-cards",
+            "onepiece": "one-piece-cards",
+        }
+        cat = cat_map.get((ctype or "").lower(), "")
+        if category_hint:
+            cat = category_hint
+
+        best = {}
+        detail = {}
+        used_pid = str(pid or "").strip()
+
+        if used_pid:
+            detail = await _pc_product(used_pid)
+            best = detail or {}
+        else:
+            products = await _pc_search(qs, category=cat or None, limit=10)
+            if not products:
+                return {
+                    "available": False,
+                    "message": "No sufficient PriceCharting market data found for this item.",
+                    "used_query": qs,
+                    "query_ladder": ladder,
+                    "observed": {"currency": "AUD", "active": {"count": 0}, "sold": {"count": 0}},
+                }
+            best = products[0]
+            used_pid = str(best.get("id") or best.get("product-id") or "").strip()
+            detail = await _pc_product(used_pid) if used_pid else {}
+
+        merged = {}
+        if isinstance(best, dict):
+            merged.update(best)
+        if isinstance(detail, dict):
+            merged.update(detail)
+
+        title = _norm_ws(str(merged.get("product-name") or merged.get("name") or merged.get("title") or qs))
+        url = str(merged.get("url") or best.get("url") or "")
+
+        prices_usd = _pc_extract_price_fields(merged)
+        vals_usd = [float(v) for v in prices_usd.values() if isinstance(v, (int, float)) and float(v) > 0]
+        vals_aud = [_usd_to_aud_simple(v) for v in vals_usd]
+        vals_aud = [v for v in vals_aud if isinstance(v, (int, float)) and v > 0]
+
+        if not vals_aud:
+            return {
+                "available": False,
+                "message": "No sufficient PriceCharting market data found for this item.",
+                "used_query": qs,
+                "query_ladder": ladder,
+                "observed": {"currency": "AUD", "active": {"count": 0}, "sold": {"count": 0}},
+            }
+
+        vals_sorted = sorted(vals_aud)
+        def _pct(p: float) -> float:
+            if not vals_sorted:
+                return 0.0
+            k = int(round((len(vals_sorted) - 1) * p))
+            k = max(0, min(len(vals_sorted) - 1, k))
+            return float(vals_sorted[k])
+
+        p20 = round(_pct(0.20), 2)
+        p50 = round(_pct(0.50), 2)
+        p80 = round(_pct(0.80), 2)
+        cnt = len(vals_sorted)
+
+        # Build "matches" from available price fields (acts like comps for the UI)
+        active_matches: List[Dict[str, Any]] = []
+        for k, v in prices_usd.items():
+            if not isinstance(v, (int, float)) or float(v) <= 0:
+                continue
+            active_matches.append({
+                "title": f"{title} — {k.replace('_',' ').title()}",
+                "price": _usd_to_aud_simple(v),
+                "condition": k.replace("_", " "),
+                "score": None,
+                "url": url,
+                "source": "PriceCharting",
+            })
+        active_matches = active_matches[:5]
+
+        # Collector-style summary (works for both cards + sealed)
+        vibe = "moving" if cnt >= 4 else "thin"
+        summary = (
+            f"For {title}, PriceCharting has a {vibe} read right now. "
+            f"Across the available condition buckets, you’re roughly looking at "
+            f"{p20:.0f}–{p80:.0f} AUD, with a typical middle around {p50:.0f} AUD. "
+            f"Treat this as a guide and sanity-check against live listings for your exact variant/condition."
+        )
+
+        return {
+            "available": True,
+            "mode": "pricecharting",
+            "market_summary": summary,
+            "used_query": qs,
+            "query_ladder": ladder,
+            "confidence": confidence,
+            "card": {
+                "name": n,
+                "set": sname,
+                "number": num_display,
+                "set_code": set_code_hint,
+            },
+            "observed": {
+                "currency": "AUD",
+                "fx": {"usd_to_aud_multiplier": AUD_MULTIPLIER},
+                "active": {"p20": p20, "p50": p50, "p80": p80, "count": cnt},
+                "sold": {"count": 0},
+                "liquidity": "medium" if cnt >= 4 else "low",
+                "trend": "—",
+                "raw": {"pricecharting_product_id": used_pid, "url": url, "prices_usd": prices_usd},
+            },
+            "active_matches": active_matches,
+            "graded": {},  # sealed/memorabilia typically not bucketed by PSA grades
+            "grade_outcome": {"assessed_grade": resolved_grade, "expected_value_aud": p50} if resolved_grade else {"expected_value_aud": p50},
+            "disclaimer": "Informational market context only. Figures are third-party estimates and may vary. Not financial advice.",
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        }
+
+    # --------------------------
+    # Market source priority
+    # --------------------------
+    # Source 1: eBay ACTIVE (when enabled)
+    # Source 2: PriceCharting fallback (when eBay disabled OR eBay returns thin/empty results)
+    if not USE_EBAY_API:
+        # eBay not enabled in this deployment — fall back to PriceCharting.
+        q_pc = _norm_ws(item_name or n or description or "").strip()
+        return await _market_context_pricecharting(q_pc, category_hint="", pid=product_id or "")
+
     # --------------------------
     # eBay active fetcher (Browse API)
     # --------------------------
@@ -2809,6 +2970,14 @@ async def market_context(
     active_matches = best_matches
     active_stats = best_stats or {"count": 0, "low": None, "median": None, "high": None, "currency": "AUD"}
     active_debug = best_debug or {}
+
+    # If eBay comes back empty/thin (common for niche sealed/memorabilia wording),
+    # fall back to PriceCharting *only if configured*.
+    if int(active_stats.get("count") or 0) == 0 and PRICECHARTING_TOKEN:
+        q_pc = _norm_ws(item_name or n or description or used_query or "").strip()
+        pc_payload = await _market_context_pricecharting(q_pc, category_hint="", pid=product_id or "")
+        if pc_payload.get("available"):
+            return pc_payload
 
     # --------------------------
     # Graded buckets (ACTIVE only; brand-agnostic)
