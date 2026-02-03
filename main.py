@@ -111,6 +111,89 @@ def _relax_whitening_mm_in_obj(obj):
         return {k: _relax_whitening_mm_in_obj(v) for k, v in obj.items()}
     return obj
 
+
+def _wanted_rois_from_assessment(data: Dict[str, Any]) -> set:
+    """Infer which ROI crops we should show from the structured assessment.
+
+    We use this to ensure the UI gets at least one close-up for defects that
+    are clearly flagged (e.g., red bullets / corner whitening), even if the ROI
+    labeler returns "clean".
+
+    Returns a set of tuples: {(side, roi), ...}
+    """
+    wanted = set()
+    if not isinstance(data, dict):
+        return wanted
+
+    # Corners -> map corner keys to ROI names
+    corner_map = {
+        "top_left": "corner_top_left",
+        "top_right": "corner_top_right",
+        "bottom_left": "corner_bottom_left",
+        "bottom_right": "corner_bottom_right",
+    }
+    corners = data.get("corners") or {}
+    if isinstance(corners, dict):
+        for side in ("front", "back"):
+            s_obj = corners.get(side) or {}
+            if not isinstance(s_obj, dict):
+                continue
+            for ck, roi in corner_map.items():
+                c_obj = s_obj.get(ck) or {}
+                if not isinstance(c_obj, dict):
+                    continue
+                cond = str(c_obj.get("condition") or "").strip().lower()
+                note = str(c_obj.get("notes") or "").strip().lower()
+                # Anything other than "sharp"/"clean" should be treated as a defect for evidence.
+                if cond and cond not in {"sharp", "clean", "mint", "perfect", "nm"}:
+                    wanted.add((side, roi))
+                elif any(w in note for w in ("whitening", "wear", "nick", "chip", "rounded", "ding", "crease", "dent")):
+                    wanted.add((side, roi))
+
+    # Edges
+    edges = data.get("edges") or {}
+    if isinstance(edges, dict):
+        for side in ("front", "back"):
+            e_obj = edges.get(side) or {}
+            if not isinstance(e_obj, dict):
+                continue
+            grade = str(e_obj.get("grade") or "").strip().lower()
+            note = str(e_obj.get("notes") or "").strip().lower()
+            # If edges are anything below NM-ish, request edge closeups.
+            if grade and grade not in {"gem mint", "mint", "near mint", "excellent"}:
+                wanted.update({(side, "edge_top"), (side, "edge_bottom"), (side, "edge_left"), (side, "edge_right")})
+            elif any(w in note for w in ("whitening", "wear", "scuff", "chipping", "chip", "nick", "rough", "fray")):
+                wanted.update({(side, "edge_top"), (side, "edge_bottom"), (side, "edge_left"), (side, "edge_right")})
+
+    # Surface
+    surface = data.get("surface") or {}
+    if isinstance(surface, dict):
+        for side in ("front", "back"):
+            s_obj = surface.get(side) or {}
+            if not isinstance(s_obj, dict):
+                continue
+            grade = str(s_obj.get("grade") or "").strip().lower()
+            note = str(s_obj.get("notes") or "").strip().lower()
+            if grade and grade not in {"gem mint", "mint", "near mint", "excellent"}:
+                # We don't have dedicated surface ROIs; still allow any ROI the CV found.
+                wanted.add((side, "surface"))
+            elif any(w in note for w in ("scratch", "scuff", "print line", "crease", "dent", "indent", "stain", "mark")):
+                wanted.add((side, "surface"))
+
+    # Second pass defect candidates
+    sp = data.get("second_pass") or {}
+    if isinstance(sp, dict) and isinstance(sp.get("defect_candidates"), list):
+        for c in sp.get("defect_candidates")[:20]:
+            if not isinstance(c, dict):
+                continue
+            t = str(c.get("type") or "").lower()
+            note = str(c.get("note") or "").lower()
+            if any(w in (t + " " + note) for w in ("whitening", "edge", "corner", "crease", "dent", "tear", "scratch", "scuff")):
+                wanted.add(("front", "surface"))
+                wanted.add(("back", "surface"))
+
+    return wanted
+
 def _make_thumb_from_bbox(img_bytes: bytes, bbox: Dict[str, Any], max_size: int = 360) -> str:
     """
     Crop a normalized bbox out of an image and return base64 JPEG.
@@ -2024,6 +2107,13 @@ Return ONLY valid JSON:
     if isinstance(second_pass, dict):
         second_pass["roi_labels"] = roi_labels
 
+    # If the structured assessment clearly flags defects (e.g., whitening corners),
+    # we should *force* evidence crops for those areas even if the ROI labeler
+    # returns a "clean" verdict. This prevents empty grids when defects are obvious.
+    want_src = dict(data) if isinstance(data, dict) else {}
+    want_src["second_pass"] = second_pass
+    wanted_rois = _wanted_rois_from_assessment(want_src)
+
     defect_snaps: List[Dict[str, Any]] = []
     label_by_idx = {int(x.get("crop_index", -1)): x for x in (roi_labels or []) if isinstance(x, dict)}
 
@@ -2092,6 +2182,58 @@ Return ONLY valid JSON:
             return True
 
         return False
+    # Helper to pull a human note from the structured assessment for a given ROI
+    def _note_from_assessment(side: str, roi: str) -> str:
+        try:
+            side = str(side or "").lower().strip()
+            roi = str(roi or "").lower().strip()
+            # corners
+            if roi.startswith("corner_"):
+                ck = roi.replace("corner_", "")
+                corner_key = {
+                    "top_left": "top_left",
+                    "top_right": "top_right",
+                    "bottom_left": "bottom_left",
+                    "bottom_right": "bottom_right",
+                }.get(ck)
+                if corner_key:
+                    c = (((data.get("corners") or {}).get(side) or {}).get(corner_key) or {})
+                    n = str(c.get("notes") or "").strip()
+                    if n:
+                        return n
+            if roi.startswith("edge_"):
+                e = ((data.get("edges") or {}).get(side) or {})
+                n = str(e.get("notes") or "").strip()
+                if n:
+                    return n
+            s = ((data.get("surface") or {}).get(side) or {})
+            n = str(s.get("notes") or "").strip()
+            return n
+        except Exception:
+            return ""
+
+    # Helper: pull a nice human note from the structured section where possible
+    def _note_for_roi(side: str, roi_name: str) -> str:
+        try:
+            if roi_name.startswith("corner_"):
+                cm = {
+                    "corner_top_left": "top_left",
+                    "corner_top_right": "top_right",
+                    "corner_bottom_left": "bottom_left",
+                    "corner_bottom_right": "bottom_right",
+                }
+                ck = cm.get(roi_name)
+                c = (data.get("corners") or {}).get(side, {}).get(ck, {}) if ck else {}
+                n = str((c or {}).get("notes") or "").strip()
+                return _norm_ws(n)
+            if roi_name.startswith("edge_"):
+                e = (data.get("edges") or {}).get(side, {})
+                n = str((e or {}).get("notes") or "").strip()
+                return _norm_ws(n)
+        except Exception:
+            pass
+        return ""
+
     for i, r in enumerate((rois or [])[:10]):
         src = front_bytes if r.get("side") == "front" else back_bytes
         if not src:
@@ -2101,10 +2243,25 @@ Return ONLY valid JSON:
         if not thumb:
             continue
         lab = label_by_idx.get(i) or {}
-        if not _is_likely_defect(lab, r):
+        side = str(r.get("side") or "").lower().strip()
+        roi_name = str(r.get("roi") or "").lower().strip()
+        force = (side, roi_name) in wanted_rois
+        # Allow surface forcing: we don't have dedicated surface ROIs, so if surface is wanted,
+        # accept any non-empty ROI from that side.
+        if not force and (side, "surface") in wanted_rois:
+            force = True
+
+        if not _is_likely_defect(lab, r) and not force:
             continue
-        dtype = lab.get("type") or "defect"
-        note = lab.get("note") if lab else f"CV hotspot: {r.get('roi')}"
+
+        dtype = lab.get("type") or ("whitening" if roi_name.startswith("corner_") else "defect")
+        note = lab.get("note") if lab else ""
+        if not note or force:
+            note2 = _note_from_assessment(side, roi_name)
+            if note2:
+                note = note2
+            elif not note:
+                note = f"Close-up of {roi_name.replace('_',' ')}"
         conf = lab.get("confidence") if lab else 0.0
         defect_snaps.append({
             "side": r.get("side"),
@@ -2252,7 +2409,7 @@ Return ONLY valid JSON:
         summary = " ".join([p for p in parts if p]).strip()
 
         data["assessment_summary"] = summary
-    return JSONResponse(content={
+    resp = {
         "pregrade": pregrade_norm or "N/A",
         "confidence": _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0),
         "centering": data.get("centering", {"front": {"grade": "", "notes": ""}, "back": {"grade": "", "notes": ""}}),
@@ -2271,7 +2428,10 @@ Return ONLY valid JSON:
         "market_context_mode": "click_only",
         "condition_anchor": condition_anchor,
         "has_structural_damage": bool(has_structural_damage),
-    })
+    }
+    # Remove clinical mm sizing for whitening notes (collector-style language)
+    resp = _relax_whitening_mm_in_obj(resp)
+    return JSONResponse(content=resp)
 
 # ==============================
 # Memorabilia / Sealed: Identify + Assess (NO pricing here)
@@ -2538,14 +2698,22 @@ Respond ONLY with JSON, no extra text.
         if not thumb:
             continue
         lab = label_by_idx.get(i) or {}
-        if not _is_likely_defect(lab, r):
+        side = str(r.get("side") or "")
+        roi_name = str(r.get("roi") or "")
+        force = (side, roi_name) in wanted_rois
+        # Surface is a meta-request; allow any ROI on that side if surface is flagged.
+        if not force and (side, "surface") in wanted_rois:
+            force = True
+
+        if not (_is_likely_defect(lab, r) or force):
             continue
-        dtype = lab.get("type") or "defect"
-        note = lab.get("note") if lab else f"CV hotspot: {r.get('roi')}"
+
+        dtype = lab.get("type") or ("whitening" if roi_name.startswith("corner_") else "defect")
+        note = (lab.get("note") if isinstance(lab, dict) else "") or _note_for_roi(side, roi_name) or f"Close-up: {roi_name}"
         conf = lab.get("confidence") if lab else 0.0
         defect_snaps.append({
-            "side": r.get("side"),
-            "roi": r.get("roi"),
+            "side": side,
+            "roi": roi_name,
             "type": dtype,
             "note": _norm_ws(str(note))[:220],
             "confidence": _clamp(_safe_float(conf, 0.0), 0.0, 1.0),
