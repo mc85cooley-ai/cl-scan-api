@@ -1,6 +1,6 @@
 """
 The Collectors League Australia - Scan API
-Futureproof v6.7.6 (2026-02-03)
+Futureproof v6.7.7 (2026-02-03)
 
 What changed vs v6.3.x
 - ✅ Adds PriceCharting API as primary market source for cards + sealed/memorabilia (current prices).
@@ -670,6 +670,82 @@ def _make_defect_filter_variants(img_bytes: bytes) -> Dict[str, bytes]:
         return variants
     except Exception:
         return {}
+
+
+def _best_effort_defect_snaps(img_bytes: bytes, side: str) -> List[Dict[str, Any]]:
+    """
+    Always produce a small set of evidence crops (corners/edges/surface) for UI display.
+    This is best-effort and must never throw; callers should be able to return defect images
+    even if the AI second pass fails.
+    Returns list of dicts: {side,type,note,score,bbox,thumbnail_b64}
+    bbox is normalized to original image (x,y,w,h).
+    """
+    snaps: List[Dict[str, Any]] = []
+    if not img_bytes or Image is None:
+        return snaps
+    try:
+        from io import BytesIO
+        from PIL import ImageStat
+
+        im = Image.open(BytesIO(img_bytes)).convert("RGB")
+        w, h = im.size
+
+        # Define ROIs (normalized). Keep them generous to avoid "missing" defects.
+        rois: List[Tuple[str, str, Tuple[float, float, float, float]]] = [
+            ("corner", "top_left", (0.00, 0.00, 0.28, 0.28)),
+            ("corner", "top_right", (0.72, 0.00, 0.28, 0.28)),
+            ("corner", "bottom_left", (0.00, 0.72, 0.28, 0.28)),
+            ("corner", "bottom_right", (0.72, 0.72, 0.28, 0.28)),
+            ("edge", "top_edge", (0.10, 0.00, 0.80, 0.16)),
+            ("edge", "bottom_edge", (0.10, 0.84, 0.80, 0.16)),
+            ("edge", "left_edge", (0.00, 0.10, 0.16, 0.80)),
+            ("edge", "right_edge", (0.84, 0.10, 0.16, 0.80)),
+            ("surface", "center_surface", (0.25, 0.25, 0.50, 0.50)),
+        ]
+
+        def crop_from_norm(b: Tuple[float, float, float, float]) -> Image.Image:
+            x, y, bw, bh = b
+            x1 = max(0, int(round(x * w)))
+            y1 = max(0, int(round(y * h)))
+            x2 = min(w, int(round((x + bw) * w)))
+            y2 = min(h, int(round((y + bh) * h)))
+            return im.crop((x1, y1, x2, y2))
+
+        def roi_score(crop: Image.Image, kind: str) -> float:
+            # Simple heuristics: whitening tends to be bright / low chroma; scratches/print-lines increase contrast.
+            g = crop.convert("L")
+            st = ImageStat.Stat(g)
+            mean_v = float(st.mean[0]) if st.mean else 0.0
+            std_v = float(st.stddev[0]) if st.stddev else 0.0
+            if kind in ("corner", "edge"):
+                # brighter borders + some texture variation -> likely whitening/chipping
+                return (mean_v / 255.0) * 0.6 + (std_v / 128.0) * 0.4
+            # surface
+            return (std_v / 128.0)
+
+        for kind, label, bbox in rois:
+            crop = crop_from_norm(bbox)
+            score = roi_score(crop, kind)
+            # Create thumbnail (max 280px)
+            thumb = crop.copy()
+            thumb.thumbnail((280, 280))
+            buf = BytesIO()
+            thumb.save(buf, format="JPEG", quality=85)
+            snaps.append({
+                "side": side,
+                "type": kind,
+                "note": label.replace("_", " "),
+                "score": round(float(score), 3),
+                "bbox": {"x": bbox[0], "y": bbox[1], "w": bbox[2], "h": bbox[3]},
+                "thumbnail_b64": base64.b64encode(buf.getvalue()).decode("utf-8"),
+            })
+
+        # Sort by score so top crops show first
+        snaps.sort(key=lambda d: float(d.get("score", 0.0)), reverse=True)
+        return snaps
+    except Exception:
+        # Must never break grading
+        return []
 
 def _make_basic_hotspot_snaps(img_bytes: bytes, side: str, max_snaps: int = 6) -> List[Dict[str, Any]]:
     """Best-effort crops (corners + edges) used for UI evidence.
@@ -1480,6 +1556,15 @@ async def verify(
 ):
     front_bytes = await front.read()
     back_bytes = await back.read()
+
+    # Always initialize output collections (avoid NameError on return)
+    defect_snaps: List[Dict[str, Any]] = []
+    try:
+        defect_snaps.extend(_best_effort_defect_snaps(front_bytes, 'front'))
+        defect_snaps.extend(_best_effort_defect_snaps(back_bytes, 'back'))
+    except Exception:
+        defect_snaps = []
+
     angled_bytes = await angled.read() if angled is not None else b""
     if not front_bytes or not back_bytes or len(front_bytes) < 200 or len(back_bytes) < 200:
         raise HTTPException(status_code=400, detail="Images are too small or empty")
