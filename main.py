@@ -2026,6 +2026,72 @@ Return ONLY valid JSON:
 
     defect_snaps: List[Dict[str, Any]] = []
     label_by_idx = {int(x.get("crop_index", -1)): x for x in (roi_labels or []) if isinstance(x, dict)}
+
+    def _is_likely_defect(lab: Dict[str, Any], roi: Dict[str, Any]) -> bool:
+        """Same defect gating as cards, for sealed/memorabilia ROI crops."""
+        if not isinstance(lab, dict):
+            return False
+        if bool(lab.get("is_defect", False)):
+            return True
+
+        t = str(lab.get("type") or "").strip().lower()
+        note = str(lab.get("note") or "").strip().lower()
+        conf = _clamp(_safe_float(lab.get("confidence"), 0.0), 0.0, 1.0)
+
+        clean_types = {"none", "clean", "ok", "okay", "good", "no_defect", "no defect"}
+        if t and t not in clean_types and conf >= 0.35:
+            return True
+
+        defect_words = (
+            "tear", "split", "rip", "hole", "puncture", "crush", "crease", "dent",
+            "scuff", "scratch", "mark", "stain", "lift", "peel", "wrinkle", "cloud",
+            "seal", "seam", "repack", "tamper", "edge wear", "wear", "whitening",
+        )
+        if any(w in note for w in defect_words) and conf >= 0.30:
+            return True
+
+        roi_score = _safe_float(roi.get("score"), 0.0)
+        if roi_score >= 0.80 and t and t not in clean_types:
+            return True
+
+        return False
+
+    def _is_likely_defect(lab: Dict[str, Any], roi: Dict[str, Any]) -> bool:
+        """Gate ROI thumbnails so we show only defect-ish photos.
+
+        The ROI labeler sometimes forgets to set `is_defect=true` even when it
+        provides a non-clean type/note. We treat a crop as a defect if ANY of:
+          - explicit is_defect=True
+          - non-clean `type` with decent confidence
+          - defect-keyword `note` with decent confidence
+          - high ROI score + non-clean type
+        """
+        if not isinstance(lab, dict):
+            return False
+        if bool(lab.get("is_defect", False)):
+            return True
+
+        t = str(lab.get("type") or "").strip().lower()
+        note = str(lab.get("note") or "").strip().lower()
+        conf = _clamp(_safe_float(lab.get("confidence"), 0.0), 0.0, 1.0)
+
+        clean_types = {"none", "clean", "ok", "okay", "good", "no_defect", "no defect"}
+        if t and t not in clean_types and conf >= 0.35:
+            return True
+
+        defect_words = (
+            "whitening", "white", "wear", "edge wear", "chip", "chipping", "nick", "dent",
+            "crease", "bend", "scratch", "scratches", "scuff", "scuffs", "print line",
+            "indent", "stain", "mark", "marks", "lift", "peel", "tear", "split",
+        )
+        if any(w in note for w in defect_words) and conf >= 0.30:
+            return True
+
+        roi_score = _safe_float(roi.get("score"), 0.0)
+        if roi_score >= 0.80 and t and t not in clean_types:
+            return True
+
+        return False
     for i, r in enumerate((rois or [])[:10]):
         src = front_bytes if r.get("side") == "front" else back_bytes
         if not src:
@@ -2035,10 +2101,9 @@ Return ONLY valid JSON:
         if not thumb:
             continue
         lab = label_by_idx.get(i) or {}
-        is_def = bool(lab.get("is_defect", False))
-        if not is_def:
+        if not _is_likely_defect(lab, r):
             continue
-        dtype = lab.get("type") if is_def else "hotspot"
+        dtype = lab.get("type") or "defect"
         note = lab.get("note") if lab else f"CV hotspot: {r.get('roi')}"
         conf = lab.get("confidence") if lab else 0.0
         defect_snaps.append({
@@ -2439,6 +2504,31 @@ Respond ONLY with JSON, no extra text.
 
     defect_snaps: List[Dict[str, Any]] = []
     label_by_idx = {int(x.get("crop_index", -1)): x for x in (roi_labels or []) if isinstance(x, dict)}
+
+    def _is_likely_defect(lab: Dict[str, Any], roi: Dict[str, Any]) -> bool:
+        """Gate ROI thumbnails so we show only defect-ish photos (sealed/memorabilia)."""
+        if not isinstance(lab, dict):
+            return False
+        if bool(lab.get("is_defect", False)):
+            return True
+        t = str(lab.get("type") or "").strip().lower()
+        note = str(lab.get("note") or "").strip().lower()
+        conf = _clamp(_safe_float(lab.get("confidence"), 0.0), 0.0, 1.0)
+        clean_types = {"none", "clean", "ok", "okay", "good", "no_defect", "no defect"}
+        if t and t not in clean_types and conf >= 0.35:
+            return True
+        defect_words = (
+            "seal", "seam", "tear", "split", "hole", "puncture", "wrinkle", "crease",
+            "scuff", "scratch", "dent", "crush", "corner", "edge", "wear", "whitening",
+            "stain", "mark", "lift", "peel", "tamper", "reseal",
+        )
+        if any(w in note for w in defect_words) and conf >= 0.30:
+            return True
+        roi_score = _safe_float(roi.get("score"), 0.0)
+        if roi_score >= 0.80 and t and t not in clean_types:
+            return True
+        return False
+
     for i, r in enumerate((rois or [])[:10]):
         src = b1 if r.get("side") == "front" else b2
         if not src:
@@ -2448,10 +2538,9 @@ Respond ONLY with JSON, no extra text.
         if not thumb:
             continue
         lab = label_by_idx.get(i) or {}
-        is_def = bool(lab.get("is_defect", False))
-        if not is_def:
+        if not _is_likely_defect(lab, r):
             continue
-        dtype = lab.get("type") if is_def else "hotspot"
+        dtype = lab.get("type") or "defect"
         note = lab.get("note") if lab else f"CV hotspot: {r.get('roi')}"
         conf = lab.get("confidence") if lab else 0.0
         defect_snaps.append({
