@@ -1438,7 +1438,10 @@ async def identify(front: UploadFile = File(...), back: UploadFile | None = File
     except Exception:
         pass
 
-    return {"ok": True, "card": result}
+    # Backward-compatible response: expose fields at top-level AND under card
+    flat = dict(result)
+    flat.update({"ok": True, "card": result})
+    return flat
 
 
 @app.post("/api/verify")
