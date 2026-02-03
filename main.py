@@ -54,6 +54,63 @@ except Exception:
 PIL_AVAILABLE = bool(Image)
 
 
+
+def _relax_whitening_mm(text: str) -> str:
+    """Replace clinical mm measurements for whitening with collector-style language.
+
+    Only touches sentences that mention whitening, so centering measurements (e.g. 5mm) stay intact.
+    """
+    try:
+        s = str(text or "")
+        if not s:
+            return s
+        parts = re.split(r'(?<=[.!?])\s+', s)
+        out_parts = []
+        mm_rx = re.compile(r'(?:about\s+|around\s+|approx(?:imately)?\s+)?(\d+(?:\.\d+)?)\s*mm', re.IGNORECASE)
+
+        def _mm_to_words(num: float) -> str:
+            if num <= 0.6:
+                return 'a hairline bit'
+            if num <= 1.4:
+                return 'a tiny bit'
+            if num <= 2.4:
+                return 'a small bit'
+            if num <= 4.0:
+                return 'a noticeable bit'
+            return 'a fair bit'
+
+        for part in parts:
+            if 'whitening' not in part.lower():
+                out_parts.append(part)
+                continue
+
+            def repl(m):
+                try:
+                    num = float(m.group(1))
+                except Exception:
+                    num = 1.0
+                return _mm_to_words(num)
+
+            new = mm_rx.sub(repl, part)
+            # also soften "extending" phrasing a touch
+            new = re.sub(r'extending\s+', 'running ', new, flags=re.IGNORECASE)
+            out_parts.append(new)
+
+        return ' '.join(out_parts).strip()
+    except Exception:
+        return str(text or "")
+
+
+def _relax_whitening_mm_in_obj(obj):
+    """Recursively apply _relax_whitening_mm to any string fields in nested dict/list."""
+    if isinstance(obj, str):
+        return _relax_whitening_mm(obj)
+    if isinstance(obj, list):
+        return [_relax_whitening_mm_in_obj(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _relax_whitening_mm_in_obj(v) for k, v in obj.items()}
+    return obj
+
 def _make_thumb_from_bbox(img_bytes: bytes, bbox: Dict[str, Any], max_size: int = 360) -> str:
     """
     Crop a normalized bbox out of an image and return base64 JPEG.
@@ -1979,6 +2036,8 @@ Return ONLY valid JSON:
             continue
         lab = label_by_idx.get(i) or {}
         is_def = bool(lab.get("is_defect", False))
+        if not is_def:
+            continue
         dtype = lab.get("type") if is_def else "hotspot"
         note = lab.get("note") if lab else f"CV hotspot: {r.get('roi')}"
         conf = lab.get("confidence") if lab else 0.0
@@ -2390,6 +2449,8 @@ Respond ONLY with JSON, no extra text.
             continue
         lab = label_by_idx.get(i) or {}
         is_def = bool(lab.get("is_defect", False))
+        if not is_def:
+            continue
         dtype = lab.get("type") if is_def else "hotspot"
         note = lab.get("note") if lab else f"CV hotspot: {r.get('roi')}"
         conf = lab.get("confidence") if lab else 0.0
@@ -2982,12 +3043,12 @@ async def market_context(
     # --------------------------
     # Graded buckets (ACTIVE only; brand-agnostic)
     # --------------------------
-    GRADE_RX = re.compile(r'(?:\bpsa\b|\bbgs\b|\bcgc\b|\bsgc\b|\bgraded\b|\bslab\b|\bgem\s*mint\b|\bpristine\b)?\s*([0-9]{1,2}(?:\.[05])?)\b', re.IGNORECASE)
-    PSA10_RX = re.compile(r'\bpsa\s*10\b|\bpsa10\b|\bgem\s*mint\s*10\b|\b10\s*gem\b', re.IGNORECASE)
+    GRADE_RX = re.compile(r"(?:psa|cgc|bgs|sgc)\s*(?:grade\s*)?([0-9]{1,2}(?:\.[05])?)", re.IGNORECASE)
+    GEM10_RX = re.compile(r"(psa\s*10|psa10|gem\s*mint\s*10|10\s*gem|cgc\s*10|bgs\s*10|sgc\s*10)", re.IGNORECASE)
 
     def _parse_grade_from_title(title: str) -> Optional[float]:
         t = (title or "").lower()
-        if PSA10_RX.search(t):
+        if GEM10_RX.search(t):
             return 10.0
         m = GRADE_RX.search(title or "")
         if not m:
@@ -3097,6 +3158,23 @@ async def market_context(
     current_low = active_stats.get("low")
     current_high = active_stats.get("high")
 
+
+    # Where does THIS copy likely sit in the current ask range?
+    value_position_aud = None
+    try:
+        if current_low is not None and current_high is not None and resolved_grade is not None:
+            lo = float(current_low); hi = float(current_high)
+            if hi >= lo and (hi - lo) > 0:
+                g = float(resolved_grade)
+                # map grade 1..10 -> 0.08..0.92
+                f = (max(1.0, min(10.0, g)) - 1.0) / 9.0
+                f = 0.08 + 0.84 * f
+                value_position_aud = lo + (hi - lo) * f
+        if value_position_aud is None and current_typ is not None:
+            value_position_aud = float(current_typ)
+    except Exception:
+        value_position_aud = current_typ
+
     # trend proxy (active-only; honest language)
     trend_hint = "pretty steady right now"
     if current_low is not None and current_high is not None and current_typ is not None:
@@ -3116,31 +3194,100 @@ async def market_context(
 
     slang_openers = [
         "Alright mate, here’s the vibe on this one:",
-        "Okay, Pokéfam — quick market check:",
+        "Okay — quick market check before you send it:",
         "Righto, let’s suss the market real quick:",
+        "Alright, pack-ripper rundown:",
     ]
-    opener = slang_openers[0]
+
+    openers_2 = [
+        "Here’s what I’m seeing:",
+        "Here’s the read:",
+        "Here’s the go:",
+    ]
+
+    opener = secrets.choice(slang_openers)
+    if secrets.randbelow(100) < 25:
+        opener = f"{opener} {secrets.choice(openers_2)}"
 
     grade_line = ""
     if exp_grade_key:
-        grade_line = f" LeagAI’s calling it around a {exp_grade_key} in the current state."
-    price_line = f" On current listings, it’s sitting around {_money(current_typ)} AUD (rough range {_money(current_low)}–{_money(current_high)})."
-    trend_line = f" The market looks {trend_hint} based on live asks."
+        grade_line = f" LeagAI’s got it around a {exp_grade_key} on the pics."
+    price_line = f" Live asks are roughly {_money(current_typ)} AUD (range {_money(current_low)}–{_money(current_high)})."
+
+    trend_phrases = [
+        f" It looks {trend_hint} off what’s listed right now.",
+        f" The asks look {trend_hint} at the moment.",
+        f" Market mood is {trend_hint} based on current listings.",
+    ]
+    trend_line = secrets.choice(trend_phrases)
+
+    # Where does *your* copy likely sit inside the live range?
+    est_value_aud = None
+    if current_low is not None and current_high is not None and resolved_grade is not None:
+        try:
+            g = float(resolved_grade)
+            # map grade 1..10 => 0.08..0.92 (keeps it away from extreme ends)
+            factor = (g - 1.0) / 9.0
+            factor = max(0.0, min(1.0, factor))
+            factor = 0.08 + 0.84 * factor
+            lo = float(current_low)
+            hi = float(current_high)
+            est_value_aud = lo + (hi - lo) * factor
+
+            # If it’s a rougher grade, nudge slightly below the low ask (buyers discount hard)
+            if g <= 5.5 and lo > 0:
+                est_value_aud = min(est_value_aud, lo * (0.92 + 0.01 * g))
+            est_value_aud = round(est_value_aud, 2)
+        except Exception:
+            est_value_aud = None
+
+    position_line = ""
+    if est_value_aud is not None and current_low is not None and current_high is not None:
+        position_templates = [
+            f" For a {exp_grade_key}-ish copy like yours, I’d peg it around {_money(est_value_aud)} AUD — basically sitting between the low and the high asks.",
+            f" Given the condition call, I’d slot your copy at about {_money(est_value_aud)} AUD in that current range.",
+            f" Realistically, your one probably lives around {_money(est_value_aud)} AUD (condition-wise), not at the tippy-top.",
+        ]
+        position_line = secrets.choice(position_templates)
+
     graded_line = ""
     if exp_grade_key and exp_grade_key in grade_market:
         st = grade_market.get(exp_grade_key, {}).get("stats", {})
         if st and st.get("median") is not None:
-            graded_line = f" If it lands that grade, you’re looking at roughly {_money(st.get('median'))} AUD in the graded lane (based on current graded listings)."
+            graded_templates = [
+                f" If it lands that grade in a slab, graded asks are roughly {_money(st.get('median'))} AUD (current listings).",
+                f" In the graded lane at that number, you’re seeing about {_money(st.get('median'))} AUD on asks right now.",
+            ]
+            graded_line = " " + secrets.choice(graded_templates)
+
+    # Grading decision language — keep it collector-real, not the same line every time
     grade_advice = ""
+    try:
+        gc = float(grading_cost or 0)
+    except Exception:
+        gc = 0.0
+
     if worth_grading is True:
-        grade_advice = f" With grading cost around ${float(grading_cost or 0):.0f}, it looks worth a crack if your goal is long-term hold or a clean flip."
+        grade_advice = " " + secrets.choice([
+            f" With grading around ${gc:.0f}, it’s a decent shout if you’re chasing a slab or a cleaner resale.",
+            f" Grading fee’s about ${gc:.0f} — I’d consider sending it if you want it protected/registry-ready.",
+        ])
     elif worth_grading is False:
-        grade_advice = f" With grading cost around ${float(grading_cost or 0):.0f}, it’s probably not worth sending in this condition unless you’re chasing the slab for the collection."
+        grade_advice = " " + secrets.choice([
+            f" Grading’s about ${gc:.0f} — I’d only send it if it’s a personal PC piece or you want it in the registry slabbed up.",
+            f" With a ~${gc:.0f} fee, this feels more like a binder/PC card unless you just want it in plastic for the vibe.",
+            f" Fee’s ~${gc:.0f}; if you’re grading for profit, I’d be picky here — but for the collection? send it.",
+        ])
+
     buy_line = ""
     if buy_target_aud is not None:
-        buy_line = f" If you’re buying, a good target entry is about {_money(buy_target_aud)} AUD or less for this condition — that’s where the risk/reward starts to feel spicy."
+        buy_line = " " + secrets.choice([
+            f" If you’re buying raw, I’d want to be around {_money(buy_target_aud)} AUD or less for this condition.",
+            f" Raw buy target: about {_money(buy_target_aud)} AUD (or under) — that’s where it starts to make sense.",
+            f" If you’re hunting a deal, try land it near {_money(buy_target_aud)} AUD — anything higher and you’re paying for hope.",
+        ])
 
-    market_summary = _norm_ws(f"{opener}{grade_line}{price_line} {trend_line}{graded_line} {grade_advice} {buy_line}")
+    market_summary = _norm_ws(f"{opener}{grade_line}{price_line}{trend_line}{position_line}{graded_line}{grade_advice}{buy_line}")
 
     resp = {
         "available": True,
