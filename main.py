@@ -1,6 +1,6 @@
 """
 The Collectors League Australia - Scan API
-Futureproof v6.7.4 (2026-02-03)
+Futureproof v6.7.5 (2026-02-03)
 
 What changed vs v6.3.x
 - ✅ Adds PriceCharting API as primary market source for cards + sealed/memorabilia (current prices).
@@ -671,6 +671,57 @@ def _make_defect_filter_variants(img_bytes: bytes) -> Dict[str, bytes]:
     except Exception:
         return {}
 
+def _make_basic_hotspot_snaps(img_bytes: bytes, side: str, max_snaps: int = 6) -> List[Dict[str, Any]]:
+    """Best-effort crops (corners + edges) used for UI evidence.
+    Returns list of {side,type,note,thumbnail_b64,bbox}.
+    BBox is normalized to [0..1] relative to the source image.
+    """
+    if not img_bytes or Image is None:
+        return []
+    try:
+        from io import BytesIO
+        im = Image.open(BytesIO(img_bytes)).convert("RGB")
+        w, h = im.size
+
+        def _crop_norm(x0, y0, x1, y1):
+            x0i = max(0, min(w-1, int(x0*w)))
+            y0i = max(0, min(h-1, int(y0*h)))
+            x1i = max(1, min(w, int(x1*w)))
+            y1i = max(1, min(h, int(y1*h)))
+            crop = im.crop((x0i, y0i, x1i, y1i))
+            # Slight upscale for better visibility
+            crop = crop.resize((min(420, (x1i-x0i)*3), min(420, (y1i-y0i)*3)))
+            buf = BytesIO()
+            crop.save(buf, format="JPEG", quality=90)
+            return {
+                "thumbnail_b64": _b64(buf.getvalue()),
+                "bbox": {"x": float(x0), "y": float(y0), "w": float(x1-x0), "h": float(y1-y0)}
+            }
+
+        # Regions: 4 corners + top/bottom edge strips
+        regions = [
+            ("corner", "top_left",   0.00, 0.00, 0.22, 0.22),
+            ("corner", "top_right",  0.78, 0.00, 1.00, 0.22),
+            ("corner", "bottom_left",0.00, 0.78, 0.22, 1.00),
+            ("corner", "bottom_right",0.78,0.78, 1.00, 1.00),
+            ("edge", "top_edge",     0.18, 0.00, 0.82, 0.14),
+            ("edge", "bottom_edge",  0.18, 0.86, 0.82, 1.00),
+        ]
+
+        snaps: List[Dict[str, Any]] = []
+        for kind, label, x0, y0, x1, y1 in regions[:max_snaps]:
+            out = _crop_norm(x0, y0, x1, y1)
+            snaps.append({
+                "side": side,
+                "type": kind,
+                "note": f"{side} {label} close-up (best effort)",
+                "confidence": 0.5,
+                **out
+            })
+        return snaps
+    except Exception:
+        return []
+
 def _norm_ws(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
@@ -1284,77 +1335,31 @@ async def pricecharting_history(product_id: str, limit: int = 52):
 async def identify(front: UploadFile = File(...)):
     img = await front.read()
     if not img or len(img) < 200:
-        raise HTTPException(status_code=400, detail="Image is too small or empty")
-
-    prompt = """You are identifying a trading card from a front photo.
-
-Return ONLY valid JSON with these exact fields:
-
-{
-  "card_name": "exact card name including variants (ex, V, VMAX, holo, first edition, etc.)",
-  "card_type": "Pokemon/Magic/YuGiOh/Sports/OnePiece/Other",
-  "year": "4 digit year if visible else empty string",
-  "card_number": "card number if visible (e.g. 006/165 or 004 or 4/102) else empty string",
-  "set_code": "set abbreviation printed on the card if visible (often 2-4 chars like MEW, OBF, SVI). EMPTY if not visible",
-  "set_name": "set or series name (full name) if visible/known else empty string",
-  "confidence": 0.0-1.0,
-  "notes": "one short sentence about how you identified it"
-}
-
-Rules:
-- PRIORITIZE set_code if you can see it.
-- Do NOT guess a set_code you cannot see.
-- Preserve leading zeros in card_number if shown (e.g., 006/165).
-- If you cannot identify with confidence, set card_name to "Unknown" and confidence to 0.0.
-Respond ONLY with JSON, no extra text.
-"""
-
-    msg = [{
-        "role": "user",
-        "content": [
-            {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(img)}", "detail": "high"}},
-        ],
-    }]
-
-    result = await _openai_chat(msg, max_tokens=800, temperature=0.1)
-    if result.get("error"):
-        return JSONResponse(content={
-            "card_name": "Unknown",
-            "card_type": "Other",
-            "year": "",
-            "card_number": "",
-            "set_code": "",
-            "set_name": "",
-            "confidence": 0.0,
-            "notes": "AI identification failed",
-            "identify_token": f"idt_{secrets.token_urlsafe(12)}",
-            "pokemontcg": None,
-            "pokemontcg_enriched": False,
-        })
-
-    data = _parse_json_or_none(result.get("content", "")) or {}
-
-    # ------------------------------
-    # Second-pass (defect enhanced) analysis
-    # ------------------------------
-    # SECOND PASS GUARANTEE:
-    # Enhanced filtered images (grayscale/autocontrast + contrast/sharpness)
-    # are ALWAYS generated when PIL is available and are fed back into
-    # grading logic to surface print lines, whitening, scratches, and dents.
-
+        raise HTTPException(stat
+    # -------------------------
+    # SECOND PASS + DEFECT SNAPSHOTS (best-effort)
+    # We ALWAYS generate a small set of close-ups for UI evidence (corners/edges).
+    # The AI second-pass is optional and will never block returning defect_snaps.
     second_pass = {"enabled": True, "ran": False, "skipped_reason": None, "glare_suspects": [], "defect_candidates": []}
-    angled_bytes = b""  # identify() has no angled image
+
+    # Always generate UI close-ups from the raw uploads (best effort)
+    defect_snaps: List[Dict[str, Any]] = []
     try:
-        # Only run for cards; memorabilia uses a different endpoint.
-        front_vars = _make_defect_filter_variants(img)
-        back_vars = {}
+        defect_snaps += _make_basic_hotspot_snaps(front_bytes, "front")
+        defect_snaps += _make_basic_hotspot_snaps(back_bytes, "back")
+    except Exception:
+        pass
+
+    # AI second-pass (filtered variants + optional angled) to refine defect descriptions
+    try:
+        front_vars = _make_defect_filter_variants(front_bytes)
+        back_vars = _make_defect_filter_variants(back_bytes)
 
         if not front_vars and not back_vars:
             second_pass["enabled"] = False
             second_pass["skipped_reason"] = "image_filters_unavailable"
         else:
-            sp_prompt = f"""You are a meticulous trading card defect inspector.
+            sp_prompt = """You are a meticulous trading card defect inspector.
 You are analyzing ENHANCED/FILTERED variants created to make defects stand out (print lines, scratches, whitening, dents).
 You may also receive an ANGLED image used to rule out glare/light refraction.
 
@@ -1364,14 +1369,14 @@ CRITICAL:
 - Print lines are typically straight and consistent; glare moves with angle.
 
 Return ONLY valid JSON:
-{{
+{
   "defect_candidates": [
-    {{"type":"print_line|scratch|whitening|dent|crease|tear|stain|other","severity":"minor|moderate|severe","note":"short plain description","confidence":0-1}}
+    {"type":"print_line|scratch|whitening|dent|crease|tear|stain|other","severity":"minor|moderate|severe","note":"short plain description","confidence":0-1}
   ],
   "glare_suspects": [
-    {{"type":"whitening|scratch|print_line|other","note":"why it looks like glare","confidence":0-1}}
+    {"type":"whitening|scratch|print_line|other","note":"why it looks like glare","confidence":0-1}
   ]
-}}
+}
 """
 
             content_parts = [{"type": "text", "text": sp_prompt}]
@@ -1412,7 +1417,7 @@ Return ONLY valid JSON:
                 if isinstance(sp_data, dict):
                     second_pass["ran"] = True
                     if isinstance(sp_data.get("glare_suspects"), list):
-                        second_pass["glare_suspects"] = sp_data.get("glare_suspects")[:10]
+                        second_pass["glare_suspects"] = sp_data.get("glare_suspects")[:20]
                     if isinstance(sp_data.get("defect_candidates"), list):
                         second_pass["defect_candidates"] = sp_data.get("defect_candidates")[:20]
             else:
@@ -1911,6 +1916,7 @@ Return ONLY valid JSON:
         "defects": defects_list_out,
         "flags": flags_list_out,
         "second_pass": second_pass,
+        "defect_snaps": defect_snaps,
         "glare_suspects": data.get("glare_suspects", []) if isinstance(data.get("glare_suspects", []), list) else [],
         "assessment_summary": _norm_ws(str(data.get("assessment_summary", ""))) or summary or "",
         "spoken_word": _norm_ws(str(data.get("spoken_word", ""))) or _norm_ws(str(data.get("assessment_summary", ""))) or summary or "",
