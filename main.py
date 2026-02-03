@@ -1,11 +1,13 @@
 """
 The Collectors League Australia - Scan API
-Futureproof v6.7.2 (2026-02-03)
+Futureproof v6.4.1 (2026-01-31)
 
 What changed vs v6.3.x
-- ✅ Adds CV-based defect close-up thumbnails (defect_snaps) for UI rendering.
-- ✅ Adds spoken_word style variation so summaries don't sound identical each run.
-- ✅ Keeps previous pricing/ID behavior unchanged.
+- ✅ Adds PriceCharting API as primary market source for cards + sealed/memorabilia (current prices).
+- ✅ Keeps PokemonTCG.io for identification + metadata enrichment (NOT price history).
+- ✅ Adds weekly snapshot option (store PriceCharting CSV/API snapshots on a schedule) to build your own price history.
+- ✅ eBay API scaffolding included but DISABLED by default (waiting for your dev account approval).
+- ✅ Market endpoints return "click-only" informational context + no ROI language.
 
 Env vars
 - OPENAI_API_KEY (required for vision grading/ID)
@@ -22,11 +24,11 @@ from datetime import datetime
 from statistics import mean, median
 from functools import wraps
 import base64
+import io
 import os
 import json
 import sqlite3
 import csv
-import io
 import secrets
 import hashlib
 import re
@@ -46,154 +48,12 @@ except Exception:
     Image = None
     ImageEnhance = None
     ImageOps = None
-    ImageFilt
-
-def _crop_region_for_location(w: int, h: int, loc: str) -> Tuple[int,int,int,int]:
-    """Return a conservative crop box (left, top, right, bottom) based on a text location hint."""
-    l = (loc or "").lower()
-    # default central crop
-    x0, y0, x1, y1 = int(w*0.25), int(h*0.25), int(w*0.75), int(h*0.75)
-
-    if "top" in l:
-        y0, y1 = 0, int(h*0.45)
-    if "bottom" in l:
-        y0, y1 = int(h*0.55), h
-    if "left" in l:
-        x0, x1 = 0, int(w*0.45)
-    if "right" in l:
-        x0, x1 = int(w*0.55), w
-
-    # edges
-    if "top edge" in l or ("edge" in l and "top" in l):
-        y0, y1 = 0, int(h*0.28)
-        x0, x1 = int(w*0.10), int(w*0.90)
-    if "bottom edge" in l or ("edge" in l and "bottom" in l):
-        y0, y1 = int(h*0.72), h
-        x0, x1 = int(w*0.10), int(w*0.90)
-    if "left edge" in l or ("edge" in l and "left" in l):
-        x0, x1 = 0, int(w*0.28)
-        y0, y1 = int(h*0.10), int(h*0.90)
-    if "right edge" in l or ("edge" in l and "right" in l):
-        x0, x1 = int(w*0.72), w
-        y0, y1 = int(h*0.10), int(h*0.90)
-
-    # ensure sane
-    x0 = max(0, min(x0, w-2)); x1 = max(x0+2, min(x1, w))
-    y0 = max(0, min(y0, h-2)); y1 = max(y0+2, min(y1, h))
-    return x0, y0, x1, y1
-
-def _defect_snaps_from_defects(front_bytes: bytes, back_bytes: bytes, defects: List[str], max_snaps: int = 6) -> List[Dict[str, Any]]:
-    """Create simple close-up thumbnails from textual defect locations (no CV required)."""
-    if Image is None:
-        return []
-    out: List[Dict[str, Any]] = []
-    try:
-        img_f = Image.open(io.BytesIO(front_bytes)).convert("RGB")
-        img_b = Image.open(io.BytesIO(back_bytes)).convert("RGB")
-    except Exception:
-        return []
-
-    def _infer_side_loc(s: str) -> Tuple[str,str,str]:
-        t = (s or "").lower()
-        side = "front" if "front" in t else ("back" if "back" in t else "front")
-        loc = ""
-        # common corner phrases
-        for k in ["top-left","top left","top-right","top right","bottom-left","bottom left","bottom-right","bottom right",
-                  "top edge","bottom edge","left edge","right edge","center","middle","holo","foil","surface"]:
-            if k in t:
-                loc = k
-                break
-        if not loc:
-            # fallback: first 6 words
-            loc = " ".join((t.split()[:6] or ["surface"]))
-        # defect type hint
-        dtype = "defect"
-        for dt in ["print line","print_line","scratch","whitening","dent","crease","tear","stain","scuff","chip","edge wear","wear","indent"]:
-            if dt in t:
-                dtype = dt.replace("_"," ")
-                break
-        return side, loc, dtype
-
-    for d in defects or []:
-        if len(out) >= max_snaps:
-            break
-        side, loc, dtype = _infer_side_loc(d)
-        img = img_f if side == "front" else img_b
-        w, h = img.size
-        box = _crop_region_for_location(w, h, loc)
-        try:
-            crop = img.crop(box)
-            crop = crop.resize((320, 320))
-            buf = io.BytesIO()
-            crop.save(buf, format="JPEG", quality=82)
-            out.append({
-                "side": side,
-                "type": dtype,
-                "location": loc,
-                "thumbnail_b64": base64.b64encode(buf.getvalue()).decode("utf-8"),
-            })
-        except Exception:
-            continue
-    return out
-
-er = None
-
-# Optional OpenCV defect cropping (for UI thumbnails)
-try:
-    import cv2  # type: ignore
-    import numpy as np  # type: ignore
-except Exception:
-    cv2 = None
-    np = None
-
+    ImageFilter = None
 
 # Simple in-memory caches (per-process)
 _FX_CACHE = {"ts": 0, "usd_aud": None}
 _EBAY_CACHE = {}  # key -> {ts, data}
 FX_CACHE_SECONDS = int(os.getenv("FX_CACHE_SECONDS", "3600"))
-
-
-# ==============================
-# Text style variance (keeps meaning, varies vibe)
-# ==============================
-def _choice(seq):
-    try:
-        return seq[secrets.randbelow(len(seq))]
-    except Exception:
-        return seq[0] if seq else ""
-
-def _vary_spoken_word(text: str) -> str:
-    t = _norm_ws(text or "")
-    if not t:
-        return t
-    # light-touch opener swaps
-    swaps = [
-        ("Hey there!", _choice(["Hey!", "Yo!", "G’day!", "Alright!", "Hey mate!"])),
-        ("Looking at your", _choice(["Checking out your", "Having a look at your", "Peeping your", "Reviewing your"])),
-        ("I’d realistically expect", _choice(["Realistically I’d peg it at", "I’d call it about", "I reckon you’re looking at", "I’d expect around"])),
-        ("in this condition", _choice(["in its current state", "as it sits", "from what I can see here"])),
-    ]
-    for a, b in swaps:
-        if a in t:
-            t = t.replace(a, b, 1)
-    return t
-
-def _vary_assessment_summary(text: str) -> str:
-    t = _norm_ws(text or "")
-    if not t:
-        return t
-    swaps = [
-        ("Looking at your", _choice(["Looking over your", "Having a look at your", "Checking out your", "From what I’m seeing on your"])),
-        ("the front", _choice(["the front side", "the front face", "the front of the card"])),
-        ("the back", _choice(["the back side", "the reverse", "the back of the card"])),
-        ("minor", _choice(["slight", "a touch of", "a bit of"])),
-        ("overall", _choice(["overall", "in general", "all up"])),
-    ]
-    for a, b in swaps:
-        if a in t:
-            t = t.replace(a, b, 1)
-    return t
-
 
 # ==============================
 # App & CORS
@@ -238,7 +98,7 @@ def safe_endpoint(func):
 # ==============================
 # Config
 # ==============================
-APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-02-03-v6.7.2")
+APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-01-31-v6.5.0")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
@@ -257,7 +117,7 @@ except Exception:
 # ==============================
 # FX + eBay helpers
 # ==============================
-UA = "CollectorsLeagueScan/6.7.2 (+https://collectors-league.com)"
+UA = "CollectorsLeagueScan/6.6 (+https://collectors-league.com)"
 
 async def _fx_usd_to_aud() -> float:
     """Return live-ish USD->AUD rate with a short cache. Falls back to 1.50 if unavailable."""
@@ -782,125 +642,54 @@ def _b64(img: bytes) -> str:
     return base64.b64encode(img).decode("utf-8")
 
 
-def _cv_defect_snaps_from_bytes(label: str, img_bytes: bytes, max_snaps: int = 3) -> List[Dict[str, Any]]:
-    """Return a list of close-up crops as base64 JPEG thumbnails.
 
-    Heuristic detector:
-    - prioritizes low-saturation bright specks near borders (whitening)
-    - falls back to general high-contrast blobs if no border candidates found
-
-    This is intentionally conservative + lightweight (no training needed).
+# ==============================
+# Best-effort defect close-ups (hotspot thumbnails)
+# ==============================
+def _generate_hotspot_snaps(image_bytes: bytes, side: str) -> List[Dict[str, Any]]:
+    """Return a small set of best-effort close-ups so the UI can always show evidence images.
+    This is NOT a definitive defect detector. It simply crops likely areas: corners + a couple of edge strips.
     """
-    if cv2 is None or np is None:
+    if not image_bytes or Image is None:
         return []
     try:
-        arr = np.frombuffer(img_bytes, dtype=np.uint8)
-        im = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if im is None:
-            return []
-        h, w = im.shape[:2]
-        if h < 80 or w < 80:
-            return []
-
-        hsv = cv2.cvtColor(im, cv2.COLOR_BGR2HSV)
-        H, S, V = cv2.split(hsv)
-
-        # Border mask (outer 12% of the card area)
-        border = np.zeros((h, w), dtype=np.uint8)
-        bx = int(max(6, w * 0.12))
-        by = int(max(6, h * 0.12))
-        border[:by, :] = 255
-        border[-by:, :] = 255
-        border[:, :bx] = 255
-        border[:, -bx:] = 255
-
-        # Whitening-ish: bright + low saturation in border
-        bright = cv2.inRange(V, 200, 255)
-        low_sat = cv2.inRange(S, 0, 70)
-        mask = cv2.bitwise_and(bright, low_sat)
-        mask = cv2.bitwise_and(mask, border)
-
-        # Clean up
-        k = max(3, int(min(h, w) * 0.01) | 1)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, kernel, iterations=1)
-
-        # Connected components
-        num, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
-        candidates = []
-        for i in range(1, num):
-            x, y, ww, hh, area = stats[i]
-            if area < 25 or area > int(h*w*0.02):
-                continue
-            cx, cy = centroids[i]
-            # score: area * brightness in bbox
-            roi_v = V[y:y+hh, x:x+ww]
-            score = float(area) * float(np.mean(roi_v) if roi_v.size else 0.0)
-            candidates.append((score, x, y, ww, hh, area))
-
-        # Fallback: if nothing found, use general high-contrast blobs (helps with scratches/print-lines/haze artifacts)
-        if not candidates:
-            gray = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
-            lap = cv2.Laplacian(gray, cv2.CV_16S, ksize=3)
-            lap = cv2.convertScaleAbs(lap)
-            thr = cv2.threshold(lap, 30, 255, cv2.THRESH_BINARY)[1]
-            thr = cv2.morphologyEx(thr, cv2.MORPH_OPEN, kernel, iterations=1)
-            num2, lab2, stats2, cent2 = cv2.connectedComponentsWithStats(thr, connectivity=8)
-            for i in range(1, num2):
-                x, y, ww, hh, area = stats2[i]
-                if area < 40 or area > int(h*w*0.04):
-                    continue
-                cx, cy = cent2[i]
-                score = float(area) * 10.0
-                candidates.append((score, x, y, ww, hh, area))
-
-        if not candidates:
-            return []
-
-        candidates.sort(key=lambda t: t[0], reverse=True)
-        out = []
-        for score, x, y, ww, hh, area in candidates[:max_snaps]:
-            # crop with padding
-            pad = int(max(18, min(w, h) * 0.06))
-            x1 = max(0, int(x - pad))
-            y1 = max(0, int(y - pad))
-            x2 = min(w, int(x + ww + pad))
-            y2 = min(h, int(y + hh + pad))
-            crop = im[y1:y2, x1:x2]
-            if crop.size == 0:
-                continue
-
-            # thumbnail target ~360px wide
-            tw = 360
-            ch, cw = crop.shape[:2]
-            scale = tw / float(cw) if cw else 1.0
-            th = int(max(1, ch * scale))
-            thumb = cv2.resize(crop, (tw, th), interpolation=cv2.INTER_AREA)
-
-            ok, buf = cv2.imencode(".jpg", thumb, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-            if not ok:
-                continue
-            b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
-
-            out.append({
-                "side": label,
-                "source": label,
-                "type": "candidate_defect",
-                "note": f"auto-detected candidate (score {round(float(score),2)})",
-                "score": round(float(score), 2),
-                "thumbnail_b64": b64
-            })
-        return out
+        im = Image.open(io.BytesIO(image_bytes)).convert('RGB')
     except Exception:
         return []
-
-
-def _build_defect_snaps(front_bytes: bytes, back_bytes: bytes) -> List[Dict[str, Any]]:
-    snaps: List[Dict[str, Any]] = []
-    snaps.extend(_cv_defect_snaps_from_bytes("front", front_bytes, max_snaps=3))
-    snaps.extend(_cv_defect_snaps_from_bytes("back", back_bytes, max_snaps=3))
-    return snaps
+    w, h = im.size
+    if w < 80 or h < 80:
+        return []
+    cw, ch = int(w * 0.22), int(h * 0.22)
+    ew, eh = int(w * 0.30), int(h * 0.18)
+    regions = [
+        ('corner', 'top_left', (0, 0, cw, ch)),
+        ('corner', 'top_right', (w - cw, 0, w, ch)),
+        ('corner', 'bottom_left', (0, h - ch, cw, h)),
+        ('corner', 'bottom_right', (w - cw, h - ch, w, h)),
+        ('edge', 'top_edge', (int((w-ew)/2), 0, int((w+ew)/2), eh)),
+        ('edge', 'bottom_edge', (int((w-ew)/2), h - eh, int((w+ew)/2), h)),
+    ]
+    out: List[Dict[str, Any]] = []
+    for _typ, roi, box in regions:
+        try:
+            crop = im.crop(box)
+            max_side = max(crop.size)
+            if max_side > 520:
+                scale = 520 / float(max_side)
+                crop = crop.resize((max(1, int(crop.size[0]*scale)), max(1, int(crop.size[1]*scale))), Image.LANCZOS)
+            buf = io.BytesIO()
+            crop.save(buf, format='JPEG', quality=85, optimize=True)
+            b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+            out.append({
+                'side': side,
+                'type': 'hotspot',
+                'note': f"{side} {roi.replace('_',' ')} close-up (best effort)",
+                'confidence': 0.35,
+                'thumbnail_b64': b64,
+            })
+        except Exception:
+            continue
+    return out
 
 def _make_defect_filter_variants(img_bytes: bytes) -> Dict[str, bytes]:
     """Create enhanced variants to help the second-pass detect print lines / scratches / whitening.
@@ -1820,28 +1609,12 @@ async def verify(
         if provided_year: context += f"- Year: {provided_year}\n"
         if provided_type: context += f"- Type: {provided_type}\n"
 
-    # Vary spoken-word delivery so outputs don't feel templated
-    _spoken_styles = [
-        'Energetic collector-to-collector (short sentences, upbeat close)',
-        'Calm professional appraisal (measured, matter-of-fact)',
-        'Straight-shooting grader (direct, no fluff, ends with clear grade expectation)',
-        'Friendly hobby shop chat (warm, relatable, uses simple language)',
-        'Premium concierge tone (polished, confident, succinct)'
-    ]
-    voice_hint = f"\nSPOKEN WORD DELIVERY STYLE: {random.choice(_spoken_styles)}\n"
-
+    style_seed = random.randint(1000, 999999)  # used to vary phrasing slightly
     prompt = f"""You are a professional trading card grader with 15+ years experience.
 
-STYLE SEED: {style_seed}
-- Vary your phrasing and slang naturally. Avoid repeating the same opener sentence across different runs.
-
 Analyze the provided images with EXTREME scrutiny.
+Use the STYLE SEED below to vary your wording slightly each run while keeping the same meaning. STYLE_SEED: {style_seed}
 You will receive FRONT and BACK images, and MAY receive a third ANGLED image used to rule out glare / light refraction artifacts (holo sheen) vs true whitening / scratches / print lines. Write as if speaking directly to a collector who needs honest, specific feedback about their card.
-
-{voice_hint}
-- Avoid repeating stock openings like 'Hey there!' every time.
-- Vary the closing line (e.g., submit recommendation, sleeve advice, or expectations).
-
 
 CRITICAL RULES:
 1) Be conversational and specific. Write like you're examining the card in person and describing what you see:
@@ -1977,9 +1750,7 @@ Respond ONLY with JSON, no extra text.
         ),
     }]
 
-    style_seed = secrets.token_hex(2)
-    # Slightly higher temperature so spoken/summary doesn't feel copy-paste
-    result = await _openai_chat(msg, max_tokens=2200, temperature=0.25)
+    result = await _openai_chat(msg, max_tokens=2200, temperature=0.1)
     if result.get("error"):
         return JSONResponse(content={"error": True, "message": "AI grading failed", "details": result.get("message", "")}, status_code=502)
 
@@ -2183,15 +1954,15 @@ Return ONLY valid JSON:
         summary = " ".join([p for p in parts if p]).strip()
 
         data["assessment_summary"] = summary
-    # Defect close-ups for UI (text-guided crops; best-effort; never blocks verification)
+    # Best-effort close-up thumbnails so the UI can show evidence images
     defect_snaps: List[Dict[str, Any]] = []
     try:
-        defect_snaps = _defect_snaps_from_defects(front_bytes, back_bytes, defects_list_out, max_snaps=6)
+        defect_snaps = _generate_hotspot_snaps(front_bytes, 'front') + _generate_hotspot_snaps(back_bytes, 'back')
+        defect_snaps = defect_snaps[:8]
     except Exception:
         defect_snaps = []
 
     return JSONResponse(content={
-        "defect_snaps": defect_snaps,
         "pregrade": pregrade_norm or "N/A",
         "confidence": _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0),
         "centering": data.get("centering", {"front": {"grade": "", "notes": ""}, "back": {"grade": "", "notes": ""}}),
@@ -2200,10 +1971,11 @@ Return ONLY valid JSON:
         "surface": data.get("surface", {"front": {"grade": "", "notes": ""}, "back": {"grade": "", "notes": ""}}),
         "defects": defects_list_out,
         "flags": flags_list_out,
+        "defect_snaps": defect_snaps,
         "second_pass": second_pass,
         "glare_suspects": data.get("glare_suspects", []) if isinstance(data.get("glare_suspects", []), list) else [],
-        "assessment_summary": _vary_assessment_summary(_norm_ws(str(data.get("assessment_summary", ""))) or summary or ""),
-        "spoken_word": _vary_spoken_word(_norm_ws(str(data.get("spoken_word", ""))) or _norm_ws(str(data.get("assessment_summary", ""))) or summary or ""),
+        "assessment_summary": _norm_ws(str(data.get("assessment_summary", ""))) or summary or "",
+        "spoken_word": _norm_ws(str(data.get("spoken_word", ""))) or _norm_ws(str(data.get("assessment_summary", ""))) or summary or "",
         "observed_id": data.get("observed_id", {}) if isinstance(data.get("observed_id", {}), dict) else {},
         "verify_token": f"vfy_{secrets.token_urlsafe(12)}",
         "market_context_mode": "click_only",
@@ -2951,13 +2723,13 @@ async def market_context(
         "Okay, Pokéfam — quick market check:",
         "Righto, let’s suss the market real quick:",
     ]
-    opener = _choice(slang_openers)
+    opener = random.choice(slang_openers)
 
     grade_line = ""
     if exp_grade_key:
         grade_line = f" LeagAI’s calling it around a {exp_grade_key} in the current state."
     price_line = f" On current listings, it’s sitting around {_money(current_typ)} AUD (rough range {_money(current_low)}–{_money(current_high)})."
-    trend_line = f" {_choice(["Market’s looking", "The market looks", "Right now it’s feeling", "Price action looks"])} {trend_hint} based on live asks."
+    trend_line = f" The market looks {trend_hint} based on live asks."
     graded_line = ""
     if exp_grade_key and exp_grade_key in grade_market:
         st = grade_market.get(exp_grade_key, {}).get("stats", {})
@@ -2965,12 +2737,12 @@ async def market_context(
             graded_line = f" If it lands that grade, you’re looking at roughly {_money(st.get('median'))} AUD in the graded lane (based on current graded listings)."
     grade_advice = ""
     if worth_grading is True:
-        grade_advice = f" With grading cost around ${float(grading_cost or 0):.0f}, it looks worth a crack if your goal is long-term hold or a clean flip."
-    elif worth_grading is False:
-        grade_advice = f" With grading cost around ${float(grading_cost or 0):.0f}, it’s probably not worth sending in this condition unless you’re chasing the slab for the collection."
-    buy_line = ""
-    if buy_target_aud is not None:
-        buy_line = f" {_choice(["If you’re buying", "If you’re looking to pick one up", "If you’re shopping", "If you’re trying to snag it"])}, a solid target entry is about {_money(buy_target_aud)} AUD or less for this condition — that’s where the risk/reward starts to feel spicy."
+        grade_advice = random.choice([
+            f" With grading cost around ${float(grading_cost or 0):.0f}, it looks worth a crack if you’re holding long-term or chasing a tidy flip.",
+            f" Grading’s roughly ${float(grading_cost or 0):.0f} — on balance, it stacks up if you’re aiming for a slabbed keeper or resale.",
+            f" With grading fees around ${float(grading_cost or 0):.0f}, there’s enough upside to justify a submission if the goal is a long hold.",
+        ])
+        buy_line = f" If you’re buying, a good target entry is about {_money(buy_target_aud)} AUD or less for this condition — that’s where the risk/reward starts to feel spicy."
 
     market_summary = _norm_ws(f"{opener}{grade_line}{price_line} {trend_line}{graded_line} {grade_advice} {buy_line}")
 
