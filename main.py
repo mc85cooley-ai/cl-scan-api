@@ -24,6 +24,7 @@ from datetime import datetime
 from statistics import mean, median
 from functools import wraps
 import base64
+import io
 import os
 import json
 import sqlite3
@@ -42,12 +43,170 @@ import math
 
 # Optional image processing for 2-pass defect enhancement
 try:
-    from PIL import Image, ImageEnhance, ImageOps, ImageFilter
+    from PIL import Image, ImageEnhance, ImageOps, ImageFilter, ImageStat
 except Exception:
     Image = None
     ImageEnhance = None
     ImageOps = None
     ImageFilter = None
+
+
+PIL_AVAILABLE = bool(Image)
+
+
+def _make_thumb_from_bbox(img_bytes: bytes, bbox: Dict[str, Any], max_size: int = 520) -> str:
+    """Crop a normalized bbox out of an image and return base64 JPEG."""
+    if not PIL_AVAILABLE or not img_bytes or not bbox:
+        return ""
+    try:
+        im = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        w, h = im.size
+        x = float(bbox.get("x", 0.0)); y = float(bbox.get("y", 0.0))
+        bw = float(bbox.get("w", 1.0)); bh = float(bbox.get("h", 1.0))
+        px1 = max(0, min(w-1, int(round(x * w))))
+        py1 = max(0, min(h-1, int(round(y * h))))
+        px2 = max(1, min(w, int(round((x + bw) * w))))
+        py2 = max(1, min(h, int(round((y + bh) * h))))
+        if px2 <= px1 or py2 <= py1:
+            return ""
+        crop = im.crop((px1, py1, px2, py2))
+        # Resize to max_size while preserving aspect
+        cw, ch = crop.size
+        scale = min(1.0, float(max_size) / max(cw, ch))
+        if scale < 1.0:
+            crop = crop.resize((max(1,int(cw*scale)), max(1,int(ch*scale))))
+        buf = io.BytesIO()
+        crop.save(buf, format="JPEG", quality=85, optimize=True)
+        return _b64(buf.getvalue())
+    except Exception:
+        return ""
+
+def _cv_candidate_bboxes(img_bytes: bytes, side: str) -> List[Dict[str, Any]]:
+    """
+    Light CV assist to propose 'hotspot' regions near borders where whitening/edge wear is likely.
+    Returns normalized bboxes: {side, roi, score, bbox:{x,y,w,h}}
+    """
+    if not PIL_AVAILABLE or not img_bytes:
+        return []
+    try:
+        im = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        w, h = im.size
+        g = ImageOps.grayscale(im)
+        edge = g.filter(ImageFilter.FIND_EDGES)
+
+        def score_box(px, py, px2, py2):
+            cg = g.crop((px, py, px2, py2))
+            ce = edge.crop((px, py, px2, py2))
+            bg = ImageStat.Stat(cg).mean[0] / 255.0
+            be = ImageStat.Stat(ce).mean[0] / 255.0
+            return 0.65 * be + 0.35 * bg
+
+        rois = []
+        t = max(6, int(0.08 * min(w, h)))  # edge strips
+        roi_defs = [
+            ("edge_top", (0, 0, w, t)),
+            ("edge_bottom", (0, h - t, w, h)),
+            ("edge_left", (0, 0, t, h)),
+            ("edge_right", (w - t, 0, w, h)),
+        ]
+        c = max(18, int(0.18 * min(w, h)))  # corners
+        roi_defs += [
+            ("corner_top_left", (0, 0, c, c)),
+            ("corner_top_right", (w - c, 0, w, c)),
+            ("corner_bottom_left", (0, h - c, c, h)),
+            ("corner_bottom_right", (w - c, h - c, w, h)),
+        ]
+
+        for name, (px, py, px2, py2) in roi_defs:
+            s = float(score_box(px, py, px2, py2))
+            bbox = {"x": round(px / w, 4), "y": round(py / h, 4),
+                    "w": round((px2 - px) / w, 4), "h": round((py2 - py) / h, 4)}
+            rois.append({"side": side, "roi": name, "score": round(s, 4), "bbox": bbox})
+
+        rois.sort(key=lambda r: r.get("score", 0.0), reverse=True)
+        corners = [r for r in rois if str(r.get("roi","")).startswith("corner_")]
+        edges = [r for r in rois if str(r.get("roi","")).startswith("edge_")]
+        out = (corners[:4] + edges[:2])
+        seen = set()
+        final = []
+        for r in out:
+            if r.get("roi") in seen:
+                continue
+            seen.add(r.get("roi"))
+            final.append(r)
+        return final
+    except Exception:
+        return []
+
+async def _openai_label_rois(rois: List[Dict[str, Any]], front_bytes: Optional[bytes], back_bytes: Optional[bytes]) -> List[Dict[str, Any]]:
+    """
+    Ask the vision model to confirm if ROI crops contain real defects and label them.
+    Returns list:
+      [{crop_index, side, roi, is_defect, type, note, confidence}]
+    """
+    if not rois:
+        return []
+    content_parts: List[Dict[str, Any]] = [{
+        "type": "text",
+        "text": (
+            "You are reviewing close-up crops from a trading card photo. "
+            "For each crop, decide whether it shows a REAL defect (not glare/noise). "
+            "If real, label the defect type and write a short note. Return ONLY JSON as an array."
+        )
+    }]
+
+    crop_map = []  # keeps (i, side, roi) only for included crops
+    for i, r in enumerate(rois):
+        side = r.get("side")
+        bbox = r.get("bbox") or {}
+        src = front_bytes if side == "front" else back_bytes
+        if not src:
+            continue
+        thumb = _make_thumb_from_bbox(src, bbox, max_size=520)
+        if not thumb:
+            continue
+        crop_map.append((i, side, r.get("roi")))
+        content_parts += [
+            {"type": "text", "text": f"CROP {i} | side={side} | roi={r.get('roi')}"},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{thumb}", "detail": "high"}},
+        ]
+
+    label_prompt = (
+        "Return ONLY JSON array, one object per crop you can judge. "
+        "Schema: {crop_index:int, is_defect:bool, type:string, note:string, confidence:0-1}. "
+        "type should be one of: whitening, edge_chipping, corner_whitening, scratch, print_line, dent, crease, stain, other. "
+        "If not a defect, set is_defect=false and type='none'. Keep note short."
+    )
+    content_parts += [{"type":"text","text": label_prompt}]
+    msg = [{"role":"user","content": content_parts}]
+    res = await _openai_chat(msg, max_tokens=700, temperature=0.1)
+    if res.get("error"):
+        return []
+    arr = _parse_json_or_none(res.get("content","")) or []
+    if not isinstance(arr, list):
+        return []
+    out = []
+    for x in arr:
+        if not isinstance(x, dict):
+            continue
+        try:
+            ci = int(x.get("crop_index", -1))
+        except Exception:
+            ci = -1
+        if ci < 0 or ci >= len(rois):
+            continue
+        r = rois[ci]
+        out.append({
+            "crop_index": ci,
+            "side": r.get("side"),
+            "roi": r.get("roi"),
+            "is_defect": bool(x.get("is_defect", False)),
+            "type": str(x.get("type","") or "none")[:32],
+            "note": _norm_ws(str(x.get("note","") or ""))[:220],
+            "confidence": _clamp(_safe_float(x.get("confidence", 0.0)), 0.0, 1.0),
+        })
+    return out
+
 
 # Simple in-memory caches (per-process)
 _FX_CACHE = {"ts": 0, "usd_aud": None}
@@ -1643,7 +1802,7 @@ Respond ONLY with JSON, no extra text.
 
     second_pass = {"enabled": True, "ran": False, "skipped_reason": None, "glare_suspects": [], "defect_candidates": []}
     # Optional preview images (filtered variants). Keep defined to avoid runtime errors.
-    defect_snaps: Dict[str, str] = {}
+    defect_filters: Dict[str, str] = {}
     try:
         # Only run for cards; memorabilia uses a different endpoint.
         front_vars = _make_defect_filter_variants(front_bytes)
@@ -1653,11 +1812,11 @@ Respond ONLY with JSON, no extra text.
         if isinstance(front_vars, dict):
             for k, v in front_vars.items():
                 if isinstance(v, (bytes, bytearray)) and len(v) > 200:
-                    defect_snaps[f"front_{k}"] = _b64(bytes(v))
+                    defect_filters[f"front_{k}"] = _b64(bytes(v))
         if isinstance(back_vars, dict):
             for k, v in back_vars.items():
                 if isinstance(v, (bytes, bytearray)) and len(v) > 200:
-                    defect_snaps[f"back_{k}"] = _b64(bytes(v))
+                    defect_filters[f"back_{k}"] = _b64(bytes(v))
 
         if not front_vars and not back_vars:
             second_pass["enabled"] = False
@@ -1728,6 +1887,52 @@ Return ONLY valid JSON:
                 second_pass["skipped_reason"] = "second_pass_ai_failed"
     except Exception:
         second_pass["skipped_reason"] = "second_pass_exception"
+
+
+    # ------------------------------
+    # CV-assisted defect closeups (defect_snaps) for UI thumbnails
+    # ------------------------------
+    rois: List[Dict[str, Any]] = []
+    try:
+        rois = _cv_candidate_bboxes(front_bytes, "front") + _cv_candidate_bboxes(back_bytes, "back")
+    except Exception:
+        rois = []
+
+    roi_labels: List[Dict[str, Any]] = []
+    try:
+        roi_labels = await _openai_label_rois(rois, front_bytes, back_bytes) if rois else []
+    except Exception:
+        roi_labels = []
+
+    if isinstance(second_pass, dict):
+        second_pass["roi_labels"] = roi_labels
+
+    defect_snaps: List[Dict[str, Any]] = []
+    label_by_idx = {int(x.get("crop_index", -1)): x for x in (roi_labels or []) if isinstance(x, dict)}
+    for i, r in enumerate((rois or [])[:10]):
+        src = front_bytes if r.get("side") == "front" else back_bytes
+        if not src:
+            continue
+        bbox = r.get("bbox") or {}
+        thumb = _make_thumb_from_bbox(src, bbox, max_size=520)
+        if not thumb:
+            continue
+        lab = label_by_idx.get(i) or {}
+        is_def = bool(lab.get("is_defect", False))
+        dtype = lab.get("type") if is_def else "hotspot"
+        note = lab.get("note") if lab else f"CV hotspot: {r.get('roi')}"
+        conf = lab.get("confidence") if lab else 0.0
+        defect_snaps.append({
+            "side": r.get("side"),
+            "type": dtype,
+            "note": _norm_ws(str(note))[:220],
+            "confidence": _clamp(_safe_float(conf, 0.0), 0.0, 1.0),
+            "bbox": bbox,
+            "thumbnail_b64": thumb,
+        })
+
+    defect_snaps.sort(key=lambda x: (0 if x.get("type") != "hotspot" else 1, -float(x.get("confidence") or 0.0)))
+    defect_snaps = defect_snaps[:8]
 
     # Normalize flags/defects and compute structural-damage indicator
     flags_raw = data.get("flags", [])
