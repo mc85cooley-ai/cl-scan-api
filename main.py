@@ -32,6 +32,7 @@ import secrets
 import hashlib
 import re
 import traceback
+import logging
 import statistics
 from pathlib import Path
 
@@ -58,7 +59,17 @@ FX_CACHE_SECONDS = int(os.getenv("FX_CACHE_SECONDS", "3600"))
 # ==============================
 app = FastAPI(title="Collectors League Scan API")
 
-ALLOWED_ORIGINS = ["*"]
+logger = logging.getLogger("cl-scan-api")
+
+ALLOWED_ORIGINS = [
+    "https://collectors-league.com",
+    "https://www.collectors-league.com",
+    "http://localhost",
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "*",
+]
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -1348,95 +1359,87 @@ async def pricecharting_history(product_id: str, limit: int = 52):
 # Card: Identify (AI + optional PokemonTCG enrichment)
 # ==============================
 @app.post("/api/identify")
+@safe_endpoint
 async def identify(front: UploadFile = File(...), back: UploadFile | None = File(None)):
     """Identify a collectible card/item from images.
     Front is required. Back is optional (kept for backward compatibility).
     """
-    try:
-        front_bytes = await front.read()
-        if not front_bytes:
-            raise HTTPException(status_code=400, detail="No front image uploaded.")
-        back_bytes: bytes | None = None
-        if back is not None:
-            back_bytes = await back.read()
-            if not back_bytes:
-                back_bytes = None
+    front_bytes = await front.read()
+    if not front_bytes or len(front_bytes) < 200:
+        raise HTTPException(status_code=400, detail="No front image uploaded (or image too small).")
 
-        # Build OpenAI vision messages
-        images = [
+    back_bytes: bytes | None = None
+    if back is not None:
+        bb = await back.read()
+        if bb and len(bb) >= 200:
+            back_bytes = bb
+
+    images = [
+        {
+            "type": "image_url",
+            "image_url": {"url": f"data:{front.content_type or 'image/jpeg'};base64,{_b64(front_bytes)}"},
+        }
+    ]
+    if back_bytes is not None:
+        images.append(
             {
                 "type": "image_url",
-                "image_url": {"url": f"data:{front.content_type or 'image/jpeg'};base64,{_b64(front_bytes)}"},
+                "image_url": {"url": f"data:{back.content_type or 'image/jpeg'};base64,{_b64(back_bytes)}"},
             }
-        ]
-        if back_bytes is not None:
-            images.append(
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:{back.content_type or 'image/jpeg'};base64,{_b64(back_bytes)}"},
-                }
-            )
-
-        system = (
-            "You are an expert collectibles identifier. "
-            "Return ONLY valid JSON. Be conservative; if unsure, leave fields empty rather than hallucinating."
-        )
-        user = (
-            "Identify the card/item from the image(s). "
-            "Return JSON with keys: "
-            "card_name, card_type, game, year, card_number, set_code, set_name, manufacturer, language, "
-            "confidence (0-1), reasoning (short). "
-            "For Pokemon, set_code should be the PT-CGO set code if visible (e.g., MEW), else empty."
         )
 
-        resp = await _openai_chat(
-            model=VISION_MODEL,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": [{"type": "text", "text": user}, *images]},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.1,
-        )
+    system = (
+        "You are an expert collectibles identifier. "
+        "Return ONLY valid JSON. Be conservative; if unsure, leave fields empty rather than hallucinating."
+    )
+    user = (
+        "Identify the card/item from the image(s). "
+        "Return JSON with keys: "
+        "card_name, card_type, game, year, card_number, set_code, set_name, manufacturer, language, "
+        "confidence (0-1), reasoning (short). "
+        "For Pokemon, set_code should be the PT-CGO set code if visible (e.g., MEW), else empty."
+    )
 
-        content = resp.choices[0].message.content or "{}"
-        try:
-            data = json.loads(content)
-        except Exception:
-            # Try to salvage JSON
-            data = _safe_json_extract(content) or {}
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": [{"type": "text", "text": user}, *images]},
+    ]
 
-        # Normalize expected fields
-        result = {
-            "card_name": _norm_ws(str(data.get("card_name", ""))),
-            "card_type": _norm_ws(str(data.get("card_type", ""))),
-            "game": _norm_ws(str(data.get("game", ""))),
-            "year": _norm_ws(str(data.get("year", ""))),
-            "card_number": _norm_ws(str(data.get("card_number", ""))),
-            "set_code": _norm_ws(str(data.get("set_code", ""))),
-            "set_name": _norm_ws(str(data.get("set_name", ""))),
-            "manufacturer": _norm_ws(str(data.get("manufacturer", ""))),
-            "language": _norm_ws(str(data.get("language", ""))),
-            "confidence": float(data.get("confidence", 0) or 0),
-            "reasoning": _norm_ws(str(data.get("reasoning", ""))),
-        }
+    resp = await _openai_chat(messages=messages, max_tokens=900, temperature=0.1)
+    if resp.get("error"):
+        # bubble as 502 to clearly show upstream dependency issues
+        raise HTTPException(status_code=502, detail=f"AI identify failed: {resp.get('message', 'unknown error')}")
 
-        # Canonicalize set info where helpers exist
-        try:
-            set_info = _canonicalize_set(result["set_code"], result["set_name"])
-            result["set_code"] = set_info.get("set_code", result["set_code"])
-            result["set_name"] = set_info.get("set_name", result["set_name"])
-            result["set_source"] = set_info.get("set_source", "")
-        except Exception:
-            pass
+    content = resp.get("content") or "{}"
+    data = _parse_json_or_none(content) or _safe_json_extract(content) or {}
+    if not isinstance(data, dict):
+        data = {}
 
-        return {"ok": True, "card": result}
+    result = {
+        "card_name": _norm_ws(str(data.get("card_name", ""))),
+        "card_type": _normalize_card_type(str(data.get("card_type", ""))),
+        "game": _norm_ws(str(data.get("game", ""))),
+        "year": _norm_ws(str(data.get("year", ""))),
+        "card_number": _clean_card_number_display(str(data.get("card_number", ""))),
+        "set_code": _norm_ws(str(data.get("set_code", ""))).upper(),
+        "set_name": _norm_ws(str(data.get("set_name", ""))),
+        "manufacturer": _norm_ws(str(data.get("manufacturer", ""))),
+        "language": _norm_ws(str(data.get("language", ""))),
+        "confidence": _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0),
+        "reasoning": _norm_ws(str(data.get("reasoning", ""))),
+    }
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("identify failed")
-        raise HTTPException(status_code=500, detail=f"Identify error: {e}")
+    # Canonicalize set info where helpers exist
+    try:
+        set_info = _canonicalize_set(result["set_code"], result["set_name"])
+        result["set_code"] = set_info.get("set_code", result["set_code"])
+        result["set_name"] = set_info.get("set_name", result["set_name"])
+        result["set_source"] = set_info.get("set_source", "")
+    except Exception:
+        pass
+
+    return {"ok": True, "card": result}
+
 
 @app.post("/api/verify")
 @safe_endpoint
