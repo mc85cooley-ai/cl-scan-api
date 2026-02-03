@@ -948,57 +948,46 @@ def _norm_ws(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
 
-def _is_blankish(s: str) -> bool:
-    s2 = _norm_ws(s or "").lower()
-    return (not s2) or s2 in ("unknown", "n/a", "na", "none", "null", "undefined")
-
-def _safe_json_extract(text: str) -> dict | None:
-    """Best-effort extraction of a JSON object from a model response."""
-    if not text:
-        return None
-    # Fast path
-    try:
-        obj = json.loads(text)
-        if isinstance(obj, dict):
-            return obj
-    except Exception:
-        pass
-    # Heuristic: find first {...} block
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        snippet = text[start:end+1]
-        try:
-            obj = json.loads(snippet)
-            if isinstance(obj, dict):
-                return obj
-        except Exception:
-            return None
-    return None
-
-
-def _normalize_card_type(card_type: str) -> str:
-    """Force card_type into the allowed enum."""
-    s = _norm_ws(card_type or "").lower()
+def _relax_measurements(s: str) -> str:
+    """Turn clinical measurement phrasing (mm/cm/in) into relaxed collector-friendly language."""
     if not s:
-        return "Other"
-    # common variants
-    if "pokemon" in s or s in ("pkmn", "poke", "pokémon"):
-        return "Pokemon"
-    if "magic" in s or "mtg" in s:
-        return "Magic"
-    if "yug" in s or "yu-gi" in s or "yugi" in s:
-        return "YuGiOh"
-    if "one piece" in s or "onepiece" in s:
-        return "OnePiece"
-    if "sport" in s:
-        return "Sports"
-    if s in ("other", "other tcg", "tcg", "trading card", "tradingcard"):
-        return "Other"
-    # fallback: title-case but keep enum
-    return "Other"
+        return ""
+    s0 = str(s)
 
+    # Replace explicit units with vibe-words
+    def _repl(m: re.Match) -> str:
+        num = m.group('num')
+        unit = (m.group('unit') or '').lower()
+        try:
+            val = float(num)
+        except Exception:
+            val = None
 
+        # Normalize inches to mm-ish scale just for rough phrasing
+        if val is not None and unit.startswith('in'):
+            val = val * 25.4
+        if val is None:
+            return "a bit"
+        if val <= 1.2:
+            return "a tiny bit"
+        if val <= 3.5:
+            return "a small bit"
+        if val <= 8:
+            return "a bit"
+        return "a fair bit"
+
+    s0 = re.sub(r"\b(?P<num>\d+(?:\.\d+)?)\s*(?P<unit>mm|cm|inches|inch|in)\b", _repl, s0, flags=re.IGNORECASE)
+
+    # If we've now got 'about a small bit' etc, drop the qualifier to keep it natural
+    s0 = re.sub(r"\b(approximately|approx\.?|around|about)\b\s+(a tiny bit|a small bit|a bit|a fair bit)", r"\2", s0, flags=re.IGNORECASE)
+
+    # Tidy up some overly-clinical phrases
+    s0 = re.sub(r"\binto the card surface\b", "into the card", s0, flags=re.IGNORECASE)
+    s0 = re.sub(r"\bextending\b", "running", s0, flags=re.IGNORECASE)
+
+    # Normalize whitespace
+    s0 = re.sub(r"\s+", " ", s0).strip()
+    return s0
 def _is_blankish(s: str) -> bool:
     s=(s or "").strip().lower()
     return s in ("", "unknown", "n/a", "na", "none", "not sure", "unsure")
@@ -1715,11 +1704,11 @@ You will receive FRONT and BACK images, and MAY receive a third ANGLED image use
 CRITICAL RULES:
 1) Be conversational and specific. Write like you're examining the card in person and describing what you see:
    - BAD: "Minor edge wear present"
-   - GOOD: "Looking at the front, I can see some very slight edge wear along the top edge, approximately 2mm from the top-left corner. The right edge is notably cleaner."
+   - GOOD: "Looking at the front, I can see some very slight edge wear along the top edge, near the top-left corner. The right edge is notably cleaner."
 
 2) Call out every single corner individually with precise location and severity:
    - For EACH of the 8 corners (4 front + 4 back), describe what you observe
-   - Examples: "Front top-left corner is perfectly sharp", "Back bottom-right shows minor whitening about 1mm deep"
+   - Examples: "Front top-left corner is perfectly sharp", "Back bottom-right shows a touch of whitening"
 
 3) Grade must reflect worst visible defect (conservative PSA-style):
    - Any crease/fold/tear/major dent → pregrade 4 or lower
@@ -1750,7 +1739,7 @@ Return ONLY valid JSON with this EXACT structure:
   "centering": {{
     "front": {{
       "grade": "55/45",
-      "notes": "Detailed observation: slightly off-center towards [direction], approximately [measurement]. [Impact on grade]."
+      "notes": "Detailed observation: slightly off-center towards [direction], a touch off-center. [Impact on grade]."
     }},
     "back": {{
       "grade": "60/40", 
@@ -1804,7 +1793,7 @@ Return ONLY valid JSON with this EXACT structure:
     }}
   }},
   "defects": [
-    "Each defect as a complete sentence: [SIDE] [precise location] shows [type of defect] [severity]. Example: 'Front top-left corner shows moderate whitening extending approximately 2mm into the card surface.'"
+    "Each defect as a complete sentence: [SIDE] [precise location] shows [type of defect] [severity]. Example: 'Front top-left corner shows moderate whitening running slightly into the card.'"
   ],
   "flags": [
     "Short flags for important issues (crease, bend, edge chipping, etc.)"
@@ -1978,9 +1967,21 @@ Return ONLY valid JSON:
         if not thumb:
             continue
         lab = label_by_idx.get(i) or {}
-        is_def = bool(lab.get("is_defect", False))
-        dtype = lab.get("type") if is_def else "hotspot"
-        note = lab.get("note") if lab else f"CV hotspot: {r.get('roi')}"
+        conf = lab.get("confidence") if isinstance(lab, dict) else 0.0
+        is_def = bool(lab.get("is_defect", False)) if isinstance(lab, dict) else False
+        dtype_guess = (lab.get("type") if isinstance(lab, dict) else None) or "none"
+        # Robust "defect-flag" logic: primarily respect is_defect, but tolerate missing/buggy flags.
+        # Treat as a defect when model assigns a non-"none" type with reasonable confidence.
+        if (not is_def) and dtype_guess != "none" and float(conf or 0.0) >= 0.40:
+            is_def = True
+        # If the model did not return any label for this crop, fall back to ROI score.
+        if (not is_def) and (not lab) and float(r.get("score") or 0.0) >= 0.75:
+            is_def = True
+        # Only show CV evidence when it is flagged/treated as a defect.
+        if not is_def:
+            continue
+        dtype = lab.get("type") or "defect"
+        note = lab.get("note") if lab else f"CV defect: {r.get('roi')}"
         conf = lab.get("confidence") if lab else 0.0
         defect_snaps.append({
             "side": r.get("side"),
@@ -1992,8 +1993,10 @@ Return ONLY valid JSON:
             "thumbnail_b64": thumb,
         })
 
-    defect_snaps.sort(key=lambda x: (0 if x.get("type") != "hotspot" else 1, -float(x.get("confidence") or 0.0)))
+    defect_snaps.sort(key=lambda x: (-float(x.get("confidence") or 0.0)))
     defect_snaps = defect_snaps[:8]
+
+
 
     # Add stable IDs + coarse categories for UI linking (photos <-> bullet refs)
     def _snap_category(s: Dict[str, Any]) -> str:
@@ -2128,6 +2131,33 @@ Return ONLY valid JSON:
         summary = " ".join([p for p in parts if p]).strip()
 
         data["assessment_summary"] = summary
+
+    # Make language less clinical (e.g., remove mm/cm/in callouts)
+    try:
+        # Relax defects list coming from the model
+        if isinstance(defects_list_out, list):
+            defects_list_out = [_relax_measurements(_norm_ws(str(d))) for d in defects_list_out if _norm_ws(str(d))][:50]
+        # Relax notes in common structured areas
+        for sect in ("centering", "edges", "surface"):
+            if isinstance(data.get(sect), dict):
+                for side in ("front", "back"):
+                    o = data.get(sect, {}).get(side)
+                    if isinstance(o, dict) and isinstance(o.get("notes"), str):
+                        o["notes"] = _relax_measurements(o.get("notes"))
+        # Corners notes
+        if isinstance(data.get("corners"), dict):
+            for side in ("front", "back"):
+                for k,v in (data.get("corners", {}).get(side, {}) or {}).items():
+                    if isinstance(v, dict) and isinstance(v.get("notes"), str):
+                        v["notes"] = _relax_measurements(v.get("notes"))
+        # Summaries
+        if isinstance(data.get("assessment_summary"), str):
+            data["assessment_summary"] = _relax_measurements(data.get("assessment_summary"))
+        if isinstance(data.get("spoken_word"), str):
+            data["spoken_word"] = _relax_measurements(data.get("spoken_word"))
+    except Exception:
+        pass
+
     return JSONResponse(content={
         "pregrade": pregrade_norm or "N/A",
         "confidence": _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0),
@@ -2389,9 +2419,21 @@ Respond ONLY with JSON, no extra text.
         if not thumb:
             continue
         lab = label_by_idx.get(i) or {}
-        is_def = bool(lab.get("is_defect", False))
-        dtype = lab.get("type") if is_def else "hotspot"
-        note = lab.get("note") if lab else f"CV hotspot: {r.get('roi')}"
+        conf = lab.get("confidence") if isinstance(lab, dict) else 0.0
+        is_def = bool(lab.get("is_defect", False)) if isinstance(lab, dict) else False
+        dtype_guess = (lab.get("type") if isinstance(lab, dict) else None) or "none"
+        # Robust "defect-flag" logic: primarily respect is_defect, but tolerate missing/buggy flags.
+        # Treat as a defect when model assigns a non-"none" type with reasonable confidence.
+        if (not is_def) and dtype_guess != "none" and float(conf or 0.0) >= 0.40:
+            is_def = True
+        # If the model did not return any label for this crop, fall back to ROI score.
+        if (not is_def) and (not lab) and float(r.get("score") or 0.0) >= 0.75:
+            is_def = True
+        # Only show CV evidence when it is flagged/treated as a defect.
+        if not is_def:
+            continue
+        dtype = lab.get("type") or "defect"
+        note = lab.get("note") if lab else f"CV defect: {r.get('roi')}"
         conf = lab.get("confidence") if lab else 0.0
         defect_snaps.append({
             "side": r.get("side"),
@@ -2403,7 +2445,7 @@ Respond ONLY with JSON, no extra text.
             "thumbnail_b64": thumb,
         })
 
-    defect_snaps.sort(key=lambda x: (0 if x.get("type") != "hotspot" else 1, -float(x.get("confidence") or 0.0)))
+    defect_snaps.sort(key=lambda x: (-float(x.get("confidence") or 0.0)))
     defect_snaps = defect_snaps[:8]
 
     def _snap_category(s: Dict[str, Any]) -> str:
@@ -2421,6 +2463,29 @@ Respond ONLY with JSON, no extra text.
         s["id"] = idx
         s["ref"] = f"#{idx}"
         s["category"] = _snap_category(s)
+
+
+    # Make language less clinical (e.g., remove mm/cm/in callouts)
+    try:
+        # Relax common notes/strings
+        if isinstance(seal, dict) and isinstance(seal.get("notes"), str):
+            seal["notes"] = _relax_measurements(seal.get("notes"))
+        pc = data.get("packaging_condition") if isinstance(data.get("packaging_condition"), dict) else {}
+        if isinstance(pc.get("notes"), str):
+            pc["notes"] = _relax_measurements(pc.get("notes"))
+        data["packaging_condition"] = pc
+        sig = data.get("signature_assessment") if isinstance(data.get("signature_assessment"), dict) else {}
+        if isinstance(sig.get("notes"), str):
+            sig["notes"] = _relax_measurements(sig.get("notes"))
+        data["signature_assessment"] = sig
+        if isinstance(data.get("defects"), list):
+            data["defects"] = [_relax_measurements(_norm_ws(str(d))) for d in data.get("defects", []) if _norm_ws(str(d))][:50]
+        if isinstance(data.get("overall_assessment"), str):
+            data["overall_assessment"] = _relax_measurements(data.get("overall_assessment"))
+        if isinstance(data.get("spoken_word"), str):
+            data["spoken_word"] = _relax_measurements(data.get("spoken_word"))
+    except Exception:
+        pass
 
     return JSONResponse(content={
         "condition_grade": _norm_ws(str(data.get("condition_grade", "N/A"))),
@@ -3113,34 +3178,95 @@ async def market_context(
             worth_grading = (uplift > float(grading_cost or 0))
         except Exception:
             worth_grading = None
+    # Collector-style summary with stable "random" variation (so it doesn't change on refresh)
+    import hashlib as _hashlib
+
+    def _pick(arr, seed_int, offset=0):
+        if not arr:
+            return ""
+        return arr[(seed_int + offset) % len(arr)]
+
+    seed_key = f"{used_query}|{exp_grade_key}|{current_typ}|{current_low}|{current_high}|{grading_cost}|{buy_target_aud}"
+    seed_int = int(_hashlib.sha256(seed_key.encode("utf-8")).hexdigest(), 16)
 
     slang_openers = [
-        "Alright mate, here’s the vibe on this one:",
-        "Okay, Pokéfam — quick market check:",
-        "Righto, let’s suss the market real quick:",
+        "Alright mate — quick market check:",
+        "Okay, let’s do a fast price suss:",
+        "Righto, here’s what the market’s doing:",
+        "Pack-ripper vibes report:",
+        "Collector’s take — here’s the read:",
     ]
-    opener = slang_openers[0]
+    opener = _pick(slang_openers, seed_int, 0)
 
-    grade_line = ""
-    if exp_grade_key:
-        grade_line = f" LeagAI’s calling it around a {exp_grade_key} in the current state."
-    price_line = f" On current listings, it’s sitting around {_money(current_typ)} AUD (rough range {_money(current_low)}–{_money(current_high)})."
-    trend_line = f" The market looks {trend_hint} based on live asks."
+    grade_bits = [
+        f"LeagAI’s calling it around a {exp_grade_key} in the current state." if exp_grade_key else "",
+        f"Condition-wise, it’s roughly sitting at a {exp_grade_key} today." if exp_grade_key else "",
+        f"I’d peg it around a {exp_grade_key} as it sits (no sugar-coating)." if exp_grade_key else "",
+    ]
+    grade_line = (" " + _pick([b for b in grade_bits if b], seed_int, 1)) if exp_grade_key else ""
+
+    price_bits = [
+        f"Raw asks are hovering around {_money(current_typ)} AUD (rough {_money(current_low)}–{_money(current_high)}).",
+        f"Current listings put it near {_money(current_typ)} AUD, with most asks landing {_money(current_low)}–{_money(current_high)}.",
+        f"On the open market, you’re basically in the {_money(current_low)}–{_money(current_high)} AUD lane (typical ask ~{_money(current_typ)}).",
+    ]
+    price_line = " " + _pick(price_bits, seed_int, 2)
+
+    trend_bits = [
+        f"Feels {trend_hint} right now based on live asks.",
+        f"Overall vibe is {trend_hint} from what’s up for sale.",
+        f"Market looks {trend_hint} — not heaps of wild swings in the asks.",
+        f"At the moment it’s {trend_hint} — buyers aren’t getting punished, sellers aren’t panicking.",
+    ]
+    trend_line = " " + _pick(trend_bits, seed_int, 3)
+
     graded_line = ""
     if exp_grade_key and exp_grade_key in grade_market:
         st = grade_market.get(exp_grade_key, {}).get("stats", {})
         if st and st.get("median") is not None:
-            graded_line = f" If it lands that grade, you’re looking at roughly {_money(st.get('median'))} AUD in the graded lane (based on current graded listings)."
+            graded_bits = [
+                f"If it lands that grade, graded asks cluster around {_money(st.get('median'))} AUD.",
+                f"Hit that grade and the graded lane is roughly {_money(st.get('median'))} AUD from current listings.",
+                f"At that grade, you’re looking at about {_money(st.get('median'))} AUD in the slab market (based on what's up now).",
+            ]
+            graded_line = " " + _pick(graded_bits, seed_int, 4)
+
+    # Grading/strategy advice — vary tone and don't always default to 'not worth it'
     grade_advice = ""
+    gc = float(grading_cost or 0)
     if worth_grading is True:
-        grade_advice = f" With grading cost around ${float(grading_cost or 0):.0f}, it looks worth a crack if your goal is long-term hold or a clean flip."
+        yes_bits = [
+            f"With grading around ${gc:.0f}, it actually stacks up — worth a crack if you want the slab or a cleaner flip.",
+            f"At ~${gc:.0f} to grade, the maths works — I’d seriously consider sending it.",
+            f"Grading cost (~${gc:.0f}) looks justified here, especially if you’re chasing registry/portfolio value.",
+        ]
+        grade_advice = " " + _pick(yes_bits, seed_int, 5)
     elif worth_grading is False:
-        grade_advice = f" With grading cost around ${float(grading_cost or 0):.0f}, it’s probably not worth sending in this condition unless you’re chasing the slab for the collection."
+        no_bits = [
+            f"At ~${gc:.0f} to grade, I’d only send it if it’s PC/registry flex — otherwise raw might be the smarter play.",
+            f"Grading (~${gc:.0f}) is a bit spicy for the expected lift — unless you just want it slabbed for the collection.",
+            f"With grading around ${gc:.0f}, this one’s more of a ‘grade for love’ than ‘grade for profit’.",
+            f"Slabbing it could still make sense for protection/registry, but purely on dollars it’s not a slam dunk.",
+        ]
+        grade_advice = " " + _pick(no_bits, seed_int, 5)
+    else:
+        unk_bits = [
+            f"Grading costs vary, but keep it simple: only send it if the slab premium matters to you.",
+            f"If you’re thinking grading, the play depends on the grade ceiling — this isn’t a guaranteed slam dunk either way.",
+            f"On grading: it’s a vibe call — profit if it pops the grade, but don’t bank on it.",
+        ]
+        grade_advice = " " + _pick(unk_bits, seed_int, 5)
+
     buy_line = ""
     if buy_target_aud is not None:
-        buy_line = f" If you’re buying, a good target entry is about {_money(buy_target_aud)} AUD or less for this condition — that’s where the risk/reward starts to feel spicy."
+        buy_bits = [
+            f"Buying tip: try land it at {_money(buy_target_aud)} AUD or under for this condition — that’s where the deal starts looking tasty.",
+            f"If you’re shopping, {_money(buy_target_aud)} AUD or less is the sweet spot for this condition.",
+            f"As a buyer, I’d be aiming ≤ {_money(buy_target_aud)} AUD given the current condition call.",
+        ]
+        buy_line = " " + _pick(buy_bits, seed_int, 6)
 
-    market_summary = _norm_ws(f"{opener}{grade_line}{price_line} {trend_line}{graded_line} {grade_advice} {buy_line}")
+    market_summary = _norm_ws(f"{opener}{grade_line}{price_line}{trend_line}{graded_line}{grade_advice}{buy_line}")
 
     resp = {
         "available": True,
