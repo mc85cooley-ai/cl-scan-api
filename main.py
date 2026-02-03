@@ -1642,10 +1642,22 @@ Respond ONLY with JSON, no extra text.
     # grading logic to surface print lines, whitening, scratches, and dents.
 
     second_pass = {"enabled": True, "ran": False, "skipped_reason": None, "glare_suspects": [], "defect_candidates": []}
+    # Optional preview images (filtered variants). Keep defined to avoid runtime errors.
+    defect_snaps: Dict[str, str] = {}
     try:
         # Only run for cards; memorabilia uses a different endpoint.
-        front_vars = _make_defect_filter_variants(img)
-        back_vars = {}  # identify() only has a front image
+        front_vars = _make_defect_filter_variants(front_bytes)
+        back_vars = _make_defect_filter_variants(back_bytes)
+
+        # Expose filtered variants as base64 strings (if present). Frontend may ignore these.
+        if isinstance(front_vars, dict):
+            for k, v in front_vars.items():
+                if isinstance(v, (bytes, bytearray)) and len(v) > 200:
+                    defect_snaps[f"front_{k}"] = _b64(bytes(v))
+        if isinstance(back_vars, dict):
+            for k, v in back_vars.items():
+                if isinstance(v, (bytes, bytearray)) and len(v) > 200:
+                    defect_snaps[f"back_{k}"] = _b64(bytes(v))
 
         if not front_vars and not back_vars:
             second_pass["enabled"] = False
