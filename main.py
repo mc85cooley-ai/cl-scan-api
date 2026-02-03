@@ -1,6 +1,6 @@
 """
 The Collectors League Australia - Scan API
-Futureproof v6.4.1 (2026-01-31)
+Futureproof v6.7.5 (2026-02-03)
 
 What changed vs v6.3.x
 - ✅ Adds PriceCharting API as primary market source for cards + sealed/memorabilia (current prices).
@@ -24,7 +24,6 @@ from datetime import datetime
 from statistics import mean, median
 from functools import wraps
 import base64
-import io
 import os
 import json
 import sqlite3
@@ -39,7 +38,6 @@ from pathlib import Path
 import httpx
 import time
 import math
-import random
 
 # Optional image processing for 2-pass defect enhancement
 try:
@@ -60,15 +58,7 @@ FX_CACHE_SECONDS = int(os.getenv("FX_CACHE_SECONDS", "3600"))
 # ==============================
 app = FastAPI(title="Collectors League Scan API")
 
-ALLOWED_ORIGINS = [
-    "https://collectors-league.com",
-    "https://www.collectors-league.com",
-    "http://localhost",
-    "http://localhost:3000",
-    "http://localhost:5173",
-    "*",
-]
-
+ALLOWED_ORIGINS = ["*"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -642,55 +632,6 @@ def _b64(img: bytes) -> str:
     return base64.b64encode(img).decode("utf-8")
 
 
-
-# ==============================
-# Best-effort defect close-ups (hotspot thumbnails)
-# ==============================
-def _generate_hotspot_snaps(image_bytes: bytes, side: str) -> List[Dict[str, Any]]:
-    """Return a small set of best-effort close-ups so the UI can always show evidence images.
-    This is NOT a definitive defect detector. It simply crops likely areas: corners + a couple of edge strips.
-    """
-    if not image_bytes or Image is None:
-        return []
-    try:
-        im = Image.open(io.BytesIO(image_bytes)).convert('RGB')
-    except Exception:
-        return []
-    w, h = im.size
-    if w < 80 or h < 80:
-        return []
-    cw, ch = int(w * 0.22), int(h * 0.22)
-    ew, eh = int(w * 0.30), int(h * 0.18)
-    regions = [
-        ('corner', 'top_left', (0, 0, cw, ch)),
-        ('corner', 'top_right', (w - cw, 0, w, ch)),
-        ('corner', 'bottom_left', (0, h - ch, cw, h)),
-        ('corner', 'bottom_right', (w - cw, h - ch, w, h)),
-        ('edge', 'top_edge', (int((w-ew)/2), 0, int((w+ew)/2), eh)),
-        ('edge', 'bottom_edge', (int((w-ew)/2), h - eh, int((w+ew)/2), h)),
-    ]
-    out: List[Dict[str, Any]] = []
-    for _typ, roi, box in regions:
-        try:
-            crop = im.crop(box)
-            max_side = max(crop.size)
-            if max_side > 520:
-                scale = 520 / float(max_side)
-                crop = crop.resize((max(1, int(crop.size[0]*scale)), max(1, int(crop.size[1]*scale))), Image.LANCZOS)
-            buf = io.BytesIO()
-            crop.save(buf, format='JPEG', quality=85, optimize=True)
-            b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
-            out.append({
-                'side': side,
-                'type': 'hotspot',
-                'note': f"{side} {roi.replace('_',' ')} close-up (best effort)",
-                'confidence': 0.35,
-                'thumbnail_b64': b64,
-            })
-        except Exception:
-            continue
-    return out
-
 def _make_defect_filter_variants(img_bytes: bytes) -> Dict[str, bytes]:
     """Create enhanced variants to help the second-pass detect print lines / scratches / whitening.
     Uses PIL if available. Returns dict name->jpeg_bytes. If PIL missing, returns empty dict.
@@ -722,6 +663,57 @@ def _make_defect_filter_variants(img_bytes: bytes) -> Dict[str, bytes]:
     except Exception:
         return {}
 
+def _make_basic_hotspot_snaps(img_bytes: bytes, side: str, max_snaps: int = 6) -> List[Dict[str, Any]]:
+    """Best-effort crops (corners + edges) used for UI evidence.
+    Returns list of {side,type,note,thumbnail_b64,bbox}.
+    BBox is normalized to [0..1] relative to the source image.
+    """
+    if not img_bytes or Image is None:
+        return []
+    try:
+        from io import BytesIO
+        im = Image.open(BytesIO(img_bytes)).convert("RGB")
+        w, h = im.size
+
+        def _crop_norm(x0, y0, x1, y1):
+            x0i = max(0, min(w-1, int(x0*w)))
+            y0i = max(0, min(h-1, int(y0*h)))
+            x1i = max(1, min(w, int(x1*w)))
+            y1i = max(1, min(h, int(y1*h)))
+            crop = im.crop((x0i, y0i, x1i, y1i))
+            # Slight upscale for better visibility
+            crop = crop.resize((min(420, (x1i-x0i)*3), min(420, (y1i-y0i)*3)))
+            buf = BytesIO()
+            crop.save(buf, format="JPEG", quality=90)
+            return {
+                "thumbnail_b64": _b64(buf.getvalue()),
+                "bbox": {"x": float(x0), "y": float(y0), "w": float(x1-x0), "h": float(y1-y0)}
+            }
+
+        # Regions: 4 corners + top/bottom edge strips
+        regions = [
+            ("corner", "top_left",   0.00, 0.00, 0.22, 0.22),
+            ("corner", "top_right",  0.78, 0.00, 1.00, 0.22),
+            ("corner", "bottom_left",0.00, 0.78, 0.22, 1.00),
+            ("corner", "bottom_right",0.78,0.78, 1.00, 1.00),
+            ("edge", "top_edge",     0.18, 0.00, 0.82, 0.14),
+            ("edge", "bottom_edge",  0.18, 0.86, 0.82, 1.00),
+        ]
+
+        snaps: List[Dict[str, Any]] = []
+        for kind, label, x0, y0, x1, y1 in regions[:max_snaps]:
+            out = _crop_norm(x0, y0, x1, y1)
+            snaps.append({
+                "side": side,
+                "type": kind,
+                "note": f"{side} {label} close-up (best effort)",
+                "confidence": 0.5,
+                **out
+            })
+        return snaps
+    except Exception:
+        return []
+
 def _norm_ws(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
@@ -729,6 +721,31 @@ def _norm_ws(s: str) -> str:
 def _is_blankish(s: str) -> bool:
     s2 = _norm_ws(s or "").lower()
     return (not s2) or s2 in ("unknown", "n/a", "na", "none", "null", "undefined")
+
+def _safe_json_extract(text: str) -> dict | None:
+    """Best-effort extraction of a JSON object from a model response."""
+    if not text:
+        return None
+    # Fast path
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+    # Heuristic: find first {...} block
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        snippet = text[start:end+1]
+        try:
+            obj = json.loads(snippet)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            return None
+    return None
+
 
 def _normalize_card_type(card_type: str) -> str:
     """Force card_type into the allowed enum."""
@@ -1331,240 +1348,96 @@ async def pricecharting_history(product_id: str, limit: int = 52):
 # Card: Identify (AI + optional PokemonTCG enrichment)
 # ==============================
 @app.post("/api/identify")
-@safe_endpoint
-async def identify(front: UploadFile = File(...)):
-    img = await front.read()
-    if not img or len(img) < 200:
-        raise HTTPException(status_code=400, detail="Image is too small or empty")
-
-    prompt = """You are identifying a trading card from a front photo.
-
-Return ONLY valid JSON with these exact fields:
-
-{
-  "card_name": "exact card name including variants (ex, V, VMAX, holo, first edition, etc.)",
-  "card_type": "Pokemon/Magic/YuGiOh/Sports/OnePiece/Other",
-  "year": "4 digit year if visible else empty string",
-  "card_number": "card number if visible (e.g. 006/165 or 004 or 4/102) else empty string",
-  "set_code": "set abbreviation printed on the card if visible (often 2-4 chars like MEW, OBF, SVI). EMPTY if not visible",
-  "set_name": "set or series name (full name) if visible/known else empty string",
-  "confidence": 0.0-1.0,
-  "notes": "one short sentence about how you identified it"
-}
-
-Rules:
-- PRIORITIZE set_code if you can see it.
-- Do NOT guess a set_code you cannot see.
-- Preserve leading zeros in card_number if shown (e.g., 006/165).
-- If you cannot identify with confidence, set card_name to "Unknown" and confidence to 0.0.
-Respond ONLY with JSON, no extra text.
-"""
-
-    msg = [{
-        "role": "user",
-        "content": [
-            {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(img)}", "detail": "high"}},
-        ],
-    }]
-
-    result = await _openai_chat(msg, max_tokens=800, temperature=0.1)
-    if result.get("error"):
-        return JSONResponse(content={
-            "card_name": "Unknown",
-            "card_type": "Other",
-            "year": "",
-            "card_number": "",
-            "set_code": "",
-            "set_name": "",
-            "confidence": 0.0,
-            "notes": "AI identification failed",
-            "identify_token": f"idt_{secrets.token_urlsafe(12)}",
-            "pokemontcg": None,
-            "pokemontcg_enriched": False,
-        })
-
-    data = _parse_json_or_none(result.get("content", "")) or {}
-
-    # ------------------------------
-    # Second-pass (defect enhanced) analysis
-    # ------------------------------
-    # SECOND PASS GUARANTEE:
-    # Enhanced filtered images (grayscale/autocontrast + contrast/sharpness)
-    # are ALWAYS generated when PIL is available and are fed back into
-    # grading logic to surface print lines, whitening, scratches, and dents.
-
-    second_pass = {"enabled": True, "ran": False, "skipped_reason": None, "glare_suspects": [], "defect_candidates": []}
-    angled_bytes = b""  # identify() has no angled image
+async def identify(front: UploadFile = File(...), back: UploadFile | None = File(None)):
+    """Identify a collectible card/item from images.
+    Front is required. Back is optional (kept for backward compatibility).
+    """
     try:
-        # Only run for cards; memorabilia uses a different endpoint.
-        front_vars = _make_defect_filter_variants(img)
-        back_vars = {}
+        front_bytes = await front.read()
+        if not front_bytes:
+            raise HTTPException(status_code=400, detail="No front image uploaded.")
+        back_bytes: bytes | None = None
+        if back is not None:
+            back_bytes = await back.read()
+            if not back_bytes:
+                back_bytes = None
 
-        if not front_vars and not back_vars:
-            second_pass["enabled"] = False
-            second_pass["skipped_reason"] = "image_filters_unavailable"
-        else:
-            sp_prompt = f"""You are a meticulous trading card defect inspector.
-You are analyzing ENHANCED/FILTERED variants created to make defects stand out (print lines, scratches, whitening, dents).
-You may also receive an ANGLED image used to rule out glare/light refraction.
-
-CRITICAL:
-- Do NOT treat holo sheen / glare as whitening. If the angled shot suggests the mark moves/disappears, flag it as glare_suspect.
-- Card texture is NOT damage unless there is a true crease/indent/paper break.
-- Print lines are typically straight and consistent; glare moves with angle.
-
-Return ONLY valid JSON:
-{{
-  "defect_candidates": [
-    {{"type":"print_line|scratch|whitening|dent|crease|tear|stain|other","severity":"minor|moderate|severe","note":"short plain description","confidence":0-1}}
-  ],
-  "glare_suspects": [
-    {{"type":"whitening|scratch|print_line|other","note":"why it looks like glare","confidence":0-1}}
-  ]
-}}
-"""
-
-            content_parts = [{"type": "text", "text": sp_prompt}]
-
-            # Include filtered variants first (strong signal)
-            if front_vars.get("gray_autocontrast"):
-                content_parts += [
-                    {"type":"text","text":"FRONT (filtered: gray_autocontrast)"},
-                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(front_vars['gray_autocontrast'])}", "detail":"high"}}
-                ]
-            if front_vars.get("contrast_sharp"):
-                content_parts += [
-                    {"type":"text","text":"FRONT (filtered: contrast_sharp)"},
-                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(front_vars['contrast_sharp'])}", "detail":"high"}}
-                ]
-            if back_vars.get("gray_autocontrast"):
-                content_parts += [
-                    {"type":"text","text":"BACK (filtered: gray_autocontrast)"},
-                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(back_vars['gray_autocontrast'])}", "detail":"high"}}
-                ]
-            if back_vars.get("contrast_sharp"):
-                content_parts += [
-                    {"type":"text","text":"BACK (filtered: contrast_sharp)"},
-                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(back_vars['contrast_sharp'])}", "detail":"high"}}
-                ]
-
-            # Include angled if available (glare check)
-            if angled_bytes and len(angled_bytes) > 200:
-                content_parts += [
-                    {"type":"text","text":"OPTIONAL ANGLED IMAGE (glare check)"},
-                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(angled_bytes)}", "detail":"high"}}
-                ]
-
-            sp_msg = [{"role":"user","content": content_parts}]
-            sp_result = await _openai_chat(sp_msg, max_tokens=900, temperature=0.1)
-            if not sp_result.get("error"):
-                sp_data = _parse_json_or_none(sp_result.get("content","")) or {}
-                if isinstance(sp_data, dict):
-                    second_pass["ran"] = True
-                    if isinstance(sp_data.get("glare_suspects"), list):
-                        second_pass["glare_suspects"] = sp_data.get("glare_suspects")[:10]
-                    if isinstance(sp_data.get("defect_candidates"), list):
-                        second_pass["defect_candidates"] = sp_data.get("defect_candidates")[:20]
-            else:
-                second_pass["skipped_reason"] = "second_pass_ai_failed"
-    except Exception:
-        second_pass["skipped_reason"] = "second_pass_exception"
-
-    card_name = _norm_ws(str(data.get("card_name", "Unknown")))
-    card_type = _norm_ws(str(data.get("card_type", "Other")))
-    card_type = _normalize_card_type(card_type)
-    year = _norm_ws(str(data.get("year", "")))
-    card_number_display = _clean_card_number_display(str(data.get("card_number", "")))
-    set_code = _norm_ws(str(data.get("set_code", ""))).upper()
-    set_name = _norm_ws(str(data.get("set_name", "")))
-    if _is_blankish(set_name):
-        set_name = ""
-    if set_name.strip().lower() in ("unknown","n/a","na","none"):
-        set_name = ""
-    conf = _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0)
-    notes = _norm_ws(str(data.get("notes", "")))
-
-    # If the model says "Unknown", force confidence low.
-    if card_name.strip().lower() == "unknown":
-        conf = 0.0
-        card_type = "Other"
-
-    # optional PokemonTCG enrichment (Pokemon only)
-    enriched = False
-    ptcg_payload = None
-    set_id = ""
-
-    if POKEMONTCG_API_KEY and card_type.lower() == "pokemon" and card_name != "Unknown":
-        ptcg_set = {}
-        if set_code and not set_name:
-            ptcg_set = await _pokemontcg_resolve_set_by_ptcgo(set_code)
-            if ptcg_set.get("name"):
-                set_name = _norm_ws(str(ptcg_set.get("name", "")))
-                set_id = str(ptcg_set.get("id", ""))
-
-        pid = await _pokemontcg_resolve_card_id(card_name, set_code, card_number_display, set_name=set_name, set_id=set_id)
-        if pid:
-            card = await _pokemontcg_card_by_id(pid)
-            if card:
-                enriched = True
-                conf = min(1.0, conf + 0.15)
-                set_name = _norm_ws(str((card.get("set") or {}).get("name", set_name)))
-                set_code = _norm_ws(str((card.get("set") or {}).get("ptcgoCode", set_code))).upper()
-                set_id = _norm_ws(str((card.get("set") or {}).get("id", set_id)))
-                release_date = _norm_ws(str((card.get("set") or {}).get("releaseDate", "")))
-                if release_date and not year:
-                    year = release_date[:4]
-                # keep the AI card_number display if present, else use API number
-                if not card_number_display:
-                    card_number_display = _clean_card_number_display(str(card.get("number", "")))
-                ptcg_payload = {
-                    "id": card.get("id", ""),
-                    "name": card.get("name", ""),
-                    "number": card.get("number", ""),
-                    "rarity": card.get("rarity", ""),
-                    "set": card.get("set", {}) or {},
-                    "images": card.get("images", {}) or {},
-                    "links": {
-                        "tcgplayer": (card.get("tcgplayer") or {}).get("url", ""),
-                        "cardmarket": (card.get("cardmarket") or {}).get("url", ""),
-                    },
+        # Build OpenAI vision messages
+        images = [
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:{front.content_type or 'image/jpeg'};base64,{_b64(front_bytes)}"},
+            }
+        ]
+        if back_bytes is not None:
+            images.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{back.content_type or 'image/jpeg'};base64,{_b64(back_bytes)}"},
                 }
-                notes = f"Verified via PokemonTCG API (id {pid})"
+            )
 
-    
-    # Canonicalize set (prefer map / resolved name) + build canonical id for frontend
-    set_info = _canonicalize_set(set_code, set_name)
-    canonical_id = {
-        "card_name": card_name,
-        "card_type": card_type,
-        "year": year,
-        "card_number": card_number_display,
-        "set_code": set_info["set_code"],
-        "set_name": set_info["set_name"],
-        "set_source": set_info.get("set_source", "unknown"),
-        "confidence": conf,
-    }
+        system = (
+            "You are an expert collectibles identifier. "
+            "Return ONLY valid JSON. Be conservative; if unsure, leave fields empty rather than hallucinating."
+        )
+        user = (
+            "Identify the card/item from the image(s). "
+            "Return JSON with keys: "
+            "card_name, card_type, game, year, card_number, set_code, set_name, manufacturer, language, "
+            "confidence (0-1), reasoning (short). "
+            "For Pokemon, set_code should be the PT-CGO set code if visible (e.g., MEW), else empty."
+        )
 
-    return JSONResponse(content={
-        "card_name": card_name,
-        "card_type": card_type,
-        "year": year,
-        "card_number": card_number_display,
-        "set_code": set_info["set_code"],
-        "set_name": set_info["set_name"],
-        "set_id": set_id,
-        "confidence": conf,
-        "notes": notes,
-        "canonical_id": canonical_id,
-        "identify_token": f"idt_{secrets.token_urlsafe(12)}",
-        "pokemontcg": ptcg_payload,
-        "pokemontcg_enriched": enriched,
-    })
+        resp = await _openai_chat(
+            model=VISION_MODEL,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": [{"type": "text", "text": user}, *images]},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.1,
+        )
 
-# ==============================
-# Card: Verify (grading only)
-# ==============================
+        content = resp.choices[0].message.content or "{}"
+        try:
+            data = json.loads(content)
+        except Exception:
+            # Try to salvage JSON
+            data = _safe_json_extract(content) or {}
+
+        # Normalize expected fields
+        result = {
+            "card_name": _norm_ws(str(data.get("card_name", ""))),
+            "card_type": _norm_ws(str(data.get("card_type", ""))),
+            "game": _norm_ws(str(data.get("game", ""))),
+            "year": _norm_ws(str(data.get("year", ""))),
+            "card_number": _norm_ws(str(data.get("card_number", ""))),
+            "set_code": _norm_ws(str(data.get("set_code", ""))),
+            "set_name": _norm_ws(str(data.get("set_name", ""))),
+            "manufacturer": _norm_ws(str(data.get("manufacturer", ""))),
+            "language": _norm_ws(str(data.get("language", ""))),
+            "confidence": float(data.get("confidence", 0) or 0),
+            "reasoning": _norm_ws(str(data.get("reasoning", ""))),
+        }
+
+        # Canonicalize set info where helpers exist
+        try:
+            set_info = _canonicalize_set(result["set_code"], result["set_name"])
+            result["set_code"] = set_info.get("set_code", result["set_code"])
+            result["set_name"] = set_info.get("set_name", result["set_name"])
+            result["set_source"] = set_info.get("set_source", "")
+        except Exception:
+            pass
+
+        return {"ok": True, "card": result}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("identify failed")
+        raise HTTPException(status_code=500, detail=f"Identify error: {e}")
+
 @app.post("/api/verify")
 @safe_endpoint
 async def verify(
@@ -1609,11 +1482,9 @@ async def verify(
         if provided_year: context += f"- Year: {provided_year}\n"
         if provided_type: context += f"- Type: {provided_type}\n"
 
-    style_seed = random.randint(1000, 999999)  # used to vary phrasing slightly
     prompt = f"""You are a professional trading card grader with 15+ years experience.
 
 Analyze the provided images with EXTREME scrutiny.
-Use the STYLE SEED below to vary your wording slightly each run while keeping the same meaning. STYLE_SEED: {style_seed}
 You will receive FRONT and BACK images, and MAY receive a third ANGLED image used to rule out glare / light refraction artifacts (holo sheen) vs true whitening / scratches / print lines. Write as if speaking directly to a collector who needs honest, specific feedback about their card.
 
 CRITICAL RULES:
@@ -1954,14 +1825,6 @@ Return ONLY valid JSON:
         summary = " ".join([p for p in parts if p]).strip()
 
         data["assessment_summary"] = summary
-    # Best-effort close-up thumbnails so the UI can show evidence images
-    defect_snaps: List[Dict[str, Any]] = []
-    try:
-        defect_snaps = _generate_hotspot_snaps(front_bytes, 'front') + _generate_hotspot_snaps(back_bytes, 'back')
-        defect_snaps = defect_snaps[:8]
-    except Exception:
-        defect_snaps = []
-
     return JSONResponse(content={
         "pregrade": pregrade_norm or "N/A",
         "confidence": _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0),
@@ -1971,8 +1834,8 @@ Return ONLY valid JSON:
         "surface": data.get("surface", {"front": {"grade": "", "notes": ""}, "back": {"grade": "", "notes": ""}}),
         "defects": defects_list_out,
         "flags": flags_list_out,
-        "defect_snaps": defect_snaps,
         "second_pass": second_pass,
+        "defect_snaps": defect_snaps,
         "glare_suspects": data.get("glare_suspects", []) if isinstance(data.get("glare_suspects", []), list) else [],
         "assessment_summary": _norm_ws(str(data.get("assessment_summary", ""))) or summary or "",
         "spoken_word": _norm_ws(str(data.get("spoken_word", ""))) or _norm_ws(str(data.get("assessment_summary", ""))) or summary or "",
@@ -2723,7 +2586,7 @@ async def market_context(
         "Okay, Pokéfam — quick market check:",
         "Righto, let’s suss the market real quick:",
     ]
-    opener = random.choice(slang_openers)
+    opener = slang_openers[0]
 
     grade_line = ""
     if exp_grade_key:
@@ -2737,11 +2600,11 @@ async def market_context(
             graded_line = f" If it lands that grade, you’re looking at roughly {_money(st.get('median'))} AUD in the graded lane (based on current graded listings)."
     grade_advice = ""
     if worth_grading is True:
-        grade_advice = random.choice([
-            f" With grading cost around ${float(grading_cost or 0):.0f}, it looks worth a crack if you’re holding long-term or chasing a tidy flip.",
-            f" Grading’s roughly ${float(grading_cost or 0):.0f} — on balance, it stacks up if you’re aiming for a slabbed keeper or resale.",
-            f" With grading fees around ${float(grading_cost or 0):.0f}, there’s enough upside to justify a submission if the goal is a long hold.",
-        ])
+        grade_advice = f" With grading cost around ${float(grading_cost or 0):.0f}, it looks worth a crack if your goal is long-term hold or a clean flip."
+    elif worth_grading is False:
+        grade_advice = f" With grading cost around ${float(grading_cost or 0):.0f}, it’s probably not worth sending in this condition unless you’re chasing the slab for the collection."
+    buy_line = ""
+    if buy_target_aud is not None:
         buy_line = f" If you’re buying, a good target entry is about {_money(buy_target_aud)} AUD or less for this condition — that’s where the risk/reward starts to feel spicy."
 
     market_summary = _norm_ws(f"{opener}{grade_line}{price_line} {trend_line}{graded_line} {grade_advice} {buy_line}")
