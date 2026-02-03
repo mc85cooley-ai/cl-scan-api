@@ -1,6 +1,6 @@
 """
 The Collectors League Australia - Scan API
-Futureproof v6.7.2 (2026-02-03)
+Futureproof v6.7.1 (2026-02-03)
 
 What changed vs v6.3.x
 - ✅ Adds CV-based defect close-up thumbnails (defect_snaps) for UI rendering.
@@ -26,7 +26,6 @@ import os
 import json
 import sqlite3
 import csv
-import io
 import secrets
 import hashlib
 import re
@@ -46,97 +45,7 @@ except Exception:
     Image = None
     ImageEnhance = None
     ImageOps = None
-    ImageFilt
-
-def _crop_region_for_location(w: int, h: int, loc: str) -> Tuple[int,int,int,int]:
-    """Return a conservative crop box (left, top, right, bottom) based on a text location hint."""
-    l = (loc or "").lower()
-    # default central crop
-    x0, y0, x1, y1 = int(w*0.25), int(h*0.25), int(w*0.75), int(h*0.75)
-
-    if "top" in l:
-        y0, y1 = 0, int(h*0.45)
-    if "bottom" in l:
-        y0, y1 = int(h*0.55), h
-    if "left" in l:
-        x0, x1 = 0, int(w*0.45)
-    if "right" in l:
-        x0, x1 = int(w*0.55), w
-
-    # edges
-    if "top edge" in l or ("edge" in l and "top" in l):
-        y0, y1 = 0, int(h*0.28)
-        x0, x1 = int(w*0.10), int(w*0.90)
-    if "bottom edge" in l or ("edge" in l and "bottom" in l):
-        y0, y1 = int(h*0.72), h
-        x0, x1 = int(w*0.10), int(w*0.90)
-    if "left edge" in l or ("edge" in l and "left" in l):
-        x0, x1 = 0, int(w*0.28)
-        y0, y1 = int(h*0.10), int(h*0.90)
-    if "right edge" in l or ("edge" in l and "right" in l):
-        x0, x1 = int(w*0.72), w
-        y0, y1 = int(h*0.10), int(h*0.90)
-
-    # ensure sane
-    x0 = max(0, min(x0, w-2)); x1 = max(x0+2, min(x1, w))
-    y0 = max(0, min(y0, h-2)); y1 = max(y0+2, min(y1, h))
-    return x0, y0, x1, y1
-
-def _defect_snaps_from_defects(front_bytes: bytes, back_bytes: bytes, defects: List[str], max_snaps: int = 6) -> List[Dict[str, Any]]:
-    """Create simple close-up thumbnails from textual defect locations (no CV required)."""
-    if Image is None:
-        return []
-    out: List[Dict[str, Any]] = []
-    try:
-        img_f = Image.open(io.BytesIO(front_bytes)).convert("RGB")
-        img_b = Image.open(io.BytesIO(back_bytes)).convert("RGB")
-    except Exception:
-        return []
-
-    def _infer_side_loc(s: str) -> Tuple[str,str,str]:
-        t = (s or "").lower()
-        side = "front" if "front" in t else ("back" if "back" in t else "front")
-        loc = ""
-        # common corner phrases
-        for k in ["top-left","top left","top-right","top right","bottom-left","bottom left","bottom-right","bottom right",
-                  "top edge","bottom edge","left edge","right edge","center","middle","holo","foil","surface"]:
-            if k in t:
-                loc = k
-                break
-        if not loc:
-            # fallback: first 6 words
-            loc = " ".join((t.split()[:6] or ["surface"]))
-        # defect type hint
-        dtype = "defect"
-        for dt in ["print line","print_line","scratch","whitening","dent","crease","tear","stain","scuff","chip","edge wear","wear","indent"]:
-            if dt in t:
-                dtype = dt.replace("_"," ")
-                break
-        return side, loc, dtype
-
-    for d in defects or []:
-        if len(out) >= max_snaps:
-            break
-        side, loc, dtype = _infer_side_loc(d)
-        img = img_f if side == "front" else img_b
-        w, h = img.size
-        box = _crop_region_for_location(w, h, loc)
-        try:
-            crop = img.crop(box)
-            crop = crop.resize((320, 320))
-            buf = io.BytesIO()
-            crop.save(buf, format="JPEG", quality=82)
-            out.append({
-                "side": side,
-                "type": dtype,
-                "location": loc,
-                "thumbnail_b64": base64.b64encode(buf.getvalue()).decode("utf-8"),
-            })
-        except Exception:
-            continue
-    return out
-
-er = None
+    ImageFilter = None
 
 # Optional OpenCV defect cropping (for UI thumbnails)
 try:
@@ -151,49 +60,6 @@ except Exception:
 _FX_CACHE = {"ts": 0, "usd_aud": None}
 _EBAY_CACHE = {}  # key -> {ts, data}
 FX_CACHE_SECONDS = int(os.getenv("FX_CACHE_SECONDS", "3600"))
-
-
-# ==============================
-# Text style variance (keeps meaning, varies vibe)
-# ==============================
-def _choice(seq):
-    try:
-        return seq[secrets.randbelow(len(seq))]
-    except Exception:
-        return seq[0] if seq else ""
-
-def _vary_spoken_word(text: str) -> str:
-    t = _norm_ws(text or "")
-    if not t:
-        return t
-    # light-touch opener swaps
-    swaps = [
-        ("Hey there!", _choice(["Hey!", "Yo!", "G’day!", "Alright!", "Hey mate!"])),
-        ("Looking at your", _choice(["Checking out your", "Having a look at your", "Peeping your", "Reviewing your"])),
-        ("I’d realistically expect", _choice(["Realistically I’d peg it at", "I’d call it about", "I reckon you’re looking at", "I’d expect around"])),
-        ("in this condition", _choice(["in its current state", "as it sits", "from what I can see here"])),
-    ]
-    for a, b in swaps:
-        if a in t:
-            t = t.replace(a, b, 1)
-    return t
-
-def _vary_assessment_summary(text: str) -> str:
-    t = _norm_ws(text or "")
-    if not t:
-        return t
-    swaps = [
-        ("Looking at your", _choice(["Looking over your", "Having a look at your", "Checking out your", "From what I’m seeing on your"])),
-        ("the front", _choice(["the front side", "the front face", "the front of the card"])),
-        ("the back", _choice(["the back side", "the reverse", "the back of the card"])),
-        ("minor", _choice(["slight", "a touch of", "a bit of"])),
-        ("overall", _choice(["overall", "in general", "all up"])),
-    ]
-    for a, b in swaps:
-        if a in t:
-            t = t.replace(a, b, 1)
-    return t
-
 
 # ==============================
 # App & CORS
@@ -238,7 +104,7 @@ def safe_endpoint(func):
 # ==============================
 # Config
 # ==============================
-APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-02-03-v6.7.2")
+APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-01-31-v6.5.0")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
@@ -257,7 +123,7 @@ except Exception:
 # ==============================
 # FX + eBay helpers
 # ==============================
-UA = "CollectorsLeagueScan/6.7.2 (+https://collectors-league.com)"
+UA = "CollectorsLeagueScan/6.6 (+https://collectors-league.com)"
 
 async def _fx_usd_to_aud() -> float:
     """Return live-ish USD->AUD rate with a short cache. Falls back to 1.50 if unavailable."""
@@ -1832,9 +1698,6 @@ async def verify(
 
     prompt = f"""You are a professional trading card grader with 15+ years experience.
 
-STYLE SEED: {style_seed}
-- Vary your phrasing and slang naturally. Avoid repeating the same opener sentence across different runs.
-
 Analyze the provided images with EXTREME scrutiny.
 You will receive FRONT and BACK images, and MAY receive a third ANGLED image used to rule out glare / light refraction artifacts (holo sheen) vs true whitening / scratches / print lines. Write as if speaking directly to a collector who needs honest, specific feedback about their card.
 
@@ -1977,9 +1840,7 @@ Respond ONLY with JSON, no extra text.
         ),
     }]
 
-    style_seed = secrets.token_hex(2)
-    # Slightly higher temperature so spoken/summary doesn't feel copy-paste
-    result = await _openai_chat(msg, max_tokens=2200, temperature=0.25)
+    result = await _openai_chat(msg, max_tokens=2200, temperature=0.1)
     if result.get("error"):
         return JSONResponse(content={"error": True, "message": "AI grading failed", "details": result.get("message", "")}, status_code=502)
 
@@ -2183,10 +2044,10 @@ Return ONLY valid JSON:
         summary = " ".join([p for p in parts if p]).strip()
 
         data["assessment_summary"] = summary
-    # Defect close-ups for UI (text-guided crops; best-effort; never blocks verification)
+    # CV-based defect close-ups for UI (best-effort; never blocks verification)
     defect_snaps: List[Dict[str, Any]] = []
     try:
-        defect_snaps = _defect_snaps_from_defects(front_bytes, back_bytes, defects_list_out, max_snaps=6)
+        defect_snaps = _build_defect_snaps(front_bytes, back_bytes)
     except Exception:
         defect_snaps = []
 
@@ -2202,8 +2063,8 @@ Return ONLY valid JSON:
         "flags": flags_list_out,
         "second_pass": second_pass,
         "glare_suspects": data.get("glare_suspects", []) if isinstance(data.get("glare_suspects", []), list) else [],
-        "assessment_summary": _vary_assessment_summary(_norm_ws(str(data.get("assessment_summary", ""))) or summary or ""),
-        "spoken_word": _vary_spoken_word(_norm_ws(str(data.get("spoken_word", ""))) or _norm_ws(str(data.get("assessment_summary", ""))) or summary or ""),
+        "assessment_summary": _norm_ws(str(data.get("assessment_summary", ""))) or summary or "",
+        "spoken_word": _norm_ws(str(data.get("spoken_word", ""))) or _norm_ws(str(data.get("assessment_summary", ""))) or summary or "",
         "observed_id": data.get("observed_id", {}) if isinstance(data.get("observed_id", {}), dict) else {},
         "verify_token": f"vfy_{secrets.token_urlsafe(12)}",
         "market_context_mode": "click_only",
@@ -2951,13 +2812,13 @@ async def market_context(
         "Okay, Pokéfam — quick market check:",
         "Righto, let’s suss the market real quick:",
     ]
-    opener = _choice(slang_openers)
+    opener = slang_openers[0]
 
     grade_line = ""
     if exp_grade_key:
         grade_line = f" LeagAI’s calling it around a {exp_grade_key} in the current state."
     price_line = f" On current listings, it’s sitting around {_money(current_typ)} AUD (rough range {_money(current_low)}–{_money(current_high)})."
-    trend_line = f" {_choice(["Market’s looking", "The market looks", "Right now it’s feeling", "Price action looks"])} {trend_hint} based on live asks."
+    trend_line = f" The market looks {trend_hint} based on live asks."
     graded_line = ""
     if exp_grade_key and exp_grade_key in grade_market:
         st = grade_market.get(exp_grade_key, {}).get("stats", {})
@@ -2970,7 +2831,7 @@ async def market_context(
         grade_advice = f" With grading cost around ${float(grading_cost or 0):.0f}, it’s probably not worth sending in this condition unless you’re chasing the slab for the collection."
     buy_line = ""
     if buy_target_aud is not None:
-        buy_line = f" {_choice(["If you’re buying", "If you’re looking to pick one up", "If you’re shopping", "If you’re trying to snag it"])}, a solid target entry is about {_money(buy_target_aud)} AUD or less for this condition — that’s where the risk/reward starts to feel spicy."
+        buy_line = f" If you’re buying, a good target entry is about {_money(buy_target_aud)} AUD or less for this condition — that’s where the risk/reward starts to feel spicy."
 
     market_summary = _norm_ws(f"{opener}{grade_line}{price_line} {trend_line}{graded_line} {grade_advice} {buy_line}")
 
