@@ -1,11 +1,24 @@
 """
 The Collectors League Australia - Scan API
-Futureproof v6.7.1 (2026-02-03)
+Futureproof v6.7.0 (2026-02-03)
 
 What changed vs v6.3.x
-- ✅ Adds CV-based defect close-up thumbnails (defect_snaps) for UI rendering.
-- ✅ Adds spoken_word style variation so summaries don't sound identical each run.
-- ✅ Keeps previous pricing/ID behavior unchanged.
+
+v6.7.0 changes
+- ✅ Restored /api/verify endpoint (Identify is now ID-only)
+- ✅ CV-assisted defect hotspots + zoomed closeups returned in defect_snaps
+- ✅ Second-pass now includes filtered images + CV ROI confirmation
+
+v6.6.0 changes
+- ✅ Second-pass defect check now uses BOTH front + back filtered variants (fixes previous front-only bug).
+- ✅ Systemic wear caps (BACK-weighted) now conservatively ceiling the pregrade (closer to PSA logic).
+- ✅ Optional defect localization: returns bounding boxes + cropped thumbnails (base64) for visible defect candidates.
+- ✅ Removes over-precise mm language by encouraging ratio-based centering output.
+- ✅ Adds PriceCharting API as primary market source for cards + sealed/memorabilia (current prices).
+- ✅ Keeps PokemonTCG.io for identification + metadata enrichment (NOT price history).
+- ✅ Adds weekly snapshot option (store PriceCharting CSV/API snapshots on a schedule) to build your own price history.
+- ✅ eBay API scaffolding included but DISABLED by default (waiting for your dev account approval).
+- ✅ Market endpoints return "click-only" informational context + no ROI language.
 
 Env vars
 - OPENAI_API_KEY (required for vision grading/ID)
@@ -23,6 +36,7 @@ from statistics import mean, median
 from functools import wraps
 import base64
 import os
+import io
 import json
 import sqlite3
 import csv
@@ -36,25 +50,18 @@ from pathlib import Path
 import httpx
 import time
 import math
-import random
 
 # Optional image processing for 2-pass defect enhancement
 try:
-    from PIL import Image, ImageEnhance, ImageOps, ImageFilter
+    from PIL import Image, ImageEnhance, ImageOps, ImageFilter, ImageStat
 except Exception:
     Image = None
     ImageEnhance = None
     ImageOps = None
     ImageFilter = None
+    ImageStat = None
 
-# Optional OpenCV defect cropping (for UI thumbnails)
-try:
-    import cv2  # type: ignore
-    import numpy as np  # type: ignore
-except Exception:
-    cv2 = None
-    np = None
-
+PIL_AVAILABLE = (Image is not None and ImageOps is not None and ImageFilter is not None and ImageStat is not None)
 
 # Simple in-memory caches (per-process)
 _FX_CACHE = {"ts": 0, "usd_aud": None}
@@ -648,126 +655,6 @@ def _b64(img: bytes) -> str:
     return base64.b64encode(img).decode("utf-8")
 
 
-def _cv_defect_snaps_from_bytes(label: str, img_bytes: bytes, max_snaps: int = 3) -> List[Dict[str, Any]]:
-    """Return a list of close-up crops as base64 JPEG thumbnails.
-
-    Heuristic detector:
-    - prioritizes low-saturation bright specks near borders (whitening)
-    - falls back to general high-contrast blobs if no border candidates found
-
-    This is intentionally conservative + lightweight (no training needed).
-    """
-    if cv2 is None or np is None:
-        return []
-    try:
-        arr = np.frombuffer(img_bytes, dtype=np.uint8)
-        im = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if im is None:
-            return []
-        h, w = im.shape[:2]
-        if h < 80 or w < 80:
-            return []
-
-        hsv = cv2.cvtColor(im, cv2.COLOR_BGR2HSV)
-        H, S, V = cv2.split(hsv)
-
-        # Border mask (outer 12% of the card area)
-        border = np.zeros((h, w), dtype=np.uint8)
-        bx = int(max(6, w * 0.12))
-        by = int(max(6, h * 0.12))
-        border[:by, :] = 255
-        border[-by:, :] = 255
-        border[:, :bx] = 255
-        border[:, -bx:] = 255
-
-        # Whitening-ish: bright + low saturation in border
-        bright = cv2.inRange(V, 200, 255)
-        low_sat = cv2.inRange(S, 0, 70)
-        mask = cv2.bitwise_and(bright, low_sat)
-        mask = cv2.bitwise_and(mask, border)
-
-        # Clean up
-        k = max(3, int(min(h, w) * 0.01) | 1)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, kernel, iterations=1)
-
-        # Connected components
-        num, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
-        candidates = []
-        for i in range(1, num):
-            x, y, ww, hh, area = stats[i]
-            if area < 25 or area > int(h*w*0.02):
-                continue
-            cx, cy = centroids[i]
-            # score: area * brightness in bbox
-            roi_v = V[y:y+hh, x:x+ww]
-            score = float(area) * float(np.mean(roi_v) if roi_v.size else 0.0)
-            candidates.append((score, x, y, ww, hh, area))
-
-        # Fallback: if nothing found, use general high-contrast blobs (helps with scratches/print-lines/haze artifacts)
-        if not candidates:
-            gray = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
-            lap = cv2.Laplacian(gray, cv2.CV_16S, ksize=3)
-            lap = cv2.convertScaleAbs(lap)
-            thr = cv2.threshold(lap, 30, 255, cv2.THRESH_BINARY)[1]
-            thr = cv2.morphologyEx(thr, cv2.MORPH_OPEN, kernel, iterations=1)
-            num2, lab2, stats2, cent2 = cv2.connectedComponentsWithStats(thr, connectivity=8)
-            for i in range(1, num2):
-                x, y, ww, hh, area = stats2[i]
-                if area < 40 or area > int(h*w*0.04):
-                    continue
-                cx, cy = cent2[i]
-                score = float(area) * 10.0
-                candidates.append((score, x, y, ww, hh, area))
-
-        if not candidates:
-            return []
-
-        candidates.sort(key=lambda t: t[0], reverse=True)
-        out = []
-        for score, x, y, ww, hh, area in candidates[:max_snaps]:
-            # crop with padding
-            pad = int(max(18, min(w, h) * 0.06))
-            x1 = max(0, int(x - pad))
-            y1 = max(0, int(y - pad))
-            x2 = min(w, int(x + ww + pad))
-            y2 = min(h, int(y + hh + pad))
-            crop = im[y1:y2, x1:x2]
-            if crop.size == 0:
-                continue
-
-            # thumbnail target ~360px wide
-            tw = 360
-            ch, cw = crop.shape[:2]
-            scale = tw / float(cw) if cw else 1.0
-            th = int(max(1, ch * scale))
-            thumb = cv2.resize(crop, (tw, th), interpolation=cv2.INTER_AREA)
-
-            ok, buf = cv2.imencode(".jpg", thumb, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-            if not ok:
-                continue
-            b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
-
-            out.append({
-                "side": label,
-                "source": label,
-                "type": "candidate_defect",
-                "note": f"auto-detected candidate (score {round(float(score),2)})",
-                "score": round(float(score), 2),
-                "thumbnail_b64": b64
-            })
-        return out
-    except Exception:
-        return []
-
-
-def _build_defect_snaps(front_bytes: bytes, back_bytes: bytes) -> List[Dict[str, Any]]:
-    snaps: List[Dict[str, Any]] = []
-    snaps.extend(_cv_defect_snaps_from_bytes("front", front_bytes, max_snaps=3))
-    snaps.extend(_cv_defect_snaps_from_bytes("back", back_bytes, max_snaps=3))
-    return snaps
-
 def _make_defect_filter_variants(img_bytes: bytes) -> Dict[str, bytes]:
     """Create enhanced variants to help the second-pass detect print lines / scratches / whitening.
     Uses PIL if available. Returns dict name->jpeg_bytes. If PIL missing, returns empty dict.
@@ -987,6 +874,275 @@ async def _ebay_active_stats(keyword_query: str, limit: int = 120) -> dict:
         out = {"source": "ebay", "query": q, "count": 0, "currency": "AUD", "prices": []}
         _EBAY_CACHE[cache_key] = {"ts": now, "data": out}
         return out
+# ------------------------------
+# Defect localization helpers (optional)
+# ------------------------------
+
+def _bbox_norm_to_px(bbox: Dict[str, float], w: int, h: int, pad: float = 0.10) -> Tuple[int, int, int, int]:
+    """Convert normalized bbox (x,y,w,h in 0-1) into pixel crop box with padding."""
+    try:
+        x = float(bbox.get("x", 0.0))
+        y = float(bbox.get("y", 0.0))
+        bw = float(bbox.get("w", 1.0))
+        bh = float(bbox.get("h", 1.0))
+    except Exception:
+        x, y, bw, bh = 0.0, 0.0, 1.0, 1.0
+
+    # clamp
+    x = _clamp(x, 0.0, 1.0)
+    y = _clamp(y, 0.0, 1.0)
+    bw = _clamp(bw, 0.02, 1.0)
+    bh = _clamp(bh, 0.02, 1.0)
+
+    # pad
+    px = max(0, int((x - pad * bw) * w))
+    py = max(0, int((y - pad * bh) * h))
+    px2 = min(w, int((x + bw + pad * bw) * w))
+    py2 = min(h, int((y + bh + pad * bh) * h))
+
+    # ensure minimum size
+    if px2 - px < 24:
+        cx = (px + px2) // 2
+        px = max(0, cx - 12)
+        px2 = min(w, cx + 12)
+    if py2 - py < 24:
+        cy = (py + py2) // 2
+        py = max(0, cy - 12)
+        py2 = min(h, cy + 12)
+
+    return px, py, px2, py2
+
+def _make_thumb_from_bbox(img_bytes: bytes, bbox: Dict[str, float], max_size: int = 420) -> Optional[str]:
+    """Return base64 JPEG thumbnail cropped to bbox. None if PIL not available."""
+    if not PIL_AVAILABLE:
+        return None
+    try:
+        im = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        w, h = im.size
+        box = _bbox_norm_to_px(bbox, w, h, pad=0.12)
+        crop = im.crop(box)
+
+        # resize so longest side <= max_size (preserve detail but small payload)
+        cw, ch = crop.size
+        scale = min(1.0, float(max_size) / float(max(cw, ch)))
+        if scale < 1.0:
+            crop = crop.resize((max(1, int(cw * scale)), max(1, int(ch * scale))), Image.LANCZOS)
+
+        buf = io.BytesIO()
+        crop.save(buf, format="JPEG", quality=88, optimize=True)
+        return base64.b64encode(buf.getvalue()).decode("utf-8")
+    except Exception:
+        return None
+
+async def _openai_locate_defects(
+    *,
+    defect_candidates: List[Dict[str, Any]],
+    front_bytes: Optional[bytes],
+    back_bytes: Optional[bytes],
+    front_vars: Optional[Dict[str, bytes]] = None,
+    back_vars: Optional[Dict[str, bytes]] = None,
+    angled_bytes: Optional[bytes] = None,
+    max_defects: int = 6,
+) -> List[Dict[str, Any]]:
+    """Ask the vision model for approximate defect bounding boxes (normalized)."""
+    if not defect_candidates:
+        return []
+    if not (front_bytes or back_bytes):
+        return []
+
+    # Keep only a few candidates to keep prompt small
+    cand_small = []
+    for d in defect_candidates:
+        if isinstance(d, dict) and d.get("type"):
+            cand_small.append({
+                "type": str(d.get("type", ""))[:40],
+                "note": str(d.get("note", ""))[:160],
+                "confidence": _safe_float(d.get("confidence", 0.0)),
+                "side": str(d.get("side", "unknown"))[:10],
+            })
+        if len(cand_small) >= max_defects * 2:
+            break
+
+    system = (
+        "You are a strict trading-card inspection assistant. "
+        "Your job is to RETURN APPROXIMATE bounding boxes for the most visible defects mentioned, "
+        "based on the provided images. "
+        "Return ONLY valid JSON. Do not include markdown."
+    )
+
+    instruction = f"""Locate defects as bounding boxes.
+Return JSON array of objects:
+
+[
+  {{
+    "side": "front|back",
+    "type": "<defect type>",
+    "note": "<short note>",
+    "confidence": 0.0-1.0,
+    "bbox": {{"x":0-1,"y":0-1,"w":0-1,"h":0-1}}
+  }},
+  ...
+]
+
+Rules:
+- Coordinates are NORMALIZED to the image (0..1) where (x,y) is TOP-LEFT.
+- w/h are width/height in normalized units.
+- Only include boxes for defects you can actually see.
+- Prefer no more than {max_defects} total boxes across both sides.
+- If unsure, return fewer boxes rather than guessing.
+Defect candidates (use as hints, not gospel):
+{json.dumps(cand_small, ensure_ascii=False)}
+"""
+
+    content_parts: List[Dict[str, Any]] = [{"type": "text", "text": instruction}]
+
+    # Provide originals first (so crop coordinates map 1:1 to these)
+    if front_bytes:
+        content_parts += [
+            {"type": "text", "text": "FRONT (original)"},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(front_bytes)}", "detail": "high"}},
+        ]
+    if back_bytes:
+        content_parts += [
+            {"type": "text", "text": "BACK (original)"},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(back_bytes)}", "detail": "high"}},
+        ]
+
+    # Provide enhanced filtered versions to help locate micro-wear
+    if front_vars:
+        if front_vars.get("gray_autocontrast"):
+            content_parts += [
+                {"type": "text", "text": "FRONT (filtered: gray_autocontrast)"},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(front_vars['gray_autocontrast'])}", "detail": "high"}},
+            ]
+        if front_vars.get("contrast_sharp"):
+            content_parts += [
+                {"type": "text", "text": "FRONT (filtered: contrast_sharp)"},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(front_vars['contrast_sharp'])}", "detail": "high"}},
+            ]
+    if back_vars:
+        if back_vars.get("gray_autocontrast"):
+            content_parts += [
+                {"type": "text", "text": "BACK (filtered: gray_autocontrast)"},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(back_vars['gray_autocontrast'])}", "detail": "high"}},
+            ]
+        if back_vars.get("contrast_sharp"):
+            content_parts += [
+                {"type": "text", "text": "BACK (filtered: contrast_sharp)"},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(back_vars['contrast_sharp'])}", "detail": "high"}},
+            ]
+
+    if angled_bytes and len(angled_bytes) > 200:
+        content_parts += [
+            {"type": "text", "text": "OPTIONAL ANGLED IMAGE (glare vs defect check)"},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(angled_bytes)}", "detail": "high"}},
+        ]
+
+    msg = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": content_parts},
+    ]
+    result = await _openai_chat(msg, max_tokens=900, temperature=0.0)
+    if result.get("error"):
+        return []
+    parsed = _parse_json_or_none(result.get("content", "")) or []
+    if not isinstance(parsed, list):
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        side = str(item.get("side", "")).lower().strip()
+        if side not in ("front", "back"):
+            continue
+        bbox = item.get("bbox") or {}
+        if not isinstance(bbox, dict):
+            continue
+        out.append({
+            "side": side,
+            "type": _norm_ws(str(item.get("type", "")))[:60],
+            "note": _norm_ws(str(item.get("note", "")))[:220],
+            "confidence": _clamp(_safe_float(item.get("confidence", 0.0)), 0.0, 1.0),
+            "bbox": {
+                "x": _clamp(_safe_float(bbox.get("x", 0.0)), 0.0, 1.0),
+                "y": _clamp(_safe_float(bbox.get("y", 0.0)), 0.0, 1.0),
+                "w": _clamp(_safe_float(bbox.get("w", 0.0)), 0.02, 1.0),
+                "h": _clamp(_safe_float(bbox.get("h", 0.0)), 0.02, 1.0),
+            }
+        })
+        if len(out) >= max_defects:
+            break
+    return out
+
+def _edge_wear_count(notes: str) -> int:
+    """Heuristic: how many edges (top/right/bottom/left) are mentioned with wear terms."""
+    t = (notes or "").lower()
+    if not t:
+        return 0
+    wear_terms = r"(whitening|wear|chipp|nick|scuff|rough|fray|abrasion|dirty|grime|edge lift|silvering)"
+    edges = ["top", "right", "bottom", "left"]
+    cnt = 0
+    for e in edges:
+        # Look for 'top edge' near wear terms
+        if re.search(rf"{e}\s+edge.{{0,80}}{wear_terms}", t) or re.search(rf"{wear_terms}.{{0,80}}{e}\s+edge", t):
+            cnt += 1
+    return cnt
+
+def _corner_wear_count(corners_obj: Any) -> int:
+    """Count corners with non-sharp condition."""
+    if not isinstance(corners_obj, dict):
+        return 0
+    cnt = 0
+    for k in ("top_left", "top_right", "bottom_left", "bottom_right"):
+        c = corners_obj.get(k) or {}
+        cond = str((c or {}).get("condition", "")).lower().strip()
+        if cond and cond not in ("sharp", "clean"):
+            cnt += 1
+    return cnt
+
+def _compute_grade_cap_card(data: Dict[str, Any], second_pass: Dict[str, Any]) -> Optional[int]:
+    """Compute a conservative ceiling based on systemic wear, with BACK weighted more."""
+    try:
+        edges = data.get("edges") or {}
+        corners = data.get("corners") or {}
+        back_edges_notes = str(((edges.get("back") or {}).get("notes", "")))
+        front_edges_notes = str(((edges.get("front") or {}).get("notes", "")))
+
+        back_edges_worn = _edge_wear_count(back_edges_notes)
+        front_edges_worn = _edge_wear_count(front_edges_notes)
+
+        back_corners_worn = _corner_wear_count((corners.get("back") or {}))
+        front_corners_worn = _corner_wear_count((corners.get("front") or {}))
+
+        cand = second_pass.get("defect_candidates") or []
+        cand_types = set()
+        for d in cand:
+            if isinstance(d, dict) and d.get("type"):
+                cand_types.add(str(d.get("type")).lower())
+
+        # Start with no cap (None)
+        cap = None
+
+        # BACK dominates: systemic back wear caps hard
+        if back_edges_worn >= 3 or back_corners_worn >= 3:
+            cap = 6
+        elif back_edges_worn >= 2 or back_corners_worn >= 2:
+            cap = 7
+
+        # Front systemic wear can also cap, but slightly softer
+        if cap is None:
+            if front_edges_worn >= 3 or front_corners_worn >= 3:
+                cap = 7
+
+        # Print lines / major surface scratch candidates cap at 8 max (even if other areas strong)
+        if "print_line" in cand_types or "deep_scratch" in cand_types:
+            cap = min(cap or 10, 8)
+
+        return cap
+    except Exception:
+        return None
+
 
     def pct(p: float) -> float:
         idx = max(0, min(count - 1, int(round(p * (count - 1)))))
@@ -1407,9 +1563,14 @@ async def pricecharting_history(product_id: str, limit: int = 52):
 # ==============================
 # Card: Identify (AI + optional PokemonTCG enrichment)
 # ==============================
+
 @app.post("/api/identify")
 @safe_endpoint
 async def identify(front: UploadFile = File(...)):
+    """
+    Identify a trading card from the FRONT image only.
+    Returns lightweight ID fields used to populate the UI and to inform /api/verify and /api/market-context.
+    """
     img = await front.read()
     if not img or len(img) < 200:
         raise HTTPException(status_code=400, detail="Image is too small or empty")
@@ -1419,7 +1580,7 @@ async def identify(front: UploadFile = File(...)):
 Return ONLY valid JSON with these exact fields:
 
 {
-  "card_name": "exact card name including variants (ex, V, VMAX, holo, first edition, etc.)",
+  "card_name": "exact card name including variants (ex, V, VMAX, holo, 1st Edition, etc.)",
   "card_type": "Pokemon/Magic/YuGiOh/Sports/OnePiece/Other",
   "year": "4 digit year if visible else empty string",
   "card_number": "card number if visible (e.g. 006/165 or 004 or 4/102) else empty string",
@@ -1445,614 +1606,494 @@ Respond ONLY with JSON, no extra text.
         ],
     }]
 
-    result = await _openai_chat(msg, max_tokens=800, temperature=0.1)
-    if result.get("error"):
-        return JSONResponse(content={
-            "card_name": "Unknown",
-            "card_type": "Other",
-            "year": "",
-            "card_number": "",
-            "set_code": "",
-            "set_name": "",
-            "confidence": 0.0,
-            "notes": "AI identification failed",
-            "identify_token": f"idt_{secrets.token_urlsafe(12)}",
-            "pokemontcg": None,
-            "pokemontcg_enriched": False,
-        })
-
-    data = _parse_json_or_none(result.get("content", "")) or {}
-
-    # ------------------------------
-    # Second-pass (defect enhanced) analysis
-    # ------------------------------
-    # SECOND PASS GUARANTEE:
-    # Enhanced filtered images (grayscale/autocontrast + contrast/sharpness)
-    # are ALWAYS generated when PIL is available and are fed back into
-    # grading logic to surface print lines, whitening, scratches, and dents.
-
-    second_pass = {"enabled": True, "ran": False, "skipped_reason": None, "glare_suspects": [], "defect_candidates": []}
-    angled_bytes = b""  # identify() has no angled image
-    try:
-        # Only run for cards; memorabilia uses a different endpoint.
-        front_vars = _make_defect_filter_variants(img)
-        back_vars = {}
-
-        if not front_vars and not back_vars:
-            second_pass["enabled"] = False
-            second_pass["skipped_reason"] = "image_filters_unavailable"
-        else:
-            sp_prompt = f"""You are a meticulous trading card defect inspector.
-You are analyzing ENHANCED/FILTERED variants created to make defects stand out (print lines, scratches, whitening, dents).
-You may also receive an ANGLED image used to rule out glare/light refraction.
-
-CRITICAL:
-- Do NOT treat holo sheen / glare as whitening. If the angled shot suggests the mark moves/disappears, flag it as glare_suspect.
-- Card texture is NOT damage unless there is a true crease/indent/paper break.
-- Print lines are typically straight and consistent; glare moves with angle.
-
-Return ONLY valid JSON:
-{{
-  "defect_candidates": [
-    {{"type":"print_line|scratch|whitening|dent|crease|tear|stain|other","severity":"minor|moderate|severe","note":"short plain description","confidence":0-1}}
-  ],
-  "glare_suspects": [
-    {{"type":"whitening|scratch|print_line|other","note":"why it looks like glare","confidence":0-1}}
-  ]
-}}
-"""
-
-            content_parts = [{"type": "text", "text": sp_prompt}]
-
-            # Include filtered variants first (strong signal)
-            if front_vars.get("gray_autocontrast"):
-                content_parts += [
-                    {"type":"text","text":"FRONT (filtered: gray_autocontrast)"},
-                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(front_vars['gray_autocontrast'])}", "detail":"high"}}
-                ]
-            if front_vars.get("contrast_sharp"):
-                content_parts += [
-                    {"type":"text","text":"FRONT (filtered: contrast_sharp)"},
-                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(front_vars['contrast_sharp'])}", "detail":"high"}}
-                ]
-            if back_vars.get("gray_autocontrast"):
-                content_parts += [
-                    {"type":"text","text":"BACK (filtered: gray_autocontrast)"},
-                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(back_vars['gray_autocontrast'])}", "detail":"high"}}
-                ]
-            if back_vars.get("contrast_sharp"):
-                content_parts += [
-                    {"type":"text","text":"BACK (filtered: contrast_sharp)"},
-                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(back_vars['contrast_sharp'])}", "detail":"high"}}
-                ]
-
-            # Include angled if available (glare check)
-            if angled_bytes and len(angled_bytes) > 200:
-                content_parts += [
-                    {"type":"text","text":"OPTIONAL ANGLED IMAGE (glare check)"},
-                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(angled_bytes)}", "detail":"high"}}
-                ]
-
-            sp_msg = [{"role":"user","content": content_parts}]
-            sp_result = await _openai_chat(sp_msg, max_tokens=900, temperature=0.1)
-            if not sp_result.get("error"):
-                sp_data = _parse_json_or_none(sp_result.get("content","")) or {}
-                if isinstance(sp_data, dict):
-                    second_pass["ran"] = True
-                    if isinstance(sp_data.get("glare_suspects"), list):
-                        second_pass["glare_suspects"] = sp_data.get("glare_suspects")[:10]
-                    if isinstance(sp_data.get("defect_candidates"), list):
-                        second_pass["defect_candidates"] = sp_data.get("defect_candidates")[:20]
-            else:
-                second_pass["skipped_reason"] = "second_pass_ai_failed"
-    except Exception:
-        second_pass["skipped_reason"] = "second_pass_exception"
+    result = await _openai_chat(msg, max_tokens=900, temperature=0.1)
+    data = _parse_json_or_none(result.get("content", "")) if not result.get("error") else None
+    data = data or {}
 
     card_name = _norm_ws(str(data.get("card_name", "Unknown")))
-    card_type = _norm_ws(str(data.get("card_type", "Other")))
-    card_type = _normalize_card_type(card_type)
+    card_type = _normalize_card_type(_norm_ws(str(data.get("card_type", "Other"))))
     year = _norm_ws(str(data.get("year", "")))
-    card_number_display = _clean_card_number_display(str(data.get("card_number", "")))
+    card_number = _clean_card_number_display(str(data.get("card_number", "")))
     set_code = _norm_ws(str(data.get("set_code", ""))).upper()
     set_name = _norm_ws(str(data.get("set_name", "")))
-    if _is_blankish(set_name):
-        set_name = ""
-    if set_name.strip().lower() in ("unknown","n/a","na","none"):
-        set_name = ""
-    conf = _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0)
-    notes = _norm_ws(str(data.get("notes", "")))
+    confidence = _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0)
 
-    # If the model says "Unknown", force confidence low.
-    if card_name.strip().lower() == "unknown":
-        conf = 0.0
-        card_type = "Other"
-
-    # optional PokemonTCG enrichment (Pokemon only)
-    enriched = False
-    ptcg_payload = None
-    set_id = ""
-
-    if POKEMONTCG_API_KEY and card_type.lower() == "pokemon" and card_name != "Unknown":
-        ptcg_set = {}
-        if set_code and not set_name:
-            ptcg_set = await _pokemontcg_resolve_set_by_ptcgo(set_code)
-            if ptcg_set.get("name"):
-                set_name = _norm_ws(str(ptcg_set.get("name", "")))
-                set_id = str(ptcg_set.get("id", ""))
-
-        pid = await _pokemontcg_resolve_card_id(card_name, set_code, card_number_display, set_name=set_name, set_id=set_id)
-        if pid:
-            card = await _pokemontcg_card_by_id(pid)
-            if card:
-                enriched = True
-                conf = min(1.0, conf + 0.15)
-                set_name = _norm_ws(str((card.get("set") or {}).get("name", set_name)))
-                set_code = _norm_ws(str((card.get("set") or {}).get("ptcgoCode", set_code))).upper()
-                set_id = _norm_ws(str((card.get("set") or {}).get("id", set_id)))
-                release_date = _norm_ws(str((card.get("set") or {}).get("releaseDate", "")))
-                if release_date and not year:
-                    year = release_date[:4]
-                # keep the AI card_number display if present, else use API number
-                if not card_number_display:
-                    card_number_display = _clean_card_number_display(str(card.get("number", "")))
-                ptcg_payload = {
-                    "id": card.get("id", ""),
-                    "name": card.get("name", ""),
-                    "number": card.get("number", ""),
-                    "rarity": card.get("rarity", ""),
-                    "set": card.get("set", {}) or {},
-                    "images": card.get("images", {}) or {},
-                    "links": {
-                        "tcgplayer": (card.get("tcgplayer") or {}).get("url", ""),
-                        "cardmarket": (card.get("cardmarket") or {}).get("url", ""),
-                    },
-                }
-                notes = f"Verified via PokemonTCG API (id {pid})"
-
-    
-    # Canonicalize set (prefer map / resolved name) + build canonical id for frontend
+    # Canonicalize set (mapping fallback)
     set_info = _canonicalize_set(set_code, set_name)
-    canonical_id = {
-        "card_name": card_name,
-        "card_type": card_type,
-        "year": year,
-        "card_number": card_number_display,
-        "set_code": set_info["set_code"],
-        "set_name": set_info["set_name"],
-        "set_source": set_info.get("set_source", "unknown"),
-        "confidence": conf,
-    }
+    set_code = set_info.get("set_code", set_code)
+    set_name = set_info.get("set_name", set_name)
+
+    # Optional PokemonTCG enrichment (metadata only)
+    pokemontcg_obj = None
+    enriched = False
+    try:
+        if POKEMONTCG_API_KEY and card_type.strip().lower() == "pokemon" and card_name and card_name.lower() != "unknown":
+            # If AI provided only set_code, resolve set_name from PokemonTCG sets endpoint
+            if set_code and not set_name:
+                ptcg_set = await _pokemontcg_resolve_set_by_ptcgo(set_code)
+                if isinstance(ptcg_set, dict) and ptcg_set.get("name"):
+                    set_name = _norm_ws(str(ptcg_set.get("name", "")))
+                    enriched = True
+
+            # Try resolve a card id and fetch canonical metadata
+            try:
+                card_id = await _pokemontcg_resolve_card_id(card_name, set_code, card_number, set_name=set_name)
+                if card_id:
+                    pokemontcg_obj = await _pokemontcg_card_by_id(card_id)
+                    if pokemontcg_obj:
+                        enriched = True
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     return JSONResponse(content={
         "card_name": card_name,
         "card_type": card_type,
         "year": year,
-        "card_number": card_number_display,
-        "set_code": set_info["set_code"],
-        "set_name": set_info["set_name"],
-        "set_id": set_id,
-        "confidence": conf,
-        "notes": notes,
-        "canonical_id": canonical_id,
+        "card_number": card_number,
+        "set_code": set_code,
+        "set_name": set_name,
+        "confidence": confidence,
+        "notes": _norm_ws(str(data.get("notes", ""))),
         "identify_token": f"idt_{secrets.token_urlsafe(12)}",
-        "pokemontcg": ptcg_payload,
-        "pokemontcg_enriched": enriched,
+        "pokemontcg": pokemontcg_obj,
+        "pokemontcg_enriched": bool(enriched and pokemontcg_obj),
     })
 
+
 # ==============================
-# Card: Verify (grading only)
+# Card: Verify / Grade (front + back + optional angled)
+# Includes second-pass filtering + CV-assisted defect closeups
 # ==============================
+def _cv_candidate_bboxes(img_bytes: bytes, side: str) -> List[Dict[str, Any]]:
+    """
+    Light CV assist to propose 'hotspot' regions near borders where whitening/edge wear is likely.
+    Returns normalized bboxes: {side, roi, score, bbox:{x,y,w,h}}
+    """
+    if not PIL_AVAILABLE or not img_bytes:
+        return []
+    try:
+        im = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        w, h = im.size
+        g = ImageOps.grayscale(im)
+        edge = g.filter(ImageFilter.FIND_EDGES)
+        # helper to score a crop box in px
+        def score_box(px, py, px2, py2):
+            cg = g.crop((px, py, px2, py2))
+            ce = edge.crop((px, py, px2, py2))
+            # mean brightness and mean edge intensity
+            bg = ImageStat.Stat(cg).mean[0] / 255.0
+            be = ImageStat.Stat(ce).mean[0] / 255.0
+            return 0.65 * be + 0.35 * bg
+
+        rois = []
+        # edge strips (8% thickness)
+        t = max(6, int(0.08 * min(w, h)))
+        roi_defs = [
+            ("edge_top", (0, 0, w, t)),
+            ("edge_bottom", (0, h - t, w, h)),
+            ("edge_left", (0, 0, t, h)),
+            ("edge_right", (w - t, 0, w, h)),
+        ]
+        # corners (18% squares)
+        c = max(18, int(0.18 * min(w, h)))
+        roi_defs += [
+            ("corner_top_left", (0, 0, c, c)),
+            ("corner_top_right", (w - c, 0, w, c)),
+            ("corner_bottom_left", (0, h - c, c, h)),
+            ("corner_bottom_right", (w - c, h - c, w, h)),
+        ]
+
+        for name, (px, py, px2, py2) in roi_defs:
+            s = float(score_box(px, py, px2, py2))
+            # normalize bbox
+            bbox = {
+                "x": round(px / w, 4),
+                "y": round(py / h, 4),
+                "w": round((px2 - px) / w, 4),
+                "h": round((py2 - py) / h, 4),
+            }
+            rois.append({"side": side, "roi": name, "score": round(s, 4), "bbox": bbox})
+
+        rois.sort(key=lambda r: r.get("score", 0.0), reverse=True)
+        # keep top 6 per side, but always include all 4 corners (most useful for whitening)
+        corners = [r for r in rois if r["roi"].startswith("corner_")]
+        edges = [r for r in rois if r["roi"].startswith("edge_")]
+        out = (corners[:4] + edges[:2])
+        # dedupe by roi
+        seen = set()
+        final = []
+        for r in out:
+            if r["roi"] in seen:
+                continue
+            seen.add(r["roi"])
+            final.append(r)
+        return final
+    except Exception:
+        return []
+
+async def _openai_label_rois(rois: List[Dict[str, Any]], front_bytes: Optional[bytes], back_bytes: Optional[bytes]) -> List[Dict[str, Any]]:
+    """
+    Ask the vision model to confirm if ROI crops contain real defects and label them.
+    Returns list:
+      [{roi_index, side, roi, type, note, confidence}]
+    """
+    if not rois:
+        return []
+    # Prepare crop thumbnails (base64) for the model
+    content_parts: List[Dict[str, Any]] = [{
+        "type": "text",
+        "text": (
+            "You are reviewing close-up crops from a trading card photo. "
+            "For each crop, decide whether it shows a REAL defect (not glare/noise). "
+            "If real, label the defect type and write a short note. Return ONLY JSON."
+        )
+    }]
+
+    for i, r in enumerate(rois):
+        side = r.get("side")
+        bbox = r.get("bbox") or {}
+        src = front_bytes if side == "front" else back_bytes
+        if not src:
+            continue
+        thumb = _make_thumb_from_bbox(src, bbox, max_size=520)
+        if not thumb:
+            continue
+        content_parts += [
+            {"type": "text", "text": f"CROP {i} | side={side} | roi={r.get('roi')}"},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{thumb}", "detail": "high"}}
+        ]
+
+    prompt = """Return ONLY valid JSON array. Each entry corresponds to a crop you were shown:
+
+[
+  {
+    "crop_index": 0,
+    "is_defect": true/false,
+    "type": "print_line|scratch|whitening|edge_wear|corner_wear|dent|surface_haze|stain|other",
+    "confidence": 0.0-1.0,
+    "note": "short, specific (location/what you see). If not a defect, say 'likely glare/noise' etc."
+  }
+]
+
+Rules:
+- Be conservative (PSA style). If unsure, set is_defect=false.
+- Do NOT invent defects. If a crop is too blurry, set is_defect=false and lower confidence.
+- Keep to max 10 outputs (one per crop shown).
+"""
+    msg = [
+        {"role": "system", "content": "Return only JSON. No markdown."},
+        {"role": "user", "content": content_parts + [{"type": "text", "text": prompt}]},
+    ]
+    res = await _openai_chat(msg, max_tokens=900, temperature=0.0)
+    if res.get("error"):
+        return []
+    parsed = _parse_json_or_none(res.get("content", "")) or []
+    if not isinstance(parsed, list):
+        return []
+    out = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        out.append({
+            "crop_index": int(_safe_float(item.get("crop_index", -1), -1)),
+            "is_defect": bool(item.get("is_defect", False)),
+            "type": _norm_ws(str(item.get("type", "other")))[:40],
+            "confidence": _clamp(_safe_float(item.get("confidence", 0.0)), 0.0, 1.0),
+            "note": _norm_ws(str(item.get("note", "")))[:220],
+        })
+    return out
+
 @app.post("/api/verify")
 @safe_endpoint
 async def verify(
     front: UploadFile = File(...),
     back: UploadFile = File(...),
-    angled: Optional[UploadFile] = File(None),  # new: angled/glare-check shot
+    angled: Optional[UploadFile] = File(None),
+
+    # Optional metadata from frontend (helps market context + summary; not required)
     card_name: Optional[str] = Form(None),
     card_set: Optional[str] = Form(None),
+    set_code: Optional[str] = Form(None),
     card_number: Optional[str] = Form(None),
     card_year: Optional[str] = Form(None),
     card_type: Optional[str] = Form(None),
-    set_code: Optional[str] = Form(None),
 ):
     front_bytes = await front.read()
     back_bytes = await back.read()
-    angled_bytes = await angled.read() if angled is not None else b""
-    if not front_bytes or not back_bytes or len(front_bytes) < 200 or len(back_bytes) < 200:
-        raise HTTPException(status_code=400, detail="Images are too small or empty")
+    angled_bytes = await angled.read() if angled else b""
 
-    provided_name = _norm_ws(card_name or "")
-    provided_set = _norm_ws(card_set or "")
-    if _is_blankish(provided_set):
-        provided_set = ""
-    provided_num_display = _clean_card_number_display(card_number or "")
-    provided_year = _norm_ws(card_year or "")
-    provided_type = _normalize_card_type(_norm_ws(card_type or ""))
-    provided_code = _norm_ws(set_code or "").upper()
+    if not front_bytes or len(front_bytes) < 200 or not back_bytes or len(back_bytes) < 200:
+        raise HTTPException(status_code=400, detail="Front and back images are required")
 
-    # Backfill set name if needed
-    if POKEMONTCG_API_KEY and provided_code and (not provided_set or provided_set.lower()=='unknown'):
-        ptcg_set = await _pokemontcg_resolve_set_by_ptcgo(provided_code)
-        if ptcg_set.get("name"):
-            provided_set = _norm_ws(str(ptcg_set.get("name", "")))
+    ctype = _normalize_card_type(_norm_ws(card_type or "Other"))
+    cname = _norm_ws(card_name or "")
+    cset = _norm_ws(card_set or "")
+    scode = _norm_ws(set_code or "").upper()
+    cnum = _clean_card_number_display(card_number or "")
+    cyear = _norm_ws(card_year or "")
 
-    context = ""
-    if provided_name or provided_set or provided_num_display or provided_year or provided_type or provided_code:
-        context = "\n\nKNOWN/PROVIDED CARD DETAILS (use as hints, do not force if images contradict):\n"
-        if provided_name: context += f"- Card Name: {provided_name}\n"
-        if provided_set: context += f"- Set Name: {provided_set}\n"
-        if provided_code: context += f"- Set Code: {provided_code}\n"
-        if provided_num_display: context += f"- Card Number: {provided_num_display}\n"
-        if provided_year: context += f"- Year: {provided_year}\n"
-        if provided_type: context += f"- Type: {provided_type}\n"
+    # ------------------------------
+    # FIRST PASS: full grading on originals
+    # ------------------------------
+    ctx_lines = []
+    if cname: ctx_lines.append(f"- Card: {cname}")
+    if ctype: ctx_lines.append(f"- Type: {ctype}")
+    if cyear: ctx_lines.append(f"- Year: {cyear}")
+    if cset: ctx_lines.append(f"- Set: {cset}")
+    if scode: ctx_lines.append(f"- Set code: {scode}")
+    if cnum: ctx_lines.append(f"- Number: {cnum}")
 
-    # Vary spoken-word delivery so outputs don't feel templated
-    _spoken_styles = [
-        'Energetic collector-to-collector (short sentences, upbeat close)',
-        'Calm professional appraisal (measured, matter-of-fact)',
-        'Straight-shooting grader (direct, no fluff, ends with clear grade expectation)',
-        'Friendly hobby shop chat (warm, relatable, uses simple language)',
-        'Premium concierge tone (polished, confident, succinct)'
-    ]
-    voice_hint = f"\nSPOKEN WORD DELIVERY STYLE: {random.choice(_spoken_styles)}\n"
+    ctx = ("\nKNOWN CARD DETAILS (may be imperfect):\n" + "\n".join(ctx_lines) + "\n") if ctx_lines else ""
 
-    prompt = f"""You are a professional trading card grader with 15+ years experience.
-
-Analyze the provided images with EXTREME scrutiny.
-You will receive FRONT and BACK images, and MAY receive a third ANGLED image used to rule out glare / light refraction artifacts (holo sheen) vs true whitening / scratches / print lines. Write as if speaking directly to a collector who needs honest, specific feedback about their card.
-
-{voice_hint}
-- Avoid repeating stock openings like 'Hey there!' every time.
-- Vary the closing line (e.g., submit recommendation, sleeve advice, or expectations).
-
-
-CRITICAL RULES:
-1) Be conversational and specific. Write like you're examining the card in person and describing what you see:
-   - BAD: "Minor edge wear present"
-   - GOOD: "Looking at the front, I can see some very slight edge wear along the top edge, approximately 2mm from the top-left corner. The right edge is notably cleaner."
-
-2) Call out every single corner individually with precise location and severity:
-   - For EACH of the 8 corners (4 front + 4 back), describe what you observe
-   - Examples: "Front top-left corner is perfectly sharp", "Back bottom-right shows minor whitening about 1mm deep"
-
-3) Grade must reflect worst visible defect (conservative PSA-style):
-   - Any crease/fold/tear/major dent → pregrade 4 or lower
-   - Any bend/ding/impression, heavy rounding → pregrade 5 or lower
-   - Moderate whitening across multiple corners/edges → pregrade 6-7
-   - Only grade 9-10 if truly exceptional
-
-
-5) Do NOT confuse holo sheen / light refraction / texture for damage:
-   - If a mark disappears or changes drastically in the ANGLED shot, treat it as glare/reflection, NOT whitening/damage.
-   - Print lines are typically straight and consistent across lighting; glare moves with angle.
-   - Card texture (especially modern) is not damage unless there is a true crease, indentation, or paper break.
-
-4) Write the assessment summary in first person, conversational style (5-8 sentences):
-   - Open with overall impression: "Looking at your card..."
-   - Discuss specific observations: "The front presents beautifully, with..."
-   - Compare front vs back: "While the front is near-perfect, the back shows..."
-   - Explain grade rationale: "The grade of X is primarily limited by..."
-   - End with realistic expectation: "If you're considering grading..."
-
-{context}
+    grade_prompt = f"""You are a strict, PSA-style trading card grader.
 
 Return ONLY valid JSON with this EXACT structure:
 
 {{
-  "pregrade": "1-10",
+  "pregrade": "1-10 integer string (e.g. '6')",
   "confidence": 0.0-1.0,
+
   "centering": {{
-    "front": {{
-      "grade": "55/45",
-      "notes": "Detailed observation: slightly off-center towards [direction], approximately [measurement]. [Impact on grade]."
-    }},
-    "back": {{
-      "grade": "60/40", 
-      "notes": "Detailed observation: [specific description of centering quality]."
-    }}
+    "front": {{"grade":"e.g. 55/45 or 60/40","notes":"one sentence"}},
+    "back":  {{"grade":"e.g. 60/40","notes":"one sentence"}}
   }},
+
   "corners": {{
     "front": {{
-      "top_left": {{
-        "condition": "sharp/minor_whitening/whitening/bend/ding/crease",
-        "notes": "Specific description: [exactly what you see, be detailed]"
-      }},
-      "top_right": {{
-        "condition": "sharp/minor_whitening/whitening/bend/ding/crease",
-        "notes": "Specific description: [exactly what you see]"
-      }},
-      "bottom_left": {{
-        "condition": "sharp/minor_whitening/whitening/bend/ding/crease",
-        "notes": "Specific description: [exactly what you see]"
-      }},
-      "bottom_right": {{
-        "condition": "sharp/minor_whitening/whitening/bend/ding/crease",
-        "notes": "Specific description: [exactly what you see]"
-      }}
+      "top_left":    {{"condition":"sharp|minor whitening|whitening|ding|other","notes":"short"}},
+      "top_right":   {{"condition":"...","notes":"short"}},
+      "bottom_left": {{"condition":"...","notes":"short"}},
+      "bottom_right":{{"condition":"...","notes":"short"}}
     }},
     "back": {{
-      "top_left": {{"condition": "...", "notes": "..."}},
-      "top_right": {{"condition": "...", "notes": "..."}},
-      "bottom_left": {{"condition": "...", "notes": "..."}},
-      "bottom_right": {{"condition": "...", "notes": "..."}}
+      "top_left":    {{"condition":"...","notes":"short"}},
+      "top_right":   {{"condition":"...","notes":"short"}},
+      "bottom_left": {{"condition":"...","notes":"short"}},
+      "bottom_right":{{"condition":"...","notes":"short"}}
     }}
   }},
+
   "edges": {{
-    "front": {{
-      "grade": "Mint/Near Mint/Excellent/Good/Poor",
-      "notes": "Walk around all 4 edges: top edge [description], right edge [description], bottom [description], left [description]. Be specific about location and severity."
-    }},
-    "back": {{
-      "grade": "Mint/Near Mint/Excellent/Good/Poor",
-      "notes": "Detailed edge-by-edge assessment with locations."
-    }}
+    "front": {{"grade":"Gem Mint|Mint|Near Mint|Excellent|Good|Poor","notes":"be specific about which edges"}},
+    "back":  {{"grade":"Gem Mint|Mint|Near Mint|Excellent|Good|Poor","notes":"be specific about which edges"}}
   }},
+
   "surface": {{
-    "front": {{
-      "grade": "Mint/Near Mint/Excellent/Good/Poor",
-      "notes": "Describe surface quality in detail: holographic pattern quality, any print lines, scratches (with location), scuffs, gloss level."
-    }},
-    "back": {{
-      "grade": "Mint/Near Mint/Excellent/Good/Poor",
-      "notes": "Detailed surface assessment."
-    }}
+    "front": {{"grade":"Gem Mint|Mint|Near Mint|Excellent|Good|Poor","notes":"scratches/print lines/holo wear/stains"}},
+    "back":  {{"grade":"Gem Mint|Mint|Near Mint|Excellent|Good|Poor","notes":"scratches/whitening/marks"}}
   }},
-  "defects": [
-    "Each defect as a complete sentence: [SIDE] [precise location] shows [type of defect] [severity]. Example: 'Front top-left corner shows moderate whitening extending approximately 2mm into the card surface.'"
-  ],
-  "flags": [
-    "Short flags for important issues (crease, bend, edge chipping, etc.)"
-  ],
-  "assessment_summary": "Write 5-8 sentences in first person, conversational style. Start with: 'Looking at your [card name]...' Then describe specific observations, compare front vs back, explain what limits the grade, and give realistic grading expectations. Be honest but professional.",
-    "spoken_word": "A punchy spoken-word version of the assessment summary (about 20-45 seconds). First person, conversational. Mention the best features, the main grade limiters, and end with what grade you’d realistically expect.",
-  "observed_id": {{
-    "card_name": "best-effort from images",
-    "set_code": "only if clearly visible",
-    "set_name": "best-effort",
-    "card_number": "preserve leading zeros",
-    "year": "best-effort",
-    "card_type": "Pokemon/Magic/YuGiOh/Sports/OnePiece/Other"
-  }}
+
+  "defects": ["each as a full sentence with location + severity (no mm measurements)"],
+  "flags": ["short flags for major issues: crease, dent, edge lift, print line, heavy whitening, stain, etc."],
+
+  "assessment_summary": "6-10 sentences in first person. Start with: 'Looking at your {ctype or 'card'}...' Mention strengths, biggest issues, and why the pregrade lands where it does.",
+  "spoken_word": "A 20–45 second spoken-word script in first person. Format: Hook → What you see → Biggest concerns → Bottom line grade + confidence."
 }}
 
-CRITICAL REMINDERS:
-- Every corner needs a detailed note explaining what you observe
-- Every edge/surface needs location-specific observations  
-- Assessment summary must be conversational (first person, like talking to the owner)
-- Do NOT miss obvious damage - be brutally honest
-- If you can't see something clearly due to glare/blur, say so in notes
+{ctx}
 
+Rules:
+- Be conservative. If unsure between two grades, pick the lower.
+- Do NOT invent defects. If a detail isn't visible due to blur/glare, say so and reduce confidence.
+- Avoid over-precise measurements; use relative language (slight/moderate/heavy).
+- If you see structural damage (crease/bend/tear), pregrade must be 1-4 and add a flag.
 Respond ONLY with JSON, no extra text.
 """
 
-    msg = [{
-        "role": "user",
-        "content": [
-            {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(front_bytes)}", "detail": "high"}},
-            {"type": "text", "text": "FRONT IMAGE ABOVE ☝️ | BACK IMAGE BELOW 👇"},
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(back_bytes)}", "detail": "high"}},
-        ] + (
-            [
-                {"type": "text", "text": "OPTIONAL ANGLED IMAGE BELOW (use to rule out glare vs true defects) 👇"},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(angled_bytes)}", "detail": "high"}},
-            ] if angled_bytes and len(angled_bytes) > 200 else []
-        ),
-    }]
+    content_parts = [
+        {"type":"text","text": grade_prompt},
+        {"type":"text","text":"FRONT (original)"},
+        {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(front_bytes)}", "detail":"high"}},
+        {"type":"text","text":"BACK (original)"},
+        {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(back_bytes)}", "detail":"high"}},
+    ]
+    if angled_bytes and len(angled_bytes) > 200:
+        content_parts += [
+            {"type":"text","text":"OPTIONAL ANGLED IMAGE (glare vs defect check)"},
+            {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(angled_bytes)}", "detail":"high"}},
+        ]
 
-    result = await _openai_chat(msg, max_tokens=2200, temperature=0.1)
-    if result.get("error"):
-        return JSONResponse(content={"error": True, "message": "AI grading failed", "details": result.get("message", "")}, status_code=502)
+    first = await _openai_chat([{"role":"user","content": content_parts}], max_tokens=2000, temperature=0.1)
+    if first.get("error"):
+        raise HTTPException(status_code=502, detail=f"AI grading failed: {first.get('message','')}")
 
-    data = _parse_json_or_none(result.get("content", "")) or {}
+    data = _parse_json_or_none(first.get("content","")) or {}
+    if not isinstance(data, dict):
+        data = {}
 
-    # ------------------------------
-    # Second-pass (defect enhanced) analysis
-    # ------------------------------
-    # SECOND PASS GUARANTEE:
-    # Enhanced filtered images (grayscale/autocontrast + contrast/sharpness)
-    # are ALWAYS generated when PIL is available and are fed back into
-    # grading logic to surface print lines, whitening, scratches, and dents.
-
-    second_pass = {"enabled": True, "ran": False, "skipped_reason": None, "glare_suspects": [], "defect_candidates": []}
-    try:
-        # Only run for cards; memorabilia uses a different endpoint.
-        front_vars = _make_defect_filter_variants(img)
-        back_vars = {}  # identify() only has a front image
-
-        if not front_vars and not back_vars:
-            second_pass["enabled"] = False
-            second_pass["skipped_reason"] = "image_filters_unavailable"
-        else:
-            sp_prompt = f"""You are a meticulous trading card defect inspector.
-You are analyzing ENHANCED/FILTERED variants created to make defects stand out (print lines, scratches, whitening, dents).
-You may also receive an ANGLED image used to rule out glare/light refraction.
-
-CRITICAL:
-- Do NOT treat holo sheen / glare as whitening. If the angled shot suggests the mark moves/disappears, flag it as glare_suspect.
-- Card texture is NOT damage unless there is a true crease/indent/paper break.
-- Print lines are typically straight and consistent; glare moves with angle.
-
-Return ONLY valid JSON:
-{{
-  "defect_candidates": [
-    {{"type":"print_line|scratch|whitening|dent|crease|tear|stain|other","severity":"minor|moderate|severe","note":"short plain description","confidence":0-1}}
-  ],
-  "glare_suspects": [
-    {{"type":"whitening|scratch|print_line|other","note":"why it looks like glare","confidence":0-1}}
-  ]
-}}
-"""
-
-            content_parts = [{"type": "text", "text": sp_prompt}]
-
-            # Include filtered variants first (strong signal)
-            if front_vars.get("gray_autocontrast"):
-                content_parts += [
-                    {"type":"text","text":"FRONT (filtered: gray_autocontrast)"},
-                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(front_vars['gray_autocontrast'])}", "detail":"high"}}
-                ]
-            if front_vars.get("contrast_sharp"):
-                content_parts += [
-                    {"type":"text","text":"FRONT (filtered: contrast_sharp)"},
-                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(front_vars['contrast_sharp'])}", "detail":"high"}}
-                ]
-            if back_vars.get("gray_autocontrast"):
-                content_parts += [
-                    {"type":"text","text":"BACK (filtered: gray_autocontrast)"},
-                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(back_vars['gray_autocontrast'])}", "detail":"high"}}
-                ]
-            if back_vars.get("contrast_sharp"):
-                content_parts += [
-                    {"type":"text","text":"BACK (filtered: contrast_sharp)"},
-                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(back_vars['contrast_sharp'])}", "detail":"high"}}
-                ]
-
-            # Include angled if available (glare check)
-            if angled_bytes and len(angled_bytes) > 200:
-                content_parts += [
-                    {"type":"text","text":"OPTIONAL ANGLED IMAGE (glare check)"},
-                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(angled_bytes)}", "detail":"high"}}
-                ]
-
-            sp_msg = [{"role":"user","content": content_parts}]
-            sp_result = await _openai_chat(sp_msg, max_tokens=900, temperature=0.1)
-            if not sp_result.get("error"):
-                sp_data = _parse_json_or_none(sp_result.get("content","")) or {}
-                if isinstance(sp_data, dict):
-                    second_pass["ran"] = True
-                    if isinstance(sp_data.get("glare_suspects"), list):
-                        second_pass["glare_suspects"] = sp_data.get("glare_suspects")[:10]
-                    if isinstance(sp_data.get("defect_candidates"), list):
-                        second_pass["defect_candidates"] = sp_data.get("defect_candidates")[:20]
-            else:
-                second_pass["skipped_reason"] = "second_pass_ai_failed"
-    except Exception:
-        second_pass["skipped_reason"] = "second_pass_exception"
-
-    # Normalize flags/defects and compute structural-damage indicator
-    flags_raw = data.get("flags", [])
-    if isinstance(flags_raw, list):
-        flags_list_out = [str(f).lower().strip() for f in flags_raw if str(f).strip()]
-    else:
-        flags_list_out = []
-    # De-duplicate while preserving order
-    flags_list_out = list(dict.fromkeys(flags_list_out))
-
+    # Normalize lists
     defects_list_out = data.get("defects", [])
     if not isinstance(defects_list_out, list):
         defects_list_out = []
+    defects_list_out = [_norm_ws(str(d)) for d in defects_list_out if _norm_ws(str(d))]
+    flags_list_out = data.get("flags", [])
+    if not isinstance(flags_list_out, list):
+        flags_list_out = []
+    flags_list_out = [str(f).lower().strip() for f in flags_list_out if str(f).strip()]
+    flags_list_out = list(dict.fromkeys(flags_list_out))
 
-    
-    # Normalize defects to strings (avoid [object Object] in frontend)
-    _norm_def = []
-    for d in defects_list_out:
-        if isinstance(d, str):
-            s = d.strip()
-            if s:
-                _norm_def.append(s)
-        elif isinstance(d, dict):
-            note = str(d.get("note") or d.get("text") or d.get("issue") or "").strip()
-            if note:
-                _norm_def.append(note)
-    defects_list_out = list(dict.fromkeys(_norm_def))
-# Merge second-pass defect candidates (print lines / scratches / whitening) and glare suspects.
-    # - Add high-confidence print_line flags when detected.
-    # - If glare suspects exist, annotate rather than over-penalize.
-    if isinstance(second_pass, dict) and second_pass.get("ran"):
-        cand = second_pass.get("defect_candidates") or []
-        glare = second_pass.get("glare_suspects") or []
-
-        # Add candidates into defects list (dedup by (type,note))
-        seen = set(str(d).lower().strip() for d in defects_list_out if isinstance(d, str))
-        for d in cand:
-            if not isinstance(d, dict): 
-                continue
-            t = str(d.get("type","")).lower().strip()
-            note = str(d.get("note","")).strip()
-            if not t or not note:
-                continue
-            key = note.lower().strip()
-            if key in seen:
-                continue
-            seen.add(key)
-            defects_list_out.append(note)
-
-            # Promote print line detection into flags if confidence is decent
-            try:
-                c = float(d.get("confidence", 0))
-            except Exception:
-                c = 0.0
-            if t == "print_line" and c >= 0.55 and "print_line" not in flags_list_out:
-                flags_list_out.append("print_line")
-
-        # Store glare suspects into data for frontend / summary
-        data["glare_suspects"] = glare[:10]
-
+    # Structural damage gate
     has_structural_damage = any(
-        f in ("crease", "tear", "paper break", "structural bend", "hole")
+        f in ("crease","bend","tear","paper break","hole","structural bend","rip")
         for f in flags_list_out
     )
 
-
-
-    raw_pregrade = str(data.get("pregrade", "")).strip()
+    raw_pregrade = str(data.get("pregrade","")).strip()
     g = _grade_bucket(raw_pregrade)
-    # NOTE: We intentionally do NOT cap the AI-assessed pregrade here.
-    # Any condition-based value adjustments are applied in /api/market-context only.
-
     pregrade_norm = str(g) if g is not None else ""
 
-    # Condition anchor for downstream market logic (trust gate)
+    # ------------------------------
+    # SECOND PASS: filtered images + CV hotspot crops
+    # ------------------------------
+    second_pass = {"enabled": True, "ran": False, "skipped_reason": None, "defect_candidates": [], "roi_labels": []}
+
+    front_vars = _make_defect_filter_variants(front_bytes) if front_bytes else {}
+    back_vars = _make_defect_filter_variants(back_bytes) if back_bytes else {}
+
+    # CV hotspots (edge/corner)
+    rois = []
+    rois += _cv_candidate_bboxes(front_bytes, "front")
+    rois += _cv_candidate_bboxes(back_bytes, "back")
+
+    if not PIL_AVAILABLE:
+        second_pass["enabled"] = False
+        second_pass["skipped_reason"] = "pil_unavailable"
+
+    if second_pass["enabled"]:
+        # Second-pass defect candidates from filtered images (global)
+        sp_instructions = """You are doing a second-pass defect check using ENHANCED filtered images.
+Return ONLY valid JSON:
+
+{
+  "defect_candidates": [
+    {"side":"front|back","type":"print_line|scratch|whitening|edge_wear|corner_wear|dent|surface_haze|stain|other","note":"...","confidence":0-1}
+  ]
+}
+
+Rules:
+- Be conservative and grading-realistic (PSA style).
+- Do NOT hallucinate defects. If unsure, omit.
+- Prefer the most obvious 3-8 candidates total.
+"""
+
+        sp_parts: List[Dict[str, Any]] = [{"type":"text","text": sp_instructions}]
+
+        # Feed BOTH sides + both filter variants where available
+        if front_vars.get("gray_autocontrast"):
+            sp_parts += [
+                {"type":"text","text":"FRONT (filtered: gray_autocontrast)"},
+                {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(front_vars['gray_autocontrast'])}", "detail":"high"}}
+            ]
+        if front_vars.get("contrast_sharp"):
+            sp_parts += [
+                {"type":"text","text":"FRONT (filtered: contrast_sharp)"},
+                {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(front_vars['contrast_sharp'])}", "detail":"high"}}
+            ]
+        if back_vars.get("gray_autocontrast"):
+            sp_parts += [
+                {"type":"text","text":"BACK (filtered: gray_autocontrast)"},
+                {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(back_vars['gray_autocontrast'])}", "detail":"high"}}
+            ]
+        if back_vars.get("contrast_sharp"):
+            sp_parts += [
+                {"type":"text","text":"BACK (filtered: contrast_sharp)"},
+                {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(back_vars['contrast_sharp'])}", "detail":"high"}}
+            ]
+
+        sp_res = await _openai_chat([{"role":"user","content": sp_parts}], max_tokens=900, temperature=0.0)
+        if not sp_res.get("error"):
+            sp_data = _parse_json_or_none(sp_res.get("content","")) or {}
+            if isinstance(sp_data, dict):
+                second_pass["ran"] = True
+                second_pass["defect_candidates"] = sp_data.get("defect_candidates") or []
+
+        # CV ROI labeling (zoomed closeups)
+        roi_labels = await _openai_label_rois(rois[:10], front_bytes, back_bytes) if rois else []
+        second_pass["roi_labels"] = roi_labels
+
+    # Merge second-pass defect candidates into top-level defects/flags
+    if second_pass.get("ran"):
+        for d in (second_pass.get("defect_candidates") or []):
+            if not isinstance(d, dict):
+                continue
+            note = _norm_ws(str(d.get("note","")))
+            if note and note.lower() not in [x.lower() for x in defects_list_out]:
+                defects_list_out.append(note)
+            t = str(d.get("type","")).lower().strip()
+            try:
+                c = float(d.get("confidence", 0.0))
+            except Exception:
+                c = 0.0
+            if t in ("print_line","crease","dent") and c >= 0.55 and t not in flags_list_out:
+                flags_list_out.append(t)
+
+    # Apply caps (BACK-weighted systemic wear) using existing heuristic
+    cap = _compute_grade_cap_card(data if isinstance(data, dict) else {}, second_pass if isinstance(second_pass, dict) else {})
+    if g is not None and cap is not None and cap > 0 and g > cap:
+        data["grade_cap_applied"] = cap
+        g = cap
+        pregrade_norm = str(g)
+
+    # ------------------------------
+    # Build defect_snaps (ROI thumbnails)
+    # We return closeups for confirmed defects first, then best-scoring hotspots (as 'hotspot') if none confirmed.
+    # ------------------------------
+    defect_snaps: List[Dict[str, Any]] = []
+    # map labels by crop_index
+    label_by_idx = {int(x.get("crop_index",-1)): x for x in (second_pass.get("roi_labels") or []) if isinstance(x, dict)}
+    for i, r in enumerate(rois[:10]):
+        src = front_bytes if r.get("side") == "front" else back_bytes
+        if not src:
+            continue
+        bbox = r.get("bbox") or {}
+        thumb = _make_thumb_from_bbox(src, bbox, max_size=520)
+        if not thumb:
+            continue
+        lab = label_by_idx.get(i) or {}
+        is_def = bool(lab.get("is_defect", False))
+        dtype = lab.get("type") if is_def else "hotspot"
+        note = lab.get("note") if lab else f"CV hotspot: {r.get('roi')}"
+        conf = lab.get("confidence") if lab else 0.0
+        defect_snaps.append({
+            "side": r.get("side"),
+            "type": dtype,
+            "note": _norm_ws(str(note))[:220],
+            "confidence": _clamp(_safe_float(conf, 0.0), 0.0, 1.0),
+            "bbox": bbox,
+            "thumbnail_b64": thumb,
+        })
+
+    # prioritize real defects
+    defect_snaps.sort(key=lambda x: (0 if x.get("type") != "hotspot" else 1, -float(x.get("confidence") or 0.0)))
+    defect_snaps = defect_snaps[:8]
+
+    # Ensure assessment_summary length
+    summary = _norm_ws(str(data.get("assessment_summary","")))
+    if len(summary.split()) < 35:
+        # fallback: build from components without inventing
+        parts = []
+        parts.append(f"Looking at your {cname or 'card'}, the overall condition estimate lands around a {pregrade_norm or raw_pregrade or 'N/A'} based on what’s visible in the photos.")
+        parts.append(f"Centering: front {((data.get('centering') or {}).get('front') or {}).get('grade','N/A')} / back {((data.get('centering') or {}).get('back') or {}).get('grade','N/A')}.")
+        if defects_list_out:
+            parts.append("Main visible issues: " + "; ".join(defects_list_out[:8]) + ".")
+        if flags_list_out:
+            parts.append("Key flags: " + ", ".join(flags_list_out[:10]) + ".")
+        parts.append("The final grade will mainly depend on the worst corner/edge whitening and any surface scratches/print lines that show under light.")
+        summary = " ".join([_norm_ws(p) for p in parts if p])
+
+    spoken = _norm_ws(str(data.get("spoken_word",""))) or summary
+
+    # Condition anchor (for market logic)
     g_int = None
     try:
         g_int = int(round(float(pregrade_norm))) if pregrade_norm else None
     except Exception:
         g_int = None
     condition_anchor = "damaged" if (has_structural_damage or (g_int is not None and g_int <= 4)) else ("low" if (g_int is not None and g_int <= 6) else ("mid" if (g_int is not None and g_int <= 8) else "high"))
-    
-
-    # Ensure assessment_summary is detailed enough (UI-friendly)
-    summary = _norm_ws(str(data.get("assessment_summary", "")))
-    if len(summary.split()) < 35:
-        # Build a fuller summary from structured fields (without inventing defects)
-        flags_list = data.get("flags", []) if isinstance(data.get("flags", []), list) else []
-        defects_list = data.get("defects", []) if isinstance(data.get("defects", []), list) else []
-        cen = data.get("centering", {}) if isinstance(data.get("centering", {}), dict) else {}
-        cen_f = (cen.get("front") or {}) if isinstance(cen.get("front") or {}, dict) else {}
-        cen_b = (cen.get("back") or {}) if isinstance(cen.get("back") or {}, dict) else {}
-        edges = data.get("edges", {}) if isinstance(data.get("edges", {}), dict) else {}
-        surf = data.get("surface", {}) if isinstance(data.get("surface", {}), dict) else {}
-        ef = (edges.get("front") or {}) if isinstance(edges.get("front") or {}, dict) else {}
-        eb = (edges.get("back") or {}) if isinstance(edges.get("back") or {}, dict) else {}
-        sf = (surf.get("front") or {}) if isinstance(surf.get("front") or {}, dict) else {}
-        sb = (surf.get("back") or {}) if isinstance(surf.get("back") or {}, dict) else {}
-
-        parts = []
-        parts.append(f"Overall, this looks like a PSA-style {pregrade_norm or raw_pregrade or 'N/A'} estimate based on what is visible in the photos.")
-        if cen_f.get("grade") or cen_b.get("grade"):
-            parts.append(f"Centering appears around Front {cen_f.get('grade','').strip() or 'N/A'} and Back {cen_b.get('grade','').strip() or 'N/A'}.")
-        if ef.get("grade") or eb.get("grade"):
-            parts.append(f"Edges read as Front {ef.get('grade','').strip() or 'N/A'} / Back {eb.get('grade','').strip() or 'N/A'}; notes: {_norm_ws(str(ef.get('notes','')))} {_norm_ws(str(eb.get('notes','')))}".strip())
-        if sf.get("grade") or sb.get("grade"):
-            parts.append(f"Surface reads as Front {sf.get('grade','').strip() or 'N/A'} / Back {sb.get('grade','').strip() or 'N/A'}; notes: {_norm_ws(str(sf.get('notes','')))} {_norm_ws(str(sb.get('notes','')))}".strip())
-        if defects_list:
-            parts.append("Visible issues noted: " + "; ".join([_norm_ws(str(d)) for d in defects_list[:8]]) + ("" if len(defects_list) <= 8 else " (and more)."))
-        if flags_list:
-            parts.append("Key flags: " + ", ".join([_norm_ws(str(f)) for f in flags_list[:10]]) + ("" if len(flags_list) <= 10 else ", …") + ".")
-        parts.append("Biggest grade limiters are the most severe corner/edge whitening/chipping, any surface scratches/print lines, and any bends/creases/dents if present.")
-        summary = " ".join([p for p in parts if p]).strip()
-
-        data["assessment_summary"] = summary
-    # CV-based defect close-ups for UI (best-effort; never blocks verification)
-    defect_snaps: List[Dict[str, Any]] = []
-    try:
-        defect_snaps = _build_defect_snaps(front_bytes, back_bytes)
-    except Exception:
-        defect_snaps = []
 
     return JSONResponse(content={
-        "defect_snaps": defect_snaps,
         "pregrade": pregrade_norm or "N/A",
         "confidence": _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0),
         "centering": data.get("centering", {"front": {"grade": "", "notes": ""}, "back": {"grade": "", "notes": ""}}),
@@ -2062,19 +2103,24 @@ Return ONLY valid JSON:
         "defects": defects_list_out,
         "flags": flags_list_out,
         "second_pass": second_pass,
-        "glare_suspects": data.get("glare_suspects", []) if isinstance(data.get("glare_suspects", []), list) else [],
-        "assessment_summary": _norm_ws(str(data.get("assessment_summary", ""))) or summary or "",
-        "spoken_word": _norm_ws(str(data.get("spoken_word", ""))) or _norm_ws(str(data.get("assessment_summary", ""))) or summary or "",
-        "observed_id": data.get("observed_id", {}) if isinstance(data.get("observed_id", {}), dict) else {},
+        "defect_snaps": defect_snaps,
+        "grade_cap_applied": data.get("grade_cap_applied", None),
+        "assessment_summary": summary,
+        "spoken_word": spoken,
+        "observed_id": {
+            "card_name": cname,
+            "card_type": ctype,
+            "year": cyear,
+            "set_name": cset,
+            "set_code": scode,
+            "card_number": cnum,
+        },
         "verify_token": f"vfy_{secrets.token_urlsafe(12)}",
         "market_context_mode": "click_only",
         "condition_anchor": condition_anchor,
         "has_structural_damage": bool(has_structural_damage),
     })
 
-# ==============================
-# Memorabilia / Sealed: Identify + Assess (NO pricing here)
-# ==============================
 @app.post("/api/identify-memorabilia")
 @safe_endpoint
 async def identify_memorabilia(
