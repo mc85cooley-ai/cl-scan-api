@@ -66,7 +66,7 @@ def _relax_whitening_mm(text: str) -> str:
             return s
         parts = re.split(r'(?<=[.!?])\s+', s)
         out_parts = []
-        mm_rx = re.compile(r'(?:about\s+|around\s+|approx(?:imately)?\s+)?(\d+(?:\.\d+)?)\s*mm', re.IGNORECASE)
+        mm_rx = re.compile(r'(?:about\s+|around\s+|approx(?:imately)?\s+)?(\d+(?:\.\d+)?)\s*mm\b', re.IGNORECASE)
 
         def _mm_to_words(num: float) -> str:
             if num <= 0.6:
@@ -93,7 +93,7 @@ def _relax_whitening_mm(text: str) -> str:
 
             new = mm_rx.sub(repl, part)
             # also soften "extending" phrasing a touch
-            new = re.sub(r'extending\s+', 'running ', new, flags=re.IGNORECASE)
+            new = re.sub(r'\bextending\s+\b', 'running ', new, flags=re.IGNORECASE)
             out_parts.append(new)
 
         return ' '.join(out_parts).strip()
@@ -2276,6 +2276,38 @@ Return ONLY valid JSON:
     defect_snaps.sort(key=lambda x: (0 if x.get("type") != "hotspot" else 1, -float(x.get("confidence") or 0.0)))
     defect_snaps = defect_snaps[:8]
 
+
+    # Fallback: if defects were clearly flagged but ROI labeling filtered everything out,
+    # still show a few evidence crops so the UI isn't empty.
+    if (not defect_snaps) and rois and (wanted_rois or (isinstance(data, dict) and (data.get("defects") or data.get("flags")))):
+        try:
+            _pref = [r for r in rois if str(r.get("roi","")).startswith("corner_")] + [r for r in rois if str(r.get("roi","")).startswith("edge_")]
+            _pref = _pref[:4]
+            for r in _pref:
+                src = front_bytes if r.get("side") == "front" else back_bytes
+                if not src:
+                    continue
+                bbox = r.get("bbox") or {}
+                thumb = _make_thumb_from_bbox(src, bbox, max_size=520)
+                if not thumb:
+                    continue
+                side = str(r.get("side") or "").lower().strip()
+                roi_name = str(r.get("roi") or "").lower().strip()
+                note = _note_from_assessment(side, roi_name) or f"Close-up of {roi_name.replace('_',' ')}"
+                defect_snaps.append({
+                    "side": r.get("side"),
+                    "roi": r.get("roi"),
+                    "type": "defect",
+                    "note": _norm_ws(str(note))[:220],
+                    "confidence": 0.45,
+                    "bbox": bbox,
+                    "thumbnail_b64": thumb,
+                })
+            defect_snaps.sort(key=lambda x: (0 if x.get("type") != "hotspot" else 1, -float(x.get("confidence") or 0.0)))
+            defect_snaps[:] = defect_snaps[:8]
+        except Exception:
+            pass
+
     # Add stable IDs + coarse categories for UI linking (photos <-> bullet refs)
     def _snap_category(s: Dict[str, Any]) -> str:
         t = str(s.get("type") or "").lower()
@@ -2691,6 +2723,19 @@ Respond ONLY with JSON, no extra text.
 
     # wanted_rois is used as an optional override (mainly for cards). For sealed/memorabilia we keep it empty unless we add a dedicated mapping.
     wanted_rois: set = set()
+    # If defects/flags mention packaging issues, force evidence crops for those ROIs (sealed/memorabilia).
+    try:
+        _df_txt = " ".join([str(x) for x in (data.get("defects") or []) if str(x).strip()])
+        _df_txt += " " + " ".join([str(x) for x in (flags_list_out or []) if str(x).strip()])
+        _df_txt = _df_txt.lower()
+        if any(w in _df_txt for w in ("corner", "scuff", "crease", "dent", "crush", "bump")):
+            wanted_rois.update({("front","corner_top_left"),("front","corner_top_right"),("front","corner_bottom_left"),("front","corner_bottom_right"),
+                               ("back","corner_top_left"),("back","corner_top_right"),("back","corner_bottom_left"),("back","corner_bottom_right")})
+        if any(w in _df_txt for w in ("edge", "wear", "whitening", "split", "tear", "seal", "seam", "rip", "hole", "puncture")):
+            wanted_rois.update({("front","edge_top"),("front","edge_bottom"),("front","edge_left"),("front","edge_right"),
+                               ("back","edge_top"),("back","edge_bottom"),("back","edge_left"),("back","edge_right")})
+    except Exception:
+        pass
 
     for i, r in enumerate((rois or [])[:10]):
         src = b1 if r.get("side") == "front" else b2
@@ -2724,7 +2769,36 @@ Respond ONLY with JSON, no extra text.
             "thumbnail_b64": thumb,
         })
 
-    defect_snaps.sort(key=lambda x: (0 if x.get("type") != "hotspot" else 1, -float(x.get("confidence") or 0.0)))
+    
+    # Fallback: if defects exist but ROI labeling filtered everything out, still show a few closeups.
+    if (not defect_snaps) and rois and (isinstance(data, dict) and (data.get("defects") or data.get("flags"))):
+        try:
+            _pref = [r for r in rois if str(r.get("roi","")).startswith("corner_")] + [r for r in rois if str(r.get("roi","")).startswith("edge_")]
+            _pref = _pref[:4]
+            for r in _pref:
+                src = b1 if r.get("side") == "front" else b2
+                if not src:
+                    continue
+                bbox = r.get("bbox") or {}
+                thumb = _make_thumb_from_bbox(src, bbox, max_size=520)
+                if not thumb:
+                    continue
+                side = str(r.get("side") or "")
+                roi_name = str(r.get("roi") or "")
+                note = _note_for_roi(side, roi_name) or f"Close-up: {roi_name}"
+                defect_snaps.append({
+                    "side": side,
+                    "roi": roi_name,
+                    "type": "defect",
+                    "note": _norm_ws(str(note))[:220],
+                    "confidence": 0.45,
+                    "bbox": bbox,
+                    "thumbnail_b64": thumb,
+                })
+        except Exception:
+            pass
+
+defect_snaps.sort(key=lambda x: (0 if x.get("type") != "hotspot" else 1, -float(x.get("confidence") or 0.0)))
     defect_snaps = defect_snaps[:8]
 
     def _snap_category(s: Dict[str, Any]) -> str:
@@ -3303,8 +3377,8 @@ async def market_context(
     # --------------------------
     # Graded buckets (ACTIVE only; brand-agnostic)
     # --------------------------
-    GRADE_RX = re.compile(r"(?:psa|cgc|bgs|sgc)\s*(?:grade\s*)?([0-9]{1,2}(?:\.[05])?)", re.IGNORECASE)
-    GEM10_RX = re.compile(r"(psa\s*10|psa10|gem\s*mint\s*10|10\s*gem|cgc\s*10|bgs\s*10|sgc\s*10)", re.IGNORECASE)
+    GRADE_RX = re.compile(r"\b(?:psa|cgc|bgs|sgc)\s*(?:grade\s*)?([0-9]{1,2}(?:\.[05])?)\b", re.IGNORECASE)
+    GEM10_RX = re.compile(r"\b(psa\s*10|psa10|gem\s*mint\s*10|10\s*gem|cgc\s*10|bgs\s*10|sgc\s*10)\b", re.IGNORECASE)
 
     def _parse_grade_from_title(title: str) -> Optional[float]:
         t = (title or "").lower()
