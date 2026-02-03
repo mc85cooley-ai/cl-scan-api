@@ -1970,7 +1970,7 @@ Return ONLY valid JSON:
     defect_snaps: List[Dict[str, Any]] = []
     label_by_idx = {int(x.get("crop_index", -1)): x for x in (roi_labels or []) if isinstance(x, dict)}
     for i, r in enumerate((rois or [])[:10]):
-        src = front_bytes if r.get("side") == "front" else back_bytes
+        src = b1 if r.get("side") == "front" else b2
         if not src:
             continue
         bbox = r.get("bbox") or {}
@@ -1979,8 +1979,11 @@ Return ONLY valid JSON:
             continue
         lab = label_by_idx.get(i) or {}
         is_def = bool(lab.get("is_defect", False))
-        dtype = lab.get("type") if is_def else "hotspot"
-        note = lab.get("note") if lab else f"CV hotspot: {r.get('roi')}"
+        # Only show CV evidence when it is explicitly flagged as a defect.
+        if not is_def:
+            continue
+        dtype = lab.get("type") or "defect"
+        note = lab.get("note") if lab else f"CV defect: {r.get('roi')}"
         conf = lab.get("confidence") if lab else 0.0
         defect_snaps.append({
             "side": r.get("side"),
@@ -1992,8 +1995,10 @@ Return ONLY valid JSON:
             "thumbnail_b64": thumb,
         })
 
-    defect_snaps.sort(key=lambda x: (0 if x.get("type") != "hotspot" else 1, -float(x.get("confidence") or 0.0)))
+    defect_snaps.sort(key=lambda x: (-float(x.get("confidence") or 0.0)))
     defect_snaps = defect_snaps[:8]
+
+
 
     # Add stable IDs + coarse categories for UI linking (photos <-> bullet refs)
     def _snap_category(s: Dict[str, Any]) -> str:
@@ -2390,8 +2395,11 @@ Respond ONLY with JSON, no extra text.
             continue
         lab = label_by_idx.get(i) or {}
         is_def = bool(lab.get("is_defect", False))
-        dtype = lab.get("type") if is_def else "hotspot"
-        note = lab.get("note") if lab else f"CV hotspot: {r.get('roi')}"
+        # Only show CV evidence when it is explicitly flagged as a defect.
+        if not is_def:
+            continue
+        dtype = lab.get("type") or "defect"
+        note = lab.get("note") if lab else f"CV defect: {r.get('roi')}"
         conf = lab.get("confidence") if lab else 0.0
         defect_snaps.append({
             "side": r.get("side"),
@@ -2403,7 +2411,7 @@ Respond ONLY with JSON, no extra text.
             "thumbnail_b64": thumb,
         })
 
-    defect_snaps.sort(key=lambda x: (0 if x.get("type") != "hotspot" else 1, -float(x.get("confidence") or 0.0)))
+    defect_snaps.sort(key=lambda x: (-float(x.get("confidence") or 0.0)))
     defect_snaps = defect_snaps[:8]
 
     def _snap_category(s: Dict[str, Any]) -> str:
@@ -3113,34 +3121,95 @@ async def market_context(
             worth_grading = (uplift > float(grading_cost or 0))
         except Exception:
             worth_grading = None
+    # Collector-style summary with stable "random" variation (so it doesn't change on refresh)
+    import hashlib as _hashlib
+
+    def _pick(arr, seed_int, offset=0):
+        if not arr:
+            return ""
+        return arr[(seed_int + offset) % len(arr)]
+
+    seed_key = f"{used_query}|{exp_grade_key}|{current_typ}|{current_low}|{current_high}|{grading_cost}|{buy_target_aud}"
+    seed_int = int(_hashlib.sha256(seed_key.encode("utf-8")).hexdigest(), 16)
 
     slang_openers = [
-        "Alright mate, here’s the vibe on this one:",
-        "Okay, Pokéfam — quick market check:",
-        "Righto, let’s suss the market real quick:",
+        "Alright mate — quick market check:",
+        "Okay, let’s do a fast price suss:",
+        "Righto, here’s what the market’s doing:",
+        "Pack-ripper vibes report:",
+        "Collector’s take — here’s the read:",
     ]
-    opener = slang_openers[0]
+    opener = _pick(slang_openers, seed_int, 0)
 
-    grade_line = ""
-    if exp_grade_key:
-        grade_line = f" LeagAI’s calling it around a {exp_grade_key} in the current state."
-    price_line = f" On current listings, it’s sitting around {_money(current_typ)} AUD (rough range {_money(current_low)}–{_money(current_high)})."
-    trend_line = f" The market looks {trend_hint} based on live asks."
+    grade_bits = [
+        f"LeagAI’s calling it around a {exp_grade_key} in the current state." if exp_grade_key else "",
+        f"Condition-wise, it’s roughly sitting at a {exp_grade_key} today." if exp_grade_key else "",
+        f"I’d peg it around a {exp_grade_key} as it sits (no sugar-coating)." if exp_grade_key else "",
+    ]
+    grade_line = (" " + _pick([b for b in grade_bits if b], seed_int, 1)) if exp_grade_key else ""
+
+    price_bits = [
+        f"Raw asks are hovering around {_money(current_typ)} AUD (rough {_money(current_low)}–{_money(current_high)}).",
+        f"Current listings put it near {_money(current_typ)} AUD, with most asks landing {_money(current_low)}–{_money(current_high)}.",
+        f"On the open market, you’re basically in the {_money(current_low)}–{_money(current_high)} AUD lane (typical ask ~{_money(current_typ)}).",
+    ]
+    price_line = " " + _pick(price_bits, seed_int, 2)
+
+    trend_bits = [
+        f"Feels {trend_hint} right now based on live asks.",
+        f"Overall vibe is {trend_hint} from what’s up for sale.",
+        f"Market looks {trend_hint} — not heaps of wild swings in the asks.",
+        f"At the moment it’s {trend_hint} — buyers aren’t getting punished, sellers aren’t panicking.",
+    ]
+    trend_line = " " + _pick(trend_bits, seed_int, 3)
+
     graded_line = ""
     if exp_grade_key and exp_grade_key in grade_market:
         st = grade_market.get(exp_grade_key, {}).get("stats", {})
         if st and st.get("median") is not None:
-            graded_line = f" If it lands that grade, you’re looking at roughly {_money(st.get('median'))} AUD in the graded lane (based on current graded listings)."
+            graded_bits = [
+                f"If it lands that grade, graded asks cluster around {_money(st.get('median'))} AUD.",
+                f"Hit that grade and the graded lane is roughly {_money(st.get('median'))} AUD from current listings.",
+                f"At that grade, you’re looking at about {_money(st.get('median'))} AUD in the slab market (based on what's up now).",
+            ]
+            graded_line = " " + _pick(graded_bits, seed_int, 4)
+
+    # Grading/strategy advice — vary tone and don't always default to 'not worth it'
     grade_advice = ""
+    gc = float(grading_cost or 0)
     if worth_grading is True:
-        grade_advice = f" With grading cost around ${float(grading_cost or 0):.0f}, it looks worth a crack if your goal is long-term hold or a clean flip."
+        yes_bits = [
+            f"With grading around ${gc:.0f}, it actually stacks up — worth a crack if you want the slab or a cleaner flip.",
+            f"At ~${gc:.0f} to grade, the maths works — I’d seriously consider sending it.",
+            f"Grading cost (~${gc:.0f}) looks justified here, especially if you’re chasing registry/portfolio value.",
+        ]
+        grade_advice = " " + _pick(yes_bits, seed_int, 5)
     elif worth_grading is False:
-        grade_advice = f" With grading cost around ${float(grading_cost or 0):.0f}, it’s probably not worth sending in this condition unless you’re chasing the slab for the collection."
+        no_bits = [
+            f"At ~${gc:.0f} to grade, I’d only send it if it’s PC/registry flex — otherwise raw might be the smarter play.",
+            f"Grading (~${gc:.0f}) is a bit spicy for the expected lift — unless you just want it slabbed for the collection.",
+            f"With grading around ${gc:.0f}, this one’s more of a ‘grade for love’ than ‘grade for profit’.",
+            f"Slabbing it could still make sense for protection/registry, but purely on dollars it’s not a slam dunk.",
+        ]
+        grade_advice = " " + _pick(no_bits, seed_int, 5)
+    else:
+        unk_bits = [
+            f"Grading costs vary, but keep it simple: only send it if the slab premium matters to you.",
+            f"If you’re thinking grading, the play depends on the grade ceiling — this isn’t a guaranteed slam dunk either way.",
+            f"On grading: it’s a vibe call — profit if it pops the grade, but don’t bank on it.",
+        ]
+        grade_advice = " " + _pick(unk_bits, seed_int, 5)
+
     buy_line = ""
     if buy_target_aud is not None:
-        buy_line = f" If you’re buying, a good target entry is about {_money(buy_target_aud)} AUD or less for this condition — that’s where the risk/reward starts to feel spicy."
+        buy_bits = [
+            f"Buying tip: try land it at {_money(buy_target_aud)} AUD or under for this condition — that’s where the deal starts looking tasty.",
+            f"If you’re shopping, {_money(buy_target_aud)} AUD or less is the sweet spot for this condition.",
+            f"As a buyer, I’d be aiming ≤ {_money(buy_target_aud)} AUD given the current condition call.",
+        ]
+        buy_line = " " + _pick(buy_bits, seed_int, 6)
 
-    market_summary = _norm_ws(f"{opener}{grade_line}{price_line} {trend_line}{graded_line} {grade_advice} {buy_line}")
+    market_summary = _norm_ws(f"{opener}{grade_line}{price_line}{trend_line}{graded_line}{grade_advice}{buy_line}")
 
     resp = {
         "available": True,
