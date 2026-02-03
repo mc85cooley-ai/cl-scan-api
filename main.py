@@ -1,6 +1,6 @@
 """
 The Collectors League Australia - Scan API
-Futureproof v6.7.5 (2026-02-03)
+Futureproof v6.7.6 (2026-02-03)
 
 What changed vs v6.3.x
 - ✅ Adds PriceCharting API as primary market source for cards + sealed/memorabilia (current prices).
@@ -1330,123 +1330,71 @@ async def pricecharting_history(product_id: str, limit: int = 52):
 # ==============================
 # Card: Identify (AI + optional PokemonTCG enrichment)
 # ==============================
+# ==============================
+# Card: Identify (AI + optional PokemonTCG enrichment)
+# ==============================
 @app.post("/api/identify")
 @safe_endpoint
 async def identify(front: UploadFile = File(...)):
+    """
+    Identifies the card/item from a single FRONT image.
+    Returns a canonical_id payload used by the frontend and (optionally) PokemonTCG metadata enrichment.
+    """
     img = await front.read()
     if not img or len(img) < 200:
-        raise HTTPException(stat
-    # -------------------------
-    # SECOND PASS + DEFECT SNAPSHOTS (best-effort)
-    # We ALWAYS generate a small set of close-ups for UI evidence (corners/edges).
-    # The AI second-pass is optional and will never block returning defect_snaps.
-    second_pass = {"enabled": True, "ran": False, "skipped_reason": None, "glare_suspects": [], "defect_candidates": []}
+        raise HTTPException(status_code=400, detail="No valid image uploaded")
 
-    # Always generate UI close-ups from the raw uploads (best effort)
-    defect_snaps: List[Dict[str, Any]] = []
-    try:
-        defect_snaps += _make_basic_hotspot_snaps(front_bytes, "front")
-        defect_snaps += _make_basic_hotspot_snaps(back_bytes, "back")
-    except Exception:
-        pass
+    # --- Vision ID prompt (return JSON only) ---
+    id_prompt = """You are LeagueAI for The Collectors League Australia.
+Identify the collectible item in the photo (trading card / sticker / sealed product / memorabilia etc).
 
-    # AI second-pass (filtered variants + optional angled) to refine defect descriptions
-    try:
-        front_vars = _make_defect_filter_variants(front_bytes)
-        back_vars = _make_defect_filter_variants(back_bytes)
-
-        if not front_vars and not back_vars:
-            second_pass["enabled"] = False
-            second_pass["skipped_reason"] = "image_filters_unavailable"
-        else:
-            sp_prompt = """You are a meticulous trading card defect inspector.
-You are analyzing ENHANCED/FILTERED variants created to make defects stand out (print lines, scratches, whitening, dents).
-You may also receive an ANGLED image used to rule out glare/light refraction.
-
-CRITICAL:
-- Do NOT treat holo sheen / glare as whitening. If the angled shot suggests the mark moves/disappears, flag it as glare_suspect.
-- Card texture is NOT damage unless there is a true crease/indent/paper break.
-- Print lines are typically straight and consistent; glare moves with angle.
-
-Return ONLY valid JSON:
+Return ONLY valid JSON with these keys:
 {
-  "defect_candidates": [
-    {"type":"print_line|scratch|whitening|dent|crease|tear|stain|other","severity":"minor|moderate|severe","note":"short plain description","confidence":0-1}
-  ],
-  "glare_suspects": [
-    {"type":"whitening|scratch|print_line|other","note":"why it looks like glare","confidence":0-1}
-  ]
+  "card_name": "string",
+  "card_type": "Pokemon|Sports|Magic|YuGiOh|Other",
+  "year": "string",
+  "card_number": "string",
+  "set_code": "string",
+  "set_name": "string",
+  "confidence": 0-1,
+  "notes": "short reason based on visible text/art"
 }
+
+Rules:
+- Use the most specific name visible on the item.
+- For Pokemon WOTC era, card_number should look like "014/102" when visible.
+- If you are uncertain, leave a field as "" (empty string), do NOT hallucinate.
 """
 
-            content_parts = [{"type": "text", "text": sp_prompt}]
+    msg = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": id_prompt},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(img)}", "detail": "high"}},
+        ],
+    }]
 
-            # Include filtered variants first (strong signal)
-            if front_vars.get("gray_autocontrast"):
-                content_parts += [
-                    {"type":"text","text":"FRONT (filtered: gray_autocontrast)"},
-                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(front_vars['gray_autocontrast'])}", "detail":"high"}}
-                ]
-            if front_vars.get("contrast_sharp"):
-                content_parts += [
-                    {"type":"text","text":"FRONT (filtered: contrast_sharp)"},
-                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(front_vars['contrast_sharp'])}", "detail":"high"}}
-                ]
-            if back_vars.get("gray_autocontrast"):
-                content_parts += [
-                    {"type":"text","text":"BACK (filtered: gray_autocontrast)"},
-                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(back_vars['gray_autocontrast'])}", "detail":"high"}}
-                ]
-            if back_vars.get("contrast_sharp"):
-                content_parts += [
-                    {"type":"text","text":"BACK (filtered: contrast_sharp)"},
-                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(back_vars['contrast_sharp'])}", "detail":"high"}}
-                ]
+    result = await _openai_chat(msg, max_tokens=650, temperature=0.1)
+    if result.get("error"):
+        raise HTTPException(status_code=500, detail=f"Identification failed: {result.get('message','unknown error')}")
 
-            # Include angled if available (glare check)
-            if angled_bytes and len(angled_bytes) > 200:
-                content_parts += [
-                    {"type":"text","text":"OPTIONAL ANGLED IMAGE (glare check)"},
-                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(angled_bytes)}", "detail":"high"}}
-                ]
-
-            sp_msg = [{"role":"user","content": content_parts}]
-            sp_result = await _openai_chat(sp_msg, max_tokens=900, temperature=0.1)
-            if not sp_result.get("error"):
-                sp_data = _parse_json_or_none(sp_result.get("content","")) or {}
-                if isinstance(sp_data, dict):
-                    second_pass["ran"] = True
-                    if isinstance(sp_data.get("glare_suspects"), list):
-                        second_pass["glare_suspects"] = sp_data.get("glare_suspects")[:20]
-                    if isinstance(sp_data.get("defect_candidates"), list):
-                        second_pass["defect_candidates"] = sp_data.get("defect_candidates")[:20]
-            else:
-                second_pass["skipped_reason"] = "second_pass_ai_failed"
-    except Exception:
-        second_pass["skipped_reason"] = "second_pass_exception"
+    data = _parse_json_or_none(result.get("content", "")) or {}
+    if not isinstance(data, dict):
+        data = {}
 
     card_name = _norm_ws(str(data.get("card_name", "Unknown")))
-    card_type = _norm_ws(str(data.get("card_type", "Other")))
-    card_type = _normalize_card_type(card_type)
+    card_type = _normalize_card_type(_norm_ws(str(data.get("card_type", "Other"))))
     year = _norm_ws(str(data.get("year", "")))
     card_number_display = _clean_card_number_display(str(data.get("card_number", "")))
     set_code = _norm_ws(str(data.get("set_code", ""))).upper()
     set_name = _norm_ws(str(data.get("set_name", "")))
-    if _is_blankish(set_name):
-        set_name = ""
-    if set_name.strip().lower() in ("unknown","n/a","na","none"):
-        set_name = ""
-    conf = _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0)
-    notes = _norm_ws(str(data.get("notes", "")))
+    conf = float(data.get("confidence", 0.65) or 0.65)
+    conf = max(0.0, min(1.0, conf))
+    notes = _norm_ws(str(data.get("notes", ""))) or "Identified by visible text/art (best effort)."
 
-    # If the model says "Unknown", force confidence low.
-    if card_name.strip().lower() == "unknown":
-        conf = 0.0
-        card_type = "Other"
-
-    # optional PokemonTCG enrichment (Pokemon only)
-    enriched = False
+    # Optional enrichment via PokemonTCG (Pokemon only)
     ptcg_payload = None
+    enriched = False
     set_id = ""
 
     if POKEMONTCG_API_KEY and card_type.lower() == "pokemon" and card_name != "Unknown":
@@ -1469,7 +1417,6 @@ Return ONLY valid JSON:
                 release_date = _norm_ws(str((card.get("set") or {}).get("releaseDate", "")))
                 if release_date and not year:
                     year = release_date[:4]
-                # keep the AI card_number display if present, else use API number
                 if not card_number_display:
                     card_number_display = _clean_card_number_display(str(card.get("number", "")))
                 ptcg_payload = {
@@ -1486,8 +1433,7 @@ Return ONLY valid JSON:
                 }
                 notes = f"Verified via PokemonTCG API (id {pid})"
 
-    
-    # Canonicalize set (prefer map / resolved name) + build canonical id for frontend
+    # Canonicalize set + build canonical id for frontend
     set_info = _canonicalize_set(set_code, set_name)
     canonical_id = {
         "card_name": card_name,
