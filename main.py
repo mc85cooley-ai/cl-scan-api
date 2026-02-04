@@ -2571,7 +2571,6 @@ Respond ONLY with JSON, no extra text.
 @app.post("/api/assess-memorabilia")
 @safe_endpoint
 async def assess_memorabilia(
-    try:
         image1: UploadFile = File(...),
         image2: UploadFile = File(...),
         image3: Optional[UploadFile] = File(None),
@@ -2850,6 +2849,7 @@ async def assess_memorabilia(
         except Exception:
             roi_labels = []
     
+if True:
     # Heuristic: sealed/memorabilia photos often include lots of table/background.
     # We estimate the "subject" (box/item) bounding box and then generate tighter crops
     # for corner/edge/seam ROIs inside that subject box. This makes defect snaps actually
@@ -4130,18 +4130,3 @@ async def assess_memorabilia(
             seen.add(q.lower())
             out.append(q)
         return out
-    except Exception as e:
-        # Sealed/Memorabilia safety fallback: never return null
-        try:
-            import traceback; traceback.print_exc()
-        except Exception: pass
-        return {
-            "condition_grade": "Pending",
-            "confidence": 0.5,
-            "defects": [],
-            "flags": ["assessment_degraded"],
-            "overall_assessment": "We hit a temporary limit while assessing this item. Please try again in a moment.",
-            "spoken_word": "Quick heads up — the system got rate-limited mid-check. Give it a sec and run it again for the full pass.",
-            "verify_token": "",
-            "assessment_degraded": True
-        }
