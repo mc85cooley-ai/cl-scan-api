@@ -2486,9 +2486,13 @@ Return ONLY valid JSON:
     resp = _relax_whitening_mm_in_obj(resp)
     return JSONResponse(content=resp)
 
+
 # ==============================
-# Memorabilia / Sealed: Identify + Assess (NO pricing here)
+# Memorabilia / Sealed: Identify + Assess (independent from cards)
+# - No card-specific fields
+# - Returns product_id when possible (PriceCharting resolver) so Market Context can be accurate
 # ==============================
+
 @app.post("/api/identify-memorabilia")
 @safe_endpoint
 async def identify_memorabilia(
@@ -2508,36 +2512,34 @@ async def identify_memorabilia(
             if bb and len(bb) >= 200:
                 imgs.append(bb)
 
-    prompt = """You are identifying a collectible item (sealed product or memorabilia) from photos.
-
-Goal: be SPECIFIC. Name the exact product when possible, including brand/TCG, series/set, configuration, and any visible edition or language.
-
-Return ONLY valid JSON with these exact fields:
-
-{
-  "item_type": "sealed booster box/sealed booster bundle/sealed pack/sealed tin/sealed case/elite trainer box/collection box/autographed memorabilia/game-used memorabilia/graded item/other",
-  "brand": "brand/league/publisher if visible (e.g., Pokemon TCG, Panini, Topps, Upper Deck, Wizards of the Coast) else empty string",
-  "product_name": "exact product name if visible (e.g., 'Scarlet & Violet—151 Booster Bundle') else best-effort specific name",
-  "set_or_series": "set/series/expansion name if visible (e.g., 'Scarlet & Violet—151') else empty string",
-  "year": "4 digit year if visible else empty string",
-  "edition_or_language": "e.g., English/Japanese/1st Edition/Unlimited/Collector's Edition if visible else empty string",
-  "special_attributes": ["short tags like Factory Sealed", "Pokemon Center", "Hobby Box", "1st Edition", "Case Fresh"],
-  "description": "one clear paragraph describing exactly what it is and what can be seen (packaging, labels, markings)",
-  "signatures": "names of any visible signatures or 'None visible'",
-  "seal_condition": "Factory Sealed/Opened/Resealed/Damaged/Not applicable",
-  "authenticity_notes": "authenticity indicators visible (holograms, stickers, COA) and any red flags",
-  "notable_features": "unique features worth noting (promo contents, special print, chase set, serial numbering, COA, etc.)",
-  "confidence": 0.0-1.0,
-  "category_hint": "Pokemon/Magic/YuGiOh/Sports/OnePiece/Other"
-}
-
-Rules:
-- If multiple products are plausible, choose the best match and explain uncertainty in authenticity_notes (briefly).
-- Do NOT invent a year/edition/language if you cannot see it.
-- If it appears sealed, describe the wrap (tight/loose, tears, holes, seams, bubbling). Use 'Factory Sealed' only if it looks consistent.
-- If you cannot identify confidently, keep product_name generic and set confidence low.
-Respond ONLY with JSON, no extra text.
-"""
+    prompt = (
+        "You are identifying a collectible item (sealed product or memorabilia) from photos.\n\n"
+        "Goal: be SPECIFIC. Name the exact product when possible, including brand/league, series/set, "
+        "configuration, and any visible edition or language.\n\n"
+        "Return ONLY valid JSON with these exact fields:\n"
+        "{\n"
+        "  \"item_type\": \"sealed booster box/sealed booster bundle/sealed pack/sealed tin/sealed case/elite trainer box/collection box/autographed memorabilia/game-used memorabilia/graded item/other\",\n"
+        "  \"brand\": \"brand/league/publisher if visible (e.g., Pokemon TCG, Panini, Topps, Upper Deck, Wizards of the Coast) else empty string\",\n"
+        "  \"product_name\": \"exact product name if visible else best-effort specific name\",\n"
+        "  \"set_or_series\": \"set/series/expansion name if visible else empty string\",\n"
+        "  \"year\": \"4 digit year if visible else empty string\",\n"
+        "  \"edition_or_language\": \"e.g., English/Japanese/1st Edition/Unlimited/Collector's Edition if visible else empty string\",\n"
+        "  \"special_attributes\": [\"short tags like Factory Sealed\", \"Pokemon Center\", \"Hobby Box\", \"1st Edition\", \"Case Fresh\"],\n"
+        "  \"description\": \"one clear paragraph describing what it is and what can be seen (packaging, labels, markings)\",\n"
+        "  \"signatures\": \"names of any visible signatures or 'None visible'\",\n"
+        "  \"seal_condition\": \"Factory Sealed/Opened/Resealed/Damaged/Not applicable\",\n"
+        "  \"authenticity_notes\": \"authenticity indicators visible (holograms, stickers, COA) and any red flags\",\n"
+        "  \"notable_features\": \"unique features worth noting (promo contents, special print, chase set, serial numbering, COA, etc.)\",\n"
+        "  \"confidence\": 0.0-1.0,\n"
+        "  \"category_hint\": \"Pokemon/Magic/YuGiOh/Sports/OnePiece/Other\"\n"
+        "}\n\n"
+        "Rules:\n"
+        "- If multiple products are plausible, choose the best match and briefly note uncertainty in authenticity_notes.\n"
+        "- Do NOT invent a year/edition/language if you cannot see it.\n"
+        "- If it appears sealed, describe the wrap (tight/loose, tears, holes, seams, bubbling). Use 'Factory Sealed' only if it looks consistent.\n"
+        "- If you cannot identify confidently, keep product_name generic and set confidence low.\n"
+        "Respond ONLY with JSON, no extra text."
+    )
 
     content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
     for i, bb in enumerate(imgs):
@@ -2550,7 +2552,7 @@ Respond ONLY with JSON, no extra text.
     data = _parse_json_or_none(result.get("content", "")) if not result.get("error") else None
     data = data or {}
 
-    return JSONResponse(content={
+    item = {
         "item_type": _norm_ws(str(data.get("item_type", "Unknown"))),
         "brand": _norm_ws(str(data.get("brand", ""))),
         "product_name": _norm_ws(str(data.get("product_name", ""))),
@@ -2565,8 +2567,31 @@ Respond ONLY with JSON, no extra text.
         "notable_features": _norm_ws(str(data.get("notable_features", ""))),
         "confidence": _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0),
         "category_hint": _norm_ws(str(data.get("category_hint", "Other"))),
+    }
+
+    # Optional: resolve a PriceCharting product_id for tighter Market Context matching
+    product_id = ""
+    try:
+        if PRICECHARTING_TOKEN:
+            q_parts = [item.get("brand"), item.get("product_name"), item.get("set_or_series"), item.get("edition_or_language"), item.get("year")]
+            q = _norm_ws(" ".join([p for p in q_parts if p])).strip()
+            if q:
+                products = await _pc_search(q, category=None, limit=5)
+                if products:
+                    top = products[0] or {}
+                    product_id = str(top.get("id") or top.get("product-id") or "").strip()
+    except Exception:
+        product_id = ""
+
+    if product_id:
+        item["product_id"] = product_id
+
+    return JSONResponse(content={
+        "item": item,  # wrapped payload (frontend supports item or flat)
+        **item,        # flat payload for back-compat
         "identify_token": f"idt_{secrets.token_urlsafe(12)}",
     })
+
 
 @app.post("/api/assess-memorabilia")
 @safe_endpoint
@@ -2590,137 +2615,76 @@ async def assess_memorabilia(
             if bb and len(bb) >= 200:
                 imgs.append(bb)
 
-    # --- Memorabilia baseline fallback (prevents null/blank UI on transient model limits) ---
-        def _memo_fallback(message: str = "Assessment temporarily limited. Please retry shortly."):
-        
-    # If model response is missing/invalid, return a safe fallback instead of raising or returning null
-    try:
-        if not isinstance(data, dict) or not data:
-            return _memo_fallback("Assessment came back empty. Please retry in a moment.")
-    except Exception:
-        return _memo_fallback("Assessment came back empty. Please retry in a moment.")
-return JSONResponse(content={
-            "condition_grade": "Pending",
-            "confidence": 0.5,
-            "overall_assessment": message,
-            "spoken_word": message,
-            "observed_id": {
-                "brand": "",
-                "product_name": "",
-                "set_or_series": "",
-                "year": "",
-                "edition_or_language": "",
-                "item_type": item_type or ""
-            },
-            "flags": [],
-            "defect_snaps": [],
-            "assessment_degraded": True,
-            "verify_token": f"vfy_{secrets.token_urlsafe(12)}"
-        }, status_code=200)
-    # --- end fallback ---
-
-    # Memorabilia: subject bbox used to keep ROI crops on-product (avoid table/background)
-    global _memo_subject
-    try:
-        _memo_subject = {
-            "front": _memo_subject_bbox(b1) if b1 else {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
-            "back":  _memo_subject_bbox(b2) if b2 else {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
-        }
-    except Exception:
-        _memo_subject = {
-            "front": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
-            "back":  {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
-        }
-
     ctx = ""
     if item_type or description:
         ctx = "\n\nKNOWN ITEM DETAILS:\n"
-        if item_type: ctx += f"- Item Type: {_norm_ws(item_type)}\n"
-        if description: ctx += f"- Description: {_norm_ws(description)}\n"
+        if item_type:
+            ctx += f"- Item Type: {_norm_ws(item_type)}\n"
+        if description:
+            ctx += f"- Description: {_norm_ws(description)}\n"
 
-    prompt = """You are a professional memorabilia/collectibles grader.
-
-You MUST identify what the item is (brand + product name + series/set) as specifically as the images allow, then grade condition conservatively.
-
-Return ONLY valid JSON with this EXACT structure:
-
-{{
-  "condition_grade": "Mint/Near Mint/Excellent/Good/Fair/Poor",
-  "confidence": 0.0-1.0,
-  "condition_distribution": {{
-    "Mint": 0.0-1.0,
-    "Near Mint": 0.0-1.0,
-    "Excellent": 0.0-1.0,
-    "Good": 0.0-1.0,
-    "Fair": 0.0-1.0,
-    "Poor": 0.0-1.0
-  }},
-  "seal_integrity": {{
-    "status": "Factory Sealed/Opened/Resealed/Compromised/Not Applicable",
-    "notes": "detailed notes about seal/wrap (tightness, tears, holes, seams, bubbling). Mention exact locations."
-  }},
-  "packaging_condition": {{
-    "grade": "Mint/Near Mint/Excellent/Good/Fair/Poor",
-    "notes": "detailed notes about packaging wear: corners, dents, crushing, scratches, scuffs, sticker residue, window plastic, edges. Mention exact locations."
-  }},
-  "signature_assessment": {{
-    "present": true/false,
-    "quality": "Clear/Faded/Smudged/Not Applicable",
-    "notes": "notes about signature placement/ink flow/bleeding and any authenticity concerns"
-  }},
-  "value_factors": ["short bullets: print run, desirability, era, sealed premium, athlete/popularity, scarcity, set demand"],
-  "defects": ["each defect as a full sentence with location + severity"],
-  "flags": ["short flags for important issues (reseal risk, crush damage, water, heavy dents, COA missing)"],
-  "overall_assessment": "5-8 sentences in first person (start with: 'Looking at your [brand] [product_name]...'). Mention what it is, what looks strong, what issues you see, and what limits the condition grade.",
-  "spoken_word": "A 20–45 second spoken-word script in first person. Format it like: Hook (1 line) → What it is (1–2 lines) → Best features (1–2 lines) → Biggest concerns (1–3 lines) → Bottom line grade + confidence (1 line). No hype, no guarantees.",
-  "authenticity_logic": {
-    "overall_authenticity_risk": "Low/Medium/High",
-    "story_alignment": "1-3 sentences on whether age/wear/story line up",
-    "sealed_checks": {
-      "wrap_fold_pattern": "Pass/Unclear/Fail/Not Applicable",
-      "seam_alignment": "Pass/Unclear/Fail/Not Applicable",
-      "wear_vs_seal_consistency": "Pass/Unclear/Fail/Not Applicable",
-      "hologram_sticker_check": "Pass/Unclear/Fail/Not Applicable",
-      "weight_check": "Pass/Unclear/Fail/Not Applicable"
-    },
-    "game_used_checks": {
-      "wear_pattern_realism": "Pass/Unclear/Fail/Not Applicable",
-      "material_stress_realism": "Pass/Unclear/Fail/Not Applicable",
-      "markings_and_codes": "Pass/Unclear/Fail/Not Applicable",
-      "repairs_alterations": "Pass/Unclear/Fail/Not Applicable",
-      "photo_match_potential": "High/Medium/Low/Not Applicable"
-    },
-    "autograph_checks": {
-      "ink_pressure_variation": "Pass/Unclear/Fail/Not Applicable",
-      "stroke_flow_tapering": "Pass/Unclear/Fail/Not Applicable",
-      "hesitation_or_retrace": "Pass/Unclear/Fail/Not Applicable",
-      "ink_absorption_on_surface": "Pass/Unclear/Fail/Not Applicable"
-    },
-    "universal_red_flags": ["short bullets"],
-    "notes": "3-6 sentences, plain-English, first person, practical advice"
-  },
-  "observed_id": {{
-    "brand": "best-effort",
-    "product_name": "best-effort",
-    "set_or_series": "best-effort",
-    "year": "best-effort",
-    "edition_or_language": "best-effort",
-    "item_type": "best-effort"
-  }}
-}}
-
-{ctx}
-
-Rules:
-- For sealed items: evaluate wrap fold patterns (Y-folds), seam paths, wrap tension/thickness, glue/warping/bubbling, and whether box wear vs seal wear tells a consistent story.
-- For game-used/player-used: assess whether wear patterns, material stress, markings/codes, and any repairs look authentic vs artificially distressed; note photo-match potential.
-- For autographs: assess natural pressure variation, tapered strokes, flow, hesitation/retrace, and whether ink sits in/soaks into the surface.
-- Do NOT claim Factory Sealed unless the wrap/seal looks consistent. If uncertain, say so and reduce confidence.
-- If glare/blur prevents certainty, say so and reduce confidence.
-- Be specific with locations and avoid generic statements.
-Respond ONLY with JSON, no extra text.
-"""
-    prompt = prompt.replace("{ctx}", ctx)
+    prompt = (
+        "You are a professional memorabilia/collectibles grader.\n\n"
+        "You MUST identify what the item is (brand + product name + series/set) as specifically as the images allow, "
+        "then grade condition conservatively.\n\n"
+        "Return ONLY valid JSON with this EXACT structure:\n"
+        "{\n"
+        "  \"condition_grade\": \"Mint/Near Mint/Excellent/Good/Fair/Poor\",\n"
+        "  \"confidence\": 0.0-1.0,\n"
+        "  \"condition_distribution\": {\"Mint\":0-1,\"Near Mint\":0-1,\"Excellent\":0-1,\"Good\":0-1,\"Fair\":0-1,\"Poor\":0-1},\n"
+        "  \"seal_integrity\": {\"status\": \"Factory Sealed/Opened/Resealed/Compromised/Not Applicable\", \"notes\": \"detailed notes about seal/wrap with exact locations\"},\n"
+        "  \"packaging_condition\": {\"grade\": \"Mint/Near Mint/Excellent/Good/Fair/Poor\", \"notes\": \"detailed notes about packaging wear with exact locations\"},\n"
+        "  \"signature_assessment\": {\"present\": true/false, \"quality\": \"Clear/Faded/Smudged/Not Applicable\", \"notes\": \"notes about signature placement/ink flow and authenticity concerns\"},\n"
+        "  \"value_factors\": [\"short bullets\"],\n"
+        "  \"defects\": [\"each defect as a full sentence with location + severity\"],\n"
+        "  \"flags\": [\"short flags for important issues\"],\n"
+        "  \"overall_assessment\": \"5-8 sentences in first person (start with: 'Looking at your [brand] [product_name]...')\",\n"
+        "  \"spoken_word\": \"20-45 second spoken-word script in first person\",\n"
+        "  \"authenticity_logic\": {\n"
+        "    \"overall_authenticity_risk\": \"Low/Medium/High\",\n"
+        "    \"story_alignment\": \"1-3 sentences\",\n"
+        "    \"sealed_checks\": {\n"
+        "      \"wrap_fold_pattern\": \"Pass/Unclear/Fail/Not Applicable\",\n"
+        "      \"seam_alignment\": \"Pass/Unclear/Fail/Not Applicable\",\n"
+        "      \"wear_vs_seal_consistency\": \"Pass/Unclear/Fail/Not Applicable\",\n"
+        "      \"hologram_sticker_check\": \"Pass/Unclear/Fail/Not Applicable\",\n"
+        "      \"weight_check\": \"Pass/Unclear/Fail/Not Applicable\"\n"
+        "    },\n"
+        "    \"game_used_checks\": {\n"
+        "      \"wear_pattern_realism\": \"Pass/Unclear/Fail/Not Applicable\",\n"
+        "      \"material_stress_realism\": \"Pass/Unclear/Fail/Not Applicable\",\n"
+        "      \"markings_and_codes\": \"Pass/Unclear/Fail/Not Applicable\",\n"
+        "      \"repairs_alterations\": \"Pass/Unclear/Fail/Not Applicable\",\n"
+        "      \"photo_match_potential\": \"High/Medium/Low/Not Applicable\"\n"
+        "    },\n"
+        "    \"autograph_checks\": {\n"
+        "      \"ink_pressure_variation\": \"Pass/Unclear/Fail/Not Applicable\",\n"
+        "      \"stroke_flow_tapering\": \"Pass/Unclear/Fail/Not Applicable\",\n"
+        "      \"hesitation_or_retrace\": \"Pass/Unclear/Fail/Not Applicable\",\n"
+        "      \"ink_absorption_on_surface\": \"Pass/Unclear/Fail/Not Applicable\"\n"
+        "    },\n"
+        "    \"universal_red_flags\": [\"short bullets\"],\n"
+        "    \"notes\": \"3-6 sentences, plain-English, first person\"\n"
+        "  },\n"
+        "  \"observed_id\": {\n"
+        "    \"brand\": \"best-effort\",\n"
+        "    \"product_name\": \"best-effort\",\n"
+        "    \"set_or_series\": \"best-effort\",\n"
+        "    \"year\": \"best-effort\",\n"
+        "    \"edition_or_language\": \"best-effort\",\n"
+        "    \"item_type\": \"best-effort\"\n"
+        "  }\n"
+        "}\n"
+        f"{ctx}\n"
+        "Rules:\n"
+        "- For sealed items: evaluate wrap fold patterns (Y-folds), seam paths, wrap tension/thickness, glue/warping/bubbling, and whether box wear vs seal wear tells a consistent story.\n"
+        "- For game-used/player-used: assess whether wear patterns, material stress, markings/codes, and any repairs look authentic vs artificially distressed; note photo-match potential.\n"
+        "- For autographs: assess natural pressure variation, tapered strokes, flow, hesitation/retrace, and whether ink sits in/soaks into the surface.\n"
+        "- Do NOT claim Factory Sealed unless the wrap/seal looks consistent. If uncertain, say so and reduce confidence.\n"
+        "- If glare/blur prevents certainty, say so and reduce confidence.\n"
+        "- Be specific with locations and avoid generic statements.\n"
+        "Respond ONLY with JSON, no extra text."
+    )
 
     content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
     for i, bb in enumerate(imgs):
@@ -2729,437 +2693,122 @@ Respond ONLY with JSON, no extra text.
         content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(bb)}", "detail": "low"}})
 
     msg = [{"role": "user", "content": content}]
-    result = {}
-    data = {}
-    try:
-        result = await _openai_chat(msg, max_tokens=1600, temperature=0.1)
-        data = _parse_json_or_none(result.get("content", "")) if not result.get("error") else None
-        data = data or {}
-    except Exception as e:
-        # Rate-limit / transient failure safe fallback (memorabilia only)
-        data = {
-            "condition_grade": "N/A",
-            "confidence": 0.0,
-            "seal_integrity": {"status":"Not Applicable","notes":"","grade":"Not Applicable"},
-            "packaging_condition": {"grade":"N/A","notes":""},
-            "signature_assessment": {"present": False, "quality":"Not Applicable","notes":""},
-            "value_factors": [],
-            "defects": [],
-            "flags": [],
-            "overall_assessment": "",
-            "spoken_word": "",
-            "authenticity_logic": {},
-            "observed_id": {},
-        }
-    flags_raw = data.get("flags", [])
-    if isinstance(flags_raw, list):
-        flags_list_out = [str(f).lower().strip() for f in flags_raw if str(f).strip()]
-    else:
-        flags_list_out = []
-    flags_list_out = list(dict.fromkeys(flags_list_out))
+    result = await _openai_chat(msg, max_tokens=1600, temperature=0.1)
+    data = _parse_json_or_none(result.get("content", "")) if not result.get("error") else None
+    data = data or {}
 
+    # Normalize / defaults (frontend-safe)
+    condition_grade = _norm_ws(str(data.get("condition_grade", "N/A"))) or "N/A"
+    conf = _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0)
 
-    # Ensure condition_distribution exists (confidence-weighted)
-    if not isinstance(data.get("condition_distribution"), dict):
-        cg = _norm_ws(str(data.get("condition_grade", ""))).title()
-        confv = _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0)
+    # Condition distribution
+    dist = data.get("condition_distribution")
+    if not isinstance(dist, dict):
         ladder = ["Mint", "Near Mint", "Excellent", "Good", "Fair", "Poor"]
-        try:
-            i = ladder.index(cg) if cg in ladder else 2
-        except Exception:
-            i = 2
-        # Put most weight on predicted bucket, spill to neighbors based on confidence
-        p_main = 0.45 + 0.50 * confv
+        cg_norm = condition_grade.title()
+        i = ladder.index(cg_norm) if cg_norm in ladder else 2
+        p_main = 0.45 + 0.50 * conf
         rem = 1.0 - p_main
         dist = {k: 0.0 for k in ladder}
         dist[ladder[i]] = p_main
-        if i-1 >= 0: dist[ladder[i-1]] += rem * 0.55
-        if i+1 < len(ladder): dist[ladder[i+1]] += rem * 0.45
-        total = sum(dist.values()) or 1.0
-        data["condition_distribution"] = {k: round(v/total, 4) for k, v in dist.items()}
+        if i - 1 >= 0:
+            dist[ladder[i - 1]] += rem * 0.55
+        if i + 1 < len(ladder):
+            dist[ladder[i + 1]] += rem * 0.45
+        tot = sum(dist.values()) or 1.0
+        dist = {k: round(v / tot, 4) for k, v in dist.items()}
 
-
-    # Ensure seal_integrity always has status (fixes UI "undefined" cases)
     seal = data.get("seal_integrity") if isinstance(data.get("seal_integrity"), dict) else {}
-    if not seal.get("status"):
-        seal["status"] = "Not Applicable"
-    if not seal.get("notes"):
-        seal["notes"] = ""
-    if not seal.get("grade"):
-        # Frontend may expect "grade" - mirror status for compatibility
-        seal["grade"] = seal.get("status", "Not Applicable")
+    seal_status = _norm_ws(str(seal.get("status") or "Not Applicable"))
+    seal_notes = _norm_ws(str(seal.get("notes") or ""))
+    seal_obj = {"status": seal_status, "notes": seal_notes, "grade": seal_status}
 
-    # ------------------------------
-    # Authenticity logic (sealed / game-used / autographs)
-    # ------------------------------
-    auth = data.get("authenticity_logic") if isinstance(data.get("authenticity_logic"), dict) else {}
-    # Defaults
-    def _default_checks(keys, default="Not Applicable"):
-        return {k: (auth.get(k) if isinstance(auth.get(k), str) and auth.get(k).strip() else default) for k in keys}
-
-    # Determine item context
-    _it = str(((data.get("observed_id") or {}).get("item_type") or item_type or "")).lower()
-    is_sealed = any(w in _it for w in ("sealed", "booster", "box", "pack", "case", "bundle"))
-    is_auto = bool((data.get("signature_assessment") or {}).get("present"))
-    is_game = any(w in _it for w in ("game", "used", "worn", "player", "jersey", "bat", "ball", "glove", "helmet", "equipment"))
-
-    sealed_keys = ["wrap_fold_pattern", "seam_alignment", "wear_vs_seal_consistency", "hologram_sticker_check", "weight_check"]
-    game_keys = ["wear_pattern_realism", "material_stress_realism", "markings_and_codes", "repairs_alterations", "photo_match_potential"]
-    auto_keys = ["ink_pressure_variation", "stroke_flow_tapering", "hesitation_or_retrace", "ink_absorption_on_surface"]
-
-    sealed_checks = auth.get("sealed_checks") if isinstance(auth.get("sealed_checks"), dict) else {}
-    game_checks = auth.get("game_used_checks") if isinstance(auth.get("game_used_checks"), dict) else {}
-    auto_checks = auth.get("autograph_checks") if isinstance(auth.get("autograph_checks"), dict) else {}
-
-    # Fill with Not Applicable where needed
-    if not is_sealed:
-        sealed_checks = {k: "Not Applicable" for k in sealed_keys}
-    else:
-        for k in sealed_keys:
-            v = sealed_checks.get(k)
-            sealed_checks[k] = v if isinstance(v, str) and v.strip() else "Unclear"
-
-    if not is_game:
-        game_checks = {k: "Not Applicable" for k in game_keys}
-    else:
-        for k in game_keys:
-            v = game_checks.get(k)
-            game_checks[k] = v if isinstance(v, str) and v.strip() else ("Low" if k=="photo_match_potential" else "Unclear")
-
-    if not is_auto:
-        auto_checks = {k: "Not Applicable" for k in auto_keys}
-    else:
-        for k in auto_keys:
-            v = auto_checks.get(k)
-            auto_checks[k] = v if isinstance(v, str) and v.strip() else "Unclear"
-
-    # Normalize overall risk + notes
-    risk = auth.get("overall_authenticity_risk")
-    if not (isinstance(risk, str) and risk.strip()):
-        # If any "Fail" present, call it High; if mostly Pass, Low; otherwise Medium.
-        checks_flat = list(sealed_checks.values()) + list(game_checks.values()) + list(auto_checks.values())
-        if any(str(v).lower().strip() == "fail" for v in checks_flat):
-            risk = "High"
-        elif any(str(v).lower().strip() == "pass" for v in checks_flat):
-            risk = "Low"
-        else:
-            risk = "Medium"
-
-    urf = auth.get("universal_red_flags", [])
-    if not isinstance(urf, list):
-        urf = []
-    urf = [str(x).strip() for x in urf if str(x).strip()][:8]
-
-    data["authenticity_logic"] = {
-        "overall_authenticity_risk": _norm_ws(str(risk)),
-        "story_alignment": _norm_ws(str(auth.get("story_alignment", "")))[:320],
-        "sealed_checks": sealed_checks,
-        "game_used_checks": game_checks,
-        "autograph_checks": auto_checks,
-        "universal_red_flags": urf,
-        "notes": _norm_ws(str(auth.get("notes", "")))[:900],
+    packaging = data.get("packaging_condition") if isinstance(data.get("packaging_condition"), dict) else {}
+    packaging_obj = {
+        "grade": _norm_ws(str(packaging.get("grade") or "N/A")),
+        "notes": _norm_ws(str(packaging.get("notes") or "")),
     }
 
+    sig = data.get("signature_assessment") if isinstance(data.get("signature_assessment"), dict) else {}
+    sig_obj = {
+        "present": bool(sig.get("present")) if "present" in sig else False,
+        "quality": _norm_ws(str(sig.get("quality") or "Not Applicable")),
+        "notes": _norm_ws(str(sig.get("notes") or "")),
+    }
 
-    # ------------------------------
-    # CV-assisted defect closeups (defect_snaps) for sealed/memorabilia
-    # ------------------------------
-    # Use the first two images as "front/back" equivalents for CV ROI proposals.
-    rois: List[Dict[str, Any]] = []
-    try:
-        rois = _cv_candidate_bboxes(b1, "front") + _cv_candidate_bboxes(b2, "back")
-    except Exception:
-        rois = []
+    flags = data.get("flags", [])
+    if not isinstance(flags, list):
+        flags = []
+    flags_out = list(dict.fromkeys([_norm_ws(str(x)).lower() for x in flags if _norm_ws(str(x))]))[:20]
 
-    roi_labels: List[Dict[str, Any]] = []
-    try:
-        # Second pass disabled for sealed/memorabilia (rebased fix)
-        roi_labels = []
-    except Exception:
-        roi_labels = []
+    defects = data.get("defects", [])
+    if not isinstance(defects, list):
+        defects = []
+    defects_out = [_norm_ws(str(x)) for x in defects if _norm_ws(str(x))][:40]
 
-# Heuristic: sealed/memorabilia photos often include lots of table/background.
-# We estimate the "subject" (box/item) bounding box and then generate tighter crops
-# for corner/edge/seam ROIs inside that subject box. This makes defect snaps actually
-# show the issue, even when the original photo has lots of negative space.
-def _memo_subject_bbox(img_bytes: bytes) -> Dict[str, float]:
-    try:
-        from PIL import Image
-        import numpy as np
-        im = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        arr = np.asarray(im)
-        h, w = arr.shape[:2]
-        if h < 10 or w < 10:
-            return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
+    value_factors = data.get("value_factors", [])
+    if not isinstance(value_factors, list):
+        value_factors = []
+    value_factors_out = [_norm_ws(str(x)) for x in value_factors if _norm_ws(str(x))][:15]
 
-        # Sample border pixels to approximate background colour
-        b = max(2, int(min(h, w) * 0.04))
-        border = np.concatenate([
-            arr[:b, :, :].reshape(-1, 3),
-            arr[-b:, :, :].reshape(-1, 3),
-            arr[:, :b, :].reshape(-1, 3),
-            arr[:, -b:, :].reshape(-1, 3),
-        ], axis=0)
-        bg = np.median(border, axis=0).astype(np.float32)
+    observed = data.get("observed_id") if isinstance(data.get("observed_id"), dict) else {}
+    observed_id = {
+        "item_type": _norm_ws(str(observed.get("item_type") or item_type or "")),
+        "brand": _norm_ws(str(observed.get("brand") or "")),
+        "product_name": _norm_ws(str(observed.get("product_name") or "")),
+        "set_or_series": _norm_ws(str(observed.get("set_or_series") or "")),
+        "year": _norm_ws(str(observed.get("year") or "")),
+        "edition_or_language": _norm_ws(str(observed.get("edition_or_language") or "")),
+    }
 
-        diff = np.sqrt(((arr.astype(np.float32) - bg) ** 2).sum(axis=2))
-        # Threshold tuned to ignore mild lighting gradients
-        mask = diff > 28.0
-
-        # If background isn't uniform, fall back to full frame
-        if mask.mean() < 0.01:
-            return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
-
-        ys, xs = np.where(mask)
-        y0, y1 = int(ys.min()), int(ys.max())
-        x0, x1 = int(xs.min()), int(xs.max())
-
-        # Pad a little so corners/edges aren't clipped
-        pad = int(min(h, w) * 0.03)
-        y0 = max(0, y0 - pad); y1 = min(h - 1, y1 + pad)
-        x0 = max(0, x0 - pad); x1 = min(w - 1, x1 + pad)
-
-        bw = max(1, x1 - x0)
-        bh = max(1, y1 - y0)
-        # If we somehow got a tiny box, don't use it
-        if (bw * bh) < (0.08 * w * h):
-            return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
-
-        return {"x": x0 / w, "y": y0 / h, "w": bw / w, "h": bh / h}
-    except Exception:
-        return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
-
-_memo_subject = {
-    "front": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
-    "back":  {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
-}
-
-def _memo_bbox_for_roi(side: str, roi_name: str, fallback_bbox: Dict[str, Any]) -> Dict[str, Any]:
-    sb = _memo_subject.get(side) or {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
-    sx, sy, sw, sh = (_safe_float(sb.get("x"), 0.0), _safe_float(sb.get("y"), 0.0),
-                      _safe_float(sb.get("w"), 1.0), _safe_float(sb.get("h"), 1.0))
-    sx = _clamp(sx, 0.0, 1.0); sy = _clamp(sy, 0.0, 1.0)
-    sw = _clamp(sw, 0.05, 1.0); sh = _clamp(sh, 0.05, 1.0)
-
-    rn = (roi_name or "").strip().lower()
-    # Default crop size inside the subject bbox
-    cs = 0.20  # 20% of subject for corners
-    es = 0.18  # 18% for edges/seams
-
-    def box(rx, ry, rw, rh):
-        return {
-            "x": _clamp(sx + sw * rx, 0.0, 1.0),
-            "y": _clamp(sy + sh * ry, 0.0, 1.0),
-            "w": _clamp(sw * rw, 0.02, 1.0),
-            "h": _clamp(sh * rh, 0.02, 1.0),
-        }
-
-    if rn == "corner_top_left": return box(0.0, 0.0, cs, cs)
-    if rn == "corner_top_right": return box(1.0 - cs, 0.0, cs, cs)
-    if rn == "corner_bottom_left": return box(0.0, 1.0 - cs, cs, cs)
-    if rn == "corner_bottom_right": return box(1.0 - cs, 1.0 - cs, cs, cs)
-
-    if rn == "edge_top": return box(0.12, 0.0, 0.76, es)
-    if rn == "edge_bottom": return box(0.12, 1.0 - es, 0.76, es)
-    if rn == "edge_left": return box(0.0, 0.12, es, 0.76)
-    if rn == "edge_right": return box(1.0 - es, 0.12, es, 0.76)
-
-    # Seam / wrap / sticker style ROIs: take an upper-middle "band" which usually catches seals.
-    if ("seam" in rn) or ("seal" in rn) or ("wrap" in rn):
-        return box(0.18, 0.10, 0.64, 0.30)
-    if ("holo" in rn) or ("sticker" in rn) or ("label" in rn):
-        return box(0.35, 0.35, 0.30, 0.30)
-
-    # Otherwise, tighten the provided bbox towards the subject bbox (clip + slight zoom)
-    try:
-        fb = fallback_bbox or {}
-        x = _safe_float(fb.get("x"), 0.0); y = _safe_float(fb.get("y"), 0.0)
-        w = _safe_float(fb.get("w"), 1.0); h = _safe_float(fb.get("h"), 1.0)
-        # Clip to subject
-        x = max(x, sx); y = max(y, sy)
-        w = min(w, sx + sw - x); h = min(h, sy + sh - y)
-        # Add a bit of zoom-in
-        cx = x + w/2; cy = y + h/2
-        w2 = max(0.04, w * 0.80); h2 = max(0.04, h * 0.80)
-        x2 = _clamp(cx - w2/2, 0.0, 1.0); y2 = _clamp(cy - h2/2, 0.0, 1.0)
-        return {"x": x2, "y": y2, "w": min(w2, 1.0 - x2), "h": min(h2, 1.0 - y2)}
-    except Exception:
-        return fallback_bbox or {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
-
-    defect_snaps: List[Dict[str, Any]] = []
-    label_by_idx = {int(x.get("crop_index", -1)): x for x in (roi_labels or []) if isinstance(x, dict)}
-
-    def _is_likely_defect(lab: Dict[str, Any], roi: Dict[str, Any]) -> bool:
-        """Gate ROI thumbnails so we show only defect-ish photos (sealed/memorabilia)."""
-        if not isinstance(lab, dict):
-            return False
-        if bool(lab.get("is_defect", False)):
-            return True
-        t = str(lab.get("type") or "").strip().lower()
-        note = str(lab.get("note") or "").strip().lower()
-        conf = _clamp(_safe_float(lab.get("confidence"), 0.0), 0.0, 1.0)
-        clean_types = {"none", "clean", "ok", "okay", "good", "no_defect", "no defect"}
-        if t and t not in clean_types and conf >= 0.35:
-            return True
-        defect_words = (
-            "seal", "seam", "tear", "split", "hole", "puncture", "wrinkle", "crease",
-            "scuff", "scratch", "dent", "crush", "corner", "edge", "wear", "whitening",
-            "stain", "mark", "lift", "peel", "tamper", "reseal",
-        )
-        if any(w in note for w in defect_words) and conf >= 0.30:
-            return True
-        roi_score = _safe_float(roi.get("score"), 0.0)
-        if roi_score >= 0.80 and t and t not in clean_types:
-            return True
-        return False
-
-    # wanted_rois is used as an optional override (mainly for cards). For sealed/memorabilia we keep it empty unless we add a dedicated mapping.
-    wanted_rois: set = set()
-    # If defects/flags mention packaging issues, force evidence crops for those ROIs (sealed/memorabilia).
-    try:
-        _df_txt = " ".join([str(x) for x in (data.get("defects") or []) if str(x).strip()])
-        _df_txt += " " + " ".join([str(x) for x in (flags_list_out or []) if str(x).strip()])
-        _df_txt = _df_txt.lower()
-        if any(w in _df_txt for w in ("corner", "scuff", "crease", "dent", "crush", "bump")):
-            wanted_rois.update({("front","corner_top_left"),("front","corner_top_right"),("front","corner_bottom_left"),("front","corner_bottom_right"),
-                               ("back","corner_top_left"),("back","corner_top_right"),("back","corner_bottom_left"),("back","corner_bottom_right")})
-        if any(w in _df_txt for w in ("edge", "wear", "whitening", "split", "tear", "seal", "seam", "rip", "hole", "puncture")):
-            wanted_rois.update({("front","edge_top"),("front","edge_bottom"),("front","edge_left"),("front","edge_right"),
-                               ("back","edge_top"),("back","edge_bottom"),("back","edge_left"),("back","edge_right")})
-    except Exception:
-        pass
-
-
-    def _note_for_roi(side: str, roi_name: str) -> str:
-        """Simple human note fallback for sealed/memorabilia ROI crops."""
-        rn = (roi_name or "").strip().lower()
-        # Corners / edges
-        corner_map = {
-            "corner_top_left": "Top-left corner close-up",
-            "corner_top_right": "Top-right corner close-up",
-            "corner_bottom_left": "Bottom-left corner close-up",
-            "corner_bottom_right": "Bottom-right corner close-up",
-        }
-        edge_map = {
-            "edge_top": "Top edge close-up",
-            "edge_bottom": "Bottom edge close-up",
-            "edge_left": "Left edge close-up",
-            "edge_right": "Right edge close-up",
-        }
-        seam_map = {
-            "seam_top": "Top seam / seal line close-up",
-            "seam_bottom": "Bottom seam / seal line close-up",
-            "seam_left": "Left seam / seal line close-up",
-            "seam_right": "Right seam / seal line close-up",
-            "seal": "Seal / wrap close-up",
-            "wrap": "Wrap / seal close-up",
-            "holo": "Hologram / sticker close-up",
-            "sticker": "Sticker close-up",
-        }
-        if rn in corner_map: return corner_map[rn]
-        if rn in edge_map: return edge_map[rn]
-        if rn in seam_map: return seam_map[rn]
-        if rn.startswith("corner_"): return "Corner close-up"
-        if rn.startswith("edge_"): return "Edge close-up"
-        if "seam" in rn or "seal" in rn or "wrap" in rn: return "Seal / seam close-up"
-        if "holo" in rn or "sticker" in rn or "label" in rn: return "Label / sticker close-up"
-        return "Close-up detail"
-    for i, r in enumerate((rois or [])[:10]):
-        src = b1 if r.get("side") == "front" else b2
-        if not src:
-            continue
-        bbox = r.get("bbox") or {}
-        side = str(r.get("side") or "")
-        roi_name = str(r.get("roi") or "")
-        bbox = _memo_bbox_for_roi(side, roi_name, bbox)
-        thumb = _make_thumb_from_bbox(src, bbox, max_size=520)
-        if not thumb:
-            continue
-        lab = label_by_idx.get(i) or {}
-        force = (side, roi_name) in wanted_rois
-        # Surface is a meta-request; allow any ROI on that side if surface is flagged.
-        if not force and (side, "surface") in wanted_rois:
-            force = True
-
-        if not (_is_likely_defect(lab, r) or force):
-            continue
-
-        dtype = lab.get("type") or ("whitening" if roi_name.startswith("corner_") else "defect")
-        note = (lab.get("note") if isinstance(lab, dict) else "") or _note_for_roi(side, roi_name) or f"Close-up: {roi_name}"
-        conf = lab.get("confidence") if lab else 0.0
-        defect_snaps.append({
-            "side": side,
-            "roi": roi_name,
-            "type": dtype,
-            "note": _norm_ws(str(note))[:220],
-            "confidence": _clamp(_safe_float(conf, 0.0), 0.0, 1.0),
-            "bbox": bbox,
-            "thumbnail_b64": thumb,
-        })
-
-    
-    # Fallback: if defects exist but ROI labeling filtered everything out, still show a few closeups.
-    if (not defect_snaps) and rois and (isinstance(data, dict) and (data.get("defects") or data.get("flags"))):
+    # Carry forward (or resolve) PriceCharting product_id if present
+    product_id = str(observed.get("product_id") or observed.get("productId") or "").strip()
+    if not product_id:
         try:
-            _pref = [r for r in rois if str(r.get("roi","")).startswith("corner_")] + [r for r in rois if str(r.get("roi","")).startswith("edge_")]
-            _pref = _pref[:4]
-            for r in _pref:
-                src = b1 if r.get("side") == "front" else b2
-                if not src:
-                    continue
-                bbox = r.get("bbox") or {}
-                side = str(r.get("side") or "")
-                roi_name = str(r.get("roi") or "")
-                bbox = _memo_bbox_for_roi(side, roi_name, bbox)
-                thumb = _make_thumb_from_bbox(src, bbox, max_size=520)
-                if not thumb:
-                    continue
-                note = _note_for_roi(side, roi_name) or f"Close-up: {roi_name}"
-                defect_snaps.append({
-                    "side": side,
-                    "roi": roi_name,
-                    "type": "defect",
-                    "note": _norm_ws(str(note))[:220],
-                    "confidence": 0.45,
-                    "bbox": bbox,
-                    "thumbnail_b64": thumb,
-                })
+            if PRICECHARTING_TOKEN:
+                q_parts = [observed_id.get("brand"), observed_id.get("product_name"), observed_id.get("set_or_series"), observed_id.get("edition_or_language"), observed_id.get("year")]
+                q = _norm_ws(" ".join([p for p in q_parts if p])).strip()
+                if q:
+                    products = await _pc_search(q, category=None, limit=5)
+                    if products:
+                        top = products[0] or {}
+                        product_id = str(top.get("id") or top.get("product-id") or "").strip()
         except Exception:
-            pass
+            product_id = ""
+    if product_id:
+        observed_id["product_id"] = product_id
 
-    defect_snaps.sort(key=lambda x: (0 if x.get("type") != "hotspot" else 1, -float(x.get("confidence") or 0.0)))
-    defect_snaps = defect_snaps[:8]
+    overall = _norm_ws(str(data.get("overall_assessment", "")))
+    spoken = _norm_ws(str(data.get("spoken_word", ""))) or overall
 
-    def _snap_category(s: Dict[str, Any]) -> str:
-        t = str(s.get("type") or "").lower()
-        roi = str(s.get("roi") or "").lower()
-        if "corner" in t or roi.startswith("corner_"):
-            return "packaging"
-        if "edge" in t or roi.startswith("edge_"):
-            return "packaging"
-        if "surface" in t:
-            return "packaging"
-        return "other"
-
-    for idx, s in enumerate(defect_snaps, start=1):
-        s["id"] = idx
-        s["ref"] = f"#{idx}"
-        s["category"] = _snap_category(s)
+    auth = data.get("authenticity_logic") if isinstance(data.get("authenticity_logic"), dict) else {}
+    auth_obj = {
+        "overall_authenticity_risk": _norm_ws(str(auth.get("overall_authenticity_risk", ""))),
+        "story_alignment": _norm_ws(str(auth.get("story_alignment", ""))),
+        "sealed_checks": auth.get("sealed_checks", {}) if isinstance(auth.get("sealed_checks", {}), dict) else {},
+        "game_used_checks": auth.get("game_used_checks", {}) if isinstance(auth.get("game_used_checks", {}), dict) else {},
+        "autograph_checks": auth.get("autograph_checks", {}) if isinstance(auth.get("autograph_checks", {}), dict) else {},
+        "universal_red_flags": auth.get("universal_red_flags", []) if isinstance(auth.get("universal_red_flags", []), list) else [],
+        "notes": _norm_ws(str(auth.get("notes", ""))),
+    }
 
     return JSONResponse(content={
-        "condition_grade": _norm_ws(str(data.get("condition_grade", "N/A"))),
-        "confidence": _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0),
-        "seal_integrity": seal,
-        "packaging_condition": data.get("packaging_condition", {"grade": "N/A", "notes": ""}),
-        "signature_assessment": data.get("signature_assessment", {"present": False, "quality": "Not Applicable", "notes": ""}),
-        "value_factors": data.get("value_factors", []) if isinstance(data.get("value_factors", []), list) else [],
-        "defects": data.get("defects", []) if isinstance(data.get("defects", []), list) else [],
-        "overall_assessment": _norm_ws(str(data.get("overall_assessment", ""))),
-        "spoken_word": _norm_ws(str(data.get("spoken_word", ""))) or _norm_ws(str(data.get("overall_assessment", ""))),
-        "observed_id": data.get("observed_id", {}) if isinstance(data.get("observed_id", {}), dict) else {},
-        "flags": flags_list_out,
-        "defect_snaps": defect_snaps,
+        "condition_grade": condition_grade,
+        "confidence": conf,
+        "condition_distribution": dist,
+        "seal_integrity": seal_obj,
+        "packaging_condition": packaging_obj,
+        "signature_assessment": sig_obj,
+        "value_factors": value_factors_out,
+        "defects": defects_out,
+        "flags": flags_out,
+        "overall_assessment": overall,
+        "spoken_word": spoken,
+        "authenticity_logic": auth_obj,
+        "observed_id": observed_id,
+        "defect_snaps": [],
         "verify_token": f"vfy_{secrets.token_urlsafe(12)}",
+        "market_context_mode": "click_only",
     })
 
 # ==============================
@@ -4055,12 +3704,6 @@ async def _ebay_sold_prices_stub(query: str) -> Dict[str, Any]:
 # ==============================
 # Runner
 # ==============================
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", "10000"))
-    uvicorn.run("main:app", host="0.0.0.0", port=port)
-
-
 def _normalize_num_variants(card_number: str) -> List[str]:
     """
     Return card number variants commonly used in listings:
@@ -4158,3 +3801,10 @@ def _build_ebay_query_ladder(card_name: str, set_name: str, set_code: str, card_
         seen.add(q.lower())
         out.append(q)
     return out
+# ==============================
+# Runner
+# ==============================
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "10000"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
