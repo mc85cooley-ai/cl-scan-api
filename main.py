@@ -2578,6 +2578,8 @@ async def assess_memorabilia(
     item_type: Optional[str] = Form(None),
     description: Optional[str] = Form(None),
 ):
+    # Using _safe_llm_call_memorabilia for sealed/memorabilia LLM calls
+
     b1 = await image1.read()
     b2 = await image2.read()
     if not b1 or not b2 or len(b1) < 200 or len(b2) < 200:
@@ -2701,6 +2703,50 @@ Respond ONLY with JSON, no extra text.
 
     msg = [{"role": "user", "content": content}]
     result = await _openai_chat(msg, max_tokens=2000, temperature=0.1)
+    # --- Sealed/Memorabilia: rate-limit safe retry + degraded fallback ---
+    if isinstance(result, dict) and result.get("error"):
+        msg_txt = str(result.get("message") or result.get("content") or "").lower()
+        if "rate limit" in msg_txt or "rate_limit" in msg_txt or "too many requests" in msg_txt:
+            # Parse "try again in XXXms" if present, else default ~1.1s
+            wait_ms = 1100
+            m_rl = re.search(r"try\s+again\s+in\s+(\d+)\s*ms", msg_txt)
+            if m_rl:
+                try:
+                    wait_ms = max(250, min(5000, int(m_rl.group(1)) + 150))
+                except Exception:
+                    wait_ms = 1100
+            try:
+                time.sleep(wait_ms / 1000.0)
+            except Exception:
+                pass
+            result = await _openai_chat(msg, max_tokens=2000, temperature=0.1)
+
+            if isinstance(result, dict) and result.get("error"):
+                # Degraded but non-null assessment so UI never blanks out
+                return {
+                    "condition_grade": "Pending",
+                    "confidence": 0.5,
+                    "seal_integrity": {"status": "Unclear", "notes": "Assessment temporarily limited due to high system load.", "grade": "Unclear"},
+                    "packaging_condition": {"grade": "Unclear", "notes": "Assessment temporarily limited due to high system load."},
+                    "signature_assessment": {"present": False, "quality": "Not Applicable", "notes": "Not assessed"},
+                    "value_factors": [],
+                    "defects": [],
+                    "overall_assessment": (
+                        "We hit a brief system limit while analysing this sealed/memorabilia item. "
+                        "Nothing is lost — please retry in a moment for a full pass."
+                    ),
+                    "spoken_word": (
+                        "Looks like we hit a quick system limit on this one. "
+                        "Give it another go in a moment and I’ll run a full check."
+                    ),
+                    "observed_id": {},
+                    "flags": [],
+                    "defect_snaps": [],
+                    "assessment_degraded": True
+                }
+    # --- end rate-limit safe block ---
+
+
     data = _parse_json_or_none(result.get("content", "")) if not result.get("error") else None
     data = data or {}
 
@@ -2826,7 +2872,7 @@ Respond ONLY with JSON, no extra text.
 
     roi_labels: List[Dict[str, Any]] = []
     try:
-        roi_labels = await _openai_label_rois(rois, b1, b2) if rois else []
+        roi_labels = []  # second pass disabled for sealed/memorabilia (no ROI LLM labeling)
     except Exception:
         roi_labels = []
 
