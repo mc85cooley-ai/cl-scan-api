@@ -2571,725 +2571,752 @@ Respond ONLY with JSON, no extra text.
 @app.post("/api/assess-memorabilia")
 @safe_endpoint
 async def assess_memorabilia(
-    image1: UploadFile = File(...),
-    image2: UploadFile = File(...),
-    image3: Optional[UploadFile] = File(None),
-    image4: Optional[UploadFile] = File(None),
-    item_type: Optional[str] = Form(None),
-    description: Optional[str] = Form(None),
-):
-    b1 = await image1.read()
-    b2 = await image2.read()
-    if not b1 or not b2 or len(b1) < 200 or len(b2) < 200:
-        raise HTTPException(status_code=400, detail="At least two images required")
-
-    imgs = [b1, b2]
-    for f in (image3, image4):
-        if f:
-            bb = await f.read()
-            if bb and len(bb) >= 200:
-                imgs.append(bb)
-
-    # Memorabilia: subject bbox used to keep ROI crops on-product (avoid table/background)
-    global _memo_subject
     try:
-        _memo_subject = {
-            "front": _memo_subject_bbox(b1) if b1 else {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
-            "back":  _memo_subject_bbox(b2) if b2 else {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
-        }
-    except Exception:
-        _memo_subject = {
-            "front": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
-            "back":  {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
-        }
-
-    ctx = ""
-    if item_type or description:
-        ctx = "\n\nKNOWN ITEM DETAILS:\n"
-        if item_type: ctx += f"- Item Type: {_norm_ws(item_type)}\n"
-        if description: ctx += f"- Description: {_norm_ws(description)}\n"
-
-    prompt = """You are a professional memorabilia/collectibles grader.
-
-You MUST identify what the item is (brand + product name + series/set) as specifically as the images allow, then grade condition conservatively.
-
-Return ONLY valid JSON with this EXACT structure:
-
-{{
-  "condition_grade": "Mint/Near Mint/Excellent/Good/Fair/Poor",
-  "confidence": 0.0-1.0,
-  "condition_distribution": {{
-    "Mint": 0.0-1.0,
-    "Near Mint": 0.0-1.0,
-    "Excellent": 0.0-1.0,
-    "Good": 0.0-1.0,
-    "Fair": 0.0-1.0,
-    "Poor": 0.0-1.0
-  }},
-  "seal_integrity": {{
-    "status": "Factory Sealed/Opened/Resealed/Compromised/Not Applicable",
-    "notes": "detailed notes about seal/wrap (tightness, tears, holes, seams, bubbling). Mention exact locations."
-  }},
-  "packaging_condition": {{
-    "grade": "Mint/Near Mint/Excellent/Good/Fair/Poor",
-    "notes": "detailed notes about packaging wear: corners, dents, crushing, scratches, scuffs, sticker residue, window plastic, edges. Mention exact locations."
-  }},
-  "signature_assessment": {{
-    "present": true/false,
-    "quality": "Clear/Faded/Smudged/Not Applicable",
-    "notes": "notes about signature placement/ink flow/bleeding and any authenticity concerns"
-  }},
-  "value_factors": ["short bullets: print run, desirability, era, sealed premium, athlete/popularity, scarcity, set demand"],
-  "defects": ["each defect as a full sentence with location + severity"],
-  "flags": ["short flags for important issues (reseal risk, crush damage, water, heavy dents, COA missing)"],
-  "overall_assessment": "5-8 sentences in first person (start with: 'Looking at your [brand] [product_name]...'). Mention what it is, what looks strong, what issues you see, and what limits the condition grade.",
-  "spoken_word": "A 20–45 second spoken-word script in first person. Format it like: Hook (1 line) → What it is (1–2 lines) → Best features (1–2 lines) → Biggest concerns (1–3 lines) → Bottom line grade + confidence (1 line). No hype, no guarantees.",
-  "authenticity_logic": {
-    "overall_authenticity_risk": "Low/Medium/High",
-    "story_alignment": "1-3 sentences on whether age/wear/story line up",
-    "sealed_checks": {
-      "wrap_fold_pattern": "Pass/Unclear/Fail/Not Applicable",
-      "seam_alignment": "Pass/Unclear/Fail/Not Applicable",
-      "wear_vs_seal_consistency": "Pass/Unclear/Fail/Not Applicable",
-      "hologram_sticker_check": "Pass/Unclear/Fail/Not Applicable",
-      "weight_check": "Pass/Unclear/Fail/Not Applicable"
-    },
-    "game_used_checks": {
-      "wear_pattern_realism": "Pass/Unclear/Fail/Not Applicable",
-      "material_stress_realism": "Pass/Unclear/Fail/Not Applicable",
-      "markings_and_codes": "Pass/Unclear/Fail/Not Applicable",
-      "repairs_alterations": "Pass/Unclear/Fail/Not Applicable",
-      "photo_match_potential": "High/Medium/Low/Not Applicable"
-    },
-    "autograph_checks": {
-      "ink_pressure_variation": "Pass/Unclear/Fail/Not Applicable",
-      "stroke_flow_tapering": "Pass/Unclear/Fail/Not Applicable",
-      "hesitation_or_retrace": "Pass/Unclear/Fail/Not Applicable",
-      "ink_absorption_on_surface": "Pass/Unclear/Fail/Not Applicable"
-    },
-    "universal_red_flags": ["short bullets"],
-    "notes": "3-6 sentences, plain-English, first person, practical advice"
-  },
-  "observed_id": {{
-    "brand": "best-effort",
-    "product_name": "best-effort",
-    "set_or_series": "best-effort",
-    "year": "best-effort",
-    "edition_or_language": "best-effort",
-    "item_type": "best-effort"
-  }}
-}}
-
-{ctx}
-
-Rules:
-- For sealed items: evaluate wrap fold patterns (Y-folds), seam paths, wrap tension/thickness, glue/warping/bubbling, and whether box wear vs seal wear tells a consistent story.
-- For game-used/player-used: assess whether wear patterns, material stress, markings/codes, and any repairs look authentic vs artificially distressed; note photo-match potential.
-- For autographs: assess natural pressure variation, tapered strokes, flow, hesitation/retrace, and whether ink sits in/soaks into the surface.
-- Do NOT claim Factory Sealed unless the wrap/seal looks consistent. If uncertain, say so and reduce confidence.
-- If glare/blur prevents certainty, say so and reduce confidence.
-- Be specific with locations and avoid generic statements.
-Respond ONLY with JSON, no extra text.
-"""
-    prompt = prompt.replace("{ctx}", ctx)
-
-    content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
-    for i, bb in enumerate(imgs):
-        if i > 0:
-            content.append({"type": "text", "text": f"IMAGE {i} ABOVE ☝️ | IMAGE {i+1} BELOW 👇"})
-        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(bb)}", "detail": "low"}})
-
-    msg = [{"role": "user", "content": content}]
-    result = {}
-    data = {}
-    try:
-        result = await _openai_chat(msg, max_tokens=1600, temperature=0.1)
-        data = _parse_json_or_none(result.get("content", "")) if not result.get("error") else None
-        data = data or {}
-    except Exception as e:
-        # Rate-limit / transient failure safe fallback (memorabilia only)
-        data = {
-            "condition_grade": "N/A",
-            "confidence": 0.0,
-            "seal_integrity": {"status":"Not Applicable","notes":"","grade":"Not Applicable"},
-            "packaging_condition": {"grade":"N/A","notes":""},
-            "signature_assessment": {"present": False, "quality":"Not Applicable","notes":""},
-            "value_factors": [],
-            "defects": [],
-            "flags": [],
-            "overall_assessment": "",
-            "spoken_word": "",
-            "authenticity_logic": {},
-            "observed_id": {},
-        }
-    flags_raw = data.get("flags", [])
-    if isinstance(flags_raw, list):
-        flags_list_out = [str(f).lower().strip() for f in flags_raw if str(f).strip()]
-    else:
-        flags_list_out = []
-    flags_list_out = list(dict.fromkeys(flags_list_out))
-
-
-    # Ensure condition_distribution exists (confidence-weighted)
-    if not isinstance(data.get("condition_distribution"), dict):
-        cg = _norm_ws(str(data.get("condition_grade", ""))).title()
-        confv = _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0)
-        ladder = ["Mint", "Near Mint", "Excellent", "Good", "Fair", "Poor"]
-        try:
-            i = ladder.index(cg) if cg in ladder else 2
-        except Exception:
-            i = 2
-        # Put most weight on predicted bucket, spill to neighbors based on confidence
-        p_main = 0.45 + 0.50 * confv
-        rem = 1.0 - p_main
-        dist = {k: 0.0 for k in ladder}
-        dist[ladder[i]] = p_main
-        if i-1 >= 0: dist[ladder[i-1]] += rem * 0.55
-        if i+1 < len(ladder): dist[ladder[i+1]] += rem * 0.45
-        total = sum(dist.values()) or 1.0
-        data["condition_distribution"] = {k: round(v/total, 4) for k, v in dist.items()}
-
-
-    # Ensure seal_integrity always has status (fixes UI "undefined" cases)
-    seal = data.get("seal_integrity") if isinstance(data.get("seal_integrity"), dict) else {}
-    if not seal.get("status"):
-        seal["status"] = "Not Applicable"
-    if not seal.get("notes"):
-        seal["notes"] = ""
-    if not seal.get("grade"):
-        # Frontend may expect "grade" - mirror status for compatibility
-        seal["grade"] = seal.get("status", "Not Applicable")
-
-    # ------------------------------
-    # Authenticity logic (sealed / game-used / autographs)
-    # ------------------------------
-    auth = data.get("authenticity_logic") if isinstance(data.get("authenticity_logic"), dict) else {}
-    # Defaults
-    def _default_checks(keys, default="Not Applicable"):
-        return {k: (auth.get(k) if isinstance(auth.get(k), str) and auth.get(k).strip() else default) for k in keys}
-
-    # Determine item context
-    _it = str(((data.get("observed_id") or {}).get("item_type") or item_type or "")).lower()
-    is_sealed = any(w in _it for w in ("sealed", "booster", "box", "pack", "case", "bundle"))
-    is_auto = bool((data.get("signature_assessment") or {}).get("present"))
-    is_game = any(w in _it for w in ("game", "used", "worn", "player", "jersey", "bat", "ball", "glove", "helmet", "equipment"))
-
-    sealed_keys = ["wrap_fold_pattern", "seam_alignment", "wear_vs_seal_consistency", "hologram_sticker_check", "weight_check"]
-    game_keys = ["wear_pattern_realism", "material_stress_realism", "markings_and_codes", "repairs_alterations", "photo_match_potential"]
-    auto_keys = ["ink_pressure_variation", "stroke_flow_tapering", "hesitation_or_retrace", "ink_absorption_on_surface"]
-
-    sealed_checks = auth.get("sealed_checks") if isinstance(auth.get("sealed_checks"), dict) else {}
-    game_checks = auth.get("game_used_checks") if isinstance(auth.get("game_used_checks"), dict) else {}
-    auto_checks = auth.get("autograph_checks") if isinstance(auth.get("autograph_checks"), dict) else {}
-
-    # Fill with Not Applicable where needed
-    if not is_sealed:
-        sealed_checks = {k: "Not Applicable" for k in sealed_keys}
-    else:
-        for k in sealed_keys:
-            v = sealed_checks.get(k)
-            sealed_checks[k] = v if isinstance(v, str) and v.strip() else "Unclear"
-
-    if not is_game:
-        game_checks = {k: "Not Applicable" for k in game_keys}
-    else:
-        for k in game_keys:
-            v = game_checks.get(k)
-            game_checks[k] = v if isinstance(v, str) and v.strip() else ("Low" if k=="photo_match_potential" else "Unclear")
-
-    if not is_auto:
-        auto_checks = {k: "Not Applicable" for k in auto_keys}
-    else:
-        for k in auto_keys:
-            v = auto_checks.get(k)
-            auto_checks[k] = v if isinstance(v, str) and v.strip() else "Unclear"
-
-    # Normalize overall risk + notes
-    risk = auth.get("overall_authenticity_risk")
-    if not (isinstance(risk, str) and risk.strip()):
-        # If any "Fail" present, call it High; if mostly Pass, Low; otherwise Medium.
-        checks_flat = list(sealed_checks.values()) + list(game_checks.values()) + list(auto_checks.values())
-        if any(str(v).lower().strip() == "fail" for v in checks_flat):
-            risk = "High"
-        elif any(str(v).lower().strip() == "pass" for v in checks_flat):
-            risk = "Low"
-        else:
-            risk = "Medium"
-
-    urf = auth.get("universal_red_flags", [])
-    if not isinstance(urf, list):
-        urf = []
-    urf = [str(x).strip() for x in urf if str(x).strip()][:8]
-
-    data["authenticity_logic"] = {
-        "overall_authenticity_risk": _norm_ws(str(risk)),
-        "story_alignment": _norm_ws(str(auth.get("story_alignment", "")))[:320],
-        "sealed_checks": sealed_checks,
-        "game_used_checks": game_checks,
-        "autograph_checks": auto_checks,
-        "universal_red_flags": urf,
-        "notes": _norm_ws(str(auth.get("notes", "")))[:900],
-    }
-
-
-    # ------------------------------
-    # CV-assisted defect closeups (defect_snaps) for sealed/memorabilia
-    # ------------------------------
-    # Use the first two images as "front/back" equivalents for CV ROI proposals.
-    rois: List[Dict[str, Any]] = []
-    try:
-        rois = _cv_candidate_bboxes(b1, "front") + _cv_candidate_bboxes(b2, "back")
-    except Exception:
-        rois = []
-
-    roi_labels: List[Dict[str, Any]] = []
-    try:
-        # Second pass disabled for sealed/memorabilia (rebased fix)
-        roi_labels = []
-    except Exception:
-        roi_labels = []
-
-# Heuristic: sealed/memorabilia photos often include lots of table/background.
-# We estimate the "subject" (box/item) bounding box and then generate tighter crops
-# for corner/edge/seam ROIs inside that subject box. This makes defect snaps actually
-# show the issue, even when the original photo has lots of negative space.
-def _memo_subject_bbox(img_bytes: bytes) -> Dict[str, float]:
-    try:
-        from PIL import Image
-        import numpy as np
-        im = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        arr = np.asarray(im)
-        h, w = arr.shape[:2]
-        if h < 10 or w < 10:
-            return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
-
-        # Sample border pixels to approximate background colour
-        b = max(2, int(min(h, w) * 0.04))
-        border = np.concatenate([
-            arr[:b, :, :].reshape(-1, 3),
-            arr[-b:, :, :].reshape(-1, 3),
-            arr[:, :b, :].reshape(-1, 3),
-            arr[:, -b:, :].reshape(-1, 3),
-        ], axis=0)
-        bg = np.median(border, axis=0).astype(np.float32)
-
-        diff = np.sqrt(((arr.astype(np.float32) - bg) ** 2).sum(axis=2))
-        # Threshold tuned to ignore mild lighting gradients
-        mask = diff > 28.0
-
-        # If background isn't uniform, fall back to full frame
-        if mask.mean() < 0.01:
-            return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
-
-        ys, xs = np.where(mask)
-        y0, y1 = int(ys.min()), int(ys.max())
-        x0, x1 = int(xs.min()), int(xs.max())
-
-        # Pad a little so corners/edges aren't clipped
-        pad = int(min(h, w) * 0.03)
-        y0 = max(0, y0 - pad); y1 = min(h - 1, y1 + pad)
-        x0 = max(0, x0 - pad); x1 = min(w - 1, x1 + pad)
-
-        bw = max(1, x1 - x0)
-        bh = max(1, y1 - y0)
-        # If we somehow got a tiny box, don't use it
-        if (bw * bh) < (0.08 * w * h):
-            return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
-
-        return {"x": x0 / w, "y": y0 / h, "w": bw / w, "h": bh / h}
-    except Exception:
-        return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
-
-_memo_subject = {
-    "front": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
-    "back":  {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
-}
-
-def _memo_bbox_for_roi(side: str, roi_name: str, fallback_bbox: Dict[str, Any]) -> Dict[str, Any]:
-    sb = _memo_subject.get(side) or {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
-    sx, sy, sw, sh = (_safe_float(sb.get("x"), 0.0), _safe_float(sb.get("y"), 0.0),
-                      _safe_float(sb.get("w"), 1.0), _safe_float(sb.get("h"), 1.0))
-    sx = _clamp(sx, 0.0, 1.0); sy = _clamp(sy, 0.0, 1.0)
-    sw = _clamp(sw, 0.05, 1.0); sh = _clamp(sh, 0.05, 1.0)
-
-    rn = (roi_name or "").strip().lower()
-    # Default crop size inside the subject bbox
-    cs = 0.20  # 20% of subject for corners
-    es = 0.18  # 18% for edges/seams
-
-    def box(rx, ry, rw, rh):
-        return {
-            "x": _clamp(sx + sw * rx, 0.0, 1.0),
-            "y": _clamp(sy + sh * ry, 0.0, 1.0),
-            "w": _clamp(sw * rw, 0.02, 1.0),
-            "h": _clamp(sh * rh, 0.02, 1.0),
-        }
-
-    if rn == "corner_top_left": return box(0.0, 0.0, cs, cs)
-    if rn == "corner_top_right": return box(1.0 - cs, 0.0, cs, cs)
-    if rn == "corner_bottom_left": return box(0.0, 1.0 - cs, cs, cs)
-    if rn == "corner_bottom_right": return box(1.0 - cs, 1.0 - cs, cs, cs)
-
-    if rn == "edge_top": return box(0.12, 0.0, 0.76, es)
-    if rn == "edge_bottom": return box(0.12, 1.0 - es, 0.76, es)
-    if rn == "edge_left": return box(0.0, 0.12, es, 0.76)
-    if rn == "edge_right": return box(1.0 - es, 0.12, es, 0.76)
-
-    # Seam / wrap / sticker style ROIs: take an upper-middle "band" which usually catches seals.
-    if ("seam" in rn) or ("seal" in rn) or ("wrap" in rn):
-        return box(0.18, 0.10, 0.64, 0.30)
-    if ("holo" in rn) or ("sticker" in rn) or ("label" in rn):
-        return box(0.35, 0.35, 0.30, 0.30)
-
-    # Otherwise, tighten the provided bbox towards the subject bbox (clip + slight zoom)
-    try:
-        fb = fallback_bbox or {}
-        x = _safe_float(fb.get("x"), 0.0); y = _safe_float(fb.get("y"), 0.0)
-        w = _safe_float(fb.get("w"), 1.0); h = _safe_float(fb.get("h"), 1.0)
-        # Clip to subject
-        x = max(x, sx); y = max(y, sy)
-        w = min(w, sx + sw - x); h = min(h, sy + sh - y)
-        # Add a bit of zoom-in
-        cx = x + w/2; cy = y + h/2
-        w2 = max(0.04, w * 0.80); h2 = max(0.04, h * 0.80)
-        x2 = _clamp(cx - w2/2, 0.0, 1.0); y2 = _clamp(cy - h2/2, 0.0, 1.0)
-        return {"x": x2, "y": y2, "w": min(w2, 1.0 - x2), "h": min(h2, 1.0 - y2)}
-    except Exception:
-        return fallback_bbox or {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
-
-    defect_snaps: List[Dict[str, Any]] = []
-    label_by_idx = {int(x.get("crop_index", -1)): x for x in (roi_labels or []) if isinstance(x, dict)}
-
-    def _is_likely_defect(lab: Dict[str, Any], roi: Dict[str, Any]) -> bool:
-        """Gate ROI thumbnails so we show only defect-ish photos (sealed/memorabilia)."""
-        if not isinstance(lab, dict):
-            return False
-        if bool(lab.get("is_defect", False)):
-            return True
-        t = str(lab.get("type") or "").strip().lower()
-        note = str(lab.get("note") or "").strip().lower()
-        conf = _clamp(_safe_float(lab.get("confidence"), 0.0), 0.0, 1.0)
-        clean_types = {"none", "clean", "ok", "okay", "good", "no_defect", "no defect"}
-        if t and t not in clean_types and conf >= 0.35:
-            return True
-        defect_words = (
-            "seal", "seam", "tear", "split", "hole", "puncture", "wrinkle", "crease",
-            "scuff", "scratch", "dent", "crush", "corner", "edge", "wear", "whitening",
-            "stain", "mark", "lift", "peel", "tamper", "reseal",
-        )
-        if any(w in note for w in defect_words) and conf >= 0.30:
-            return True
-        roi_score = _safe_float(roi.get("score"), 0.0)
-        if roi_score >= 0.80 and t and t not in clean_types:
-            return True
-        return False
-
-    # wanted_rois is used as an optional override (mainly for cards). For sealed/memorabilia we keep it empty unless we add a dedicated mapping.
-    wanted_rois: set = set()
-    # If defects/flags mention packaging issues, force evidence crops for those ROIs (sealed/memorabilia).
-    try:
-        _df_txt = " ".join([str(x) for x in (data.get("defects") or []) if str(x).strip()])
-        _df_txt += " " + " ".join([str(x) for x in (flags_list_out or []) if str(x).strip()])
-        _df_txt = _df_txt.lower()
-        if any(w in _df_txt for w in ("corner", "scuff", "crease", "dent", "crush", "bump")):
-            wanted_rois.update({("front","corner_top_left"),("front","corner_top_right"),("front","corner_bottom_left"),("front","corner_bottom_right"),
-                               ("back","corner_top_left"),("back","corner_top_right"),("back","corner_bottom_left"),("back","corner_bottom_right")})
-        if any(w in _df_txt for w in ("edge", "wear", "whitening", "split", "tear", "seal", "seam", "rip", "hole", "puncture")):
-            wanted_rois.update({("front","edge_top"),("front","edge_bottom"),("front","edge_left"),("front","edge_right"),
-                               ("back","edge_top"),("back","edge_bottom"),("back","edge_left"),("back","edge_right")})
-    except Exception:
-        pass
-
-
-    def _note_for_roi(side: str, roi_name: str) -> str:
-        """Simple human note fallback for sealed/memorabilia ROI crops."""
-        rn = (roi_name or "").strip().lower()
-        # Corners / edges
-        corner_map = {
-            "corner_top_left": "Top-left corner close-up",
-            "corner_top_right": "Top-right corner close-up",
-            "corner_bottom_left": "Bottom-left corner close-up",
-            "corner_bottom_right": "Bottom-right corner close-up",
-        }
-        edge_map = {
-            "edge_top": "Top edge close-up",
-            "edge_bottom": "Bottom edge close-up",
-            "edge_left": "Left edge close-up",
-            "edge_right": "Right edge close-up",
-        }
-        seam_map = {
-            "seam_top": "Top seam / seal line close-up",
-            "seam_bottom": "Bottom seam / seal line close-up",
-            "seam_left": "Left seam / seal line close-up",
-            "seam_right": "Right seam / seal line close-up",
-            "seal": "Seal / wrap close-up",
-            "wrap": "Wrap / seal close-up",
-            "holo": "Hologram / sticker close-up",
-            "sticker": "Sticker close-up",
-        }
-        if rn in corner_map: return corner_map[rn]
-        if rn in edge_map: return edge_map[rn]
-        if rn in seam_map: return seam_map[rn]
-        if rn.startswith("corner_"): return "Corner close-up"
-        if rn.startswith("edge_"): return "Edge close-up"
-        if "seam" in rn or "seal" in rn or "wrap" in rn: return "Seal / seam close-up"
-        if "holo" in rn or "sticker" in rn or "label" in rn: return "Label / sticker close-up"
-        return "Close-up detail"
-    for i, r in enumerate((rois or [])[:10]):
-        src = b1 if r.get("side") == "front" else b2
-        if not src:
-            continue
-        bbox = r.get("bbox") or {}
-        side = str(r.get("side") or "")
-        roi_name = str(r.get("roi") or "")
-        bbox = _memo_bbox_for_roi(side, roi_name, bbox)
-        thumb = _make_thumb_from_bbox(src, bbox, max_size=520)
-        if not thumb:
-            continue
-        lab = label_by_idx.get(i) or {}
-        force = (side, roi_name) in wanted_rois
-        # Surface is a meta-request; allow any ROI on that side if surface is flagged.
-        if not force and (side, "surface") in wanted_rois:
-            force = True
-
-        if not (_is_likely_defect(lab, r) or force):
-            continue
-
-        dtype = lab.get("type") or ("whitening" if roi_name.startswith("corner_") else "defect")
-        note = (lab.get("note") if isinstance(lab, dict) else "") or _note_for_roi(side, roi_name) or f"Close-up: {roi_name}"
-        conf = lab.get("confidence") if lab else 0.0
-        defect_snaps.append({
-            "side": side,
-            "roi": roi_name,
-            "type": dtype,
-            "note": _norm_ws(str(note))[:220],
-            "confidence": _clamp(_safe_float(conf, 0.0), 0.0, 1.0),
-            "bbox": bbox,
-            "thumbnail_b64": thumb,
-        })
-
+        image1: UploadFile = File(...),
+        image2: UploadFile = File(...),
+        image3: Optional[UploadFile] = File(None),
+        image4: Optional[UploadFile] = File(None),
+        item_type: Optional[str] = Form(None),
+        description: Optional[str] = Form(None),
+    ):
+        b1 = await image1.read()
+        b2 = await image2.read()
+        if not b1 or not b2 or len(b1) < 200 or len(b2) < 200:
+            raise HTTPException(status_code=400, detail="At least two images required")
     
-    # Fallback: if defects exist but ROI labeling filtered everything out, still show a few closeups.
-    if (not defect_snaps) and rois and (isinstance(data, dict) and (data.get("defects") or data.get("flags"))):
+        imgs = [b1, b2]
+        for f in (image3, image4):
+            if f:
+                bb = await f.read()
+                if bb and len(bb) >= 200:
+                    imgs.append(bb)
+    
+        # Memorabilia: subject bbox used to keep ROI crops on-product (avoid table/background)
+        global _memo_subject
         try:
-            _pref = [r for r in rois if str(r.get("roi","")).startswith("corner_")] + [r for r in rois if str(r.get("roi","")).startswith("edge_")]
-            _pref = _pref[:4]
-            for r in _pref:
-                src = b1 if r.get("side") == "front" else b2
-                if not src:
-                    continue
-                bbox = r.get("bbox") or {}
-                side = str(r.get("side") or "")
-                roi_name = str(r.get("roi") or "")
-                bbox = _memo_bbox_for_roi(side, roi_name, bbox)
-                thumb = _make_thumb_from_bbox(src, bbox, max_size=520)
-                if not thumb:
-                    continue
-                note = _note_for_roi(side, roi_name) or f"Close-up: {roi_name}"
-                defect_snaps.append({
-                    "side": side,
-                    "roi": roi_name,
-                    "type": "defect",
-                    "note": _norm_ws(str(note))[:220],
-                    "confidence": 0.45,
-                    "bbox": bbox,
-                    "thumbnail_b64": thumb,
-                })
+            _memo_subject = {
+                "front": _memo_subject_bbox(b1) if b1 else {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+                "back":  _memo_subject_bbox(b2) if b2 else {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+            }
+        except Exception:
+            _memo_subject = {
+                "front": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+                "back":  {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+            }
+    
+        ctx = ""
+        if item_type or description:
+            ctx = "\n\nKNOWN ITEM DETAILS:\n"
+            if item_type: ctx += f"- Item Type: {_norm_ws(item_type)}\n"
+            if description: ctx += f"- Description: {_norm_ws(description)}\n"
+    
+        prompt = """You are a professional memorabilia/collectibles grader.
+    
+    You MUST identify what the item is (brand + product name + series/set) as specifically as the images allow, then grade condition conservatively.
+    
+    Return ONLY valid JSON with this EXACT structure:
+    
+    {{
+      "condition_grade": "Mint/Near Mint/Excellent/Good/Fair/Poor",
+      "confidence": 0.0-1.0,
+      "condition_distribution": {{
+        "Mint": 0.0-1.0,
+        "Near Mint": 0.0-1.0,
+        "Excellent": 0.0-1.0,
+        "Good": 0.0-1.0,
+        "Fair": 0.0-1.0,
+        "Poor": 0.0-1.0
+      }},
+      "seal_integrity": {{
+        "status": "Factory Sealed/Opened/Resealed/Compromised/Not Applicable",
+        "notes": "detailed notes about seal/wrap (tightness, tears, holes, seams, bubbling). Mention exact locations."
+      }},
+      "packaging_condition": {{
+        "grade": "Mint/Near Mint/Excellent/Good/Fair/Poor",
+        "notes": "detailed notes about packaging wear: corners, dents, crushing, scratches, scuffs, sticker residue, window plastic, edges. Mention exact locations."
+      }},
+      "signature_assessment": {{
+        "present": true/false,
+        "quality": "Clear/Faded/Smudged/Not Applicable",
+        "notes": "notes about signature placement/ink flow/bleeding and any authenticity concerns"
+      }},
+      "value_factors": ["short bullets: print run, desirability, era, sealed premium, athlete/popularity, scarcity, set demand"],
+      "defects": ["each defect as a full sentence with location + severity"],
+      "flags": ["short flags for important issues (reseal risk, crush damage, water, heavy dents, COA missing)"],
+      "overall_assessment": "5-8 sentences in first person (start with: 'Looking at your [brand] [product_name]...'). Mention what it is, what looks strong, what issues you see, and what limits the condition grade.",
+      "spoken_word": "A 20–45 second spoken-word script in first person. Format it like: Hook (1 line) → What it is (1–2 lines) → Best features (1–2 lines) → Biggest concerns (1–3 lines) → Bottom line grade + confidence (1 line). No hype, no guarantees.",
+      "authenticity_logic": {
+        "overall_authenticity_risk": "Low/Medium/High",
+        "story_alignment": "1-3 sentences on whether age/wear/story line up",
+        "sealed_checks": {
+          "wrap_fold_pattern": "Pass/Unclear/Fail/Not Applicable",
+          "seam_alignment": "Pass/Unclear/Fail/Not Applicable",
+          "wear_vs_seal_consistency": "Pass/Unclear/Fail/Not Applicable",
+          "hologram_sticker_check": "Pass/Unclear/Fail/Not Applicable",
+          "weight_check": "Pass/Unclear/Fail/Not Applicable"
+        },
+        "game_used_checks": {
+          "wear_pattern_realism": "Pass/Unclear/Fail/Not Applicable",
+          "material_stress_realism": "Pass/Unclear/Fail/Not Applicable",
+          "markings_and_codes": "Pass/Unclear/Fail/Not Applicable",
+          "repairs_alterations": "Pass/Unclear/Fail/Not Applicable",
+          "photo_match_potential": "High/Medium/Low/Not Applicable"
+        },
+        "autograph_checks": {
+          "ink_pressure_variation": "Pass/Unclear/Fail/Not Applicable",
+          "stroke_flow_tapering": "Pass/Unclear/Fail/Not Applicable",
+          "hesitation_or_retrace": "Pass/Unclear/Fail/Not Applicable",
+          "ink_absorption_on_surface": "Pass/Unclear/Fail/Not Applicable"
+        },
+        "universal_red_flags": ["short bullets"],
+        "notes": "3-6 sentences, plain-English, first person, practical advice"
+      },
+      "observed_id": {{
+        "brand": "best-effort",
+        "product_name": "best-effort",
+        "set_or_series": "best-effort",
+        "year": "best-effort",
+        "edition_or_language": "best-effort",
+        "item_type": "best-effort"
+      }}
+    }}
+    
+    {ctx}
+    
+    Rules:
+    - For sealed items: evaluate wrap fold patterns (Y-folds), seam paths, wrap tension/thickness, glue/warping/bubbling, and whether box wear vs seal wear tells a consistent story.
+    - For game-used/player-used: assess whether wear patterns, material stress, markings/codes, and any repairs look authentic vs artificially distressed; note photo-match potential.
+    - For autographs: assess natural pressure variation, tapered strokes, flow, hesitation/retrace, and whether ink sits in/soaks into the surface.
+    - Do NOT claim Factory Sealed unless the wrap/seal looks consistent. If uncertain, say so and reduce confidence.
+    - If glare/blur prevents certainty, say so and reduce confidence.
+    - Be specific with locations and avoid generic statements.
+    Respond ONLY with JSON, no extra text.
+    """
+        prompt = prompt.replace("{ctx}", ctx)
+    
+        content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+        for i, bb in enumerate(imgs):
+            if i > 0:
+                content.append({"type": "text", "text": f"IMAGE {i} ABOVE ☝️ | IMAGE {i+1} BELOW 👇"})
+            content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(bb)}", "detail": "low"}})
+    
+        msg = [{"role": "user", "content": content}]
+        result = {}
+        data = {}
+        try:
+            result = await _openai_chat(msg, max_tokens=1600, temperature=0.1)
+            data = _parse_json_or_none(result.get("content", "")) if not result.get("error") else None
+            data = data or {}
+        except Exception as e:
+            # Rate-limit / transient failure safe fallback (memorabilia only)
+            data = {
+                "condition_grade": "N/A",
+                "confidence": 0.0,
+                "seal_integrity": {"status":"Not Applicable","notes":"","grade":"Not Applicable"},
+                "packaging_condition": {"grade":"N/A","notes":""},
+                "signature_assessment": {"present": False, "quality":"Not Applicable","notes":""},
+                "value_factors": [],
+                "defects": [],
+                "flags": [],
+                "overall_assessment": "",
+                "spoken_word": "",
+                "authenticity_logic": {},
+                "observed_id": {},
+            }
+        flags_raw = data.get("flags", [])
+        if isinstance(flags_raw, list):
+            flags_list_out = [str(f).lower().strip() for f in flags_raw if str(f).strip()]
+        else:
+            flags_list_out = []
+        flags_list_out = list(dict.fromkeys(flags_list_out))
+    
+    
+        # Ensure condition_distribution exists (confidence-weighted)
+        if not isinstance(data.get("condition_distribution"), dict):
+            cg = _norm_ws(str(data.get("condition_grade", ""))).title()
+            confv = _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0)
+            ladder = ["Mint", "Near Mint", "Excellent", "Good", "Fair", "Poor"]
+            try:
+                i = ladder.index(cg) if cg in ladder else 2
+            except Exception:
+                i = 2
+            # Put most weight on predicted bucket, spill to neighbors based on confidence
+            p_main = 0.45 + 0.50 * confv
+            rem = 1.0 - p_main
+            dist = {k: 0.0 for k in ladder}
+            dist[ladder[i]] = p_main
+            if i-1 >= 0: dist[ladder[i-1]] += rem * 0.55
+            if i+1 < len(ladder): dist[ladder[i+1]] += rem * 0.45
+            total = sum(dist.values()) or 1.0
+            data["condition_distribution"] = {k: round(v/total, 4) for k, v in dist.items()}
+    
+    
+        # Ensure seal_integrity always has status (fixes UI "undefined" cases)
+        seal = data.get("seal_integrity") if isinstance(data.get("seal_integrity"), dict) else {}
+        if not seal.get("status"):
+            seal["status"] = "Not Applicable"
+        if not seal.get("notes"):
+            seal["notes"] = ""
+        if not seal.get("grade"):
+            # Frontend may expect "grade" - mirror status for compatibility
+            seal["grade"] = seal.get("status", "Not Applicable")
+    
+        # ------------------------------
+        # Authenticity logic (sealed / game-used / autographs)
+        # ------------------------------
+        auth = data.get("authenticity_logic") if isinstance(data.get("authenticity_logic"), dict) else {}
+        # Defaults
+        def _default_checks(keys, default="Not Applicable"):
+            return {k: (auth.get(k) if isinstance(auth.get(k), str) and auth.get(k).strip() else default) for k in keys}
+    
+        # Determine item context
+        _it = str(((data.get("observed_id") or {}).get("item_type") or item_type or "")).lower()
+        is_sealed = any(w in _it for w in ("sealed", "booster", "box", "pack", "case", "bundle"))
+        is_auto = bool((data.get("signature_assessment") or {}).get("present"))
+        is_game = any(w in _it for w in ("game", "used", "worn", "player", "jersey", "bat", "ball", "glove", "helmet", "equipment"))
+    
+        sealed_keys = ["wrap_fold_pattern", "seam_alignment", "wear_vs_seal_consistency", "hologram_sticker_check", "weight_check"]
+        game_keys = ["wear_pattern_realism", "material_stress_realism", "markings_and_codes", "repairs_alterations", "photo_match_potential"]
+        auto_keys = ["ink_pressure_variation", "stroke_flow_tapering", "hesitation_or_retrace", "ink_absorption_on_surface"]
+    
+        sealed_checks = auth.get("sealed_checks") if isinstance(auth.get("sealed_checks"), dict) else {}
+        game_checks = auth.get("game_used_checks") if isinstance(auth.get("game_used_checks"), dict) else {}
+        auto_checks = auth.get("autograph_checks") if isinstance(auth.get("autograph_checks"), dict) else {}
+    
+        # Fill with Not Applicable where needed
+        if not is_sealed:
+            sealed_checks = {k: "Not Applicable" for k in sealed_keys}
+        else:
+            for k in sealed_keys:
+                v = sealed_checks.get(k)
+                sealed_checks[k] = v if isinstance(v, str) and v.strip() else "Unclear"
+    
+        if not is_game:
+            game_checks = {k: "Not Applicable" for k in game_keys}
+        else:
+            for k in game_keys:
+                v = game_checks.get(k)
+                game_checks[k] = v if isinstance(v, str) and v.strip() else ("Low" if k=="photo_match_potential" else "Unclear")
+    
+        if not is_auto:
+            auto_checks = {k: "Not Applicable" for k in auto_keys}
+        else:
+            for k in auto_keys:
+                v = auto_checks.get(k)
+                auto_checks[k] = v if isinstance(v, str) and v.strip() else "Unclear"
+    
+        # Normalize overall risk + notes
+        risk = auth.get("overall_authenticity_risk")
+        if not (isinstance(risk, str) and risk.strip()):
+            # If any "Fail" present, call it High; if mostly Pass, Low; otherwise Medium.
+            checks_flat = list(sealed_checks.values()) + list(game_checks.values()) + list(auto_checks.values())
+            if any(str(v).lower().strip() == "fail" for v in checks_flat):
+                risk = "High"
+            elif any(str(v).lower().strip() == "pass" for v in checks_flat):
+                risk = "Low"
+            else:
+                risk = "Medium"
+    
+        urf = auth.get("universal_red_flags", [])
+        if not isinstance(urf, list):
+            urf = []
+        urf = [str(x).strip() for x in urf if str(x).strip()][:8]
+    
+        data["authenticity_logic"] = {
+            "overall_authenticity_risk": _norm_ws(str(risk)),
+            "story_alignment": _norm_ws(str(auth.get("story_alignment", "")))[:320],
+            "sealed_checks": sealed_checks,
+            "game_used_checks": game_checks,
+            "autograph_checks": auto_checks,
+            "universal_red_flags": urf,
+            "notes": _norm_ws(str(auth.get("notes", "")))[:900],
+        }
+    
+    
+        # ------------------------------
+        # CV-assisted defect closeups (defect_snaps) for sealed/memorabilia
+        # ------------------------------
+        # Use the first two images as "front/back" equivalents for CV ROI proposals.
+        rois: List[Dict[str, Any]] = []
+        try:
+            rois = _cv_candidate_bboxes(b1, "front") + _cv_candidate_bboxes(b2, "back")
+        except Exception:
+            rois = []
+    
+        roi_labels: List[Dict[str, Any]] = []
+        try:
+            # Second pass disabled for sealed/memorabilia (rebased fix)
+            roi_labels = []
+        except Exception:
+            roi_labels = []
+    
+    # Heuristic: sealed/memorabilia photos often include lots of table/background.
+    # We estimate the "subject" (box/item) bounding box and then generate tighter crops
+    # for corner/edge/seam ROIs inside that subject box. This makes defect snaps actually
+    # show the issue, even when the original photo has lots of negative space.
+    def _memo_subject_bbox(img_bytes: bytes) -> Dict[str, float]:
+        try:
+            from PIL import Image
+            import numpy as np
+            im = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            arr = np.asarray(im)
+            h, w = arr.shape[:2]
+            if h < 10 or w < 10:
+                return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
+    
+            # Sample border pixels to approximate background colour
+            b = max(2, int(min(h, w) * 0.04))
+            border = np.concatenate([
+                arr[:b, :, :].reshape(-1, 3),
+                arr[-b:, :, :].reshape(-1, 3),
+                arr[:, :b, :].reshape(-1, 3),
+                arr[:, -b:, :].reshape(-1, 3),
+            ], axis=0)
+            bg = np.median(border, axis=0).astype(np.float32)
+    
+            diff = np.sqrt(((arr.astype(np.float32) - bg) ** 2).sum(axis=2))
+            # Threshold tuned to ignore mild lighting gradients
+            mask = diff > 28.0
+    
+            # If background isn't uniform, fall back to full frame
+            if mask.mean() < 0.01:
+                return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
+    
+            ys, xs = np.where(mask)
+            y0, y1 = int(ys.min()), int(ys.max())
+            x0, x1 = int(xs.min()), int(xs.max())
+    
+            # Pad a little so corners/edges aren't clipped
+            pad = int(min(h, w) * 0.03)
+            y0 = max(0, y0 - pad); y1 = min(h - 1, y1 + pad)
+            x0 = max(0, x0 - pad); x1 = min(w - 1, x1 + pad)
+    
+            bw = max(1, x1 - x0)
+            bh = max(1, y1 - y0)
+            # If we somehow got a tiny box, don't use it
+            if (bw * bh) < (0.08 * w * h):
+                return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
+    
+            return {"x": x0 / w, "y": y0 / h, "w": bw / w, "h": bh / h}
+        except Exception:
+            return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
+    
+    _memo_subject = {
+        "front": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+        "back":  {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+    }
+    
+    def _memo_bbox_for_roi(side: str, roi_name: str, fallback_bbox: Dict[str, Any]) -> Dict[str, Any]:
+        sb = _memo_subject.get(side) or {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
+        sx, sy, sw, sh = (_safe_float(sb.get("x"), 0.0), _safe_float(sb.get("y"), 0.0),
+                          _safe_float(sb.get("w"), 1.0), _safe_float(sb.get("h"), 1.0))
+        sx = _clamp(sx, 0.0, 1.0); sy = _clamp(sy, 0.0, 1.0)
+        sw = _clamp(sw, 0.05, 1.0); sh = _clamp(sh, 0.05, 1.0)
+    
+        rn = (roi_name or "").strip().lower()
+        # Default crop size inside the subject bbox
+        cs = 0.20  # 20% of subject for corners
+        es = 0.18  # 18% for edges/seams
+    
+        def box(rx, ry, rw, rh):
+            return {
+                "x": _clamp(sx + sw * rx, 0.0, 1.0),
+                "y": _clamp(sy + sh * ry, 0.0, 1.0),
+                "w": _clamp(sw * rw, 0.02, 1.0),
+                "h": _clamp(sh * rh, 0.02, 1.0),
+            }
+    
+        if rn == "corner_top_left": return box(0.0, 0.0, cs, cs)
+        if rn == "corner_top_right": return box(1.0 - cs, 0.0, cs, cs)
+        if rn == "corner_bottom_left": return box(0.0, 1.0 - cs, cs, cs)
+        if rn == "corner_bottom_right": return box(1.0 - cs, 1.0 - cs, cs, cs)
+    
+        if rn == "edge_top": return box(0.12, 0.0, 0.76, es)
+        if rn == "edge_bottom": return box(0.12, 1.0 - es, 0.76, es)
+        if rn == "edge_left": return box(0.0, 0.12, es, 0.76)
+        if rn == "edge_right": return box(1.0 - es, 0.12, es, 0.76)
+    
+        # Seam / wrap / sticker style ROIs: take an upper-middle "band" which usually catches seals.
+        if ("seam" in rn) or ("seal" in rn) or ("wrap" in rn):
+            return box(0.18, 0.10, 0.64, 0.30)
+        if ("holo" in rn) or ("sticker" in rn) or ("label" in rn):
+            return box(0.35, 0.35, 0.30, 0.30)
+    
+        # Otherwise, tighten the provided bbox towards the subject bbox (clip + slight zoom)
+        try:
+            fb = fallback_bbox or {}
+            x = _safe_float(fb.get("x"), 0.0); y = _safe_float(fb.get("y"), 0.0)
+            w = _safe_float(fb.get("w"), 1.0); h = _safe_float(fb.get("h"), 1.0)
+            # Clip to subject
+            x = max(x, sx); y = max(y, sy)
+            w = min(w, sx + sw - x); h = min(h, sy + sh - y)
+            # Add a bit of zoom-in
+            cx = x + w/2; cy = y + h/2
+            w2 = max(0.04, w * 0.80); h2 = max(0.04, h * 0.80)
+            x2 = _clamp(cx - w2/2, 0.0, 1.0); y2 = _clamp(cy - h2/2, 0.0, 1.0)
+            return {"x": x2, "y": y2, "w": min(w2, 1.0 - x2), "h": min(h2, 1.0 - y2)}
+        except Exception:
+            return fallback_bbox or {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
+    
+        defect_snaps: List[Dict[str, Any]] = []
+        label_by_idx = {int(x.get("crop_index", -1)): x for x in (roi_labels or []) if isinstance(x, dict)}
+    
+        def _is_likely_defect(lab: Dict[str, Any], roi: Dict[str, Any]) -> bool:
+            """Gate ROI thumbnails so we show only defect-ish photos (sealed/memorabilia)."""
+            if not isinstance(lab, dict):
+                return False
+            if bool(lab.get("is_defect", False)):
+                return True
+            t = str(lab.get("type") or "").strip().lower()
+            note = str(lab.get("note") or "").strip().lower()
+            conf = _clamp(_safe_float(lab.get("confidence"), 0.0), 0.0, 1.0)
+            clean_types = {"none", "clean", "ok", "okay", "good", "no_defect", "no defect"}
+            if t and t not in clean_types and conf >= 0.35:
+                return True
+            defect_words = (
+                "seal", "seam", "tear", "split", "hole", "puncture", "wrinkle", "crease",
+                "scuff", "scratch", "dent", "crush", "corner", "edge", "wear", "whitening",
+                "stain", "mark", "lift", "peel", "tamper", "reseal",
+            )
+            if any(w in note for w in defect_words) and conf >= 0.30:
+                return True
+            roi_score = _safe_float(roi.get("score"), 0.0)
+            if roi_score >= 0.80 and t and t not in clean_types:
+                return True
+            return False
+    
+        # wanted_rois is used as an optional override (mainly for cards). For sealed/memorabilia we keep it empty unless we add a dedicated mapping.
+        wanted_rois: set = set()
+        # If defects/flags mention packaging issues, force evidence crops for those ROIs (sealed/memorabilia).
+        try:
+            _df_txt = " ".join([str(x) for x in (data.get("defects") or []) if str(x).strip()])
+            _df_txt += " " + " ".join([str(x) for x in (flags_list_out or []) if str(x).strip()])
+            _df_txt = _df_txt.lower()
+            if any(w in _df_txt for w in ("corner", "scuff", "crease", "dent", "crush", "bump")):
+                wanted_rois.update({("front","corner_top_left"),("front","corner_top_right"),("front","corner_bottom_left"),("front","corner_bottom_right"),
+                                   ("back","corner_top_left"),("back","corner_top_right"),("back","corner_bottom_left"),("back","corner_bottom_right")})
+            if any(w in _df_txt for w in ("edge", "wear", "whitening", "split", "tear", "seal", "seam", "rip", "hole", "puncture")):
+                wanted_rois.update({("front","edge_top"),("front","edge_bottom"),("front","edge_left"),("front","edge_right"),
+                                   ("back","edge_top"),("back","edge_bottom"),("back","edge_left"),("back","edge_right")})
         except Exception:
             pass
-
-    defect_snaps.sort(key=lambda x: (0 if x.get("type") != "hotspot" else 1, -float(x.get("confidence") or 0.0)))
-    defect_snaps = defect_snaps[:8]
-
-    def _snap_category(s: Dict[str, Any]) -> str:
-        t = str(s.get("type") or "").lower()
-        roi = str(s.get("roi") or "").lower()
-        if "corner" in t or roi.startswith("corner_"):
-            return "packaging"
-        if "edge" in t or roi.startswith("edge_"):
-            return "packaging"
-        if "surface" in t:
-            return "packaging"
-        return "other"
-
-    for idx, s in enumerate(defect_snaps, start=1):
-        s["id"] = idx
-        s["ref"] = f"#{idx}"
-        s["category"] = _snap_category(s)
-
-    return JSONResponse(content={
-        "condition_grade": _norm_ws(str(data.get("condition_grade", "N/A"))),
-        "confidence": _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0),
-        "seal_integrity": seal,
-        "packaging_condition": data.get("packaging_condition", {"grade": "N/A", "notes": ""}),
-        "signature_assessment": data.get("signature_assessment", {"present": False, "quality": "Not Applicable", "notes": ""}),
-        "value_factors": data.get("value_factors", []) if isinstance(data.get("value_factors", []), list) else [],
-        "defects": data.get("defects", []) if isinstance(data.get("defects", []), list) else [],
-        "overall_assessment": _norm_ws(str(data.get("overall_assessment", ""))),
-        "spoken_word": _norm_ws(str(data.get("spoken_word", ""))) or _norm_ws(str(data.get("overall_assessment", ""))),
-        "observed_id": data.get("observed_id", {}) if isinstance(data.get("observed_id", {}), dict) else {},
-        "flags": flags_list_out,
-        "defect_snaps": defect_snaps,
-        "verify_token": f"vfy_{secrets.token_urlsafe(12)}",
-    })
-
-# ==============================
-# Market Context (Click-only) - Cards
-# Primary: PriceCharting (current prices, includes graded where available)
-# Secondary: PokemonTCG links (ID + marketplace links, not history)
-# eBay API: scaffold only (disabled)
-# ==============================
-
-
-@app.post("/api/market-context")
-@safe_endpoint
-async def market_context(
-    # Preferred keys (new)
-    item_name: Optional[str] = Form(None),
-    item_category: Optional[str] = Form("Pokemon"),  # Pokemon/Magic/YuGiOh/Sports/OnePiece/Other
-    item_set: Optional[str] = Form(None),
-    item_number: Optional[str] = Form(None),
-    product_id: Optional[str] = Form(None),
-
-    predicted_grade: Optional[str] = Form(None),
-    confidence: float = Form(0.0),
-    grading_cost: float = Form(35.0),
-
-    # Trust gates / coupling
-    has_structural_damage: Optional[bool] = Form(False),
-    assessed_pregrade: Optional[str] = Form(None),
-
-    # Back-compat aliases from older frontends
-    card_name: Optional[str] = Form(None),
-    card_type: Optional[str] = Form(None),
-    card_set: Optional[str] = Form(None),
-    card_number: Optional[str] = Form(None),
-
-    # Extra loose aliases (some JS sends these)
-    name: Optional[str] = Form(None),
-    query: Optional[str] = Form(None),
-    item_type: Optional[str] = Form(None),
-    description: Optional[str] = Form(None),
-    seal_condition: Optional[str] = Form(None),
-
-    # Controls (optional)
-    exclude_graded: Optional[bool] = Form(None),   # if None, uses EXCLUDE_GRADED_DEFAULT
-):
-    """
-    Market context (ACTIVE + GRADED comps) — SOLD history intentionally disabled.
-
-    Why:
-      - SOLD endpoints were not returning consistent results in production.
-      - We keep the UX clean (no empty "Sold (historic)" tiles).
-      - We can re-introduce sold history later once a reliable source is confirmed.
-
-    Output:
-      - active: top-5 closest ACTIVE comps + low/median/high
-      - graded: grade buckets (10/9/8) from graded ACTIVE listings (brand-agnostic)
-      - grade_outcome: expected value if it lands the assessed grade (uses graded bucket median; falls back to active median)
-      - market_summary: a richer, Pokémon-enthusiast paragraph with buy-target guidance
-    """
-
-    # --------------------------
-    # Identity resolution
-    # --------------------------
-    n = _norm_ws(item_name or card_name or name or "").strip()
-    sname = _norm_ws(item_set or card_set or "").strip()
-    num_display = _clean_card_number_display(item_number or card_number or "").strip()
-
-    ctype = _normalize_card_type(_norm_ws(card_type or item_category or "").strip())
-
-    # Memorabilia/sealed fallback query
-    if _is_blankish(n):
-        n = _norm_ws(description or query or "").strip()
-
-    if not n:
-        return {
-            "available": False,
-            "message": "No item details available yet. Please run Identify/Verify first.",
-            "used_query": "",
-            "query_ladder": [],
-        }
-
-    # --------------------------
-    # Simple numeric grade parsing
-    # --------------------------
-    def _as_int_grade(s: Optional[str]) -> Optional[int]:
-        if s is None:
-            return None
-        ss = str(s).strip()
-        if not ss:
-            return None
-        try:
-            return int(round(float(ss)))
-        except Exception:
-            return None
-
-    g_ass = _as_int_grade(assessed_pregrade)
-    g_pred = _as_int_grade(predicted_grade)
-    resolved_grade = g_ass if g_ass is not None else g_pred
-    structural = bool(has_structural_damage)
-
-    # --------------------------
-    # Query ladder (Google-like)
-    # --------------------------
-    set_code_hint = _norm_ws((item_set or "")).strip()
-    ladder = _build_ebay_query_ladder(n, sname, set_code_hint, num_display, ctype)
-    ladder = ladder[:12] if ladder else [_norm_ws(n)]
-
-    exclude_graded_effective = EXCLUDE_GRADED_DEFAULT if exclude_graded is None else bool(exclude_graded)
-
     
-    # --------------------------
-    # PriceCharting fallback (sealed / memorabilia + when eBay disabled)
-    # --------------------------
-    def _looks_like_memorabilia(it: Optional[str], desc: Optional[str]) -> bool:
-        s = " ".join([str(it or ""), str(desc or "")]).lower()
-        if not s.strip():
-            return False
-        # Heuristic keywords for non-single-card items
-        return any(k in s for k in [
-            "sealed", "booster box", "booster pack", "etb", "elite trainer", "tin", "collection box",
-            "blister", "case", "hobby box", "display", "starter deck", "theme deck",
-            "memorabilia", "autograph", "signed", "jersey", "patch", "slab", "graded",
-            "dvd", "vhs", "figure", "funko", "comic", "poster"
-        ])
-
-    async def _market_context_pricecharting(query_str: str, category_hint: str = "", pid: str = "") -> Dict[str, Any]:
-        qs = _norm_ws(query_str).strip()
-        if not qs:
-            return {"available": False, "message": "Empty query."}
-
-        if not PRICECHARTING_TOKEN:
+    
+        def _note_for_roi(side: str, roi_name: str) -> str:
+            """Simple human note fallback for sealed/memorabilia ROI crops."""
+            rn = (roi_name or "").strip().lower()
+            # Corners / edges
+            corner_map = {
+                "corner_top_left": "Top-left corner close-up",
+                "corner_top_right": "Top-right corner close-up",
+                "corner_bottom_left": "Bottom-left corner close-up",
+                "corner_bottom_right": "Bottom-right corner close-up",
+            }
+            edge_map = {
+                "edge_top": "Top edge close-up",
+                "edge_bottom": "Bottom edge close-up",
+                "edge_left": "Left edge close-up",
+                "edge_right": "Right edge close-up",
+            }
+            seam_map = {
+                "seam_top": "Top seam / seal line close-up",
+                "seam_bottom": "Bottom seam / seal line close-up",
+                "seam_left": "Left seam / seal line close-up",
+                "seam_right": "Right seam / seal line close-up",
+                "seal": "Seal / wrap close-up",
+                "wrap": "Wrap / seal close-up",
+                "holo": "Hologram / sticker close-up",
+                "sticker": "Sticker close-up",
+            }
+            if rn in corner_map: return corner_map[rn]
+            if rn in edge_map: return edge_map[rn]
+            if rn in seam_map: return seam_map[rn]
+            if rn.startswith("corner_"): return "Corner close-up"
+            if rn.startswith("edge_"): return "Edge close-up"
+            if "seam" in rn or "seal" in rn or "wrap" in rn: return "Seal / seam close-up"
+            if "holo" in rn or "sticker" in rn or "label" in rn: return "Label / sticker close-up"
+            return "Close-up detail"
+        for i, r in enumerate((rois or [])[:10]):
+            src = b1 if r.get("side") == "front" else b2
+            if not src:
+                continue
+            bbox = r.get("bbox") or {}
+            side = str(r.get("side") or "")
+            roi_name = str(r.get("roi") or "")
+            bbox = _memo_bbox_for_roi(side, roi_name, bbox)
+            thumb = _make_thumb_from_bbox(src, bbox, max_size=520)
+            if not thumb:
+                continue
+            lab = label_by_idx.get(i) or {}
+            force = (side, roi_name) in wanted_rois
+            # Surface is a meta-request; allow any ROI on that side if surface is flagged.
+            if not force and (side, "surface") in wanted_rois:
+                force = True
+    
+            if not (_is_likely_defect(lab, r) or force):
+                continue
+    
+            dtype = lab.get("type") or ("whitening" if roi_name.startswith("corner_") else "defect")
+            note = (lab.get("note") if isinstance(lab, dict) else "") or _note_for_roi(side, roi_name) or f"Close-up: {roi_name}"
+            conf = lab.get("confidence") if lab else 0.0
+            defect_snaps.append({
+                "side": side,
+                "roi": roi_name,
+                "type": dtype,
+                "note": _norm_ws(str(note))[:220],
+                "confidence": _clamp(_safe_float(conf, 0.0), 0.0, 1.0),
+                "bbox": bbox,
+                "thumbnail_b64": thumb,
+            })
+    
+        
+        # Fallback: if defects exist but ROI labeling filtered everything out, still show a few closeups.
+        if (not defect_snaps) and rois and (isinstance(data, dict) and (data.get("defects") or data.get("flags"))):
+            try:
+                _pref = [r for r in rois if str(r.get("roi","")).startswith("corner_")] + [r for r in rois if str(r.get("roi","")).startswith("edge_")]
+                _pref = _pref[:4]
+                for r in _pref:
+                    src = b1 if r.get("side") == "front" else b2
+                    if not src:
+                        continue
+                    bbox = r.get("bbox") or {}
+                    side = str(r.get("side") or "")
+                    roi_name = str(r.get("roi") or "")
+                    bbox = _memo_bbox_for_roi(side, roi_name, bbox)
+                    thumb = _make_thumb_from_bbox(src, bbox, max_size=520)
+                    if not thumb:
+                        continue
+                    note = _note_for_roi(side, roi_name) or f"Close-up: {roi_name}"
+                    defect_snaps.append({
+                        "side": side,
+                        "roi": roi_name,
+                        "type": "defect",
+                        "note": _norm_ws(str(note))[:220],
+                        "confidence": 0.45,
+                        "bbox": bbox,
+                        "thumbnail_b64": thumb,
+                    })
+            except Exception:
+                pass
+    
+        defect_snaps.sort(key=lambda x: (0 if x.get("type") != "hotspot" else 1, -float(x.get("confidence") or 0.0)))
+        defect_snaps = defect_snaps[:8]
+    
+        def _snap_category(s: Dict[str, Any]) -> str:
+            t = str(s.get("type") or "").lower()
+            roi = str(s.get("roi") or "").lower()
+            if "corner" in t or roi.startswith("corner_"):
+                return "packaging"
+            if "edge" in t or roi.startswith("edge_"):
+                return "packaging"
+            if "surface" in t:
+                return "packaging"
+            return "other"
+    
+        for idx, s in enumerate(defect_snaps, start=1):
+            s["id"] = idx
+            s["ref"] = f"#{idx}"
+            s["category"] = _snap_category(s)
+    
+        return JSONResponse(content={
+            "condition_grade": _norm_ws(str(data.get("condition_grade", "N/A"))),
+            "confidence": _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0),
+            "seal_integrity": seal,
+            "packaging_condition": data.get("packaging_condition", {"grade": "N/A", "notes": ""}),
+            "signature_assessment": data.get("signature_assessment", {"present": False, "quality": "Not Applicable", "notes": ""}),
+            "value_factors": data.get("value_factors", []) if isinstance(data.get("value_factors", []), list) else [],
+            "defects": data.get("defects", []) if isinstance(data.get("defects", []), list) else [],
+            "overall_assessment": _norm_ws(str(data.get("overall_assessment", ""))),
+            "spoken_word": _norm_ws(str(data.get("spoken_word", ""))) or _norm_ws(str(data.get("overall_assessment", ""))),
+            "observed_id": data.get("observed_id", {}) if isinstance(data.get("observed_id", {}), dict) else {},
+            "flags": flags_list_out,
+            "defect_snaps": defect_snaps,
+            "verify_token": f"vfy_{secrets.token_urlsafe(12)}",
+        })
+    
+    # ==============================
+    # Market Context (Click-only) - Cards
+    # Primary: PriceCharting (current prices, includes graded where available)
+    # Secondary: PokemonTCG links (ID + marketplace links, not history)
+    # eBay API: scaffold only (disabled)
+    # ==============================
+    
+    
+    @app.post("/api/market-context")
+    @safe_endpoint
+    async def market_context(
+        # Preferred keys (new)
+        item_name: Optional[str] = Form(None),
+        item_category: Optional[str] = Form("Pokemon"),  # Pokemon/Magic/YuGiOh/Sports/OnePiece/Other
+        item_set: Optional[str] = Form(None),
+        item_number: Optional[str] = Form(None),
+        product_id: Optional[str] = Form(None),
+    
+        predicted_grade: Optional[str] = Form(None),
+        confidence: float = Form(0.0),
+        grading_cost: float = Form(35.0),
+    
+        # Trust gates / coupling
+        has_structural_damage: Optional[bool] = Form(False),
+        assessed_pregrade: Optional[str] = Form(None),
+    
+        # Back-compat aliases from older frontends
+        card_name: Optional[str] = Form(None),
+        card_type: Optional[str] = Form(None),
+        card_set: Optional[str] = Form(None),
+        card_number: Optional[str] = Form(None),
+    
+        # Extra loose aliases (some JS sends these)
+        name: Optional[str] = Form(None),
+        query: Optional[str] = Form(None),
+        item_type: Optional[str] = Form(None),
+        description: Optional[str] = Form(None),
+        seal_condition: Optional[str] = Form(None),
+    
+        # Controls (optional)
+        exclude_graded: Optional[bool] = Form(None),   # if None, uses EXCLUDE_GRADED_DEFAULT
+    ):
+        """
+        Market context (ACTIVE + GRADED comps) — SOLD history intentionally disabled.
+    
+        Why:
+          - SOLD endpoints were not returning consistent results in production.
+          - We keep the UX clean (no empty "Sold (historic)" tiles).
+          - We can re-introduce sold history later once a reliable source is confirmed.
+    
+        Output:
+          - active: top-5 closest ACTIVE comps + low/median/high
+          - graded: grade buckets (10/9/8) from graded ACTIVE listings (brand-agnostic)
+          - grade_outcome: expected value if it lands the assessed grade (uses graded bucket median; falls back to active median)
+          - market_summary: a richer, Pokémon-enthusiast paragraph with buy-target guidance
+        """
+    
+        # --------------------------
+        # Identity resolution
+        # --------------------------
+        n = _norm_ws(item_name or card_name or name or "").strip()
+        sname = _norm_ws(item_set or card_set or "").strip()
+        num_display = _clean_card_number_display(item_number or card_number or "").strip()
+    
+        ctype = _normalize_card_type(_norm_ws(card_type or item_category or "").strip())
+    
+        # Memorabilia/sealed fallback query
+        if _is_blankish(n):
+            n = _norm_ws(description or query or "").strip()
+    
+        if not n:
             return {
                 "available": False,
-                "message": "Market context is not configured (PriceCharting token missing).",
-                "used_query": qs,
-                "query_ladder": ladder,
+                "message": "No item details available yet. Please run Identify/Verify first.",
+                "used_query": "",
+                "query_ladder": [],
             }
-
-        # Light category mapping (PriceCharting categories vary; empty is ok)
-        cat_map = {
-            "pokemon": "pokemon-cards",
-            "magic": "magic-cards",
-            "yugioh": "yugioh-cards",
-            "sports": "sports-cards",
-            "onepiece": "one-piece-cards",
-        }
-        cat = cat_map.get((ctype or "").lower(), "")
-        if category_hint:
-            cat = category_hint
-
-        best = {}
-        detail = {}
-        used_pid = str(pid or "").strip()
-
-        if used_pid:
-            detail = await _pc_product(used_pid)
-            best = detail or {}
-        else:
-            products = await _pc_search(qs, category=cat or None, limit=10)
-            if not products:
+    
+        # --------------------------
+        # Simple numeric grade parsing
+        # --------------------------
+        def _as_int_grade(s: Optional[str]) -> Optional[int]:
+            if s is None:
+                return None
+            ss = str(s).strip()
+            if not ss:
+                return None
+            try:
+                return int(round(float(ss)))
+            except Exception:
+                return None
+    
+        g_ass = _as_int_grade(assessed_pregrade)
+        g_pred = _as_int_grade(predicted_grade)
+        resolved_grade = g_ass if g_ass is not None else g_pred
+        structural = bool(has_structural_damage)
+    
+        # --------------------------
+        # Query ladder (Google-like)
+        # --------------------------
+        set_code_hint = _norm_ws((item_set or "")).strip()
+        ladder = _build_ebay_query_ladder(n, sname, set_code_hint, num_display, ctype)
+        ladder = ladder[:12] if ladder else [_norm_ws(n)]
+    
+        exclude_graded_effective = EXCLUDE_GRADED_DEFAULT if exclude_graded is None else bool(exclude_graded)
+    
+        
+        # --------------------------
+        # PriceCharting fallback (sealed / memorabilia + when eBay disabled)
+        # --------------------------
+        def _looks_like_memorabilia(it: Optional[str], desc: Optional[str]) -> bool:
+            s = " ".join([str(it or ""), str(desc or "")]).lower()
+            if not s.strip():
+                return False
+            # Heuristic keywords for non-single-card items
+            return any(k in s for k in [
+                "sealed", "booster box", "booster pack", "etb", "elite trainer", "tin", "collection box",
+                "blister", "case", "hobby box", "display", "starter deck", "theme deck",
+                "memorabilia", "autograph", "signed", "jersey", "patch", "slab", "graded",
+                "dvd", "vhs", "figure", "funko", "comic", "poster"
+            ])
+    
+        async def _market_context_pricecharting(query_str: str, category_hint: str = "", pid: str = "") -> Dict[str, Any]:
+            qs = _norm_ws(query_str).strip()
+            if not qs:
+                return {"available": False, "message": "Empty query."}
+    
+            if not PRICECHARTING_TOKEN:
+                return {
+                    "available": False,
+                    "message": "Market context is not configured (PriceCharting token missing).",
+                    "used_query": qs,
+                    "query_ladder": ladder,
+                }
+    
+            # Light category mapping (PriceCharting categories vary; empty is ok)
+            cat_map = {
+                "pokemon": "pokemon-cards",
+                "magic": "magic-cards",
+                "yugioh": "yugioh-cards",
+                "sports": "sports-cards",
+                "onepiece": "one-piece-cards",
+            }
+            cat = cat_map.get((ctype or "").lower(), "")
+            if category_hint:
+                cat = category_hint
+    
+            best = {}
+            detail = {}
+            used_pid = str(pid or "").strip()
+    
+            if used_pid:
+                detail = await _pc_product(used_pid)
+                best = detail or {}
+            else:
+                products = await _pc_search(qs, category=cat or None, limit=10)
+                if not products:
+                    return {
+                        "available": False,
+                        "message": "No sufficient PriceCharting market data found for this item.",
+                        "used_query": qs,
+                        "query_ladder": ladder,
+                        "observed": {"currency": "AUD", "active": {"count": 0}, "sold": {"count": 0}},
+                    }
+                best = products[0]
+                used_pid = str(best.get("id") or best.get("product-id") or "").strip()
+                detail = await _pc_product(used_pid) if used_pid else {}
+    
+            merged = {}
+            if isinstance(best, dict):
+                merged.update(best)
+            if isinstance(detail, dict):
+                merged.update(detail)
+    
+            title = _norm_ws(str(merged.get("product-name") or merged.get("name") or merged.get("title") or qs))
+            url = str(merged.get("url") or best.get("url") or "")
+    
+            prices_usd = _pc_extract_price_fields(merged)
+            vals_usd = [float(v) for v in prices_usd.values() if isinstance(v, (int, float)) and float(v) > 0]
+            vals_aud = [_usd_to_aud_simple(v) for v in vals_usd]
+            vals_aud = [v for v in vals_aud if isinstance(v, (int, float)) and v > 0]
+    
+            if not vals_aud:
                 return {
                     "available": False,
                     "message": "No sufficient PriceCharting market data found for this item.",
@@ -3297,835 +3324,824 @@ async def market_context(
                     "query_ladder": ladder,
                     "observed": {"currency": "AUD", "active": {"count": 0}, "sold": {"count": 0}},
                 }
-            best = products[0]
-            used_pid = str(best.get("id") or best.get("product-id") or "").strip()
-            detail = await _pc_product(used_pid) if used_pid else {}
-
-        merged = {}
-        if isinstance(best, dict):
-            merged.update(best)
-        if isinstance(detail, dict):
-            merged.update(detail)
-
-        title = _norm_ws(str(merged.get("product-name") or merged.get("name") or merged.get("title") or qs))
-        url = str(merged.get("url") or best.get("url") or "")
-
-        prices_usd = _pc_extract_price_fields(merged)
-        vals_usd = [float(v) for v in prices_usd.values() if isinstance(v, (int, float)) and float(v) > 0]
-        vals_aud = [_usd_to_aud_simple(v) for v in vals_usd]
-        vals_aud = [v for v in vals_aud if isinstance(v, (int, float)) and v > 0]
-
-        if not vals_aud:
+    
+            vals_sorted = sorted(vals_aud)
+            def _pct(p: float) -> float:
+                if not vals_sorted:
+                    return 0.0
+                k = int(round((len(vals_sorted) - 1) * p))
+                k = max(0, min(len(vals_sorted) - 1, k))
+                return float(vals_sorted[k])
+    
+            p20 = round(_pct(0.20), 2)
+            p50 = round(_pct(0.50), 2)
+            p80 = round(_pct(0.80), 2)
+            cnt = len(vals_sorted)
+    
+            # Build "matches" from available price fields (acts like comps for the UI)
+            active_matches: List[Dict[str, Any]] = []
+            for k, v in prices_usd.items():
+                if not isinstance(v, (int, float)) or float(v) <= 0:
+                    continue
+                active_matches.append({
+                    "title": f"{title} — {k.replace('_',' ').title()}",
+                    "price": _usd_to_aud_simple(v),
+                    "condition": k.replace("_", " "),
+                    "score": None,
+                    "url": url,
+                    "source": "PriceCharting",
+                })
+            active_matches = active_matches[:5]
+    
+            # Collector-style summary (works for both cards + sealed)
+            vibe = "moving" if cnt >= 4 else "thin"
+            summary = (
+                f"For {title}, PriceCharting has a {vibe} read right now. "
+                f"Across the available condition buckets, you’re roughly looking at "
+                f"{p20:.0f}–{p80:.0f} AUD, with a typical middle around {p50:.0f} AUD. "
+                f"Treat this as a guide and sanity-check against live listings for your exact variant/condition."
+            )
+    
             return {
-                "available": False,
-                "message": "No sufficient PriceCharting market data found for this item.",
+                "available": True,
+                "mode": "pricecharting",
+                "market_summary": summary,
                 "used_query": qs,
                 "query_ladder": ladder,
-                "observed": {"currency": "AUD", "active": {"count": 0}, "sold": {"count": 0}},
-            }
-
-        vals_sorted = sorted(vals_aud)
-        def _pct(p: float) -> float:
-            if not vals_sorted:
-                return 0.0
-            k = int(round((len(vals_sorted) - 1) * p))
-            k = max(0, min(len(vals_sorted) - 1, k))
-            return float(vals_sorted[k])
-
-        p20 = round(_pct(0.20), 2)
-        p50 = round(_pct(0.50), 2)
-        p80 = round(_pct(0.80), 2)
-        cnt = len(vals_sorted)
-
-        # Build "matches" from available price fields (acts like comps for the UI)
-        active_matches: List[Dict[str, Any]] = []
-        for k, v in prices_usd.items():
-            if not isinstance(v, (int, float)) or float(v) <= 0:
-                continue
-            active_matches.append({
-                "title": f"{title} — {k.replace('_',' ').title()}",
-                "price": _usd_to_aud_simple(v),
-                "condition": k.replace("_", " "),
-                "score": None,
-                "url": url,
-                "source": "PriceCharting",
-            })
-        active_matches = active_matches[:5]
-
-        # Collector-style summary (works for both cards + sealed)
-        vibe = "moving" if cnt >= 4 else "thin"
-        summary = (
-            f"For {title}, PriceCharting has a {vibe} read right now. "
-            f"Across the available condition buckets, you’re roughly looking at "
-            f"{p20:.0f}–{p80:.0f} AUD, with a typical middle around {p50:.0f} AUD. "
-            f"Treat this as a guide and sanity-check against live listings for your exact variant/condition."
-        )
-
-        return {
-            "available": True,
-            "mode": "pricecharting",
-            "market_summary": summary,
-            "used_query": qs,
-            "query_ladder": ladder,
-            "confidence": confidence,
-            "card": {
-                "name": n,
-                "set": sname,
-                "number": num_display,
-                "set_code": set_code_hint,
-            },
-            "observed": {
-                "currency": "AUD",
-                "fx": {"usd_to_aud_multiplier": AUD_MULTIPLIER},
-                "active": {"p20": p20, "p50": p50, "p80": p80, "count": cnt},
-                "sold": {"count": 0},
-                "liquidity": "medium" if cnt >= 4 else "low",
-                "trend": "—",
-                "raw": {"pricecharting_product_id": used_pid, "url": url, "prices_usd": prices_usd},
-            },
-            "active_matches": active_matches,
-            "graded": {},  # sealed/memorabilia typically not bucketed by PSA grades
-            "grade_outcome": {"assessed_grade": resolved_grade, "expected_value_aud": p50} if resolved_grade else {"expected_value_aud": p50},
-            "disclaimer": "Informational market context only. Figures are third-party estimates and may vary. Not financial advice.",
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-        }
-
-    # --------------------------
-    # Market source priority
-    # --------------------------
-    # Source 1: eBay ACTIVE (when enabled)
-    # Source 2: PriceCharting fallback (when eBay disabled OR eBay returns thin/empty results)
-    if not USE_EBAY_API:
-        # eBay not enabled in this deployment — fall back to PriceCharting.
-        q_pc = _norm_ws(item_name or n or description or "").strip()
-        return await _market_context_pricecharting(q_pc, category_hint="", pid=product_id or "")
-
-    # --------------------------
-    # eBay active fetcher (Browse API)
-    # --------------------------
-    async def _price_to_aud(amount: Any, currency: str) -> Optional[float]:
-        try:
-            v = float(amount)
-        except Exception:
-            return None
-        cur = (currency or "").upper().strip() or DEFAULT_CURRENCY
-        if cur == "AUD":
-            return round(v, 2)
-        if cur == "USD":
-            rate = await _fx_usd_to_aud()
-            return round(v * float(rate), 2)
-        return round(v, 2)
-
-    ebay_call_debug = {
-        "active": {"calls": 0, "non200": [], "token": {}, "marketplace": EBAY_MARKETPLACE_ID},
-    }
-
-    async def _browse_active(query_str: str, limit: int = 50) -> List[Dict[str, Any]]:
-        qs = _norm_ws(query_str)
-        if not qs or not USE_EBAY_API:
-            return []
-
-        url = "https://api.ebay.com/buy/browse/v1/item_summary/search"
-        params = {"q": qs, "limit": str(max(1, min(50, int(limit or 50))))}
-
-        token, tok_dbg = await _get_ebay_app_token(force_refresh=False)
-        ebay_call_debug["active"]["token"] = tok_dbg
-        if not token:
-            return []
-
-        async def _do_call(tok: str) -> Tuple[int, Optional[Dict[str, Any]], str]:
-            headers = {
-                "Authorization": f"Bearer {tok}",
-                "X-EBAY-C-MARKETPLACE-ID": EBAY_MARKETPLACE_ID,
-                "User-Agent": UA,
-            }
-            try:
-                async with httpx.AsyncClient(timeout=20.0) as client:
-                    r = await client.get(url, params=params, headers=headers)
-                    txt = (r.text or "")
-                    if r.status_code != 200:
-                        return r.status_code, None, txt[:400]
-                    return r.status_code, r.json(), ""
-            except Exception as e:
-                return 0, None, str(e)[:400]
-
-        ebay_call_debug["active"]["calls"] += 1
-        status, j, errtxt = await _do_call(token)
-        if status in (401, 403):
-            token2, tok_dbg2 = await _get_ebay_app_token(force_refresh=True)
-            ebay_call_debug["active"]["token"] = tok_dbg2
-            if token2:
-                ebay_call_debug["active"]["calls"] += 1
-                status, j, errtxt = await _do_call(token2)
-
-        if status != 200 or not isinstance(j, dict):
-            ebay_call_debug["active"]["non200"].append({"status": status, "err": errtxt, "q": qs})
-            return []
-
-        out: List[Dict[str, Any]] = []
-        for it in (j.get("itemSummaries") or []):
-            try:
-                item_id = str(it.get("itemId") or "")
-                title = str(it.get("title") or "")
-                web_url = str(it.get("itemWebUrl") or "")
-                price = (it.get("price") or {})
-                pv = price.get("value")
-                pc = price.get("currency")
-                cond = str(it.get("condition") or it.get("conditionId") or "")
-                aud = await _price_to_aud(pv, pc)
-                if aud is None or aud <= 0:
-                    continue
-                out.append({
-                    "itemId": item_id,
-                    "title": title,
-                    "url": web_url,
-                    "condition": cond,
-                    "price_aud": aud,
+                "confidence": confidence,
+                "card": {
+                    "name": n,
+                    "set": sname,
+                    "number": num_display,
+                    "set_code": set_code_hint,
+                },
+                "observed": {
                     "currency": "AUD",
-                    "raw_currency": pc,
-                })
+                    "fx": {"usd_to_aud_multiplier": AUD_MULTIPLIER},
+                    "active": {"p20": p20, "p50": p50, "p80": p80, "count": cnt},
+                    "sold": {"count": 0},
+                    "liquidity": "medium" if cnt >= 4 else "low",
+                    "trend": "—",
+                    "raw": {"pricecharting_product_id": used_pid, "url": url, "prices_usd": prices_usd},
+                },
+                "active_matches": active_matches,
+                "graded": {},  # sealed/memorabilia typically not bucketed by PSA grades
+                "grade_outcome": {"assessed_grade": resolved_grade, "expected_value_aud": p50} if resolved_grade else {"expected_value_aud": p50},
+                "disclaimer": "Informational market context only. Figures are third-party estimates and may vary. Not financial advice.",
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+            }
+    
+        # --------------------------
+        # Market source priority
+        # --------------------------
+        # Source 1: eBay ACTIVE (when enabled)
+        # Source 2: PriceCharting fallback (when eBay disabled OR eBay returns thin/empty results)
+        if not USE_EBAY_API:
+            # eBay not enabled in this deployment — fall back to PriceCharting.
+            q_pc = _norm_ws(item_name or n or description or "").strip()
+            return await _market_context_pricecharting(q_pc, category_hint="", pid=product_id or "")
+    
+        # --------------------------
+        # eBay active fetcher (Browse API)
+        # --------------------------
+        async def _price_to_aud(amount: Any, currency: str) -> Optional[float]:
+            try:
+                v = float(amount)
             except Exception:
-                continue
-        return out
-
-    # --------------------------
-    # Candidate pooling + scoring
-    # --------------------------
-    NEGATIVE_TERMS = [
-        "proxy", "reprint", "custom", "fake", "fan made", "fanmade", "replica",
-        "digital", "print", "download", "poster", "art",
-    ]
-    LOT_TERMS = ["lot", "bundle", "collection", "job lot", "joblot", "bulk", "assorted"]
-
-    def _tokenize(s: str) -> List[str]:
-        s = re.sub(r"[^a-z0-9/#]+", " ", (s or "").lower())
-        return [t for t in s.split() if t and len(t) > 1]
-
-    expected = {
-        "name": n,
-        "name_tokens": set(_tokenize(n)),
-        "set": sname,
-        "set_tokens": set(_tokenize(sname)),
-        "num": num_display,
-        "num_variants": _normalize_num_variants(num_display),
-        "type": ctype,
-    }
-
-    # strict Pokemon card number gate (optional)
-    expected_num_pair = None
-    mnum = re.search(r"(\d+)\s*/\s*(\d+)", num_display)
-    if mnum:
-        try:
-            expected_num_pair = (int(mnum.group(1)), int(mnum.group(2)))
-        except Exception:
-            expected_num_pair = None
-    strict_number = bool(STRICT_CARD_NUMBER and ctype == "Pokemon" and expected_num_pair is not None)
-
-    GRADED_TERMS = ["psa", "bgs", "cgc", "sgc", "beckett", "graded", "slab", "gem mint", "mint 10", "gm 10"]
-
-    def _contains_any(hay: str, needles: List[str]) -> bool:
-        h = (hay or "").lower()
-        return any(x in h for x in needles)
-
-    def _score_candidate(title: str, allow_graded: bool = False) -> Tuple[int, Dict[str, Any]]:
-        t = (title or "").lower()
-        toks = set(_tokenize(t))
-        score = 0
-        dbg = {"pos": [], "neg": []}
-
-        if _contains_any(t, NEGATIVE_TERMS):
-            score -= 80
-            dbg["neg"].append("negative_term")
-        if _contains_any(t, LOT_TERMS):
-            score -= 25
-            dbg["neg"].append("lot_bundle")
-
-        is_graded = _contains_any(t, GRADED_TERMS)
-        if is_graded and not allow_graded:
-            score -= 35
-            dbg["neg"].append("graded_listing")
-
-        # Name tokens
-        name_hits = len(expected["name_tokens"].intersection(toks))
-        if name_hits:
-            score += min(35, 10 + name_hits * 5)
-            dbg["pos"].append(f"name_tokens:{name_hits}")
-
-        # Set tokens
-        set_hits = len(expected["set_tokens"].intersection(toks)) if expected["set_tokens"] else 0
-        if set_hits:
-            score += min(22, 8 + set_hits * 4)
-            dbg["pos"].append(f"set_tokens:{set_hits}")
-
-        # Card number strictness for Pokémon singles
-        if strict_number:
-            cand_pairs = re.findall(r"(\d{1,4})\s*/\s*(\d{1,4})", t)
-            if cand_pairs:
+                return None
+            cur = (currency or "").upper().strip() or DEFAULT_CURRENCY
+            if cur == "AUD":
+                return round(v, 2)
+            if cur == "USD":
+                rate = await _fx_usd_to_aud()
+                return round(v * float(rate), 2)
+            return round(v, 2)
+    
+        ebay_call_debug = {
+            "active": {"calls": 0, "non200": [], "token": {}, "marketplace": EBAY_MARKETPLACE_ID},
+        }
+    
+        async def _browse_active(query_str: str, limit: int = 50) -> List[Dict[str, Any]]:
+            qs = _norm_ws(query_str)
+            if not qs or not USE_EBAY_API:
+                return []
+    
+            url = "https://api.ebay.com/buy/browse/v1/item_summary/search"
+            params = {"q": qs, "limit": str(max(1, min(50, int(limit or 50))))}
+    
+            token, tok_dbg = await _get_ebay_app_token(force_refresh=False)
+            ebay_call_debug["active"]["token"] = tok_dbg
+            if not token:
+                return []
+    
+            async def _do_call(tok: str) -> Tuple[int, Optional[Dict[str, Any]], str]:
+                headers = {
+                    "Authorization": f"Bearer {tok}",
+                    "X-EBAY-C-MARKETPLACE-ID": EBAY_MARKETPLACE_ID,
+                    "User-Agent": UA,
+                }
                 try:
-                    ok = any((int(a) == expected_num_pair[0] and int(b) == expected_num_pair[1]) for (a, b) in cand_pairs)
+                    async with httpx.AsyncClient(timeout=20.0) as client:
+                        r = await client.get(url, params=params, headers=headers)
+                        txt = (r.text or "")
+                        if r.status_code != 200:
+                            return r.status_code, None, txt[:400]
+                        return r.status_code, r.json(), ""
+                except Exception as e:
+                    return 0, None, str(e)[:400]
+    
+            ebay_call_debug["active"]["calls"] += 1
+            status, j, errtxt = await _do_call(token)
+            if status in (401, 403):
+                token2, tok_dbg2 = await _get_ebay_app_token(force_refresh=True)
+                ebay_call_debug["active"]["token"] = tok_dbg2
+                if token2:
+                    ebay_call_debug["active"]["calls"] += 1
+                    status, j, errtxt = await _do_call(token2)
+    
+            if status != 200 or not isinstance(j, dict):
+                ebay_call_debug["active"]["non200"].append({"status": status, "err": errtxt, "q": qs})
+                return []
+    
+            out: List[Dict[str, Any]] = []
+            for it in (j.get("itemSummaries") or []):
+                try:
+                    item_id = str(it.get("itemId") or "")
+                    title = str(it.get("title") or "")
+                    web_url = str(it.get("itemWebUrl") or "")
+                    price = (it.get("price") or {})
+                    pv = price.get("value")
+                    pc = price.get("currency")
+                    cond = str(it.get("condition") or it.get("conditionId") or "")
+                    aud = await _price_to_aud(pv, pc)
+                    if aud is None or aud <= 0:
+                        continue
+                    out.append({
+                        "itemId": item_id,
+                        "title": title,
+                        "url": web_url,
+                        "condition": cond,
+                        "price_aud": aud,
+                        "currency": "AUD",
+                        "raw_currency": pc,
+                    })
                 except Exception:
-                    ok = False
-                if ok:
-                    score += 40
-                    dbg["pos"].append("number_exact")
+                    continue
+            return out
+    
+        # --------------------------
+        # Candidate pooling + scoring
+        # --------------------------
+        NEGATIVE_TERMS = [
+            "proxy", "reprint", "custom", "fake", "fan made", "fanmade", "replica",
+            "digital", "print", "download", "poster", "art",
+        ]
+        LOT_TERMS = ["lot", "bundle", "collection", "job lot", "joblot", "bulk", "assorted"]
+    
+        def _tokenize(s: str) -> List[str]:
+            s = re.sub(r"[^a-z0-9/#]+", " ", (s or "").lower())
+            return [t for t in s.split() if t and len(t) > 1]
+    
+        expected = {
+            "name": n,
+            "name_tokens": set(_tokenize(n)),
+            "set": sname,
+            "set_tokens": set(_tokenize(sname)),
+            "num": num_display,
+            "num_variants": _normalize_num_variants(num_display),
+            "type": ctype,
+        }
+    
+        # strict Pokemon card number gate (optional)
+        expected_num_pair = None
+        mnum = re.search(r"(\d+)\s*/\s*(\d+)", num_display)
+        if mnum:
+            try:
+                expected_num_pair = (int(mnum.group(1)), int(mnum.group(2)))
+            except Exception:
+                expected_num_pair = None
+        strict_number = bool(STRICT_CARD_NUMBER and ctype == "Pokemon" and expected_num_pair is not None)
+    
+        GRADED_TERMS = ["psa", "bgs", "cgc", "sgc", "beckett", "graded", "slab", "gem mint", "mint 10", "gm 10"]
+    
+        def _contains_any(hay: str, needles: List[str]) -> bool:
+            h = (hay or "").lower()
+            return any(x in h for x in needles)
+    
+        def _score_candidate(title: str, allow_graded: bool = False) -> Tuple[int, Dict[str, Any]]:
+            t = (title or "").lower()
+            toks = set(_tokenize(t))
+            score = 0
+            dbg = {"pos": [], "neg": []}
+    
+            if _contains_any(t, NEGATIVE_TERMS):
+                score -= 80
+                dbg["neg"].append("negative_term")
+            if _contains_any(t, LOT_TERMS):
+                score -= 25
+                dbg["neg"].append("lot_bundle")
+    
+            is_graded = _contains_any(t, GRADED_TERMS)
+            if is_graded and not allow_graded:
+                score -= 35
+                dbg["neg"].append("graded_listing")
+    
+            # Name tokens
+            name_hits = len(expected["name_tokens"].intersection(toks))
+            if name_hits:
+                score += min(35, 10 + name_hits * 5)
+                dbg["pos"].append(f"name_tokens:{name_hits}")
+    
+            # Set tokens
+            set_hits = len(expected["set_tokens"].intersection(toks)) if expected["set_tokens"] else 0
+            if set_hits:
+                score += min(22, 8 + set_hits * 4)
+                dbg["pos"].append(f"set_tokens:{set_hits}")
+    
+            # Card number strictness for Pokémon singles
+            if strict_number:
+                cand_pairs = re.findall(r"(\d{1,4})\s*/\s*(\d{1,4})", t)
+                if cand_pairs:
+                    try:
+                        ok = any((int(a) == expected_num_pair[0] and int(b) == expected_num_pair[1]) for (a, b) in cand_pairs)
+                    except Exception:
+                        ok = False
+                    if ok:
+                        score += 40
+                        dbg["pos"].append("number_exact")
+                    else:
+                        score -= 120
+                        dbg["neg"].append("number_mismatch")
                 else:
-                    score -= 120
-                    dbg["neg"].append("number_mismatch")
+                    score -= 20
+                    dbg["neg"].append("number_missing")
             else:
-                score -= 20
-                dbg["neg"].append("number_missing")
-        else:
-            # soft variants
-            for nv in (expected.get("num_variants") or []):
-                if nv and nv.lower() in t:
-                    score += 20
-                    dbg["pos"].append("number_match")
-                    break
-
-        return score, dbg
-
-    def _collect_top5(candidates: List[Dict[str, Any]], allow_graded: bool = False) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
-        scored: List[Dict[str, Any]] = []
-        rejected: List[Dict[str, Any]] = []
-
-        for c in candidates:
-            title = str(c.get("title") or "")
-            sc, dbg = _score_candidate(title, allow_graded=allow_graded)
-
-            if exclude_graded_effective and (not allow_graded) and ("graded_listing" in dbg.get("neg", [])):
-                rejected.append({"title": title[:120], "reason": "graded_excluded", "score": sc})
+                # soft variants
+                for nv in (expected.get("num_variants") or []):
+                    if nv and nv.lower() in t:
+                        score += 20
+                        dbg["pos"].append("number_match")
+                        break
+    
+            return score, dbg
+    
+        def _collect_top5(candidates: List[Dict[str, Any]], allow_graded: bool = False) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
+            scored: List[Dict[str, Any]] = []
+            rejected: List[Dict[str, Any]] = []
+    
+            for c in candidates:
+                title = str(c.get("title") or "")
+                sc, dbg = _score_candidate(title, allow_graded=allow_graded)
+    
+                if exclude_graded_effective and (not allow_graded) and ("graded_listing" in dbg.get("neg", [])):
+                    rejected.append({"title": title[:120], "reason": "graded_excluded", "score": sc})
+                    continue
+                if strict_number and ("number_mismatch" in dbg.get("neg", [])):
+                    rejected.append({"title": title[:120], "reason": "number_mismatch", "score": sc})
+                    continue
+                if sc < 0:
+                    rejected.append({"title": title[:120], "reason": "low_score", "score": sc})
+                    continue
+    
+                scored.append({
+                    "title": title,
+                    "price": float(c.get("price_aud") or 0),
+                    "price_aud": float(c.get("price_aud") or 0),
+                    "url": c.get("url") or "",
+                    "condition": c.get("condition") or "",
+                    "score": sc,
+                    "_dbg": dbg,
+                })
+    
+            scored.sort(key=lambda x: x["score"], reverse=True)
+            top = scored[:5]
+    
+            prices = [x["price"] for x in top if isinstance(x.get("price"), (int, float)) and x["price"] > 0]
+            prices_sorted = sorted(prices)
+            if prices_sorted:
+                low = prices_sorted[0]
+                med = float(statistics.median(prices_sorted))
+                high = prices_sorted[-1]
+            else:
+                low = med = high = None
+    
+            stats = {
+                "count": len(top),
+                "low": round(low, 2) if low is not None else None,
+                "median": round(med, 2) if med is not None else None,
+                "high": round(high, 2) if high is not None else None,
+                "currency": "AUD",
+            }
+    
+            debug = {"rejected_examples": rejected[:12]}
+            for x in top:
+                x.pop("_dbg", None)
+            return top, stats, debug
+    
+        # --------------------------
+        # Build ACTIVE pool + select best query
+        # --------------------------
+        used_query = ladder[0] if ladder else _norm_ws(n)
+        active_pool: List[Dict[str, Any]] = []
+        best_matches: List[Dict[str, Any]] = []
+        best_stats: Dict[str, Any] = {}
+        best_debug: Dict[str, Any] = {}
+    
+        for q in ladder:
+            cand = await _browse_active(q, limit=50)
+            if not cand:
                 continue
-            if strict_number and ("number_mismatch" in dbg.get("neg", [])):
-                rejected.append({"title": title[:120], "reason": "number_mismatch", "score": sc})
+            # merge pool
+            active_pool.extend(cand)
+            matches, stats, dbg = _collect_top5(cand, allow_graded=False)
+            if stats and stats.get("median") is not None and len(matches) >= 3:
+                used_query = q
+                best_matches, best_stats, best_debug = matches, stats, dbg
+                break
+            # keep first non-empty as fallback
+            if not best_matches:
+                used_query = q
+                best_matches, best_stats, best_debug = matches, stats, dbg
+    
+        active_matches = best_matches
+        active_stats = best_stats or {"count": 0, "low": None, "median": None, "high": None, "currency": "AUD"}
+        active_debug = best_debug or {}
+    
+        # If eBay comes back empty/thin (common for niche sealed/memorabilia wording),
+        # fall back to PriceCharting *only if configured*.
+        if int(active_stats.get("count") or 0) == 0 and PRICECHARTING_TOKEN:
+            q_pc = _norm_ws(item_name or n or description or used_query or "").strip()
+            pc_payload = await _market_context_pricecharting(q_pc, category_hint="", pid=product_id or "")
+            if pc_payload.get("available"):
+                return pc_payload
+    
+        # --------------------------
+        # Graded buckets (ACTIVE only; brand-agnostic)
+        # --------------------------
+        GRADE_RX = re.compile(r"\b(?:psa|cgc|bgs|sgc)\s*(?:grade\s*)?([0-9]{1,2}(?:\.[05])?)\b", re.IGNORECASE)
+        GEM10_RX = re.compile(r"\b(psa\s*10|psa10|gem\s*mint\s*10|10\s*gem|cgc\s*10|bgs\s*10|sgc\s*10)\b", re.IGNORECASE)
+    
+        def _parse_grade_from_title(title: str) -> Optional[float]:
+            t = (title or "").lower()
+            if GEM10_RX.search(t):
+                return 10.0
+            m = GRADE_RX.search(title or "")
+            if not m:
+                return None
+            try:
+                g = float(m.group(1))
+                if g < 1 or g > 10:
+                    return None
+                return g
+            except Exception:
+                return None
+    
+        def _bucket_key(g: Optional[float]) -> Optional[str]:
+            if g is None:
+                return None
+            if g >= 9.5:
+                return "10"
+            if g >= 9.0:
+                return "9"
+            if g >= 8.0:
+                return "8"
+            return None
+    
+        # Pull a separate graded pool (do NOT exclude graded)
+        graded_query_base = " ".join([x for x in [n, sname] if x]).strip()
+        graded_query = _norm_ws(f"{graded_query_base} graded psa cgc bgs")
+        graded_pool = await _browse_active(graded_query, limit=50)
+    
+        graded_buckets = {"10": [], "9": [], "8": []}
+        for it in graded_pool:
+            g = _parse_grade_from_title(str(it.get("title") or ""))
+            bk = _bucket_key(g)
+            if not bk:
                 continue
-            if sc < 0:
-                rejected.append({"title": title[:120], "reason": "low_score", "score": sc})
-                continue
-
-            scored.append({
-                "title": title,
-                "price": float(c.get("price_aud") or 0),
-                "price_aud": float(c.get("price_aud") or 0),
-                "url": c.get("url") or "",
-                "condition": c.get("condition") or "",
-                "score": sc,
-                "_dbg": dbg,
-            })
-
-        scored.sort(key=lambda x: x["score"], reverse=True)
-        top = scored[:5]
-
-        prices = [x["price"] for x in top if isinstance(x.get("price"), (int, float)) and x["price"] > 0]
-        prices_sorted = sorted(prices)
-        if prices_sorted:
+            graded_buckets[bk].append(it)
+    
+        def _bucket_stats(pool: List[Dict[str, Any]]) -> Dict[str, Any]:
+            prices = [float(x.get("price_aud") or 0) for x in pool if float(x.get("price_aud") or 0) > 0]
+            prices_sorted = sorted(prices)
+            if not prices_sorted:
+                return {"count": 0, "low": None, "median": None, "high": None, "currency": "AUD"}
             low = prices_sorted[0]
             med = float(statistics.median(prices_sorted))
             high = prices_sorted[-1]
-        else:
-            low = med = high = None
-
-        stats = {
-            "count": len(top),
-            "low": round(low, 2) if low is not None else None,
-            "median": round(med, 2) if med is not None else None,
-            "high": round(high, 2) if high is not None else None,
-            "currency": "AUD",
-        }
-
-        debug = {"rejected_examples": rejected[:12]}
-        for x in top:
-            x.pop("_dbg", None)
-        return top, stats, debug
-
-    # --------------------------
-    # Build ACTIVE pool + select best query
-    # --------------------------
-    used_query = ladder[0] if ladder else _norm_ws(n)
-    active_pool: List[Dict[str, Any]] = []
-    best_matches: List[Dict[str, Any]] = []
-    best_stats: Dict[str, Any] = {}
-    best_debug: Dict[str, Any] = {}
-
-    for q in ladder:
-        cand = await _browse_active(q, limit=50)
-        if not cand:
-            continue
-        # merge pool
-        active_pool.extend(cand)
-        matches, stats, dbg = _collect_top5(cand, allow_graded=False)
-        if stats and stats.get("median") is not None and len(matches) >= 3:
-            used_query = q
-            best_matches, best_stats, best_debug = matches, stats, dbg
-            break
-        # keep first non-empty as fallback
-        if not best_matches:
-            used_query = q
-            best_matches, best_stats, best_debug = matches, stats, dbg
-
-    active_matches = best_matches
-    active_stats = best_stats or {"count": 0, "low": None, "median": None, "high": None, "currency": "AUD"}
-    active_debug = best_debug or {}
-
-    # If eBay comes back empty/thin (common for niche sealed/memorabilia wording),
-    # fall back to PriceCharting *only if configured*.
-    if int(active_stats.get("count") or 0) == 0 and PRICECHARTING_TOKEN:
-        q_pc = _norm_ws(item_name or n or description or used_query or "").strip()
-        pc_payload = await _market_context_pricecharting(q_pc, category_hint="", pid=product_id or "")
-        if pc_payload.get("available"):
-            return pc_payload
-
-    # --------------------------
-    # Graded buckets (ACTIVE only; brand-agnostic)
-    # --------------------------
-    GRADE_RX = re.compile(r"\b(?:psa|cgc|bgs|sgc)\s*(?:grade\s*)?([0-9]{1,2}(?:\.[05])?)\b", re.IGNORECASE)
-    GEM10_RX = re.compile(r"\b(psa\s*10|psa10|gem\s*mint\s*10|10\s*gem|cgc\s*10|bgs\s*10|sgc\s*10)\b", re.IGNORECASE)
-
-    def _parse_grade_from_title(title: str) -> Optional[float]:
-        t = (title or "").lower()
-        if GEM10_RX.search(t):
-            return 10.0
-        m = GRADE_RX.search(title or "")
-        if not m:
-            return None
-        try:
-            g = float(m.group(1))
-            if g < 1 or g > 10:
-                return None
-            return g
-        except Exception:
-            return None
-
-    def _bucket_key(g: Optional[float]) -> Optional[str]:
-        if g is None:
-            return None
-        if g >= 9.5:
-            return "10"
-        if g >= 9.0:
-            return "9"
-        if g >= 8.0:
-            return "8"
-        return None
-
-    # Pull a separate graded pool (do NOT exclude graded)
-    graded_query_base = " ".join([x for x in [n, sname] if x]).strip()
-    graded_query = _norm_ws(f"{graded_query_base} graded psa cgc bgs")
-    graded_pool = await _browse_active(graded_query, limit=50)
-
-    graded_buckets = {"10": [], "9": [], "8": []}
-    for it in graded_pool:
-        g = _parse_grade_from_title(str(it.get("title") or ""))
-        bk = _bucket_key(g)
-        if not bk:
-            continue
-        graded_buckets[bk].append(it)
-
-    def _bucket_stats(pool: List[Dict[str, Any]]) -> Dict[str, Any]:
-        prices = [float(x.get("price_aud") or 0) for x in pool if float(x.get("price_aud") or 0) > 0]
-        prices_sorted = sorted(prices)
-        if not prices_sorted:
-            return {"count": 0, "low": None, "median": None, "high": None, "currency": "AUD"}
-        low = prices_sorted[0]
-        med = float(statistics.median(prices_sorted))
-        high = prices_sorted[-1]
-        return {"count": len(prices_sorted), "low": round(low, 2), "median": round(med, 2), "high": round(high, 2), "currency": "AUD"}
-
-    grade_market: Dict[str, Any] = {}
-    for k in ["10", "9", "8"]:
-        st = _bucket_stats(graded_buckets[k])
-        # Only include buckets with meaningful data
-        grade_market[k] = {
-            "stats": st,
-            "matches": [{"title": str(x.get("title") or ""), "price_aud": float(x.get("price_aud") or 0), "url": x.get("url") or ""} for x in graded_buckets[k][:5]],
-            "source": "active",
-        }
-
-    # --------------------------
-    # Expected value + buy target (ACTIVE + GRADED)
-    # --------------------------
-    exp_grade_key = str(int(resolved_grade)) if isinstance(resolved_grade, int) else (str(resolved_grade) if resolved_grade is not None else "")
-    expected_value_aud = None
-    expected_source = "active"
-
-    if exp_grade_key in grade_market and grade_market[exp_grade_key]["stats"].get("median") is not None:
-        expected_value_aud = float(grade_market[exp_grade_key]["stats"]["median"])
-        expected_source = "graded_active"
-    elif active_stats.get("median") is not None:
-        expected_value_aud = float(active_stats["median"])
+            return {"count": len(prices_sorted), "low": round(low, 2), "median": round(med, 2), "high": round(high, 2), "currency": "AUD"}
+    
+        grade_market: Dict[str, Any] = {}
+        for k in ["10", "9", "8"]:
+            st = _bucket_stats(graded_buckets[k])
+            # Only include buckets with meaningful data
+            grade_market[k] = {
+                "stats": st,
+                "matches": [{"title": str(x.get("title") or ""), "price_aud": float(x.get("price_aud") or 0), "url": x.get("url") or ""} for x in graded_buckets[k][:5]],
+                "source": "active",
+            }
+    
+        # --------------------------
+        # Expected value + buy target (ACTIVE + GRADED)
+        # --------------------------
+        exp_grade_key = str(int(resolved_grade)) if isinstance(resolved_grade, int) else (str(resolved_grade) if resolved_grade is not None else "")
+        expected_value_aud = None
         expected_source = "active"
-
-    # Buy target heuristic (conservative, depends on grade + confidence)
-    conf = float(confidence or 0.0)
-    conf = max(0.0, min(1.0, conf))
-    grade_tier = resolved_grade if isinstance(resolved_grade, int) else None
-    base_mult = 0.78 + 0.07 * conf  # 0.78..0.85
-    if grade_tier is not None:
-        if grade_tier >= 9:
-            base_mult = 0.82 + 0.06 * conf
-        elif grade_tier >= 7:
-            base_mult = 0.78 + 0.06 * conf
-        else:
-            base_mult = 0.70 + 0.06 * conf
-
-    buy_target_aud = None
-    if expected_value_aud is not None:
-        buy_target_aud = round(expected_value_aud * base_mult, 2)
-
-    grade_outcome = {
-        "assessed_grade": exp_grade_key or None,
-        "expected_value_aud": expected_value_aud,
-        "expected_source": expected_source,
-        "buy_target_aud": buy_target_aud,
-    }
-
-    # --------------------------
-    # Build an enthusiast-style market summary (no fake sold-history claims)
-    # --------------------------
-    def _money(v: Optional[float]) -> str:
-        try:
-            if v is None:
+    
+        if exp_grade_key in grade_market and grade_market[exp_grade_key]["stats"].get("median") is not None:
+            expected_value_aud = float(grade_market[exp_grade_key]["stats"]["median"])
+            expected_source = "graded_active"
+        elif active_stats.get("median") is not None:
+            expected_value_aud = float(active_stats["median"])
+            expected_source = "active"
+    
+        # Buy target heuristic (conservative, depends on grade + confidence)
+        conf = float(confidence or 0.0)
+        conf = max(0.0, min(1.0, conf))
+        grade_tier = resolved_grade if isinstance(resolved_grade, int) else None
+        base_mult = 0.78 + 0.07 * conf  # 0.78..0.85
+        if grade_tier is not None:
+            if grade_tier >= 9:
+                base_mult = 0.82 + 0.06 * conf
+            elif grade_tier >= 7:
+                base_mult = 0.78 + 0.06 * conf
+            else:
+                base_mult = 0.70 + 0.06 * conf
+    
+        buy_target_aud = None
+        if expected_value_aud is not None:
+            buy_target_aud = round(expected_value_aud * base_mult, 2)
+    
+        grade_outcome = {
+            "assessed_grade": exp_grade_key or None,
+            "expected_value_aud": expected_value_aud,
+            "expected_source": expected_source,
+            "buy_target_aud": buy_target_aud,
+        }
+    
+        # --------------------------
+        # Build an enthusiast-style market summary (no fake sold-history claims)
+        # --------------------------
+        def _money(v: Optional[float]) -> str:
+            try:
+                if v is None:
+                    return "—"
+                return f"${float(v):.0f}"
+            except Exception:
                 return "—"
-            return f"${float(v):.0f}"
-        except Exception:
-            return "—"
-
-    current_typ = active_stats.get("median")
-    current_low = active_stats.get("low")
-    current_high = active_stats.get("high")
-
-
-    # Where does THIS copy likely sit in the current ask range?
-    value_position_aud = None
-    try:
-        if current_low is not None and current_high is not None and resolved_grade is not None:
-            lo = float(current_low); hi = float(current_high)
-            if hi >= lo and (hi - lo) > 0:
-                g = float(resolved_grade)
-                # map grade 1..10 -> 0.08..0.92
-                f = (max(1.0, min(10.0, g)) - 1.0) / 9.0
-                f = 0.08 + 0.84 * f
-                value_position_aud = lo + (hi - lo) * f
-        if value_position_aud is None and current_typ is not None:
-            value_position_aud = float(current_typ)
-    except Exception:
-        value_position_aud = current_typ
-
-    # trend proxy (active-only; honest language)
-    trend_hint = "pretty steady right now"
-    if current_low is not None and current_high is not None and current_typ is not None:
-        spread = (float(current_high) - float(current_low)) / max(1.0, float(current_typ))
-        if spread > 0.6:
-            trend_hint = "kinda all over the shop (wide spread on asks)"
-        elif spread < 0.25:
-            trend_hint = "tight and steady (asks are clustering)"
-    # grading potential language
-    worth_grading = None
-    if expected_value_aud is not None and current_typ is not None:
+    
+        current_typ = active_stats.get("median")
+        current_low = active_stats.get("low")
+        current_high = active_stats.get("high")
+    
+    
+        # Where does THIS copy likely sit in the current ask range?
+        value_position_aud = None
         try:
-            uplift = float(expected_value_aud) - float(current_typ)
-            worth_grading = (uplift > float(grading_cost or 0))
+            if current_low is not None and current_high is not None and resolved_grade is not None:
+                lo = float(current_low); hi = float(current_high)
+                if hi >= lo and (hi - lo) > 0:
+                    g = float(resolved_grade)
+                    # map grade 1..10 -> 0.08..0.92
+                    f = (max(1.0, min(10.0, g)) - 1.0) / 9.0
+                    f = 0.08 + 0.84 * f
+                    value_position_aud = lo + (hi - lo) * f
+            if value_position_aud is None and current_typ is not None:
+                value_position_aud = float(current_typ)
         except Exception:
-            worth_grading = None
-
-    slang_openers = [
-        "Alright mate, here’s the vibe on this one:",
-        "Okay — quick market check before you send it:",
-        "Righto, let’s suss the market real quick:",
-        "Alright, pack-ripper rundown:",
-    ]
-
-    openers_2 = [
-        "Here’s what I’m seeing:",
-        "Here’s the read:",
-        "Here’s the go:",
-    ]
-
-    opener = secrets.choice(slang_openers)
-    if secrets.randbelow(100) < 25:
-        opener = f"{opener} {secrets.choice(openers_2)}"
-
-    grade_line = ""
-    if exp_grade_key:
-        grade_line = f" LeagAI’s got it around a {exp_grade_key} on the pics."
-    price_line = f" Live asks are roughly {_money(current_typ)} AUD (range {_money(current_low)}–{_money(current_high)})."
-
-    trend_phrases = [
-        f" It looks {trend_hint} off what’s listed right now.",
-        f" The asks look {trend_hint} at the moment.",
-        f" Market mood is {trend_hint} based on current listings.",
-    ]
-    trend_line = secrets.choice(trend_phrases)
-
-    # Where does *your* copy likely sit inside the live range?
-    est_value_aud = None
-    if current_low is not None and current_high is not None and resolved_grade is not None:
-        try:
-            g = float(resolved_grade)
-            # map grade 1..10 => 0.08..0.92 (keeps it away from extreme ends)
-            factor = (g - 1.0) / 9.0
-            factor = max(0.0, min(1.0, factor))
-            factor = 0.08 + 0.84 * factor
-            lo = float(current_low)
-            hi = float(current_high)
-            est_value_aud = lo + (hi - lo) * factor
-
-            # If it’s a rougher grade, nudge slightly below the low ask (buyers discount hard)
-            if g <= 5.5 and lo > 0:
-                est_value_aud = min(est_value_aud, lo * (0.92 + 0.01 * g))
-            est_value_aud = round(est_value_aud, 2)
-        except Exception:
-            est_value_aud = None
-
-    position_line = ""
-    if est_value_aud is not None and current_low is not None and current_high is not None:
-        position_templates = [
-            f" For a {exp_grade_key}-ish copy like yours, I’d peg it around {_money(est_value_aud)} AUD — basically sitting between the low and the high asks.",
-            f" Given the condition call, I’d slot your copy at about {_money(est_value_aud)} AUD in that current range.",
-            f" Realistically, your one probably lives around {_money(est_value_aud)} AUD (condition-wise), not at the tippy-top.",
+            value_position_aud = current_typ
+    
+        # trend proxy (active-only; honest language)
+        trend_hint = "pretty steady right now"
+        if current_low is not None and current_high is not None and current_typ is not None:
+            spread = (float(current_high) - float(current_low)) / max(1.0, float(current_typ))
+            if spread > 0.6:
+                trend_hint = "kinda all over the shop (wide spread on asks)"
+            elif spread < 0.25:
+                trend_hint = "tight and steady (asks are clustering)"
+        # grading potential language
+        worth_grading = None
+        if expected_value_aud is not None and current_typ is not None:
+            try:
+                uplift = float(expected_value_aud) - float(current_typ)
+                worth_grading = (uplift > float(grading_cost or 0))
+            except Exception:
+                worth_grading = None
+    
+        slang_openers = [
+            "Alright mate, here’s the vibe on this one:",
+            "Okay — quick market check before you send it:",
+            "Righto, let’s suss the market real quick:",
+            "Alright, pack-ripper rundown:",
         ]
-        position_line = secrets.choice(position_templates)
-
-    graded_line = ""
-    if exp_grade_key and exp_grade_key in grade_market:
-        st = grade_market.get(exp_grade_key, {}).get("stats", {})
-        if st and st.get("median") is not None:
-            graded_templates = [
-                f" If it lands that grade in a slab, graded asks are roughly {_money(st.get('median'))} AUD (current listings).",
-                f" In the graded lane at that number, you’re seeing about {_money(st.get('median'))} AUD on asks right now.",
+    
+        openers_2 = [
+            "Here’s what I’m seeing:",
+            "Here’s the read:",
+            "Here’s the go:",
+        ]
+    
+        opener = secrets.choice(slang_openers)
+        if secrets.randbelow(100) < 25:
+            opener = f"{opener} {secrets.choice(openers_2)}"
+    
+        grade_line = ""
+        if exp_grade_key:
+            grade_line = f" LeagAI’s got it around a {exp_grade_key} on the pics."
+        price_line = f" Live asks are roughly {_money(current_typ)} AUD (range {_money(current_low)}–{_money(current_high)})."
+    
+        trend_phrases = [
+            f" It looks {trend_hint} off what’s listed right now.",
+            f" The asks look {trend_hint} at the moment.",
+            f" Market mood is {trend_hint} based on current listings.",
+        ]
+        trend_line = secrets.choice(trend_phrases)
+    
+        # Where does *your* copy likely sit inside the live range?
+        est_value_aud = None
+        if current_low is not None and current_high is not None and resolved_grade is not None:
+            try:
+                g = float(resolved_grade)
+                # map grade 1..10 => 0.08..0.92 (keeps it away from extreme ends)
+                factor = (g - 1.0) / 9.0
+                factor = max(0.0, min(1.0, factor))
+                factor = 0.08 + 0.84 * factor
+                lo = float(current_low)
+                hi = float(current_high)
+                est_value_aud = lo + (hi - lo) * factor
+    
+                # If it’s a rougher grade, nudge slightly below the low ask (buyers discount hard)
+                if g <= 5.5 and lo > 0:
+                    est_value_aud = min(est_value_aud, lo * (0.92 + 0.01 * g))
+                est_value_aud = round(est_value_aud, 2)
+            except Exception:
+                est_value_aud = None
+    
+        position_line = ""
+        if est_value_aud is not None and current_low is not None and current_high is not None:
+            position_templates = [
+                f" For a {exp_grade_key}-ish copy like yours, I’d peg it around {_money(est_value_aud)} AUD — basically sitting between the low and the high asks.",
+                f" Given the condition call, I’d slot your copy at about {_money(est_value_aud)} AUD in that current range.",
+                f" Realistically, your one probably lives around {_money(est_value_aud)} AUD (condition-wise), not at the tippy-top.",
             ]
-            graded_line = " " + secrets.choice(graded_templates)
-
-    # Grading decision language — keep it collector-real, not the same line every time
-    grade_advice = ""
-    try:
-        gc = float(grading_cost or 0)
-    except Exception:
-        gc = 0.0
-
-    if worth_grading is True:
-        grade_advice = " " + secrets.choice([
-            f" With grading around ${gc:.0f}, it’s a decent shout if you’re chasing a slab or a cleaner resale.",
-            f" Grading fee’s about ${gc:.0f} — I’d consider sending it if you want it protected/registry-ready.",
-        ])
-    elif worth_grading is False:
-        grade_advice = " " + secrets.choice([
-            f" Grading’s about ${gc:.0f} — I’d only send it if it’s a personal PC piece or you want it in the registry slabbed up.",
-            f" With a ~${gc:.0f} fee, this feels more like a binder/PC card unless you just want it in plastic for the vibe.",
-            f" Fee’s ~${gc:.0f}; if you’re grading for profit, I’d be picky here — but for the collection? send it.",
-        ])
-
-    buy_line = ""
-    if buy_target_aud is not None:
-        buy_line = " " + secrets.choice([
-            f" If you’re buying raw, I’d want to be around {_money(buy_target_aud)} AUD or less for this condition.",
-            f" Raw buy target: about {_money(buy_target_aud)} AUD (or under) — that’s where it starts to make sense.",
-            f" If you’re hunting a deal, try land it near {_money(buy_target_aud)} AUD — anything higher and you’re paying for hope.",
-        ])
-
-    market_summary = _norm_ws(f"{opener}{grade_line}{price_line}{trend_line}{position_line}{graded_line}{grade_advice}{buy_line}")
-
-    resp = {
-        "available": True,
-        "source": "ebay_active",
-        "used_query": used_query,
-        "query_ladder": ladder,
-        "card": {"name": n, "set": sname, "number": num_display, "set_code": set_code_hint, "type": ctype},
-        "has_structural_damage": structural,
-        "assessed_pregrade": resolved_grade,
-        "market_summary": market_summary,
-        "grade_outcome": grade_outcome,
-        "graded": grade_market,
-        "active": active_stats,
-        "active_matches": active_matches,
-        "match_debug": {"active": active_debug, "ebay_calls": ebay_call_debug},
-        "observed": {
-            "currency": "AUD",
-            "fx": {"usd_to_aud_rate": _FX_CACHE.get("usd_aud"), "cache_seconds": FX_CACHE_SECONDS},
+            position_line = secrets.choice(position_templates)
+    
+        graded_line = ""
+        if exp_grade_key and exp_grade_key in grade_market:
+            st = grade_market.get(exp_grade_key, {}).get("stats", {})
+            if st and st.get("median") is not None:
+                graded_templates = [
+                    f" If it lands that grade in a slab, graded asks are roughly {_money(st.get('median'))} AUD (current listings).",
+                    f" In the graded lane at that number, you’re seeing about {_money(st.get('median'))} AUD on asks right now.",
+                ]
+                graded_line = " " + secrets.choice(graded_templates)
+    
+        # Grading decision language — keep it collector-real, not the same line every time
+        grade_advice = ""
+        try:
+            gc = float(grading_cost or 0)
+        except Exception:
+            gc = 0.0
+    
+        if worth_grading is True:
+            grade_advice = " " + secrets.choice([
+                f" With grading around ${gc:.0f}, it’s a decent shout if you’re chasing a slab or a cleaner resale.",
+                f" Grading fee’s about ${gc:.0f} — I’d consider sending it if you want it protected/registry-ready.",
+            ])
+        elif worth_grading is False:
+            grade_advice = " " + secrets.choice([
+                f" Grading’s about ${gc:.0f} — I’d only send it if it’s a personal PC piece or you want it in the registry slabbed up.",
+                f" With a ~${gc:.0f} fee, this feels more like a binder/PC card unless you just want it in plastic for the vibe.",
+                f" Fee’s ~${gc:.0f}; if you’re grading for profit, I’d be picky here — but for the collection? send it.",
+            ])
+    
+        buy_line = ""
+        if buy_target_aud is not None:
+            buy_line = " " + secrets.choice([
+                f" If you’re buying raw, I’d want to be around {_money(buy_target_aud)} AUD or less for this condition.",
+                f" Raw buy target: about {_money(buy_target_aud)} AUD (or under) — that’s where it starts to make sense.",
+                f" If you’re hunting a deal, try land it near {_money(buy_target_aud)} AUD — anything higher and you’re paying for hope.",
+            ])
+    
+        market_summary = _norm_ws(f"{opener}{grade_line}{price_line}{trend_line}{position_line}{graded_line}{grade_advice}{buy_line}")
+    
+        resp = {
+            "available": True,
+            "source": "ebay_active",
+            "used_query": used_query,
+            "query_ladder": ladder,
+            "card": {"name": n, "set": sname, "number": num_display, "set_code": set_code_hint, "type": ctype},
+            "has_structural_damage": structural,
+            "assessed_pregrade": resolved_grade,
+            "market_summary": market_summary,
+            "grade_outcome": grade_outcome,
+            "graded": grade_market,
             "active": active_stats,
-            "raw": {  # legacy: point raw to ACTIVE stream now
-                "source": "ebay_active_top5",
-                "count": active_stats.get("count"),
-                "low": active_stats.get("low"),
-                "median": active_stats.get("median"),
-                "high": active_stats.get("high"),
+            "active_matches": active_matches,
+            "match_debug": {"active": active_debug, "ebay_calls": ebay_call_debug},
+            "observed": {
+                "currency": "AUD",
+                "fx": {"usd_to_aud_rate": _FX_CACHE.get("usd_aud"), "cache_seconds": FX_CACHE_SECONDS},
+                "active": active_stats,
+                "raw": {  # legacy: point raw to ACTIVE stream now
+                    "source": "ebay_active_top5",
+                    "count": active_stats.get("count"),
+                    "low": active_stats.get("low"),
+                    "median": active_stats.get("median"),
+                    "high": active_stats.get("high"),
+                },
             },
-        },
-        "disclaimer": (
-            "Informational market context only. ACTIVE listings are current asks and can differ from final sale prices. "
-            "Figures are third-party estimates and may vary. Not financial advice."
-        ),
-    }
-    return resp
-
-@app.post("/api/market-context-item")
-
-@safe_endpoint
-async def market_context_item(
-    query: str = Form(...),
-    category_hint: str = Form(""),  # optional: pokemon-cards, magic-cards, sports-cards, etc.
-    condition: str = Form(""),
-):
-    q = _norm_ws(query)
-    if not q:
-        raise HTTPException(status_code=400, detail="query required")
-
-    if not PRICECHARTING_TOKEN:
-        return JSONResponse(content={
-            "available": False,
-            "mode": "click_only",
-            "query": q,
-            "message": "PRICECHARTING_TOKEN not configured.",
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "disclaimer": "Informational market context only. Not financial advice.",
-        })
-
-    products = await _pc_search(q, category=category_hint or None, limit=10)
-    if not products:
-        return JSONResponse(content={
-            "available": False,
-            "mode": "click_only",
-            "query": q,
-            "message": "No matching products found on PriceCharting for this query.",
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "disclaimer": "Informational market context only. Not financial advice.",
-        })
-
-    top = products[0]
-    pid = str(top.get("id") or top.get("product-id") or "").strip()
-    detail = await _pc_product(pid) if pid else {}
-    prices = _pc_extract_price_fields(detail or top)
-    url = (detail or {}).get("url") or top.get("url") or ""
-
-    # Provide a "typical" figure by averaging any available price fields
-    vals = [v for v in prices.values() if isinstance(v, (int, float))]
-    typical = round(mean(vals), 2) if vals else None
-
-    return JSONResponse(content={
-        "available": True,
-        "mode": "click_only",
-        "query": q,
-        "condition_hint": _norm_ws(condition),
-        "pricecharting": {
-            "best_match": top,
-            "url": url,
-            "prices": prices,
-            "alternatives": products[:5],
-        },
-        "observed": {"typical_value_estimate_usd": typical, "typical_value_estimate_aud": _usd_to_aud_simple(typical) if typical is not None else None, "usd_to_aud_multiplier": AUD_MULTIPLIER},
-        "sources": ["PriceCharting API"],
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "disclaimer": "Informational market context only. Figures are third-party estimates and may vary. Not financial advice.",
-    })
-
-# ==============================
-# eBay API scaffold (disabled)
-# ==============================
-async def _ebay_sold_prices_stub(query: str) -> Dict[str, Any]:
-    """Placeholder: wire this up once your eBay developer account is approved."""
-    return {"available": False, "message": "eBay API not enabled.", "query": query}
-
-# ==============================
-# Runner
-# ==============================
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", "10000"))
-    uvicorn.run("main:app", host="0.0.0.0", port=port)
-
-
-def _normalize_num_variants(card_number: str) -> List[str]:
-    """
-    Return card number variants commonly used in listings:
-      "004/102" -> ["4/102","4","#4"]
-      "4/102"   -> ["4/102","4","#4"]
-      "4"       -> ["4","#4"]
-    """
-    s = _norm_ws(str(card_number or ""))
-    if not s:
-        return []
-    m = re.search(r"(\d+)\s*/\s*(\d+)", s)
-    out = []
-    if m:
-        left = str(int(m.group(1)))
-        right = str(int(m.group(2)))
-        out.append(f"{left}/{right}")
-        out.append(left)
-        out.append(f"#{left}")
-        return out
-    m2 = re.search(r"(\d+)", s)
-    if m2:
-        left = str(int(m2.group(1)))
-        return [left, f"#{left}"]
-    return [s]
-
-def _dedupe_tokens(q: str) -> str:
-    """Remove immediate duplicate phrases like 'Base Set Base Set' and collapse whitespace."""
-    q = _norm_ws(q)
-    # remove duplicated bigrams/phrases conservatively
-    q = re.sub(r"\b(Base Set)\s+\1\b", r"\1", q, flags=re.I)
-    q = re.sub(r"\b(Shadowless)\s+\1\b", r"\1", q, flags=re.I)
-    q = re.sub(r"\b(1st Edition)\s+\1\b", r"\1", q, flags=re.I)
-    q = re.sub(r"\s+", " ", q).strip()
-    return q
-
-def _build_ebay_query_ladder(card_name: str, set_name: str, set_code: str, card_number: str, card_type: str) -> List[str]:
-    """
-    Build a resilient eBay keyword ladder. Start specific, progressively relax:
-      1) name + set + number (number variants)
-      2) name + set (and 1st edition cues if present)
-      3) name + number
-      4) name + tcg + 'card'
-      5) name only
-    """
-    name = _norm_ws(card_name)
-    sname = _norm_ws(set_name)
-    scode = _norm_ws(set_code)
-    ctype = (_norm_ws(card_type) or "Pokemon")
-    nums = _normalize_num_variants(card_number)
-
-    # detect common variant cues in name/set
-    is_first = bool(re.search(r"\b1st\b|\bfirst\b", name, flags=re.I))
-    first_phrase = "1st Edition" if is_first else ""
-
-    # prefer set_name; set_code is usually not in listings, but keep as fallback rung
-    set_terms = [t for t in [sname, scode] if t]
-    ladder = []
-
-    # rung 1: name + set + number variants
-    for st in set_terms[:1] or [""]:
-        for nv in nums[:2] or [""]:
-            if st and nv:
-                ladder.append(_dedupe_tokens(f"{name} {st} {nv}"))
-                if first_phrase:
-                    ladder.append(_dedupe_tokens(f"{name} {first_phrase} {st} {nv}"))
-
-    # rung 2: name + set
-    for st in set_terms[:1] or [""]:
-        if st:
-            ladder.append(_dedupe_tokens(f"{name} {st}"))
-            if first_phrase:
-                ladder.append(_dedupe_tokens(f"{name} {first_phrase} {st}"))
-        if st and "Base Set" in st and first_phrase:
-            ladder.append(_dedupe_tokens(f"{name} {first_phrase} Base Set"))
-
-    # rung 3: name + number only (good when set noise hurts)
-    for nv in nums[:2]:
-        ladder.append(_dedupe_tokens(f"{name} {nv}"))
-
-    # rung 4: name + tcg card
-    ladder.append(_dedupe_tokens(f"{name} {ctype} card"))
-
-    # rung 5: name only
-    ladder.append(_dedupe_tokens(f"{name}"))
-
-    # remove empties + duplicates preserving order
-    seen = set()
-    out = []
-    for q in ladder:
-        q = _norm_ws(q)
+            "disclaimer": (
+                "Informational market context only. ACTIVE listings are current asks and can differ from final sale prices. "
+                "Figures are third-party estimates and may vary. Not financial advice."
+            ),
+        }
+        return resp
+    
+    @app.post("/api/market-context-item")
+    
+    @safe_endpoint
+    async def market_context_item(
+        query: str = Form(...),
+        category_hint: str = Form(""),  # optional: pokemon-cards, magic-cards, sports-cards, etc.
+        condition: str = Form(""),
+    ):
+        q = _norm_ws(query)
         if not q:
-            continue
-        if q.lower() in seen:
-            continue
-        seen.add(q.lower())
-        out.append(q)
-    return out
+            raise HTTPException(status_code=400, detail="query required")
+    
+        if not PRICECHARTING_TOKEN:
+            return JSONResponse(content={
+                "available": False,
+                "mode": "click_only",
+                "query": q,
+                "message": "PRICECHARTING_TOKEN not configured.",
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "disclaimer": "Informational market context only. Not financial advice.",
+            })
+    
+        products = await _pc_search(q, category=category_hint or None, limit=10)
+        if not products:
+            return JSONResponse(content={
+                "available": False,
+                "mode": "click_only",
+                "query": q,
+                "message": "No matching products found on PriceCharting for this query.",
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "disclaimer": "Informational market context only. Not financial advice.",
+            })
+    
+        top = products[0]
+        pid = str(top.get("id") or top.get("product-id") or "").strip()
+        detail = await _pc_product(pid) if pid else {}
+        prices = _pc_extract_price_fields(detail or top)
+        url = (detail or {}).get("url") or top.get("url") or ""
+    
+        # Provide a "typical" figure by averaging any available price fields
+        vals = [v for v in prices.values() if isinstance(v, (int, float))]
+        typical = round(mean(vals), 2) if vals else None
+    
+        return JSONResponse(content={
+            "available": True,
+            "mode": "click_only",
+            "query": q,
+            "condition_hint": _norm_ws(condition),
+            "pricecharting": {
+                "best_match": top,
+                "url": url,
+                "prices": prices,
+                "alternatives": products[:5],
+            },
+            "observed": {"typical_value_estimate_usd": typical, "typical_value_estimate_aud": _usd_to_aud_simple(typical) if typical is not None else None, "usd_to_aud_multiplier": AUD_MULTIPLIER},
+            "sources": ["PriceCharting API"],
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "disclaimer": "Informational market context only. Figures are third-party estimates and may vary. Not financial advice.",
+        })
+    
+    # ==============================
+    # eBay API scaffold (disabled)
+    # ==============================
+    async def _ebay_sold_prices_stub(query: str) -> Dict[str, Any]:
+        """Placeholder: wire this up once your eBay developer account is approved."""
+        return {"available": False, "message": "eBay API not enabled.", "query": query}
+    
+    # ==============================
+    # Runner
+    # ==============================
+    if __name__ == "__main__":
+        import uvicorn
+        port = int(os.getenv("PORT", "10000"))
+        uvicorn.run("main:app", host="0.0.0.0", port=port)
+    
+    
+    def _normalize_num_variants(card_number: str) -> List[str]:
+        """
+        Return card number variants commonly used in listings:
+          "004/102" -> ["4/102","4","#4"]
+          "4/102"   -> ["4/102","4","#4"]
+          "4"       -> ["4","#4"]
+        """
+        s = _norm_ws(str(card_number or ""))
+        if not s:
+            return []
+        m = re.search(r"(\d+)\s*/\s*(\d+)", s)
+        out = []
+        if m:
+            left = str(int(m.group(1)))
+            right = str(int(m.group(2)))
+            out.append(f"{left}/{right}")
+            out.append(left)
+            out.append(f"#{left}")
+            return out
+        m2 = re.search(r"(\d+)", s)
+        if m2:
+            left = str(int(m2.group(1)))
+            return [left, f"#{left}"]
+        return [s]
+    
+    def _dedupe_tokens(q: str) -> str:
+        """Remove immediate duplicate phrases like 'Base Set Base Set' and collapse whitespace."""
+        q = _norm_ws(q)
+        # remove duplicated bigrams/phrases conservatively
+        q = re.sub(r"\b(Base Set)\s+\1\b", r"\1", q, flags=re.I)
+        q = re.sub(r"\b(Shadowless)\s+\1\b", r"\1", q, flags=re.I)
+        q = re.sub(r"\b(1st Edition)\s+\1\b", r"\1", q, flags=re.I)
+        q = re.sub(r"\s+", " ", q).strip()
+        return q
+    
+    def _build_ebay_query_ladder(card_name: str, set_name: str, set_code: str, card_number: str, card_type: str) -> List[str]:
+        """
+        Build a resilient eBay keyword ladder. Start specific, progressively relax:
+          1) name + set + number (number variants)
+          2) name + set (and 1st edition cues if present)
+          3) name + number
+          4) name + tcg + 'card'
+          5) name only
+        """
+        name = _norm_ws(card_name)
+        sname = _norm_ws(set_name)
+        scode = _norm_ws(set_code)
+        ctype = (_norm_ws(card_type) or "Pokemon")
+        nums = _normalize_num_variants(card_number)
+    
+        # detect common variant cues in name/set
+        is_first = bool(re.search(r"\b1st\b|\bfirst\b", name, flags=re.I))
+        first_phrase = "1st Edition" if is_first else ""
+    
+        # prefer set_name; set_code is usually not in listings, but keep as fallback rung
+        set_terms = [t for t in [sname, scode] if t]
+        ladder = []
+    
+        # rung 1: name + set + number variants
+        for st in set_terms[:1] or [""]:
+            for nv in nums[:2] or [""]:
+                if st and nv:
+                    ladder.append(_dedupe_tokens(f"{name} {st} {nv}"))
+                    if first_phrase:
+                        ladder.append(_dedupe_tokens(f"{name} {first_phrase} {st} {nv}"))
+    
+        # rung 2: name + set
+        for st in set_terms[:1] or [""]:
+            if st:
+                ladder.append(_dedupe_tokens(f"{name} {st}"))
+                if first_phrase:
+                    ladder.append(_dedupe_tokens(f"{name} {first_phrase} {st}"))
+            if st and "Base Set" in st and first_phrase:
+                ladder.append(_dedupe_tokens(f"{name} {first_phrase} Base Set"))
+    
+        # rung 3: name + number only (good when set noise hurts)
+        for nv in nums[:2]:
+            ladder.append(_dedupe_tokens(f"{name} {nv}"))
+    
+        # rung 4: name + tcg card
+        ladder.append(_dedupe_tokens(f"{name} {ctype} card"))
+    
+        # rung 5: name only
+        ladder.append(_dedupe_tokens(f"{name}"))
+    
+        # remove empties + duplicates preserving order
+        seen = set()
+        out = []
+        for q in ladder:
+            q = _norm_ws(q)
+            if not q:
+                continue
+            if q.lower() in seen:
+                continue
+            seen.add(q.lower())
+            out.append(q)
+        return out
+    except Exception as e:
+        # Sealed/Memorabilia safety fallback: never return null
+        try:
+            import traceback; traceback.print_exc()
+        except Exception: pass
+        return {
+            "condition_grade": "Pending",
+            "confidence": 0.5,
+            "defects": [],
+            "flags": ["assessment_degraded"],
+            "overall_assessment": "We hit a temporary limit while assessing this item. Please try again in a moment.",
+            "spoken_word": "Quick heads up — the system got rate-limited mid-check. Give it a sec and run it again for the full pass.",
+            "verify_token": "",
+            "assessment_degraded": True
+        }
