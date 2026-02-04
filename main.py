@@ -2591,7 +2591,7 @@ async def assess_memorabilia(
                 imgs.append(bb)
 
     # --- Memorabilia baseline fallback (prevents null/blank UI on transient model limits) ---
-    def _memo_fallback(message: str = "Assessment temporarily limited. Please retry shortly."):
+        def _memo_fallback(message: str = "Assessment temporarily limited. Please retry shortly."):
         
     # If model response is missing/invalid, return a safe fallback instead of raising or returning null
     try:
