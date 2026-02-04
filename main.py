@@ -2826,7 +2826,7 @@ Respond ONLY with JSON, no extra text.
 
     roi_labels: List[Dict[str, Any]] = []
     try:
-    # Second pass disabled for sealed/memorabilia (rebased fix)
+        # Second pass disabled for sealed/memorabilia (rebased fix)
         roi_labels = []
     except Exception:
         roi_labels = []
