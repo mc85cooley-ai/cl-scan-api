@@ -2697,13 +2697,31 @@ Respond ONLY with JSON, no extra text.
     for i, bb in enumerate(imgs):
         if i > 0:
             content.append({"type": "text", "text": f"IMAGE {i} ABOVE ☝️ | IMAGE {i+1} BELOW 👇"})
-        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(bb)}", "detail": "high"}})
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(bb)}", "detail": "low"}})
 
     msg = [{"role": "user", "content": content}]
-    result = await _openai_chat(msg, max_tokens=2000, temperature=0.1)
-    data = _parse_json_or_none(result.get("content", "")) if not result.get("error") else None
-    data = data or {}
-
+    result = {}
+    data = {}
+    try:
+        result = await _openai_chat(msg, max_tokens=1600, temperature=0.1)
+        data = _parse_json_or_none(result.get("content", "")) if not result.get("error") else None
+        data = data or {}
+    except Exception as e:
+        # Rate-limit / transient failure safe fallback (memorabilia only)
+        data = {
+            "condition_grade": "N/A",
+            "confidence": 0.0,
+            "seal_integrity": {"status":"Not Applicable","notes":"","grade":"Not Applicable"},
+            "packaging_condition": {"grade":"N/A","notes":""},
+            "signature_assessment": {"present": False, "quality":"Not Applicable","notes":""},
+            "value_factors": [],
+            "defects": [],
+            "flags": [],
+            "overall_assessment": "",
+            "spoken_word": "",
+            "authenticity_logic": {},
+            "observed_id": {},
+        }
     flags_raw = data.get("flags", [])
     if isinstance(flags_raw, list):
         flags_list_out = [str(f).lower().strip() for f in flags_raw if str(f).strip()]
