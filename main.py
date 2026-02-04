@@ -2610,6 +2610,32 @@ Return ONLY valid JSON with this EXACT structure:
   "flags": ["short flags for important issues (reseal risk, crush damage, water, heavy dents, COA missing)"],
   "overall_assessment": "5-8 sentences in first person (start with: 'Looking at your [brand] [product_name]...'). Mention what it is, what looks strong, what issues you see, and what limits the condition grade.",
   "spoken_word": "A 20–45 second spoken-word script in first person. Format it like: Hook (1 line) → What it is (1–2 lines) → Best features (1–2 lines) → Biggest concerns (1–3 lines) → Bottom line grade + confidence (1 line). No hype, no guarantees.",
+  "authenticity_logic": {
+    "overall_authenticity_risk": "Low/Medium/High",
+    "story_alignment": "1-3 sentences on whether age/wear/story line up",
+    "sealed_checks": {
+      "wrap_fold_pattern": "Pass/Unclear/Fail/Not Applicable",
+      "seam_alignment": "Pass/Unclear/Fail/Not Applicable",
+      "wear_vs_seal_consistency": "Pass/Unclear/Fail/Not Applicable",
+      "hologram_sticker_check": "Pass/Unclear/Fail/Not Applicable",
+      "weight_check": "Pass/Unclear/Fail/Not Applicable"
+    },
+    "game_used_checks": {
+      "wear_pattern_realism": "Pass/Unclear/Fail/Not Applicable",
+      "material_stress_realism": "Pass/Unclear/Fail/Not Applicable",
+      "markings_and_codes": "Pass/Unclear/Fail/Not Applicable",
+      "repairs_alterations": "Pass/Unclear/Fail/Not Applicable",
+      "photo_match_potential": "High/Medium/Low/Not Applicable"
+    },
+    "autograph_checks": {
+      "ink_pressure_variation": "Pass/Unclear/Fail/Not Applicable",
+      "stroke_flow_tapering": "Pass/Unclear/Fail/Not Applicable",
+      "hesitation_or_retrace": "Pass/Unclear/Fail/Not Applicable",
+      "ink_absorption_on_surface": "Pass/Unclear/Fail/Not Applicable"
+    },
+    "universal_red_flags": ["short bullets"],
+    "notes": "3-6 sentences, plain-English, first person, practical advice"
+  },
   "observed_id": {{
     "brand": "best-effort",
     "product_name": "best-effort",
@@ -2623,6 +2649,9 @@ Return ONLY valid JSON with this EXACT structure:
 {ctx}
 
 Rules:
+- For sealed items: evaluate wrap fold patterns (Y-folds), seam paths, wrap tension/thickness, glue/warping/bubbling, and whether box wear vs seal wear tells a consistent story.
+- For game-used/player-used: assess whether wear patterns, material stress, markings/codes, and any repairs look authentic vs artificially distressed; note photo-match potential.
+- For autographs: assess natural pressure variation, tapered strokes, flow, hesitation/retrace, and whether ink sits in/soaks into the surface.
 - Do NOT claim Factory Sealed unless the wrap/seal looks consistent. If uncertain, say so and reduce confidence.
 - If glare/blur prevents certainty, say so and reduce confidence.
 - Be specific with locations and avoid generic statements.
@@ -2677,6 +2706,78 @@ Respond ONLY with JSON, no extra text.
     if not seal.get("grade"):
         # Frontend may expect "grade" - mirror status for compatibility
         seal["grade"] = seal.get("status", "Not Applicable")
+
+    # ------------------------------
+    # Authenticity logic (sealed / game-used / autographs)
+    # ------------------------------
+    auth = data.get("authenticity_logic") if isinstance(data.get("authenticity_logic"), dict) else {}
+    # Defaults
+    def _default_checks(keys, default="Not Applicable"):
+        return {k: (auth.get(k) if isinstance(auth.get(k), str) and auth.get(k).strip() else default) for k in keys}
+
+    # Determine item context
+    _it = str(((data.get("observed_id") or {}).get("item_type") or item_type or "")).lower()
+    is_sealed = any(w in _it for w in ("sealed", "booster", "box", "pack", "case", "bundle"))
+    is_auto = bool((data.get("signature_assessment") or {}).get("present"))
+    is_game = any(w in _it for w in ("game", "used", "worn", "player", "jersey", "bat", "ball", "glove", "helmet", "equipment"))
+
+    sealed_keys = ["wrap_fold_pattern", "seam_alignment", "wear_vs_seal_consistency", "hologram_sticker_check", "weight_check"]
+    game_keys = ["wear_pattern_realism", "material_stress_realism", "markings_and_codes", "repairs_alterations", "photo_match_potential"]
+    auto_keys = ["ink_pressure_variation", "stroke_flow_tapering", "hesitation_or_retrace", "ink_absorption_on_surface"]
+
+    sealed_checks = auth.get("sealed_checks") if isinstance(auth.get("sealed_checks"), dict) else {}
+    game_checks = auth.get("game_used_checks") if isinstance(auth.get("game_used_checks"), dict) else {}
+    auto_checks = auth.get("autograph_checks") if isinstance(auth.get("autograph_checks"), dict) else {}
+
+    # Fill with Not Applicable where needed
+    if not is_sealed:
+        sealed_checks = {k: "Not Applicable" for k in sealed_keys}
+    else:
+        for k in sealed_keys:
+            v = sealed_checks.get(k)
+            sealed_checks[k] = v if isinstance(v, str) and v.strip() else "Unclear"
+
+    if not is_game:
+        game_checks = {k: "Not Applicable" for k in game_keys}
+    else:
+        for k in game_keys:
+            v = game_checks.get(k)
+            game_checks[k] = v if isinstance(v, str) and v.strip() else ("Low" if k=="photo_match_potential" else "Unclear")
+
+    if not is_auto:
+        auto_checks = {k: "Not Applicable" for k in auto_keys}
+    else:
+        for k in auto_keys:
+            v = auto_checks.get(k)
+            auto_checks[k] = v if isinstance(v, str) and v.strip() else "Unclear"
+
+    # Normalize overall risk + notes
+    risk = auth.get("overall_authenticity_risk")
+    if not (isinstance(risk, str) and risk.strip()):
+        # If any "Fail" present, call it High; if mostly Pass, Low; otherwise Medium.
+        checks_flat = list(sealed_checks.values()) + list(game_checks.values()) + list(auto_checks.values())
+        if any(str(v).lower().strip() == "fail" for v in checks_flat):
+            risk = "High"
+        elif any(str(v).lower().strip() == "pass" for v in checks_flat):
+            risk = "Low"
+        else:
+            risk = "Medium"
+
+    urf = auth.get("universal_red_flags", [])
+    if not isinstance(urf, list):
+        urf = []
+    urf = [str(x).strip() for x in urf if str(x).strip()][:8]
+
+    data["authenticity_logic"] = {
+        "overall_authenticity_risk": _norm_ws(str(risk)),
+        "story_alignment": _norm_ws(str(auth.get("story_alignment", "")))[:320],
+        "sealed_checks": sealed_checks,
+        "game_used_checks": game_checks,
+        "autograph_checks": auto_checks,
+        "universal_red_flags": urf,
+        "notes": _norm_ws(str(auth.get("notes", "")))[:900],
+    }
+
 
     # ------------------------------
     # CV-assisted defect closeups (defect_snaps) for sealed/memorabilia
