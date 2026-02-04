@@ -2796,6 +2796,114 @@ Respond ONLY with JSON, no extra text.
     except Exception:
         roi_labels = []
 
+# Heuristic: sealed/memorabilia photos often include lots of table/background.
+# We estimate the "subject" (box/item) bounding box and then generate tighter crops
+# for corner/edge/seam ROIs inside that subject box. This makes defect snaps actually
+# show the issue, even when the original photo has lots of negative space.
+def _memo_subject_bbox(img_bytes: bytes) -> Dict[str, float]:
+    try:
+        from PIL import Image
+        import numpy as np
+        im = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        arr = np.asarray(im)
+        h, w = arr.shape[:2]
+        if h < 10 or w < 10:
+            return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
+
+        # Sample border pixels to approximate background colour
+        b = max(2, int(min(h, w) * 0.04))
+        border = np.concatenate([
+            arr[:b, :, :].reshape(-1, 3),
+            arr[-b:, :, :].reshape(-1, 3),
+            arr[:, :b, :].reshape(-1, 3),
+            arr[:, -b:, :].reshape(-1, 3),
+        ], axis=0)
+        bg = np.median(border, axis=0).astype(np.float32)
+
+        diff = np.sqrt(((arr.astype(np.float32) - bg) ** 2).sum(axis=2))
+        # Threshold tuned to ignore mild lighting gradients
+        mask = diff > 28.0
+
+        # If background isn't uniform, fall back to full frame
+        if mask.mean() < 0.01:
+            return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
+
+        ys, xs = np.where(mask)
+        y0, y1 = int(ys.min()), int(ys.max())
+        x0, x1 = int(xs.min()), int(xs.max())
+
+        # Pad a little so corners/edges aren't clipped
+        pad = int(min(h, w) * 0.03)
+        y0 = max(0, y0 - pad); y1 = min(h - 1, y1 + pad)
+        x0 = max(0, x0 - pad); x1 = min(w - 1, x1 + pad)
+
+        bw = max(1, x1 - x0)
+        bh = max(1, y1 - y0)
+        # If we somehow got a tiny box, don't use it
+        if (bw * bh) < (0.08 * w * h):
+            return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
+
+        return {"x": x0 / w, "y": y0 / h, "w": bw / w, "h": bh / h}
+    except Exception:
+        return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
+
+_memo_subject = {
+    "front": _memo_subject_bbox(b1) if b1 else {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+    "back":  _memo_subject_bbox(b2) if b2 else {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+}
+
+def _memo_bbox_for_roi(side: str, roi_name: str, fallback_bbox: Dict[str, Any]) -> Dict[str, Any]:
+    sb = _memo_subject.get(side) or {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
+    sx, sy, sw, sh = (_safe_float(sb.get("x"), 0.0), _safe_float(sb.get("y"), 0.0),
+                      _safe_float(sb.get("w"), 1.0), _safe_float(sb.get("h"), 1.0))
+    sx = _clamp(sx, 0.0, 1.0); sy = _clamp(sy, 0.0, 1.0)
+    sw = _clamp(sw, 0.05, 1.0); sh = _clamp(sh, 0.05, 1.0)
+
+    rn = (roi_name or "").strip().lower()
+    # Default crop size inside the subject bbox
+    cs = 0.20  # 20% of subject for corners
+    es = 0.18  # 18% for edges/seams
+
+    def box(rx, ry, rw, rh):
+        return {
+            "x": _clamp(sx + sw * rx, 0.0, 1.0),
+            "y": _clamp(sy + sh * ry, 0.0, 1.0),
+            "w": _clamp(sw * rw, 0.02, 1.0),
+            "h": _clamp(sh * rh, 0.02, 1.0),
+        }
+
+    if rn == "corner_top_left": return box(0.0, 0.0, cs, cs)
+    if rn == "corner_top_right": return box(1.0 - cs, 0.0, cs, cs)
+    if rn == "corner_bottom_left": return box(0.0, 1.0 - cs, cs, cs)
+    if rn == "corner_bottom_right": return box(1.0 - cs, 1.0 - cs, cs, cs)
+
+    if rn == "edge_top": return box(0.12, 0.0, 0.76, es)
+    if rn == "edge_bottom": return box(0.12, 1.0 - es, 0.76, es)
+    if rn == "edge_left": return box(0.0, 0.12, es, 0.76)
+    if rn == "edge_right": return box(1.0 - es, 0.12, es, 0.76)
+
+    # Seam / wrap / sticker style ROIs: take an upper-middle "band" which usually catches seals.
+    if ("seam" in rn) or ("seal" in rn) or ("wrap" in rn):
+        return box(0.18, 0.10, 0.64, 0.30)
+    if ("holo" in rn) or ("sticker" in rn) or ("label" in rn):
+        return box(0.35, 0.35, 0.30, 0.30)
+
+    # Otherwise, tighten the provided bbox towards the subject bbox (clip + slight zoom)
+    try:
+        fb = fallback_bbox or {}
+        x = _safe_float(fb.get("x"), 0.0); y = _safe_float(fb.get("y"), 0.0)
+        w = _safe_float(fb.get("w"), 1.0); h = _safe_float(fb.get("h"), 1.0)
+        # Clip to subject
+        x = max(x, sx); y = max(y, sy)
+        w = min(w, sx + sw - x); h = min(h, sy + sh - y)
+        # Add a bit of zoom-in
+        cx = x + w/2; cy = y + h/2
+        w2 = max(0.04, w * 0.80); h2 = max(0.04, h * 0.80)
+        x2 = _clamp(cx - w2/2, 0.0, 1.0); y2 = _clamp(cy - h2/2, 0.0, 1.0)
+        return {"x": x2, "y": y2, "w": min(w2, 1.0 - x2), "h": min(h2, 1.0 - y2)}
+    except Exception:
+        return fallback_bbox or {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
+
     defect_snaps: List[Dict[str, Any]] = []
     label_by_idx = {int(x.get("crop_index", -1)): x for x in (roi_labels or []) if isinstance(x, dict)}
 
@@ -2879,12 +2987,13 @@ Respond ONLY with JSON, no extra text.
         if not src:
             continue
         bbox = r.get("bbox") or {}
+        side = str(r.get("side") or "")
+        roi_name = str(r.get("roi") or "")
+        bbox = _memo_bbox_for_roi(side, roi_name, bbox)
         thumb = _make_thumb_from_bbox(src, bbox, max_size=520)
         if not thumb:
             continue
         lab = label_by_idx.get(i) or {}
-        side = str(r.get("side") or "")
-        roi_name = str(r.get("roi") or "")
         force = (side, roi_name) in wanted_rois
         # Surface is a meta-request; allow any ROI on that side if surface is flagged.
         if not force and (side, "surface") in wanted_rois:
@@ -2917,11 +3026,12 @@ Respond ONLY with JSON, no extra text.
                 if not src:
                     continue
                 bbox = r.get("bbox") or {}
+                side = str(r.get("side") or "")
+                roi_name = str(r.get("roi") or "")
+                bbox = _memo_bbox_for_roi(side, roi_name, bbox)
                 thumb = _make_thumb_from_bbox(src, bbox, max_size=520)
                 if not thumb:
                     continue
-                side = str(r.get("side") or "")
-                roi_name = str(r.get("roi") or "")
                 note = _note_for_roi(side, roi_name) or f"Close-up: {roi_name}"
                 defect_snaps.append({
                     "side": side,
