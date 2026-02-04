@@ -64,23 +64,28 @@ def _relax_whitening_mm(text: str) -> str:
         s = str(text or "")
         if not s:
             return s
+
+        # Split into sentences so we only rewrite the whitening ones.
         parts = re.split(r'(?<=[.!?])\s+', s)
         out_parts = []
+
+        # Match mm mentions like "about 1mm", "approximately 2 mm"
         mm_rx = re.compile(r'(?:about\s+|around\s+|approx(?:imately)?\s+)?(\d+(?:\.\d+)?)\s*mm\b', re.IGNORECASE)
 
-        def _mm_to_words(num: float) -> str:
+        def _mm_to_phrase(num: float) -> str:
+            # Phrases are chosen to read naturally in different contexts ("deep", "into", etc.)
             if num <= 0.6:
-                return 'a hairline bit'
+                return "a hint"
             if num <= 1.4:
-                return 'a tiny bit'
+                return "a touch"
             if num <= 2.4:
-                return 'a small bit'
+                return "a little"
             if num <= 4.0:
-                return 'a noticeable bit'
-            return 'a fair bit'
+                return "a noticeable amount"
+            return "a fair bit"
 
         for part in parts:
-            if 'whitening' not in part.lower():
+            if "whitening" not in part.lower():
                 out_parts.append(part)
                 continue
 
@@ -89,14 +94,30 @@ def _relax_whitening_mm(text: str) -> str:
                     num = float(m.group(1))
                 except Exception:
                     num = 1.0
-                return _mm_to_words(num)
+                return _mm_to_phrase(num)
 
             new = mm_rx.sub(repl, part)
-            # also soften "extending" phrasing a touch
-            new = re.sub(r'\bextending\s+\b', 'running ', new, flags=re.IGNORECASE)
+
+            # Soften common phrasing after substitution
+            new = re.sub(r"\bextending\b", "creeping", new, flags=re.IGNORECASE)
+
+            # Fix awkward leftovers like "about a touch deep" or "a little into the card surface"
+            new = re.sub(r"\b(about|around|approximately)\s+(a hint|a touch|a little|a noticeable amount|a fair bit)\s+deep\b",
+                         r"\2", new, flags=re.IGNORECASE)
+            new = re.sub(r"\b(a hint|a touch|a little|a noticeable amount|a fair bit)\s+deep\b",
+                         r"\1", new, flags=re.IGNORECASE)
+
+            # If it says "... into the card surface", make it conversational
+            new = re.sub(r"\b(creeping)\s+(a hint|a touch|a little|a noticeable amount|a fair bit)\s+into\s+the\s+card\s+surface\b",
+                         r"\1 in \2", new, flags=re.IGNORECASE)
+            new = re.sub(r"\b(a hint|a touch|a little|a noticeable amount|a fair bit)\s+into\s+the\s+card\s+surface\b",
+                         r"\1", new, flags=re.IGNORECASE)
+
+            # Clean double spaces introduced by rewrites
+            new = re.sub(r"\s{2,}", " ", new).strip()
             out_parts.append(new)
 
-        return ' '.join(out_parts).strip()
+        return " ".join(out_parts).strip()
     except Exception:
         return str(text or "")
 
