@@ -1836,6 +1836,7 @@ async def verify(
     card_year: Optional[str] = Form(None),
     card_type: Optional[str] = Form(None),
     set_code: Optional[str] = Form(None),
+    intent: Optional[str] = Form(None),
 ):
     front_bytes = await front.read()
     back_bytes = await back.read()
@@ -1868,10 +1869,15 @@ async def verify(
         if provided_year: context += f"- Year: {provided_year}\n"
         if provided_type: context += f"- Type: {provided_type}\n"
 
+    intent_norm = (intent or '').strip().lower()
+    intent_context = 'BUYING' if intent_norm == 'buying' else ('SELLING' if intent_norm == 'selling' else 'UNSPECIFIED')
+
     prompt = f"""You are a professional trading card grader with 15+ years experience.
 
 Analyze the provided images with EXTREME scrutiny.
 You will receive FRONT and BACK images, and MAY receive a third ANGLED image used to rule out glare / light refraction artifacts (holo sheen) vs true whitening / scratches / print lines. Write as if speaking directly to a collector who needs honest, specific feedback about their card.
+
+USER INTENT (context): {intent_context}
 
 CRITICAL RULES:
 1) Be conversational and specific. Write like you're examining the card in person and describing what you see:
@@ -2602,6 +2608,7 @@ async def assess_memorabilia(
     image4: Optional[UploadFile] = File(None),
     item_type: Optional[str] = Form(None),
     description: Optional[str] = Form(None),
+    intent: Optional[str] = Form(None),
 ):
     b1 = await image1.read()
     b2 = await image2.read()
@@ -2623,8 +2630,12 @@ async def assess_memorabilia(
         if description:
             ctx += f"- Description: {_norm_ws(description)}\n"
 
+    
+    intent_norm = (intent or '').strip().lower()
+    intent_context = 'BUYING' if intent_norm == 'buying' else ('SELLING' if intent_norm == 'selling' else 'UNSPECIFIED')
+
     prompt = (
-        "You are a professional memorabilia/collectibles grader.\n\n"
+        f"You are a professional memorabilia/collectibles grader.\n\nUSER INTENT (context): {intent_context}\nIf BUYING: emphasise buyer risk, authenticity/red flags, and fair buy targets once market data is available.\nIf SELLING: emphasise seller optimisation, listing presentation, disclosure, and sell targets once market data is available.\nKeep grading logic identical; only tailor advice tone.\n\n"
         "You MUST identify what the item is (brand + product name + series/set) as specifically as the images allow, "
         "then grade condition conservatively.\n\n"
         "Return ONLY valid JSON with this EXACT structure:\n"
@@ -2829,6 +2840,8 @@ async def market_context(
     item_number: Optional[str] = Form(None),
     product_id: Optional[str] = Form(None),
 
+    intent: Optional[str] = Form(None),
+
     predicted_grade: Optional[str] = Form(None),
     confidence: float = Form(0.0),
     grading_cost: float = Form(35.0),
@@ -2871,6 +2884,9 @@ async def market_context(
     # --------------------------
     # Identity resolution
     # --------------------------
+    intent_norm = (intent or '').strip().lower()
+    intent_context = 'BUYING' if intent_norm == 'buying' else ('SELLING' if intent_norm == 'selling' else 'UNSPECIFIED')
+
     n = _norm_ws(item_name or card_name or name or "").strip()
     sname = _norm_ws(item_set or card_set or "").strip()
     num_display = _clean_card_number_display(item_number or card_number or "").strip()
@@ -3591,15 +3607,28 @@ async def market_context(
             f" Fee’s ~${gc:.0f}; if you’re grading for profit, I’d be picky here — but for the collection? send it.",
         ])
 
-    buy_line = ""
-    if buy_target_aud is not None:
-        buy_line = " " + secrets.choice([
-            f" If you’re buying raw, I’d want to be around {_money(buy_target_aud)} AUD or less for this condition.",
-            f" Raw buy target: about {_money(buy_target_aud)} AUD (or under) — that’s where it starts to make sense.",
-            f" If you’re hunting a deal, try land it near {_money(buy_target_aud)} AUD — anything higher and you’re paying for hope.",
-        ])
+    advice_line = ""
+    # Buyer vs Seller intent tailoring (language only; underlying data is the same)
+    if intent_context == "BUYING":
+        if buy_target_aud is not None:
+            advice_line = " " + secrets.choice([
+                f" If you’re buying raw, I’d want to be around {_money(buy_target_aud)} AUD or less for this condition.",
+                f" Raw buy target: about {_money(buy_target_aud)} AUD (or under) — that’s where it starts to make sense.",
+                f" If you’re hunting a deal, try land it near {_money(buy_target_aud)} AUD — anything higher is paying for hope."
+            ])
+    elif intent_context == "SELLING":
+        # Use the position estimate if we have one, otherwise fall back to the current active median
+        base = value_position_aud if value_position_aud is not None else (current_typ if current_typ is not None else current_low)
+        if base is not None:
+            list_at = float(base) * 1.08
+            take_at = float(base)
+            advice_line = " " + secrets.choice([
+                f" If you’re selling, I’d list around {_money(list_at)} AUD (allow room for offers) and aim to accept near {_money(take_at)} AUD depending on interest.",
+                f" Seller target: list about {_money(list_at)} AUD, realistically expect {_money(take_at)} AUD (condition + timing will move it).",
+                f" If you want a faster sale, price closer to {_money(take_at)} AUD; if you can wait, start near {_money(list_at)} AUD and adjust."
+            ])
 
-    market_summary = _norm_ws(f"{opener}{grade_line}{price_line}{trend_line}{position_line}{graded_line}{grade_advice}{buy_line}")
+    market_summary = _norm_ws(f"{opener}{grade_line}{price_line}{trend_line}{position_line}{graded_line}{grade_advice}{advice_line}")
 
     resp = {
         "available": True,
