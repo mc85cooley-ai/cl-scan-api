@@ -2839,6 +2839,41 @@ Respond ONLY with JSON, no extra text.
     except Exception:
         pass
 
+
+    def _note_for_roi(side: str, roi_name: str) -> str:
+        """Simple human note fallback for sealed/memorabilia ROI crops."""
+        rn = (roi_name or "").strip().lower()
+        # Corners / edges
+        corner_map = {
+            "corner_top_left": "Top-left corner close-up",
+            "corner_top_right": "Top-right corner close-up",
+            "corner_bottom_left": "Bottom-left corner close-up",
+            "corner_bottom_right": "Bottom-right corner close-up",
+        }
+        edge_map = {
+            "edge_top": "Top edge close-up",
+            "edge_bottom": "Bottom edge close-up",
+            "edge_left": "Left edge close-up",
+            "edge_right": "Right edge close-up",
+        }
+        seam_map = {
+            "seam_top": "Top seam / seal line close-up",
+            "seam_bottom": "Bottom seam / seal line close-up",
+            "seam_left": "Left seam / seal line close-up",
+            "seam_right": "Right seam / seal line close-up",
+            "seal": "Seal / wrap close-up",
+            "wrap": "Wrap / seal close-up",
+            "holo": "Hologram / sticker close-up",
+            "sticker": "Sticker close-up",
+        }
+        if rn in corner_map: return corner_map[rn]
+        if rn in edge_map: return edge_map[rn]
+        if rn in seam_map: return seam_map[rn]
+        if rn.startswith("corner_"): return "Corner close-up"
+        if rn.startswith("edge_"): return "Edge close-up"
+        if "seam" in rn or "seal" in rn or "wrap" in rn: return "Seal / seam close-up"
+        if "holo" in rn or "sticker" in rn or "label" in rn: return "Label / sticker close-up"
+        return "Close-up detail"
     for i, r in enumerate((rois or [])[:10]):
         src = b1 if r.get("side") == "front" else b2
         if not src:
