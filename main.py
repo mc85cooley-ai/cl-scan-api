@@ -2569,6 +2569,19 @@ async def assess_memorabilia(
             if bb and len(bb) >= 200:
                 imgs.append(bb)
 
+    # Memorabilia: subject bbox used to keep ROI crops on-product (avoid table/background)
+    global _memo_subject
+    try:
+        _memo_subject = {
+            "front": _memo_subject_bbox(b1) if b1 else {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+            "back":  _memo_subject_bbox(b2) if b2 else {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+        }
+    except Exception:
+        _memo_subject = {
+            "front": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+            "back":  {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+        }
+
     ctx = ""
     if item_type or description:
         ctx = "\n\nKNOWN ITEM DETAILS:\n"
@@ -2848,8 +2861,8 @@ def _memo_subject_bbox(img_bytes: bytes) -> Dict[str, float]:
         return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
 
 _memo_subject = {
-    "front": _memo_subject_bbox(b1) if b1 else {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
-    "back":  _memo_subject_bbox(b2) if b2 else {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+    "front": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+    "back":  {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
 }
 
 def _memo_bbox_for_roi(side: str, roi_name: str, fallback_bbox: Dict[str, Any]) -> Dict[str, Any]:
