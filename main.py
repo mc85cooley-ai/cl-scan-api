@@ -2575,7 +2575,7 @@ async def assess_memorabilia(
         if item_type: ctx += f"- Item Type: {_norm_ws(item_type)}\n"
         if description: ctx += f"- Description: {_norm_ws(description)}\n"
 
-    prompt = f"""You are a professional memorabilia/collectibles grader.
+    prompt = """You are a professional memorabilia/collectibles grader.
 
 You MUST identify what the item is (brand + product name + series/set) as specifically as the images allow, then grade condition conservatively.
 
@@ -2657,6 +2657,7 @@ Rules:
 - Be specific with locations and avoid generic statements.
 Respond ONLY with JSON, no extra text.
 """
+    prompt = prompt.replace("{ctx}", ctx)
 
     content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
     for i, bb in enumerate(imgs):
