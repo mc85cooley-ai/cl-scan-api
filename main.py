@@ -2135,438 +2135,6 @@ Return ONLY valid JSON:
     want_src["second_pass"] = second_pass
     wanted_rois = _wanted_rois_from_assessment(want_src)
 
-    defect_snaps: List[Dict[str, Any]] = []
-    label_by_idx = {int(x.get("crop_index", -1)): x for x in (roi_labels or []) if isinstance(x, dict)}
-
-    def _is_likely_defect(lab: Dict[str, Any], roi: Dict[str, Any]) -> bool:
-        """Same defect gating as cards, for sealed/memorabilia ROI crops."""
-        if not isinstance(lab, dict):
-            return False
-        if bool(lab.get("is_defect", False)):
-            return True
-
-        t = str(lab.get("type") or "").strip().lower()
-        note = str(lab.get("note") or "").strip().lower()
-        conf = _clamp(_safe_float(lab.get("confidence"), 0.0), 0.0, 1.0)
-
-        clean_types = {"none", "clean", "ok", "okay", "good", "no_defect", "no defect"}
-        if t and t not in clean_types and conf >= 0.35:
-            return True
-
-        defect_words = (
-            "tear", "split", "rip", "hole", "puncture", "crush", "crease", "dent",
-            "scuff", "scratch", "mark", "stain", "lift", "peel", "wrinkle", "cloud",
-            "seal", "seam", "repack", "tamper", "edge wear", "wear", "whitening",
-        )
-        if any(w in note for w in defect_words) and conf >= 0.30:
-            return True
-
-        roi_score = _safe_float(roi.get("score"), 0.0)
-        if roi_score >= 0.80 and t and t not in clean_types:
-            return True
-
-        return False
-
-    def _is_likely_defect(lab: Dict[str, Any], roi: Dict[str, Any]) -> bool:
-        """Gate ROI thumbnails so we show only defect-ish photos.
-
-        The ROI labeler sometimes forgets to set `is_defect=true` even when it
-        provides a non-clean type/note. We treat a crop as a defect if ANY of:
-          - explicit is_defect=True
-          - non-clean `type` with decent confidence
-          - defect-keyword `note` with decent confidence
-          - high ROI score + non-clean type
-        """
-        if not isinstance(lab, dict):
-            return False
-        if bool(lab.get("is_defect", False)):
-            return True
-
-        t = str(lab.get("type") or "").strip().lower()
-        note = str(lab.get("note") or "").strip().lower()
-        conf = _clamp(_safe_float(lab.get("confidence"), 0.0), 0.0, 1.0)
-
-        clean_types = {"none", "clean", "ok", "okay", "good", "no_defect", "no defect"}
-        if t and t not in clean_types and conf >= 0.35:
-            return True
-
-        defect_words = (
-            "whitening", "white", "wear", "edge wear", "chip", "chipping", "nick", "dent",
-            "crease", "bend", "scratch", "scratches", "scuff", "scuffs", "print line",
-            "indent", "stain", "mark", "marks", "lift", "peel", "tear", "split",
-        )
-        if any(w in note for w in defect_words) and conf >= 0.30:
-            return True
-
-        roi_score = _safe_float(roi.get("score"), 0.0)
-        if roi_score >= 0.80 and t and t not in clean_types:
-            return True
-
-        return False
-    # Helper to pull a human note from the structured assessment for a given ROI
-    def _note_from_assessment(side: str, roi: str) -> str:
-        try:
-            side = str(side or "").lower().strip()
-            roi = str(roi or "").lower().strip()
-            # corners
-            if roi.startswith("corner_"):
-                ck = roi.replace("corner_", "")
-                corner_key = {
-                    "top_left": "top_left",
-                    "top_right": "top_right",
-                    "bottom_left": "bottom_left",
-                    "bottom_right": "bottom_right",
-                }.get(ck)
-                if corner_key:
-                    c = (((data.get("corners") or {}).get(side) or {}).get(corner_key) or {})
-                    n = str(c.get("notes") or "").strip()
-                    if n:
-                        return n
-            if roi.startswith("edge_"):
-                e = ((data.get("edges") or {}).get(side) or {})
-                n = str(e.get("notes") or "").strip()
-                if n:
-                    return n
-            s = ((data.get("surface") or {}).get(side) or {})
-            n = str(s.get("notes") or "").strip()
-            return n
-        except Exception:
-            return ""
-
-    # Helper: pull a nice human note from the structured section where possible
-    def _note_for_roi(side: str, roi_name: str) -> str:
-        try:
-            if roi_name.startswith("corner_"):
-                cm = {
-                    "corner_top_left": "top_left",
-                    "corner_top_right": "top_right",
-                    "corner_bottom_left": "bottom_left",
-                    "corner_bottom_right": "bottom_right",
-                }
-                ck = cm.get(roi_name)
-                c = (data.get("corners") or {}).get(side, {}).get(ck, {}) if ck else {}
-                n = str((c or {}).get("notes") or "").strip()
-                return _norm_ws(n)
-            if roi_name.startswith("edge_"):
-                e = (data.get("edges") or {}).get(side, {})
-                n = str((e or {}).get("notes") or "").strip()
-                return _norm_ws(n)
-        except Exception:
-            pass
-        return ""
-
-    for i, r in enumerate((rois or [])[:10]):
-        src = front_bytes if r.get("side") == "front" else back_bytes
-        if not src:
-            continue
-        bbox = r.get("bbox") or {}
-        thumb = _make_thumb_from_bbox(src, bbox, max_size=520)
-        if not thumb:
-            continue
-        lab = label_by_idx.get(i) or {}
-        side = str(r.get("side") or "").lower().strip()
-        roi_name = str(r.get("roi") or "").lower().strip()
-        force = (side, roi_name) in wanted_rois
-        # Allow surface forcing: we don't have dedicated surface ROIs, so if surface is wanted,
-        # accept any non-empty ROI from that side.
-        if not force and (side, "surface") in wanted_rois:
-            force = True
-
-        if not _is_likely_defect(lab, r) and not force:
-            continue
-
-        dtype = lab.get("type") or ("whitening" if roi_name.startswith("corner_") else "defect")
-        note = lab.get("note") if lab else ""
-        if not note or force:
-            note2 = _note_from_assessment(side, roi_name)
-            if note2:
-                note = note2
-            elif not note:
-                note = f"Close-up of {roi_name.replace('_',' ')}"
-        conf = lab.get("confidence") if lab else 0.0
-        defect_snaps.append({
-            "side": r.get("side"),
-            "roi": r.get("roi"),
-            "type": dtype,
-            "note": _norm_ws(str(note))[:220],
-            "confidence": _clamp(_safe_float(conf, 0.0), 0.0, 1.0),
-            "bbox": bbox,
-            "thumbnail_b64": thumb,
-        })
-
-    defect_snaps.sort(key=lambda x: (0 if x.get("type") != "hotspot" else 1, -float(x.get("confidence") or 0.0)))
-    defect_snaps = defect_snaps[:8]
-
-
-    # Fallback: if defects were clearly flagged but ROI labeling filtered everything out,
-    # still show a few evidence crops so the UI isn't empty.
-    if (not defect_snaps) and rois and (wanted_rois or (isinstance(data, dict) and (data.get("defects") or data.get("flags")))):
-        try:
-            _pref = [r for r in rois if str(r.get("roi","")).startswith("corner_")] + [r for r in rois if str(r.get("roi","")).startswith("edge_")]
-            _pref = _pref[:4]
-            for r in _pref:
-                src = front_bytes if r.get("side") == "front" else back_bytes
-                if not src:
-                    continue
-                bbox = r.get("bbox") or {}
-                thumb = _make_thumb_from_bbox(src, bbox, max_size=520)
-                if not thumb:
-                    continue
-                side = str(r.get("side") or "").lower().strip()
-                roi_name = str(r.get("roi") or "").lower().strip()
-                note = _note_from_assessment(side, roi_name) or f"Close-up of {roi_name.replace('_',' ')}"
-                defect_snaps.append({
-                    "side": r.get("side"),
-                    "roi": r.get("roi"),
-                    "type": "defect",
-                    "note": _norm_ws(str(note))[:220],
-                    "confidence": 0.45,
-                    "bbox": bbox,
-                    "thumbnail_b64": thumb,
-                })
-            defect_snaps.sort(key=lambda x: (0 if x.get("type") != "hotspot" else 1, -float(x.get("confidence") or 0.0)))
-            defect_snaps[:] = defect_snaps[:8]
-        except Exception:
-            pass
-
-    # Add stable IDs + coarse categories for UI linking (photos <-> bullet refs)
-    def _snap_category(s: Dict[str, Any]) -> str:
-        t = str(s.get("type") or "").lower()
-        roi = str(s.get("roi") or "").lower()
-        if "corner" in t or roi.startswith("corner_"):
-            return "corners"
-        if "edge" in t or roi.startswith("edge_"):
-            return "edges"
-        if "surface" in t:
-            return "surface"
-        if "cent" in t:
-            return "centering"
-        return "other"
-
-    for idx, s in enumerate(defect_snaps, start=1):
-        s["id"] = idx
-        s["ref"] = f"#{idx}"
-        s["category"] = _snap_category(s)
-
-    # Normalize flags/defects and compute structural-damage indicator
-    flags_raw = data.get("flags", [])
-    if isinstance(flags_raw, list):
-        flags_list_out = [str(f).lower().strip() for f in flags_raw if str(f).strip()]
-    else:
-        flags_list_out = []
-    # De-duplicate while preserving order
-    flags_list_out = list(dict.fromkeys(flags_list_out))
-
-    defects_list_out = data.get("defects", [])
-    if not isinstance(defects_list_out, list):
-        defects_list_out = []
-
-    
-    # Normalize defects to strings (avoid [object Object] in frontend)
-    _norm_def = []
-    for d in defects_list_out:
-        if isinstance(d, str):
-            s = d.strip()
-            if s:
-                _norm_def.append(s)
-        elif isinstance(d, dict):
-            note = str(d.get("note") or d.get("text") or d.get("issue") or "").strip()
-            if note:
-                _norm_def.append(note)
-    defects_list_out = list(dict.fromkeys(_norm_def))
-# Merge second-pass defect candidates (print lines / scratches / whitening) and glare suspects.
-    # - Add high-confidence print_line flags when detected.
-    # - If glare suspects exist, annotate rather than over-penalize.
-    if isinstance(second_pass, dict) and second_pass.get("ran"):
-        cand = second_pass.get("defect_candidates") or []
-        glare = second_pass.get("glare_suspects") or []
-
-        # Add candidates into defects list (dedup by (type,note))
-        seen = set(str(d).lower().strip() for d in defects_list_out if isinstance(d, str))
-        for d in cand:
-            if not isinstance(d, dict): 
-                continue
-            t = str(d.get("type","")).lower().strip()
-            note = str(d.get("note","")).strip()
-            if not t or not note:
-                continue
-            key = note.lower().strip()
-            if key in seen:
-                continue
-            seen.add(key)
-            defects_list_out.append(note)
-
-            # Promote print line detection into flags if confidence is decent
-            try:
-                c = float(d.get("confidence", 0))
-            except Exception:
-                c = 0.0
-            if t == "print_line" and c >= 0.55 and "print_line" not in flags_list_out:
-                flags_list_out.append("print_line")
-
-        # Store glare suspects into data for frontend / summary
-        data["glare_suspects"] = glare[:10]
-
-    has_structural_damage = any(
-        f in ("crease", "tear", "paper break", "structural bend", "hole")
-        for f in flags_list_out
-    )
-
-
-
-    raw_pregrade = str(data.get("pregrade", "")).strip()
-    g = _grade_bucket(raw_pregrade)
-    # NOTE: We intentionally do NOT cap the AI-assessed pregrade here.
-    # Any condition-based value adjustments are applied in /api/market-context only.
-
-    pregrade_norm = str(g) if g is not None else ""
-
-    # Condition anchor for downstream market logic (trust gate)
-    g_int = None
-    try:
-        g_int = int(round(float(pregrade_norm))) if pregrade_norm else None
-    except Exception:
-        g_int = None
-    condition_anchor = "damaged" if (has_structural_damage or (g_int is not None and g_int <= 4)) else ("low" if (g_int is not None and g_int <= 6) else ("mid" if (g_int is not None and g_int <= 8) else "high"))
-    
-
-    # Ensure assessment_summary is detailed enough (UI-friendly)
-    summary = _norm_ws(str(data.get("assessment_summary", "")))
-    if len(summary.split()) < 35:
-        # Build a fuller summary from structured fields (without inventing defects)
-        flags_list = data.get("flags", []) if isinstance(data.get("flags", []), list) else []
-        defects_list = data.get("defects", []) if isinstance(data.get("defects", []), list) else []
-        cen = data.get("centering", {}) if isinstance(data.get("centering", {}), dict) else {}
-        cen_f = (cen.get("front") or {}) if isinstance(cen.get("front") or {}, dict) else {}
-        cen_b = (cen.get("back") or {}) if isinstance(cen.get("back") or {}, dict) else {}
-        edges = data.get("edges", {}) if isinstance(data.get("edges", {}), dict) else {}
-        surf = data.get("surface", {}) if isinstance(data.get("surface", {}), dict) else {}
-        ef = (edges.get("front") or {}) if isinstance(edges.get("front") or {}, dict) else {}
-        eb = (edges.get("back") or {}) if isinstance(edges.get("back") or {}, dict) else {}
-        sf = (surf.get("front") or {}) if isinstance(surf.get("front") or {}, dict) else {}
-        sb = (surf.get("back") or {}) if isinstance(surf.get("back") or {}, dict) else {}
-
-        parts = []
-        parts.append(f"Overall, this looks like a PSA-style {pregrade_norm or raw_pregrade or 'N/A'} estimate based on what is visible in the photos.")
-        if cen_f.get("grade") or cen_b.get("grade"):
-            parts.append(f"Centering appears around Front {cen_f.get('grade','').strip() or 'N/A'} and Back {cen_b.get('grade','').strip() or 'N/A'}.")
-        if ef.get("grade") or eb.get("grade"):
-            parts.append(f"Edges read as Front {ef.get('grade','').strip() or 'N/A'} / Back {eb.get('grade','').strip() or 'N/A'}; notes: {_norm_ws(str(ef.get('notes','')))} {_norm_ws(str(eb.get('notes','')))}".strip())
-        if sf.get("grade") or sb.get("grade"):
-            parts.append(f"Surface reads as Front {sf.get('grade','').strip() or 'N/A'} / Back {sb.get('grade','').strip() or 'N/A'}; notes: {_norm_ws(str(sf.get('notes','')))} {_norm_ws(str(sb.get('notes','')))}".strip())
-        if defects_list:
-            parts.append("Visible issues noted: " + "; ".join([_norm_ws(str(d)) for d in defects_list[:8]]) + ("" if len(defects_list) <= 8 else " (and more)."))
-        if flags_list:
-            parts.append("Key flags: " + ", ".join([_norm_ws(str(f)) for f in flags_list[:10]]) + ("" if len(flags_list) <= 10 else ", …") + ".")
-        parts.append("Biggest grade limiters are the most severe corner/edge whitening/chipping, any surface scratches/print lines, and any bends/creases/dents if present.")
-        summary = " ".join([p for p in parts if p]).strip()
-
-        data["assessment_summary"] = summary
-    resp = {
-        "pregrade": pregrade_norm or "N/A",
-        "confidence": _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0),
-        "centering": data.get("centering", {"front": {"grade": "", "notes": ""}, "back": {"grade": "", "notes": ""}}),
-        "corners": data.get("corners", {"front": {}, "back": {}}),
-        "edges": data.get("edges", {"front": {"grade": "", "notes": ""}, "back": {"grade": "", "notes": ""}}),
-        "surface": data.get("surface", {"front": {"grade": "", "notes": ""}, "back": {"grade": "", "notes": ""}}),
-        "defects": defects_list_out,
-        "flags": flags_list_out,
-        "second_pass": second_pass,
-        "defect_snaps": defect_snaps,
-        "glare_suspects": data.get("glare_suspects", []) if isinstance(data.get("glare_suspects", []), list) else [],
-        "assessment_summary": _norm_ws(str(data.get("assessment_summary", ""))) or summary or "",
-        "spoken_word": _norm_ws(str(data.get("spoken_word", ""))) or _norm_ws(str(data.get("assessment_summary", ""))) or summary or "",
-        "observed_id": data.get("observed_id", {}) if isinstance(data.get("observed_id", {}), dict) else {},
-        "verify_token": f"vfy_{secrets.token_urlsafe(12)}",
-        "market_context_mode": "click_only",
-        "condition_anchor": condition_anchor,
-        "has_structural_damage": bool(has_structural_damage),
-    }
-    # Remove clinical mm sizing for whitening notes (collector-style language)
-    resp = _relax_whitening_mm_in_obj(resp)
-    return JSONResponse(content=resp)
-
-# ==============================
-# Memorabilia / Sealed: Identify + Assess (NO pricing here)
-# ==============================
-@app.post("/api/identify-memorabilia")
-@safe_endpoint
-async def identify_memorabilia(
-    image1: UploadFile = File(...),
-    image2: Optional[UploadFile] = File(None),
-    image3: Optional[UploadFile] = File(None),
-    image4: Optional[UploadFile] = File(None),
-):
-    b1 = await image1.read()
-    if not b1 or len(b1) < 200:
-        raise HTTPException(status_code=400, detail="Image 1 is too small or empty")
-
-    imgs = [b1]
-    for f in (image2, image3, image4):
-        if f:
-            bb = await f.read()
-            if bb and len(bb) >= 200:
-                imgs.append(bb)
-
-    prompt = """You are identifying a collectible item (sealed product or memorabilia) from photos.
-
-Goal: be SPECIFIC. Name the exact product when possible, including brand/TCG, series/set, configuration, and any visible edition or language.
-
-Return ONLY valid JSON with these exact fields:
-
-{
-  "item_type": "sealed booster box/sealed booster bundle/sealed pack/sealed tin/sealed case/elite trainer box/collection box/autographed memorabilia/game-used memorabilia/graded item/other",
-  "brand": "brand/league/publisher if visible (e.g., Pokemon TCG, Panini, Topps, Upper Deck, Wizards of the Coast) else empty string",
-  "product_name": "exact product name if visible (e.g., 'Scarlet & Violet—151 Booster Bundle') else best-effort specific name",
-  "set_or_series": "set/series/expansion name if visible (e.g., 'Scarlet & Violet—151') else empty string",
-  "year": "4 digit year if visible else empty string",
-  "edition_or_language": "e.g., English/Japanese/1st Edition/Unlimited/Collector's Edition if visible else empty string",
-  "special_attributes": ["short tags like Factory Sealed", "Pokemon Center", "Hobby Box", "1st Edition", "Case Fresh"],
-  "description": "one clear paragraph describing exactly what it is and what can be seen (packaging, labels, markings)",
-  "signatures": "names of any visible signatures or 'None visible'",
-  "seal_condition": "Factory Sealed/Opened/Resealed/Damaged/Not applicable",
-  "authenticity_notes": "authenticity indicators visible (holograms, stickers, COA) and any red flags",
-  "notable_features": "unique features worth noting (promo contents, special print, chase set, serial numbering, COA, etc.)",
-  "confidence": 0.0-1.0,
-  "category_hint": "Pokemon/Magic/YuGiOh/Sports/OnePiece/Other"
-}
-
-Rules:
-- If multiple products are plausible, choose the best match and explain uncertainty in authenticity_notes (briefly).
-- Do NOT invent a year/edition/language if you cannot see it.
-- If it appears sealed, describe the wrap (tight/loose, tears, holes, seams, bubbling). Use 'Factory Sealed' only if it looks consistent.
-- If you cannot identify confidently, keep product_name generic and set confidence low.
-Respond ONLY with JSON, no extra text.
-"""
-
-    content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
-    for i, bb in enumerate(imgs):
-        if i > 0:
-            content.append({"type": "text", "text": f"IMAGE {i} ABOVE ☝️ | IMAGE {i+1} BELOW 👇"})
-        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(bb)}", "detail": "high"}})
-
-    msg = [{"role": "user", "content": content}]
-    result = await _openai_chat(msg, max_tokens=900, temperature=0.1)
-    data = _parse_json_or_none(result.get("content", "")) if not result.get("error") else None
-    data = data or {}
-
-    return JSONResponse(content={
-        "item_type": _norm_ws(str(data.get("item_type", "Unknown"))),
-        "brand": _norm_ws(str(data.get("brand", ""))),
-        "product_name": _norm_ws(str(data.get("product_name", ""))),
-        "set_or_series": _norm_ws(str(data.get("set_or_series", ""))),
-        "year": _norm_ws(str(data.get("year", ""))),
-        "edition_or_language": _norm_ws(str(data.get("edition_or_language", ""))),
-        "special_attributes": data.get("special_attributes", []) if isinstance(data.get("special_attributes", []), list) else [],
-        "description": _norm_ws(str(data.get("description", ""))),
-        "signatures": _norm_ws(str(data.get("signatures", "None visible"))),
-        "seal_condition": _norm_ws(str(data.get("seal_condition", "Not applicable"))),
-        "authenticity_notes": _norm_ws(str(data.get("authenticity_notes", ""))),
-        "notable_features": _norm_ws(str(data.get("notable_features", ""))),
-        "confidence": _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0),
-        "category_hint": _norm_ws(str(data.get("category_hint", "Other"))),
-        "identify_token": f"idt_{secrets.token_urlsafe(12)}",
-    })
 
 @app.post("/api/assess-memorabilia")
 @safe_endpoint
@@ -2849,6 +2417,69 @@ Respond ONLY with JSON, no extra text.
     except Exception:
         roi_labels = []
 
+
+    # Build defect snaps (evidence photos) for sealed/memorabilia
+    wanted_rois = _wanted_rois_from_assessment(data)
+
+    # Store the main subject bbox so ROI cropping ignores background/table space
+    try:
+        if b1:
+            _memo_subject["front"] = _memo_subject_bbox(b1)
+        if b2:
+            _memo_subject["back"] = _memo_subject_bbox(b2)
+    except Exception:
+        pass
+
+    defect_snaps = []
+    for r in rois:
+        try:
+            side = (r.get("side") or "front").lower().strip()
+            roi = (r.get("roi") or "").lower().strip()
+            snap_type = (r.get("type") or r.get("label") or "defect").lower().strip()
+            note = (r.get("note") or _note_for_roi(roi) or "Close-up").strip()
+
+            if wanted_rois and roi not in wanted_rois:
+                continue
+
+            src_img = b1 if side == "front" else b2
+            if not src_img:
+                continue
+
+            bbox = _memo_bbox_for_roi(side, roi)
+            crop = _crop_bbox(src_img, bbox)
+            if crop is None:
+                continue
+            defect_snaps.append({
+                "side": side,
+                "roi": roi,
+                "type": snap_type,
+                "note": note,
+                "confidence": float(r.get("confidence") or 0.0),
+                "bbox": bbox,
+                "image": _b64_jpg(crop),
+            })
+        except Exception:
+            continue
+
+    # If nothing was flagged, keep evidence list empty (UI only shows when present)
+    defect_snaps = defect_snaps[:8]
+
+    data["defect_snaps"] = defect_snaps
+    data["observed_id"] = {
+        "brand": str((id_obj.get("brand") or "")).strip(),
+        "product_name": str((id_obj.get("product_name") or id_obj.get("productName") or "")).strip(),
+        "set_or_series": str((id_obj.get("set_or_series") or id_obj.get("setOrSeries") or "")).strip(),
+        "year": str((id_obj.get("year") or "")).strip(),
+        "edition_or_language": str((id_obj.get("edition_or_language") or id_obj.get("editionOrLanguage") or "")).strip(),
+        "item_type": str((id_obj.get("item_type") or id_obj.get("itemType") or "")).strip(),
+        "product_id": str((id_obj.get("product_id") or id_obj.get("productId") or "")).strip(),
+    }
+
+    data["verify_token"] = f"vfy_{_rand_token(16)}"
+    data["market_context_mode"] = "click_only"
+
+    return JSONResponse(content=data)
+
 # Heuristic: sealed/memorabilia photos often include lots of table/background.
 # We estimate the "subject" (box/item) bounding box and then generate tighter crops
 # for corner/edge/seam ROIs inside that subject box. This makes defect snaps actually
@@ -2957,181 +2588,6 @@ def _memo_bbox_for_roi(side: str, roi_name: str, fallback_bbox: Dict[str, Any]) 
     except Exception:
         return fallback_bbox or {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
 
-    defect_snaps: List[Dict[str, Any]] = []
-    label_by_idx = {int(x.get("crop_index", -1)): x for x in (roi_labels or []) if isinstance(x, dict)}
-
-    def _is_likely_defect(lab: Dict[str, Any], roi: Dict[str, Any]) -> bool:
-        """Gate ROI thumbnails so we show only defect-ish photos (sealed/memorabilia)."""
-        if not isinstance(lab, dict):
-            return False
-        if bool(lab.get("is_defect", False)):
-            return True
-        t = str(lab.get("type") or "").strip().lower()
-        note = str(lab.get("note") or "").strip().lower()
-        conf = _clamp(_safe_float(lab.get("confidence"), 0.0), 0.0, 1.0)
-        clean_types = {"none", "clean", "ok", "okay", "good", "no_defect", "no defect"}
-        if t and t not in clean_types and conf >= 0.35:
-            return True
-        defect_words = (
-            "seal", "seam", "tear", "split", "hole", "puncture", "wrinkle", "crease",
-            "scuff", "scratch", "dent", "crush", "corner", "edge", "wear", "whitening",
-            "stain", "mark", "lift", "peel", "tamper", "reseal",
-        )
-        if any(w in note for w in defect_words) and conf >= 0.30:
-            return True
-        roi_score = _safe_float(roi.get("score"), 0.0)
-        if roi_score >= 0.80 and t and t not in clean_types:
-            return True
-        return False
-
-    # wanted_rois is used as an optional override (mainly for cards). For sealed/memorabilia we keep it empty unless we add a dedicated mapping.
-    wanted_rois: set = set()
-    # If defects/flags mention packaging issues, force evidence crops for those ROIs (sealed/memorabilia).
-    try:
-        _df_txt = " ".join([str(x) for x in (data.get("defects") or []) if str(x).strip()])
-        _df_txt += " " + " ".join([str(x) for x in (flags_list_out or []) if str(x).strip()])
-        _df_txt = _df_txt.lower()
-        if any(w in _df_txt for w in ("corner", "scuff", "crease", "dent", "crush", "bump")):
-            wanted_rois.update({("front","corner_top_left"),("front","corner_top_right"),("front","corner_bottom_left"),("front","corner_bottom_right"),
-                               ("back","corner_top_left"),("back","corner_top_right"),("back","corner_bottom_left"),("back","corner_bottom_right")})
-        if any(w in _df_txt for w in ("edge", "wear", "whitening", "split", "tear", "seal", "seam", "rip", "hole", "puncture")):
-            wanted_rois.update({("front","edge_top"),("front","edge_bottom"),("front","edge_left"),("front","edge_right"),
-                               ("back","edge_top"),("back","edge_bottom"),("back","edge_left"),("back","edge_right")})
-    except Exception:
-        pass
-
-
-    def _note_for_roi(side: str, roi_name: str) -> str:
-        """Simple human note fallback for sealed/memorabilia ROI crops."""
-        rn = (roi_name or "").strip().lower()
-        # Corners / edges
-        corner_map = {
-            "corner_top_left": "Top-left corner close-up",
-            "corner_top_right": "Top-right corner close-up",
-            "corner_bottom_left": "Bottom-left corner close-up",
-            "corner_bottom_right": "Bottom-right corner close-up",
-        }
-        edge_map = {
-            "edge_top": "Top edge close-up",
-            "edge_bottom": "Bottom edge close-up",
-            "edge_left": "Left edge close-up",
-            "edge_right": "Right edge close-up",
-        }
-        seam_map = {
-            "seam_top": "Top seam / seal line close-up",
-            "seam_bottom": "Bottom seam / seal line close-up",
-            "seam_left": "Left seam / seal line close-up",
-            "seam_right": "Right seam / seal line close-up",
-            "seal": "Seal / wrap close-up",
-            "wrap": "Wrap / seal close-up",
-            "holo": "Hologram / sticker close-up",
-            "sticker": "Sticker close-up",
-        }
-        if rn in corner_map: return corner_map[rn]
-        if rn in edge_map: return edge_map[rn]
-        if rn in seam_map: return seam_map[rn]
-        if rn.startswith("corner_"): return "Corner close-up"
-        if rn.startswith("edge_"): return "Edge close-up"
-        if "seam" in rn or "seal" in rn or "wrap" in rn: return "Seal / seam close-up"
-        if "holo" in rn or "sticker" in rn or "label" in rn: return "Label / sticker close-up"
-        return "Close-up detail"
-    for i, r in enumerate((rois or [])[:10]):
-        src = b1 if r.get("side") == "front" else b2
-        if not src:
-            continue
-        bbox = r.get("bbox") or {}
-        side = str(r.get("side") or "")
-        roi_name = str(r.get("roi") or "")
-        bbox = _memo_bbox_for_roi(side, roi_name, bbox)
-        thumb = _make_thumb_from_bbox(src, bbox, max_size=520)
-        if not thumb:
-            continue
-        lab = label_by_idx.get(i) or {}
-        force = (side, roi_name) in wanted_rois
-        # Surface is a meta-request; allow any ROI on that side if surface is flagged.
-        if not force and (side, "surface") in wanted_rois:
-            force = True
-
-        if not (_is_likely_defect(lab, r) or force):
-            continue
-
-        dtype = lab.get("type") or ("whitening" if roi_name.startswith("corner_") else "defect")
-        note = (lab.get("note") if isinstance(lab, dict) else "") or _note_for_roi(side, roi_name) or f"Close-up: {roi_name}"
-        conf = lab.get("confidence") if lab else 0.0
-        defect_snaps.append({
-            "side": side,
-            "roi": roi_name,
-            "type": dtype,
-            "note": _norm_ws(str(note))[:220],
-            "confidence": _clamp(_safe_float(conf, 0.0), 0.0, 1.0),
-            "bbox": bbox,
-            "thumbnail_b64": thumb,
-        })
-
-    
-    # Fallback: if defects exist but ROI labeling filtered everything out, still show a few closeups.
-    if (not defect_snaps) and rois and (isinstance(data, dict) and (data.get("defects") or data.get("flags"))):
-        try:
-            _pref = [r for r in rois if str(r.get("roi","")).startswith("corner_")] + [r for r in rois if str(r.get("roi","")).startswith("edge_")]
-            _pref = _pref[:4]
-            for r in _pref:
-                src = b1 if r.get("side") == "front" else b2
-                if not src:
-                    continue
-                bbox = r.get("bbox") or {}
-                side = str(r.get("side") or "")
-                roi_name = str(r.get("roi") or "")
-                bbox = _memo_bbox_for_roi(side, roi_name, bbox)
-                thumb = _make_thumb_from_bbox(src, bbox, max_size=520)
-                if not thumb:
-                    continue
-                note = _note_for_roi(side, roi_name) or f"Close-up: {roi_name}"
-                defect_snaps.append({
-                    "side": side,
-                    "roi": roi_name,
-                    "type": "defect",
-                    "note": _norm_ws(str(note))[:220],
-                    "confidence": 0.45,
-                    "bbox": bbox,
-                    "thumbnail_b64": thumb,
-                })
-        except Exception:
-            pass
-
-    defect_snaps.sort(key=lambda x: (0 if x.get("type") != "hotspot" else 1, -float(x.get("confidence") or 0.0)))
-    defect_snaps = defect_snaps[:8]
-
-    def _snap_category(s: Dict[str, Any]) -> str:
-        t = str(s.get("type") or "").lower()
-        roi = str(s.get("roi") or "").lower()
-        if "corner" in t or roi.startswith("corner_"):
-            return "packaging"
-        if "edge" in t or roi.startswith("edge_"):
-            return "packaging"
-        if "surface" in t:
-            return "packaging"
-        return "other"
-
-    for idx, s in enumerate(defect_snaps, start=1):
-        s["id"] = idx
-        s["ref"] = f"#{idx}"
-        s["category"] = _snap_category(s)
-
-    return JSONResponse(content={
-        "condition_grade": _norm_ws(str(data.get("condition_grade", "N/A"))),
-        "confidence": _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0),
-        "seal_integrity": seal,
-        "packaging_condition": data.get("packaging_condition", {"grade": "N/A", "notes": ""}),
-        "signature_assessment": data.get("signature_assessment", {"present": False, "quality": "Not Applicable", "notes": ""}),
-        "value_factors": data.get("value_factors", []) if isinstance(data.get("value_factors", []), list) else [],
-        "defects": data.get("defects", []) if isinstance(data.get("defects", []), list) else [],
-        "overall_assessment": _norm_ws(str(data.get("overall_assessment", ""))),
-        "spoken_word": _norm_ws(str(data.get("spoken_word", ""))) or _norm_ws(str(data.get("overall_assessment", ""))),
-        "observed_id": data.get("observed_id", {}) if isinstance(data.get("observed_id", {}), dict) else {},
-        "flags": flags_list_out,
-        "defect_snaps": defect_snaps,
-        "verify_token": f"vfy_{secrets.token_urlsafe(12)}",
-    })
 
 # ==============================
 # Market Context (Click-only) - Cards
