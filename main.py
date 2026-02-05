@@ -1493,6 +1493,23 @@ async def _pc_search(q: str, category: Optional[str] = None, limit: int = 10) ->
         return []
     return products[: max(1, min(50, limit))]
 
+async def _pc_search_ungraded(query: str, category: Optional[str] = None, limit: int = 10):
+    """Search PriceCharting and filter out graded products for RAW/ungraded card comparisons."""
+    products = await _pc_search(query, category=category, limit=max(10, limit * 2))
+    if not products:
+        return []
+
+    ungraded = []
+    graded_keywords = ["psa", "bgs", "cgc", "graded", "gem mint 10", "grade"]
+    for product in products:
+        title = (str(product.get("product-name") or product.get("name") or "")).lower()
+        if not any(k in title for k in graded_keywords):
+            ungraded.append(product)
+            if len(ungraded) >= limit:
+                break
+    return ungraded
+
+
 async def _pc_product(product_id: str) -> Dict[str, Any]:
     if not product_id:
         return {}
@@ -3259,6 +3276,7 @@ async def market_context(
 
     exclude_graded_effective = EXCLUDE_GRADED_DEFAULT if exclude_graded is None else bool(exclude_graded)
 
+
     
     # --------------------------
     # PriceCharting fallback (sealed / memorabilia + when eBay disabled)
@@ -3275,6 +3293,16 @@ async def market_context(
             "dvd", "vhs", "figure", "funko", "comic", "poster"
         ])
 
+
+    # If we're dealing with single cards and excluding graded comps, bias queries toward RAW/UNGRADED listings.
+    is_memorabilia_like = False
+    try:
+        is_memorabilia_like = _looks_like_memorabilia(ctype, description)
+    except Exception:
+        is_memorabilia_like = False
+
+    if exclude_graded_effective and (not is_memorabilia_like):
+        ladder = [_dedupe_tokens(q + " raw ungraded") for q in (ladder or [])]
     async def _market_context_pricecharting(query_str: str, category_hint: str = "", pid: str = "") -> Dict[str, Any]:
         qs = _norm_ws(query_str).strip()
         if not qs:
@@ -3308,7 +3336,7 @@ async def market_context(
             detail = await _pc_product(used_pid)
             best = detail or {}
         else:
-            products = await _pc_search(qs, category=cat or None, limit=10)
+            products = await (_pc_search_ungraded(qs + ' raw ungraded', category=cat or None, limit=10) if exclude_graded_effective and (not is_memorabilia_like) else _pc_search(qs, category=cat or None, limit=10))
             if not products:
                 return {
                     "available": False,
@@ -3370,7 +3398,7 @@ async def market_context(
                 "url": url,
                 "source": "PriceCharting",
             })
-        active_matches = active_matches[:5]
+        active_matches = active_matches[:10]
 
         # Collector-style summary (works for both cards + sealed)
         vibe = "moving" if cnt >= 4 else "thin"
@@ -3633,7 +3661,7 @@ async def market_context(
             })
 
         scored.sort(key=lambda x: x["score"], reverse=True)
-        top = scored[:5]
+        top = scored[:10]
 
         prices = [x["price"] for x in top if isinstance(x.get("price"), (int, float)) and x["price"] > 0]
         prices_sorted = sorted(prices)
@@ -3923,14 +3951,14 @@ async def market_context(
 
     if worth_grading is True:
         grade_advice = " " + secrets.choice([
-            f" With grading around ${gc:.0f}, it’s a decent shout if you’re chasing a slab or a cleaner resale.",
-            f" Grading fee’s about ${gc:.0f} — I’d consider sending it if you want it protected/registry-ready.",
+            f" If you’re chasing a slab or cleaner resale, it can be a decent shout if you’re chasing a slab or a cleaner resale.",
+            f" I’d consider sending it if you want it protected/registry-ready.",
         ])
     elif worth_grading is False:
         grade_advice = " " + secrets.choice([
-            f" Grading’s about ${gc:.0f} — I’d only send it if it’s a personal PC piece or you want it in the registry slabbed up.",
-            f" With a ~${gc:.0f} fee, this feels more like a binder/PC card unless you just want it in plastic for the vibe.",
-            f" Fee’s ~${gc:.0f}; if you’re grading for profit, I’d be picky here — but for the collection? send it.",
+            f" I’d only send it if it’s a personal PC piece or you want it in the registry slabbed up.",
+            f" This feels more like a binder/PC card unless you just want it in plastic for the vibe.",
+            f" If you’re grading for profit, I’d be picky here — but for the collection? send it.",
         ])
 
     advice_line = ""
@@ -3956,6 +3984,47 @@ async def market_context(
 
     market_summary = _norm_ws(f"{opener}{grade_line}{price_line}{trend_line}{position_line}{graded_line}{grade_advice}{advice_line}")
 
+    # Strip any residual grading fee mentions (keep market info clean)
+    try:
+        market_summary = market_summary.replace('Estimated grading fee:', '')
+        market_summary = re.sub(r"Grading\s*fee:.*?(\n|$)", "", market_summary, flags=re.I)
+        market_summary = re.sub(r"\$\s*\d+\s*grading.*?(\n|$)", "", market_summary, flags=re.I)
+    except Exception:
+        pass
+
+
+    
+    # --------------------------
+    # Market graph ranges (for frontend bar graph + user-value red line)
+    # --------------------------
+    assessed_value = None
+    try:
+        assessed_value = float(est_value_aud) if est_value_aud is not None else (float(value_position_aud) if value_position_aud is not None else (float(current_typ) if current_typ is not None else None))
+    except Exception:
+        assessed_value = None
+
+    low_v = float(current_low) if current_low is not None else None
+    med_v = float(current_typ) if current_typ is not None else None
+    high_v = float(current_high) if current_high is not None else None
+
+    market_graph = None
+    try:
+        if low_v is not None and med_v is not None and high_v is not None and low_v > 0 and high_v >= low_v:
+            market_graph = {
+                "price_ranges": {
+                    "poor": {"min": low_v * 0.6, "max": low_v, "label": "Poor Condition"},
+                    "played": {"min": low_v, "max": low_v + (med_v - low_v) * 0.5, "label": "Played"},
+                    "good": {"min": low_v + (med_v - low_v) * 0.5, "max": med_v, "label": "Good"},
+                    "very_good": {"min": med_v, "max": med_v + (high_v - med_v) * 0.4, "label": "Very Good"},
+                    "excellent": {"min": med_v + (high_v - med_v) * 0.4, "max": high_v, "label": "Excellent"},
+                    "near_mint": {"min": high_v, "max": high_v * 1.15, "label": "Near Mint"},
+                },
+                "user_value": assessed_value,
+                "currency": "AUD",
+            }
+    except Exception:
+        market_graph = None
+
     resp = {
         "available": True,
         "source": "ebay_active",
@@ -3968,6 +4037,7 @@ async def market_context(
         "grade_outcome": grade_outcome,
         "graded": grade_market,
         "active": active_stats,
+        "market_graph": market_graph,
         "active_matches": active_matches,
         "match_debug": {"active": active_debug, "ebay_calls": ebay_call_debug},
         "observed": {
@@ -3975,7 +4045,7 @@ async def market_context(
             "fx": {"usd_to_aud_rate": _FX_CACHE.get("usd_aud"), "cache_seconds": FX_CACHE_SECONDS},
             "active": active_stats,
             "raw": {  # legacy: point raw to ACTIVE stream now
-                "source": "ebay_active_top5",
+                "source": "ebay_active_top10",
                 "count": active_stats.get("count"),
                 "low": active_stats.get("low"),
                 "median": active_stats.get("median"),
