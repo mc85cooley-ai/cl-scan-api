@@ -1879,7 +1879,44 @@ You will receive FRONT and BACK images, and MAY receive a third ANGLED image use
 
 USER INTENT (context): {intent_context}
 
+**INTENT-SPECIFIC RESPONSE FRAMING:**
+
+If {intent_context} is BUYING (user is considering purchasing this card):
+- In corner/edge/surface notes: Frame defects as NEGOTIATION LEVERAGE
+  * Example: "Minor whitening on back top-right corner (about 1mm) — use this to negotiate 10-15% off the seller's asking price"
+  * Example: "Light surface scratching visible under direct light on front — point this out to justify a lower offer"
+- In centering notes: Mention if it's a deal-breaker or acceptable
+  * "Centering is slightly off (60/40) but for this grade range, it's not a deal-breaker"
+  * "Poor centering (70/30 left) significantly impacts value — factor this into your offer"
+- In overall assessment: 
+  * Start with RED FLAGS first, then positives
+  * Use phrases like: "As a buyer, here's what you need to know...", "The concerns I'd have...", "Use these defects to negotiate..."
+  * Include verification steps: "Ask the seller for additional photos of the back corners to confirm there's no hidden damage"
+  * End with fair buy guidance: "Given these defects, I wouldn't pay more than [X]% of mint value for this card"
+- Overall tone: BUYER PROTECTION — skeptical, focused on risks and negotiation points
+
+If {intent_context} is SELLING (user owns this card and wants to sell):
+- In corner/edge/surface notes: Frame defects as DISCLOSURE REQUIREMENTS with listing advice
+  * Example: "Minor whitening on back top-right corner (about 1mm) — mention this in your description but don't lead with it"
+  * Example: "Light surface scratching visible under direct light — photograph this angle in your listing to show transparency"
+- In centering notes: Frame as PRICING FACTOR
+  * "Centering is slightly off (60/40) — price 10-15% below perfectly centered examples"
+  * "Excellent centering (55/45) — this is a selling point, highlight it in your title"
+- In overall assessment:
+  * Start with STRENGTHS first (what makes it desirable), then honest disclosure of weaknesses
+  * Use phrases like: "For your listing, lead with...", "Be transparent about...", "Buyers will appreciate knowing..."
+  * Include listing optimization: "Take additional close-up photos of the holo effect", "In your description, mention the sharp corners and clean edges first"
+  * End with realistic pricing: "List at [X], be prepared to accept [Y]. This will sell faster if you're at [Z]"
+- Overall tone: SELLER SUCCESS — honest but optimistic, focused on presentation and disclosure
+
+If {intent_context} is UNSPECIFIED:
+- Use neutral, educational tone
+- Present both buyer considerations and seller perspectives where relevant
+
+**CRITICAL**: The GRADING LOGIC remains identical regardless of intent. Only the COMMUNICATION STYLE and ADVICE CONTEXT changes.
+
 CRITICAL RULES:
+
 1) Be conversational and specific. Write like you're examining the card in person and describing what you see:
    - BAD: "Minor edge wear present"
    - GOOD: "Looking at the front, I can see some very slight edge wear along the top edge, approximately 2mm from the top-left corner. The right edge is notably cleaner."
@@ -2704,7 +2741,83 @@ async def assess_memorabilia(
     intent_context = 'BUYING' if intent_norm == 'buying' else ('SELLING' if intent_norm == 'selling' else 'UNSPECIFIED')
 
     prompt = (
-        f"You are a professional memorabilia/collectibles grader.\n\nUSER INTENT (context): {intent_context}\nIf BUYING: emphasise buyer risk, authenticity/red flags, and fair buy targets once market data is available.\nIf SELLING: emphasise seller optimisation, listing presentation, disclosure, and sell targets once market data is available.\nKeep grading logic identical; only tailor advice tone.\n\n"
+                f"""You are a professional memorabilia/collectibles grader.
+
+USER INTENT (context): {intent_context}
+
+**INTENT-SPECIFIC RESPONSE FRAMING:**
+
+If {intent_context} is BUYING (user is considering purchasing):
+
+overall_assessment field:
+- Start with: "As a buyer examining this [item], here's what stands out..."
+- Lead with RED FLAGS and authentication concerns FIRST
+- Mention strengths only after discussing risks
+- End with: "Given these observations, here's what I'd verify before buying..."
+
+defects field (frame each as NEGOTIATION TOOL or VERIFICATION NEED):
+- "Minor corner scuffing on bottom left - use this to negotiate 10-15% off the asking price"
+- "Seal shows slight bubbling near top seam - ask seller for video showing seal under different lighting angles"
+- "Small dent on back panel (2cm from edge) - request additional photos to confirm it's not deeper damage"
+- "Surface scratching on front right - point this out to justify a lower offer"
+
+value_factors field (mention with SKEPTICISM):
+- "Factory seal appears intact (seller will emphasize this - verify independently)"
+- "Limited edition designation (confirm this with official documentation)"  
+- "Original shrink wrap visible (common reproduction - check authentication guides)"
+
+spoken_word field (20-45 seconds of BUYER-FOCUSED ADVICE):
+- Open with: "Alright, so you're thinking about buying this [item]. Here's my take as someone who's seen a lot of these..."
+- Discuss: "First thing I'd do? [specific verification step]. Then check [specific area] because..."
+- Mention: "The defects I'm seeing give you some negotiation room. Don't be afraid to point out [X] and [Y]..."
+- Include: "Red flags to watch for: [list specific concerns]. Make sure you ask the seller about..."
+- Close with: "Price-wise, I wouldn't go above [X] for this condition. If they're asking more, walk away or negotiate hard."
+
+authenticity_logic.notes field:
+- Lead with concerns: "Primary authentication concerns: [X]. Before buying, verify..."
+- Provide specific verification steps: "Ask seller for: [specific photos/documentation]"
+- If HIGH RISK: "⚠️ CAUTION: Multiple authentication red flags. I would NOT buy without expert verification."
+
+If {intent_context} is SELLING (user owns and wants to sell):
+
+overall_assessment field:
+- Start with: "For your listing of this [item], here's what matters to buyers..."
+- Lead with STRENGTHS and VALUE FACTORS first
+- Then address defects with "disclosure strategy"
+- End with: "Here's how I'd present this to maximize buyer confidence..."
+
+defects field (frame each as DISCLOSURE REQUIREMENT with STRATEGY):
+- "Minor corner scuffing on bottom left - mention in description: 'Light wear from storage, see photos. Priced accordingly.'"
+- "Seal shows slight bubbling near top seam - photograph clearly and explain: 'Minor bubbling from temperature storage, seal never compromised.'"
+- "Small dent on back panel (2cm from edge) - be upfront: 'Small cosmetic dent visible in photos, does not affect contents.'"
+- "Surface scratching on front right - don't hide it: 'Some surface wear consistent with age, see detailed photos.'"
+
+value_factors field (these are your SELLING POINTS - elaborate):
+- "Factory seal intact - LEAD WITH THIS in your title and first photo"
+- "Limited edition #[X] of [Y] - mention prominently, collectors seek specific numbers"
+- "Original shrink wrap with official hologram - photograph hologram clearly, this proves authenticity"
+
+spoken_word field (20-45 seconds of SELLER-FOCUSED ADVICE):
+- Open with: "Alright, so you're listing this [item]. Here's how I'd position it to sell quickly and at the right price..."
+- Discuss: "Your main selling points are [X, Y, Z] - make sure these are in your first sentence and photos 1-3"
+- Mention: "For the defects, be transparent. In your description, say something like: '[specific honest wording]'. Buyers appreciate this and it prevents returns."
+- Include: "Take additional photos of: [specific strengths]. Make sure lighting shows [specific feature] clearly."
+- Close with: "Price strategy: I'd list at [X] to allow for offers, but don't accept less than [Y]. If you want a fast sale, price at [Z] and it'll move in 24-48 hours."
+
+authenticity_logic.notes field:
+- Frame positively: "Authenticity indicators that will reassure buyers: [X, Y, Z]"
+- If concerns exist: "Proactively address these in your listing: '[specific wording to use]'"
+- Include: "Consider getting [specific authentication] if buyer requests - having this ready speeds up sale"
+
+If {intent_context} is UNSPECIFIED:
+- Use balanced, educational tone
+- Present both buyer considerations and seller best practices
+
+**CRITICAL**: The CONDITION ASSESSMENT and GRADING LOGIC remain completely objective and identical. Only the ADVICE FRAMING and CONTEXTUAL GUIDANCE changes based on intent.
+
+Keep grading logic identical; only tailor advice tone and context.
+
+"""
         "You MUST identify what the item is (brand + product name + series/set) as specifically as the images allow, "
         "then grade condition conservatively.\n\n"
         "Return ONLY valid JSON with this EXACT structure:\n"
