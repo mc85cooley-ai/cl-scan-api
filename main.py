@@ -2522,7 +2522,7 @@ async def identify_memorabilia(
     "You are identifying a collectible item (sealed product or memorabilia) from photos.\n\n"
     "CRITICAL: Be EXTREMELY SPECIFIC about product configuration. Many products look similar but have vastly different values:\n"
     "- Booster Box (typically 36 packs) vs Booster Bundle (typically 6 packs) vs Single Booster Pack\n"
-    "- Display Box (contains multiple booster boxes) vs Individual Booster Box\n"
+    "- Display Box/Case (contains multiple booster boxes OR multiple bundles) vs Individual Box/Bundle\n"
     "- Elite Trainer Box (8-10 packs + accessories) vs Collection Box (4-5 packs + promos)\n\n"
 
     "IDENTIFICATION HIERARCHY (check in this order):\n"
@@ -2554,7 +2554,7 @@ async def identify_memorabilia(
     "- Booster Bundle = 6 packs, ~$40-60 AUD retail\n"
     "- Elite Trainer Box = 9 packs + dice/sleeves, ~$60-80 AUD retail\n"
     "- Collection Box = 4-5 packs + promo card, ~$30-50 AUD retail\n"
-    "- Display Box = 6 booster boxes (216 packs total), ~$900-1500 AUD retail\n\n"
+    "- Booster Bundle Display Case = typically 10 booster bundles (60 packs), ~$350-700+ AUD retail\n- Display Box = 6 booster boxes (216 packs total), ~$900-1500 AUD retail\n\n"
 
     "Return ONLY valid JSON with these exact fields:\n"
     "{\n"
@@ -2579,7 +2579,7 @@ async def identify_memorabilia(
     "- If it appears sealed, describe the wrap (tight/loose, tears, holes, seams, bubbling). Use 'Factory Sealed' only if it looks consistent.\n"
     "- If you cannot identify confidently, keep product_name generic and set confidence low.\n"
     "- CRITICAL: Look for pack count or product type text - 'Booster Box' vs 'Booster Bundle' makes a HUGE price difference!\n"
-    "- When unsure between box/bundle, default to the LARGER configuration if the item looks substantial.\n"
+    "- When unsure between bundle vs bundle display case, default to the LARGER configuration if the item looks substantial.\n- When unsure between box/bundle, default to the LARGER configuration if the item looks substantial.\n"
     "Respond ONLY with JSON, no extra text."
 )
 
@@ -2610,6 +2610,39 @@ async def identify_memorabilia(
         "confidence": _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0),
         "category_hint": _norm_ws(str(data.get("category_hint", "Other"))),
     }
+    # ✅ Heuristic fix: Bundle Display/Case vs single Bundle
+    # If the model returns "booster bundle" but the text/attributes indicate a display/case (e.g., 10 bundles),
+    # force a more specific configuration to avoid huge pricing mismatches.
+    try:
+        blob_txt = " ".join([
+            str(item.get("product_name", "")),
+            str(item.get("description", "")),
+            " ".join(item.get("special_attributes", []) or []),
+            str(item.get("notable_features", "")),
+            str(item.get("authenticity_notes", "")),
+        ]).lower()
+
+        if ("bundle" in blob_txt) and (("display" in blob_txt) or ("case" in blob_txt) or ("10 booster" in blob_txt) or ("ten booster" in blob_txt) or ("10x" in blob_txt) or ("x10" in blob_txt)):
+            item["item_type"] = "sealed display box"
+
+            # ensure a more specific product_name
+            pn = (item.get("product_name") or "").strip()
+            series = (item.get("set_or_series") or "").strip()
+
+            if not pn or pn.lower() in ("booster bundle", "bundle", "booster bundle box"):
+                item["product_name"] = (f"{series} Booster Bundle Display" if series else "Booster Bundle Display").strip()
+            elif "display" not in pn.lower():
+                item["product_name"] = (pn + " Display").strip()
+
+            # tag 10 bundles if hinted
+            if ("10" in blob_txt or "ten" in blob_txt) and all("10" not in str(x) for x in item.get("special_attributes", []) or []):
+                item.setdefault("special_attributes", [])
+                if isinstance(item["special_attributes"], list):
+                    item["special_attributes"].append("10 Bundles")
+    except Exception:
+        pass
+
+
 
     # Optional: resolve a PriceCharting product_id for tighter Market Context matching
     product_id = ""
