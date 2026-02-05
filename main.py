@@ -1,11 +1,23 @@
 """
 The Collectors League Australia - Scan API
-Futureproof v6.7.5 (2026-02-03)
+Futureproof v6.7.7 (2026-02-05)
 
-What changed vs v6.3.x
-- ✅ Adds PriceCharting API as primary market source for cards + sealed/memorabilia (current prices).
+What changed vs v6.7.5 (2026-02-03)
+- ✅ Intent-aware grading language (BUYING vs SELLING) for BOTH cards + memorabilia prompts:
+  - Buyer mode: negotiation leverage, red flags, verification steps, fair buy guidance
+  - Seller mode: listing optimisation, disclosure strategy, pricing guidance
+  - CRITICAL: grading logic remains objective; only advice framing changes
+- ✅ Expanded card grading scale guidance:
+  - Allows true GEM MINT 10 when warranted (no psychological “cap at 9”)
+  - Adds Grade 12 “Collectors League Ultra Flawless” (rare, must be awarded when warranted)
+  - JSON schema hint updated: pregrade "1-12" with 12 criteria note
+- ✅ Memorabilia assessment stability fix:
+  - Corrected indentation in assess_memorabilia defect thumbnail logic (defect_snaps) to prevent syntax/runtime errors
+
+Market data architecture (unchanged)
+- ✅ PriceCharting API as primary market source for cards + sealed/memorabilia (current prices).
 - ✅ Keeps PokemonTCG.io for identification + metadata enrichment (NOT price history).
-- ✅ Adds weekly snapshot option (store PriceCharting CSV/API snapshots on a schedule) to build your own price history.
+- ✅ Weekly snapshot option (store PriceCharting CSV/API snapshots on a schedule) to build your own price history.
 - ✅ eBay API scaffolding included but DISABLED by default (waiting for your dev account approval).
 - ✅ Market endpoints return "click-only" informational context + no ROI language.
 
@@ -1929,7 +1941,24 @@ CRITICAL RULES:
    - Any crease/fold/tear/major dent → pregrade 4 or lower
    - Any bend/ding/impression, heavy rounding → pregrade 5 or lower
    - Moderate whitening across multiple corners/edges → pregrade 6-7
-   - Only grade 9-10 if truly exceptional
+   - Grade 8-9 for cards with minor flaws but overall excellent condition
+   - Grade 10 (GEM MINT) ONLY for cards that are virtually flawless:
+     * ALL 8 corners sharp with no whitening
+     * Perfect or near-perfect centering (55/45 or better)
+     * No surface scratches, print lines, or defects
+     * Clean edges with no wear
+     * High gloss, no dulling
+     DO NOT be afraid to give 10 if the card truly merits it
+
+   - Grade 12 (COLLECTORS LEAGUE ULTRA FLAWLESS) for cards that exceed perfection:
+     * PERFECT centering (50/50 or 52/48 maximum)
+     * ALL corners are razor-sharp with zero detectable flaws even under magnification
+     * Surface is pristine - looks like it came straight from pack to sleeve
+     * Edges are perfectly cut with no fraying, roughness, or inconsistency
+     * Exceptional print quality with vivid colors and perfect registration
+     * Zero factory defects (no print dots, lines, or imperfections)
+     * Card presents as if it's never been touched by human hands
+     This grade should be RARE (perhaps 1 in 1000 cards) but MUST be awarded when warranted
 
 
 5) Do NOT confuse holo sheen / light refraction / texture for damage:
@@ -1949,7 +1978,7 @@ CRITICAL RULES:
 Return ONLY valid JSON with this EXACT structure:
 
 {{
-  "pregrade": "1-10",
+  "pregrade": "1-12 (use 12 ONLY for Ultra Flawless cards that exceed all expectations)",
   "confidence": 0.0-1.0,
   "centering": {{
     "front": {{
