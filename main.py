@@ -2873,146 +2873,146 @@ async def assess_memorabilia(
     }
 
     
-# ------------------------------
-# CV-assisted defect closeups (defect_snaps) for UI thumbnails (memorabilia)
-# ------------------------------
-defect_snaps: List[Dict[str, Any]] = []
-try:
-    rois_m: List[Dict[str, Any]] = []
+    # ------------------------------
+    # CV-assisted defect closeups (defect_snaps) for UI thumbnails (memorabilia)
+    # ------------------------------
+    defect_snaps: List[Dict[str, Any]] = []
     try:
-        rois_m = _cv_candidate_bboxes(b1, "front") + _cv_candidate_bboxes(b2, "back")
-    except Exception:
-        rois_m = []
-
-    roi_labels_m: List[Dict[str, Any]] = []
-    try:
-        roi_labels_m = []
-        if rois_m:
-            roi_labels_m = await _openai_label_rois(rois_m, b1, b2)
-
-    except Exception:
-        roi_labels_m = []
-
-    label_by_idx_m = {int(x.get("crop_index", -1)): x for x in (roi_labels_m or []) if isinstance(x, dict)}
-
-    # If the LLM clearly reported defects, force a few best ROI crops even if the labeler is conservative.
-    force_idxs = set()
-    if defects_out and rois_m:
-        scored = sorted(
-            [(i, _safe_float((r or {}).get("score"), 0.0)) for i, r in enumerate(rois_m)],
-            key=lambda t: -t[1]
-        )
-        force_idxs = set([i for i, _ in scored[:3]])
-
-    def _is_likely_defect_m(lab: Dict[str, Any], roi: Dict[str, Any]) -> bool:
-        if not isinstance(lab, dict):
+        rois_m: List[Dict[str, Any]] = []
+        try:
+            rois_m = _cv_candidate_bboxes(b1, "front") + _cv_candidate_bboxes(b2, "back")
+        except Exception:
+            rois_m = []
+    
+        roi_labels_m: List[Dict[str, Any]] = []
+        try:
+            roi_labels_m = []
+            if rois_m:
+                roi_labels_m = await _openai_label_rois(rois_m, b1, b2)
+    
+        except Exception:
+            roi_labels_m = []
+    
+        label_by_idx_m = {int(x.get("crop_index", -1)): x for x in (roi_labels_m or []) if isinstance(x, dict)}
+    
+        # If the LLM clearly reported defects, force a few best ROI crops even if the labeler is conservative.
+        force_idxs = set()
+        if defects_out and rois_m:
+            scored = sorted(
+                [(i, _safe_float((r or {}).get("score"), 0.0)) for i, r in enumerate(rois_m)],
+                key=lambda t: -t[1]
+            )
+            force_idxs = set([i for i, _ in scored[:3]])
+    
+        def _is_likely_defect_m(lab: Dict[str, Any], roi: Dict[str, Any]) -> bool:
+            if not isinstance(lab, dict):
+                return False
+            if bool(lab.get("is_defect", False)):
+                return True
+    
+            t = str(lab.get("type") or "").strip().lower()
+            note = str(lab.get("note") or "").strip().lower()
+            conf = _clamp(_safe_float(lab.get("confidence"), 0.0), 0.0, 1.0)
+    
+            clean_types = {"none", "clean", "ok", "okay", "good", "no_defect", "no defect"}
+            if t and t not in clean_types and conf >= 0.35:
+                return True
+    
+            defect_words = (
+                "tear", "split", "rip", "hole", "puncture", "crush", "crease", "dent",
+                "scuff", "scratch", "mark", "stain", "lift", "peel", "wrinkle", "cloud",
+                "seal", "seam", "repack", "tamper", "edge wear", "wear", "whitening",
+            )
+            if any(w in note for w in defect_words) and conf >= 0.30:
+                return True
+    
+            roi_score = _safe_float((roi or {}).get("score"), 0.0)
+            if roi_score >= 0.80 and t and t not in clean_types:
+                return True
+    
             return False
-        if bool(lab.get("is_defect", False)):
-            return True
-
-        t = str(lab.get("type") or "").strip().lower()
-        note = str(lab.get("note") or "").strip().lower()
-        conf = _clamp(_safe_float(lab.get("confidence"), 0.0), 0.0, 1.0)
-
-        clean_types = {"none", "clean", "ok", "okay", "good", "no_defect", "no defect"}
-        if t and t not in clean_types and conf >= 0.35:
-            return True
-
-        defect_words = (
-            "tear", "split", "rip", "hole", "puncture", "crush", "crease", "dent",
-            "scuff", "scratch", "mark", "stain", "lift", "peel", "wrinkle", "cloud",
-            "seal", "seam", "repack", "tamper", "edge wear", "wear", "whitening",
-        )
-        if any(w in note for w in defect_words) and conf >= 0.30:
-            return True
-
-        roi_score = _safe_float((roi or {}).get("score"), 0.0)
-        if roi_score >= 0.80 and t and t not in clean_types:
-            return True
-
-        return False
-
-    for i, r in enumerate((rois_m or [])[:10]):
-        if not isinstance(r, dict):
-            continue
-        src = b1 if r.get("side") == "front" else b2
-        if not src:
-            continue
-        bbox = r.get("bbox") or {}
-        thumb = _make_thumb_from_bbox(src, bbox, max_size=520)
-        if not thumb:
-            continue
-
-        lab = label_by_idx_m.get(i) or {}
-        side = str(r.get("side") or "").lower().strip()
-        roi_name = str(r.get("roi") or "").lower().strip()
-        force = i in force_idxs
-
-        if not _is_likely_defect_m(lab, r) and not force:
-            continue
-
-        dtype = lab.get("type") or ("hotspot" if "edge" in roi_name else "defect")
-        note = lab.get("note") if isinstance(lab, dict) else ""
-        if not note:
-            note = f"Close-up of {roi_name.replace('_',' ')}" if roi_name else "Defect close-up"
-
-        conf2 = lab.get("confidence") if isinstance(lab, dict) else 0.0
-        defect_snaps.append({
-            "id": i + 1,
-            "side": side,
-            "roi": r.get("roi"),
-            "type": dtype,
-            "note": _norm_ws(str(note))[:220],
-            "confidence": _clamp(_safe_float(conf2, 0.0), 0.0, 1.0),
-            "bbox": bbox,
-            "thumbnail_b64": thumb,
-        })
-
-    defect_snaps.sort(key=lambda x: -float(x.get("confidence") or 0.0))
-    defect_snaps = defect_snaps[:8]
-except Exception:
-    defect_snaps = []
-
-# Fallback: if we have reported defects but no labeled defect crops, show basic hotspots instead (better than empty UI).
-if (not defect_snaps) and defects_out:
-    try:
-        snaps = _make_basic_hotspot_snaps(b1, "front", max_snaps=4) + _make_basic_hotspot_snaps(b2, "back", max_snaps=4)
-        defect_snaps = []
-        for j, s in enumerate((snaps or [])[:8]):
-            if not isinstance(s, dict) or not s.get("thumbnail_b64"):
+    
+        for i, r in enumerate((rois_m or [])[:10]):
+            if not isinstance(r, dict):
                 continue
-            s2 = dict(s)
-            s2["id"] = j + 1
-            defect_snaps.append(s2)
+            src = b1 if r.get("side") == "front" else b2
+            if not src:
+                continue
+            bbox = r.get("bbox") or {}
+            thumb = _make_thumb_from_bbox(src, bbox, max_size=520)
+            if not thumb:
+                continue
+    
+            lab = label_by_idx_m.get(i) or {}
+            side = str(r.get("side") or "").lower().strip()
+            roi_name = str(r.get("roi") or "").lower().strip()
+            force = i in force_idxs
+    
+            if not _is_likely_defect_m(lab, r) and not force:
+                continue
+    
+            dtype = lab.get("type") or ("hotspot" if "edge" in roi_name else "defect")
+            note = lab.get("note") if isinstance(lab, dict) else ""
+            if not note:
+                note = f"Close-up of {roi_name.replace('_',' ')}" if roi_name else "Defect close-up"
+    
+            conf2 = lab.get("confidence") if isinstance(lab, dict) else 0.0
+            defect_snaps.append({
+                "id": i + 1,
+                "side": side,
+                "roi": r.get("roi"),
+                "type": dtype,
+                "note": _norm_ws(str(note))[:220],
+                "confidence": _clamp(_safe_float(conf2, 0.0), 0.0, 1.0),
+                "bbox": bbox,
+                "thumbnail_b64": thumb,
+            })
+    
+        defect_snaps.sort(key=lambda x: -float(x.get("confidence") or 0.0))
+        defect_snaps = defect_snaps[:8]
     except Exception:
-        pass
-
-return JSONResponse(content={
-        "condition_grade": condition_grade,
-        "confidence": conf,
-        "condition_distribution": dist,
-        "seal_integrity": seal_obj,
-        "packaging_condition": packaging_obj,
-        "signature_assessment": sig_obj,
-        "value_factors": value_factors_out,
-        "defects": defects_out,
-        "flags": flags_out,
-        "overall_assessment": overall,
-        "spoken_word": spoken,
-        "authenticity_logic": auth_obj,
-        "observed_id": observed_id,
-        "defect_snaps": defect_snaps,
-        "verify_token": f"vfy_{secrets.token_urlsafe(12)}",
-        "market_context_mode": "click_only",
-    })
-
-# ==============================
-# Market Context (Click-only) - Cards
-# Primary: PriceCharting (current prices, includes graded where available)
-# Secondary: PokemonTCG links (ID + marketplace links, not history)
-# eBay API: scaffold only (disabled)
-# ==============================
-
+        defect_snaps = []
+    
+    # Fallback: if we have reported defects but no labeled defect crops, show basic hotspots instead (better than empty UI).
+    if (not defect_snaps) and defects_out:
+        try:
+            snaps = _make_basic_hotspot_snaps(b1, "front", max_snaps=4) + _make_basic_hotspot_snaps(b2, "back", max_snaps=4)
+            defect_snaps = []
+            for j, s in enumerate((snaps or [])[:8]):
+                if not isinstance(s, dict) or not s.get("thumbnail_b64"):
+                    continue
+                s2 = dict(s)
+                s2["id"] = j + 1
+                defect_snaps.append(s2)
+        except Exception:
+            pass
+    
+    return JSONResponse(content={
+            "condition_grade": condition_grade,
+            "confidence": conf,
+            "condition_distribution": dist,
+            "seal_integrity": seal_obj,
+            "packaging_condition": packaging_obj,
+            "signature_assessment": sig_obj,
+            "value_factors": value_factors_out,
+            "defects": defects_out,
+            "flags": flags_out,
+            "overall_assessment": overall,
+            "spoken_word": spoken,
+            "authenticity_logic": auth_obj,
+            "observed_id": observed_id,
+            "defect_snaps": defect_snaps,
+            "verify_token": f"vfy_{secrets.token_urlsafe(12)}",
+            "market_context_mode": "click_only",
+        })
+    
+    # ==============================
+    # Market Context (Click-only) - Cards
+    # Primary: PriceCharting (current prices, includes graded where available)
+    # Secondary: PokemonTCG links (ID + marketplace links, not history)
+    # eBay API: scaffold only (disabled)
+    # ==============================
+    
 
 @app.post("/api/market-context")
 @safe_endpoint
