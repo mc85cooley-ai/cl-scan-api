@@ -2886,7 +2886,10 @@ try:
 
     roi_labels_m: List[Dict[str, Any]] = []
     try:
-        roi_labels_m = await _openai_label_rois(rois_m, b1, b2) if rois_m else []
+        roi_labels_m = []
+        if rois_m:
+            roi_labels_m = await _openai_label_rois(rois_m, b1, b2)
+
     except Exception:
         roi_labels_m = []
 
