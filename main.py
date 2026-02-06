@@ -32,6 +32,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional, Dict, Any, List, Tuple
+from pydantic import BaseModel
 from datetime import datetime, timedelta
 from statistics import mean, median
 from functools import wraps
@@ -4382,6 +4383,120 @@ async def record_market_price(
 # ========================================
 # DEFECT HEATMAP GENERATION
 # ========================================
+class MarketPriceLookupRequest(BaseModel):
+    card_name: str
+    card_set: Optional[str] = None
+    card_year: Optional[str] = None
+    card_number: Optional[str] = None
+    grade: Optional[str] = None
+
+
+@app.post("/api/market/price-lookup")
+@safe_endpoint
+async def market_price_lookup(request: MarketPriceLookupRequest):
+    """
+    Look up current market price for a specific card/item.
+    Primary source: PriceCharting API (requires PRICECHARTING_TOKEN).
+    Accepts JSON request body.
+    """
+    try:
+        pc_token = os.getenv("PRICECHARTING_TOKEN", "") or ""
+        if not pc_token:
+            return {"current_price": 0, "source": "none", "error": "No PriceCharting token configured"}
+
+        # Build search query
+        search_query = request.card_name.strip()
+        if request.card_set:
+            search_query += f" {request.card_set}"
+        if request.card_year:
+            search_query += f" {request.card_year}"
+        if request.card_number:
+            search_query += f" #{request.card_number}"
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                "https://www.pricecharting.com/api/products",
+                params={
+                    "t": pc_token,
+                    "q": search_query,
+                },
+                timeout=15
+            )
+
+        if resp.status_code != 200:
+            return {"current_price": 0, "source": "error", "error": f"PriceCharting HTTP {resp.status_code}"}
+
+        data = resp.json() if resp.text else {}
+        products = data.get("products") or []
+        if not products:
+            return {"current_price": 0, "source": "none", "error": "No results found"}
+
+        product = products[0] or {}
+
+        # PriceCharting fields vary by category. Prefer graded if available and grade requested.
+        current_price = 0
+        if request.grade:
+            g = str(request.grade).lower().strip()
+            g_key = g.replace(" ", "-")
+            for key in [f"price-{g_key}", f"price-{g_key}-new", "price-graded"]:
+                if key in product and product.get(key):
+                    current_price = product.get(key)
+                    break
+
+        if not current_price:
+            for key in ["price-graded", "price-new", "price-cib", "price-loose"]:
+                if key in product and product.get(key):
+                    current_price = product.get(key)
+                    break
+
+        try:
+            current_price_val = float(current_price) if current_price else 0.0
+        except Exception:
+            current_price_val = 0.0
+
+        return {
+            "current_price": current_price_val,
+            "source": "pricecharting",
+            "product_name": product.get("product-name", "") or product.get("product_name", ""),
+            "console_name": product.get("console-name", "") or product.get("console_name", ""),
+            "last_updated": datetime.now().isoformat(),
+            "available_prices": {
+                "loose": product.get("price-loose"),
+                "cib": product.get("price-cib"),
+                "new": product.get("price-new"),
+                "graded": product.get("price-graded"),
+            },
+            "raw": product
+        }
+
+    except Exception as e:
+        logging.error(f"Price lookup error: {e}")
+        return {"current_price": 0, "source": "error", "error": str(e)}
+
+@app.post("/api/collection/update-values")
+@safe_endpoint
+async def update_collection_market_values(
+    user_id: int = Form(...),
+):
+    """
+    Fetch current market values for all items in a user's collection.
+    NOTE: WordPress is the source of truth for collections. This endpoint is a stub
+    kept for backwards compatibility with older front-ends.
+    """
+    try:
+        # WordPress now performs updates via AJAX (cg_update_collection_values).
+        return {
+            "success": True,
+            "updated_count": 0,
+            "total_value": "0.00",
+            "change_24h": "0.00",
+            "change_percent": "0.0",
+            "note": "Use WordPress AJAX action cg_update_collection_values for live updates."
+        }
+    except Exception as e:
+        logging.error(f"Market value update error: {e}")
+        return {"success": False, "error": str(e)}
+
 
 @app.post("/api/generate-heatmap")
 @safe_endpoint
