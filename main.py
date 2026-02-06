@@ -4151,7 +4151,7 @@ async def _ebay_sold_prices_stub(query: str) -> Dict[str, Any]:
 
 @app.get("/api/market-trends/{card_identifier}")
 @safe_endpoint
-async def get_market_trends(card_identifier: str, days: int = 180):
+async def get_market_trends(card_identifier: str, days: int = 90):
     """
     Get historical price data from eBay and generate predictions.
     card_identifier format: "CardName|SetName|Grade" or just "CardName SetName"
@@ -4179,13 +4179,13 @@ async def get_market_trends(card_identifier: str, days: int = 180):
             raise HTTPException(status_code=400, detail="Could not build search query from card_identifier")
 
         # eBay FindingService completed listings effectively cover ~90 days
-        ebay_days = max(1, min(int(days or 180), 90))
-
+        target_days = max(7, min(int(days or 90), 90))
+        ebay_days = target_days
         # Pull REAL eBay completed + active (if enabled/configured)
         completed = await _ebay_completed_stats(search_query, limit=200, days_lookback=ebay_days)
         active = await _ebay_active_stats(search_query, limit=120)
 
-        historical_prices = process_ebay_to_timeseries(completed, active, target_days=int(days or 180))
+        historical_prices = process_ebay_to_timeseries(completed, active, target_days=target_days)
 
         if not historical_prices or len(historical_prices) < 7:
             return JSONResponse(content={
@@ -4194,7 +4194,7 @@ async def get_market_trends(card_identifier: str, days: int = 180):
                 "card_identifier": ident,
                 "search_query": search_query,
                 "data_source": "ebay_completed_listings",
-                "analysis_period_days": int(days or 180),
+                "analysis_period_days": int(target_days),
                 "actual_data_points": len(historical_prices or []),
                 "ebay_listings_analyzed": int((completed or {}).get("count") or 0),
                 "timestamp": datetime.utcnow().isoformat() + "Z",
@@ -4211,7 +4211,7 @@ async def get_market_trends(card_identifier: str, days: int = 180):
             "historical_data": historical_prices,
             "prediction": prediction,
             "seasonality": seasonality,
-            "analysis_period_days": int(days or 180),
+            "analysis_period_days": int(target_days),
             "actual_data_points": len(historical_prices),
             "ebay_listings_analyzed": int((completed or {}).get("count") or 0),
             "timestamp": datetime.utcnow().isoformat() + "Z",
@@ -4229,7 +4229,7 @@ async def get_market_trends(card_identifier: str, days: int = 180):
         }, status_code=500)
 
 
-def process_ebay_to_timeseries(ebay_data: dict, active_data: dict, target_days: int = 180) -> list:
+def process_ebay_to_timeseries(ebay_data: dict, active_data: dict, target_days: int = 90) -> list:
     """
     Convert eBay sold listings into a daily time series for trend analysis.
 
@@ -4241,10 +4241,10 @@ def process_ebay_to_timeseries(ebay_data: dict, active_data: dict, target_days: 
       - used for today's "current asks" fallback if there is no sale today
     """
     try:
-        target_days = int(target_days or 180)
+        target_days = int(target_days or 90)
     except Exception:
-        target_days = 180
-    target_days = max(7, min(365, target_days))
+        target_days = 90
+    target_days = max(7, min(90, target_days))
 
     if not ebay_data or not isinstance(ebay_data, dict) or not ebay_data.get("prices"):
         return []
