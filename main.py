@@ -1,6 +1,6 @@
 """
 The Collectors League Australia - Scan API
-Futureproof v7.0.0 (2026-02-06)
+Futureproof v6.7.7 (2026-02-05)
 
 What changed vs v6.7.5 (2026-02-03)
 - ✅ Intent-aware grading language (BUYING vs SELLING) for BOTH cards + memorabilia prompts:
@@ -35,6 +35,7 @@ from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timedelta
 from statistics import mean, median
 from functools import wraps
+from fastapi import WebSocket
 import base64
 import io
 import os
