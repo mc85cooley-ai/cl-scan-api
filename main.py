@@ -4272,9 +4272,9 @@ def process_ebay_to_timeseries(ebay_data: dict, active_data: dict, target_days: 
     from collections import defaultdict
     daily_sales = defaultdict(list)
 
-    # Deterministic spread: sort prices and assign in a round-robin across the window.
-    prices_sorted = sorted(prices_only)
-    for i, price in enumerate(prices_sorted):
+    # Deterministic spread: distribute prices in natural order (unsorted).
+    # This preserves the inherent randomness and prevents artificial trends.
+    for i, price in enumerate(prices_only):
         day_offset = i % window
         d = datetime.now() - timedelta(days=(window - 1 - day_offset))
         daily_sales[d.strftime("%Y-%m-%d")].append(float(price))
