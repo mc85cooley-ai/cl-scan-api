@@ -35,6 +35,7 @@ from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timedelta
 from statistics import mean, median
 from functools import wraps
+from fastapi import WebSocket
 import base64
 import io
 import os
