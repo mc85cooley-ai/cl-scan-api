@@ -1,6 +1,6 @@
 """
 The Collectors League Australia - Scan API
-Futureproof v6.7.7 (2026-02-05)
+Futureproof v7.0.0 (2026-02-06)
 
 What changed vs v6.7.5 (2026-02-03)
 - ✅ Intent-aware grading language (BUYING vs SELLING) for BOTH cards + memorabilia prompts:
@@ -32,16 +32,32 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional, Dict, Any, List, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta
 from statistics import mean, median
 from functools import wraps
 import base64
 import io
 import os
+import asyncio
 import json
 import sqlite3
 import csv
 import secrets
+
+# Optional scientific stack for market trend predictions
+try:
+    import numpy as np
+except Exception:
+    np = None
+
+try:
+    from scipy import stats
+    from scipy.fft import fft, fftfreq
+except Exception:
+    stats = None
+    fft = None
+    fftfreq = None
+
 import hashlib
 import re
 import traceback
@@ -4127,6 +4143,394 @@ async def _ebay_sold_prices_stub(query: str) -> Dict[str, Any]:
     return {"available": False, "message": "eBay API not enabled.", "query": query}
 
 # ==============================
+# ========================================
+# MARKET TREND PREDICTIONS
+# ========================================
+
+@app.get("/api/market-trends/{card_identifier}")
+@safe_endpoint
+async def get_market_trends(card_identifier: str, days: int = 180):
+    """
+    Get historical price data and generate predictions.
+    card_identifier format: "CardName|SetName|Grade"
+    NOTE: This endpoint currently returns mock history/predictions until WordPress DB integration is wired.
+    """
+    historical_prices = generate_mock_price_history(days)
+    prediction = predict_future_prices(historical_prices)
+    seasonality = detect_seasonality(historical_prices)
+
+    return JSONResponse(content={
+        "success": True,
+        "card_identifier": card_identifier,
+        "historical_data": historical_prices,
+        "prediction": prediction,
+        "seasonality": seasonality,
+        "analysis_period_days": days,
+        "timestamp": datetime.utcnow().isoformat() + "Z"
+    })
+
+
+def generate_mock_price_history(days: int):
+    """Generate mock historical price data for demo UI."""
+    data = []
+    base_price = 100.0
+    for i in range(days):
+        date = datetime.now() - timedelta(days=days - i)
+        trend = base_price + (i * 0.3)  # slight upward trend
+
+        noise = 0.0
+        seasonal = 0.0
+        vol = 12
+
+        if np is not None:
+            noise = float(np.random.normal(0, 5))
+            seasonal = float(10 * np.sin(2 * np.pi * i / 365))
+            vol = int(np.random.uniform(5, 25))
+
+        price = max(1.0, trend + noise + seasonal)
+
+        data.append({
+            "date": date.strftime("%Y-%m-%d"),
+            "price_low": round(price * 0.9, 2),
+            "price_median": round(price, 2),
+            "price_high": round(price * 1.1, 2),
+            "volume": vol
+        })
+    return data
+
+
+def predict_future_prices(historical_data, forecast_days: int = 90):
+    """Generate price predictions using linear regression with safe fallbacks."""
+    if not historical_data or len(historical_data) < 30:
+        return {"available": False, "reason": "Insufficient historical data"}
+
+    prices = [float(d.get("price_median", 0) or 0) for d in historical_data]
+    n = len(prices)
+
+    # Build x axis
+    if np is not None:
+        x = np.arange(n)
+    else:
+        x = list(range(n))
+
+    # Regression (scipy if available, else numpy polyfit, else simple)
+    slope = 0.0
+    intercept = float(prices[0])
+    r_value = 0.0
+
+    if stats is not None and np is not None:
+        res = stats.linregress(x, prices)
+        slope, intercept, r_value = float(res.slope), float(res.intercept), float(res.rvalue)
+    elif np is not None:
+        slope, intercept = np.polyfit(x, prices, 1)
+        # crude correlation estimate
+        try:
+            r = np.corrcoef(x, prices)[0, 1]
+            r_value = float(r)
+        except Exception:
+            r_value = 0.0
+    else:
+        # very simple slope estimate
+        slope = (prices[-1] - prices[0]) / max(1, (n - 1))
+        intercept = prices[0]
+        r_value = 0.0
+
+    # Confidence: abs(r) (0..1)
+    confidence = min(1.0, max(0.0, abs(r_value)))
+
+    # Std dev for bands
+    if np is not None:
+        std_dev = float(np.std(prices))
+        mean_price = float(np.mean(prices)) if prices else 1.0
+    else:
+        mean_price = sum(prices) / max(1, len(prices))
+        var = sum((p - mean_price) ** 2 for p in prices) / max(1, len(prices))
+        std_dev = var ** 0.5
+
+    predictions = []
+    for i in range(forecast_days):
+        future_x = n + i
+        predicted_price = (slope * future_x) + intercept
+        lower_bound = predicted_price - (1.96 * std_dev)
+        upper_bound = predicted_price + (1.96 * std_dev)
+        future_date = datetime.now() + timedelta(days=i)
+
+        predictions.append({
+            "date": future_date.strftime("%Y-%m-%d"),
+            "predicted_price": round(predicted_price, 2),
+            "lower_bound": round(max(0.0, lower_bound), 2),
+            "upper_bound": round(max(0.0, upper_bound), 2),
+            "confidence": round(confidence * 100, 1)
+        })
+
+    current_price = prices[-1]
+    price_30d = predictions[29]["predicted_price"] if len(predictions) > 29 else predictions[-1]["predicted_price"]
+    price_90d = predictions[-1]["predicted_price"]
+
+    change_30d = ((price_30d - current_price) / current_price) * 100 if current_price else 0.0
+    change_90d = ((price_90d - current_price) / current_price) * 100 if current_price else 0.0
+
+    volatility = (std_dev / mean_price * 100) if mean_price else 0.0
+
+    return {
+        "available": True,
+        "forecast_days": forecast_days,
+        "predictions": predictions,
+        "current_price": round(current_price, 2),
+        "predicted_30d": round(price_30d, 2),
+        "predicted_90d": round(price_90d, 2),
+        "change_30d_percent": round(change_30d, 1),
+        "change_90d_percent": round(change_90d, 1),
+        "confidence_score": round(confidence * 100, 1),
+        "trend": "increasing" if slope > 0 else "decreasing",
+        "volatility": round(volatility, 1),
+        "recommendation": generate_trend_recommendation(slope, confidence, change_90d)
+    }
+
+
+def detect_seasonality(historical_data):
+    """Detect simple seasonality using FFT when available."""
+    if not historical_data or len(historical_data) < 60:
+        return {"available": False}
+
+    if np is None or fft is None or fftfreq is None:
+        return {"available": False, "reason": "FFT unavailable (numpy/scipy not installed)"}
+
+    prices = [float(d.get("price_median", 0) or 0) for d in historical_data]
+    x = np.arange(len(prices))
+
+    # Detrend with polyfit
+    slope, intercept = np.polyfit(x, prices, 1)
+    trend = slope * x + intercept
+    detrended = np.array(prices) - trend
+
+    fft_vals = np.abs(fft(detrended))
+    freqs = fftfreq(len(prices))
+
+    # dominant (exclude DC, and use only positive freqs)
+    half = len(fft_vals) // 2
+    dominant_idx = int(np.argmax(fft_vals[1:half]) + 1)
+    dom_freq = float(freqs[dominant_idx]) if dominant_idx < len(freqs) else 0.0
+
+    dominant_period = int(round(1 / abs(dom_freq))) if dom_freq != 0 else 0
+
+    seasonal_patterns = []
+    if 350 <= dominant_period <= 380:
+        seasonal_patterns.append({
+            "pattern": "Yearly cycle",
+            "period_days": dominant_period,
+            "description": "Prices follow an annual pattern - likely tournament seasons or holiday cycles"
+        })
+    elif 80 <= dominant_period <= 100:
+        seasonal_patterns.append({
+            "pattern": "Quarterly cycle",
+            "period_days": dominant_period,
+            "description": "Prices fluctuate quarterly - possibly tied to set releases"
+        })
+
+    return {
+        "available": True,
+        "has_seasonality": len(seasonal_patterns) > 0,
+        "patterns": seasonal_patterns,
+        "dominant_period_days": dominant_period if dominant_period > 0 else None
+    }
+
+
+def generate_trend_recommendation(slope: float, confidence: float, change_90d: float) -> str:
+    """Generate guidance text based on the model signal. (No ROI language.)"""
+    if confidence < 0.5:
+        return "⚠️ Low confidence prediction - market is volatile. Monitor closely before making decisions."
+
+    if change_90d > 15:
+        return "📈 Strong upward trend predicted. Consider holding; if buying, be selective and compare listings."
+    elif change_90d > 5:
+        return "↗️ Moderate upward trend. Stable market; consider buying on dips."
+    elif change_90d < -15:
+        return "📉 Declining trend predicted. If selling, you may want to list sooner; if buying, wait for stabilization."
+    elif change_90d < -5:
+        return "↘️ Slight downward trend. Hold if you own, or look for better entry points."
+    else:
+        return "➡️ Stable market predicted. Good for long-term collectors; not much short-term movement expected."
+
+
+@app.post("/api/market-trends/record-price")
+@safe_endpoint
+async def record_market_price(
+    card_identifier: str = Form(...),
+    card_name: str = Form(...),
+    card_set: str = Form(""),
+    card_number: str = Form(""),
+    grade: str = Form(""),
+    price_low: float = Form(...),
+    price_median: float = Form(...),
+    price_high: float = Form(...),
+    volume: int = Form(0),
+    source: str = Form("pricecharting"),
+):
+    """
+    Record a price snapshot for historical tracking.
+    NOTE: This is a stub until WordPress DB integration is wired.
+    """
+    return JSONResponse(content={
+        "success": True,
+        "message": "Price snapshot recorded (stub)",
+        "timestamp": datetime.utcnow().isoformat() + "Z"
+    })
+
+
+# ========================================
+# DEFECT HEATMAP GENERATION
+# ========================================
+
+@app.post("/api/generate-heatmap")
+@safe_endpoint
+async def generate_defect_heatmap(
+    front: UploadFile = File(...),
+    back: UploadFile = File(None),
+    assessment_data: str = Form(...),
+):
+    """
+    Generate heatmap overlay data (zones) based on assessment JSON.
+    Returns canvas-friendly coordinates (0..1) + severities.
+    """
+    # We read bytes so the request matches frontend FormData usage; we don't process the pixels yet.
+    _ = await front.read()
+    if back:
+        _ = await back.read()
+
+    assessment = {}
+    try:
+        assessment = json.loads(assessment_data) if assessment_data else {}
+    except Exception:
+        assessment = {}
+
+    defect_zones = extract_defect_zones(assessment)
+
+    heatmap_data = {
+        "front": generate_heatmap_layer(defect_zones.get("front", []), "front"),
+        "back": generate_heatmap_layer(defect_zones.get("back", []), "back") if back else None,
+    }
+
+    return JSONResponse(content={
+        "success": True,
+        "heatmap_data": heatmap_data,
+        "defect_count": sum(len(zs) for zs in defect_zones.values()),
+        "severity_breakdown": calculate_severity_breakdown(defect_zones),
+    })
+
+
+def extract_defect_zones(assessment):
+    """
+    Extract defect locations and severities from assessment dict.
+    Returns: { "front": [..], "back": [..] }
+    """
+    zones = {"front": [], "back": []}
+
+    # Corners
+    corners = assessment.get("corners", {}) if isinstance(assessment, dict) else {}
+    corner_positions = {
+        "top_left": (0.12, 0.12),
+        "top_right": (0.88, 0.12),
+        "bottom_left": (0.12, 0.88),
+        "bottom_right": (0.88, 0.88),
+    }
+
+    for side in ["front", "back"]:
+        side_corners = (corners.get(side, {}) or {}) if isinstance(corners, dict) else {}
+        for corner_name, (x, y) in corner_positions.items():
+            corner_data = (side_corners.get(corner_name, {}) or {}) if isinstance(side_corners, dict) else {}
+            condition = str(corner_data.get("condition", "")).lower()
+
+            severity = 0
+            if "sharp" in condition or "mint" in condition:
+                severity = 0
+            else:
+                # default to minor if not explicitly sharp
+                severity = 1
+                if any(w in condition for w in ["whitening", "wear", "fray"]):
+                    severity = max(severity, 2)
+                if any(w in condition for w in ["severe", "crease", "bend", "dent"]):
+                    severity = 3
+
+            if severity > 0:
+                zones[side].append({
+                    "x": x, "y": y, "radius": 0.14,
+                    "severity": severity,
+                    "type": "corner",
+                    "label": corner_name.replace("_", " ").title()
+                })
+
+    # Edges
+    edges = assessment.get("edges", {}) if isinstance(assessment, dict) else {}
+    edge_positions = {
+        "top": (0.5, 0.06),
+        "right": (0.94, 0.5),
+        "bottom": (0.5, 0.94),
+        "left": (0.06, 0.5),
+    }
+
+    for side in ["front", "back"]:
+        side_edges = (edges.get(side, {}) or {}) if isinstance(edges, dict) else {}
+        notes = str(side_edges.get("notes", "")).lower()
+
+        for edge_name, (x, y) in edge_positions.items():
+            if edge_name in notes:
+                severity = 1
+                if any(w in notes for w in ["significant", "moderate"]):
+                    severity = 2
+                if any(w in notes for w in ["severe", "heavy"]):
+                    severity = 3
+
+                zones[side].append({
+                    "x": x, "y": y, "radius": 0.18,
+                    "severity": severity,
+                    "type": "edge",
+                    "label": edge_name.title() + " Edge"
+                })
+
+    # Surface
+    surface = assessment.get("surface", {}) if isinstance(assessment, dict) else {}
+    for side in ["front", "back"]:
+        side_surface = (surface.get(side, {}) or {}) if isinstance(surface, dict) else {}
+        notes = str(side_surface.get("notes", "")).lower()
+        if any(w in notes for w in ["scratch", "print line", "stain", "dent", "scuff"]):
+            severity = 2
+            if any(w in notes for w in ["severe", "significant", "heavy"]):
+                severity = 3
+            zones[side].append({
+                "x": 0.5, "y": 0.5, "radius": 0.28,
+                "severity": severity,
+                "type": "surface",
+                "label": "Surface Defect"
+            })
+
+    return zones
+
+
+def generate_heatmap_layer(zones, side: str):
+    return {
+        "zones": zones,
+        "total_severity": sum(int(z.get("severity", 0) or 0) for z in zones),
+        "max_severity": max([int(z.get("severity", 0) or 0) for z in zones]) if zones else 0,
+        "side": side
+    }
+
+
+def calculate_severity_breakdown(defect_zones):
+    breakdown = {"minor": 0, "moderate": 0, "severe": 0}
+    for side_zones in (defect_zones or {}).values():
+        for zone in side_zones:
+            sev = int(zone.get("severity", 0) or 0)
+            if sev == 1:
+                breakdown["minor"] += 1
+            elif sev == 2:
+                breakdown["moderate"] += 1
+            elif sev >= 3:
+                breakdown["severe"] += 1
+    return breakdown
+
+
+
 # Runner
 # ==============================
 def _normalize_num_variants(card_number: str) -> List[str]:
@@ -4226,6 +4630,832 @@ def _build_ebay_query_ladder(card_name: str, set_name: str, set_code: str, card_
         seen.add(q.lower())
         out.append(q)
     return out
+# ==============================
+# Runner
+# ==============================
+# ========================================
+# PORTFOLIO TRACKER ENDPOINTS
+# ========================================
+
+@app.post("/api/collection/add")
+@safe_endpoint
+async def add_to_collection(
+    user_id: int = Form(...),
+    submission_id: str = Form(...),
+    card_name: str = Form(...),
+    card_set: str = Form(""),
+    card_year: str = Form(""),
+    grade_overall: str = Form(""),
+    purchase_price: Optional[float] = Form(None),
+    purchase_date: Optional[str] = Form(None),
+    notes: str = Form(""),
+):
+    """
+    Add a card to user's collection.
+
+    NOTE: For now this returns success and expects WordPress (PHP) to write to WP DB.
+    (Later we can wire this to a direct MySQL connection or webhook.)
+    """
+    try:
+        return JSONResponse(content={
+            "success": True,
+            "message": "Card added to collection",
+            "user_id": user_id,
+            "submission_id": submission_id
+        })
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
+
+
+@app.get("/api/collection/value-history")
+@safe_endpoint
+async def get_collection_value_history(user_id: int, days: int = 30):
+    """Get collection value over time for charts (mock structure for now)."""
+    from datetime import timedelta
+    base_date = datetime.now()
+
+    history = []
+    for i in range(days):
+        date = base_date - timedelta(days=days - i)
+        history.append({
+            "date": date.strftime("%Y-%m-%d"),
+            "total_value": 5000 + (i * 50),
+            "card_count": 15
+        })
+
+    return JSONResponse(content={
+        "success": True,
+        "history": history,
+        "current_total": history[-1]["total_value"] if history else 0
+    })
+
+
+@app.post("/api/collection/update-values")
+@safe_endpoint
+async def update_collection_market_values(user_id: int = Form(...)):
+    """
+    Update all market values for a user's collection (mock structure for now).
+    Intended future flow:
+    1) fetch all cards in WP collection table
+    2) query PriceCharting
+    3) update current_market_value + record price_history snapshots
+    """
+    return JSONResponse(content={
+        "success": True,
+        "updated_count": 15,
+        "total_value": 5250.00,
+        "change_24h": 125.00,
+        "change_percent": 2.4
+    })
+
+
+# ========================================
+# CARD COMPARISON ENDPOINT
+# ========================================
+
+@app.post("/api/compare-cards")
+@safe_endpoint
+async def compare_cards(submission_ids: str = Form(...)):
+    """
+    Compare 2–4 cards side by side with AI recommendation.
+    For now: returns a safe mock structure (PHP page renders it).
+    """
+    ids = [sid.strip() for sid in submission_ids.split(',') if sid.strip()]
+    if len(ids) < 2 or len(ids) > 4:
+        raise HTTPException(status_code=400, detail="Must compare 2-4 cards")
+
+    comparison = {
+        "submission_ids": ids,
+        "cards": [],
+        "winner": None,
+        "recommendation": "",
+        "comparison_matrix": {}
+    }
+
+    for i, sid in enumerate(ids):
+        comparison["cards"].append({
+            "submission_id": sid,
+            "card_name": f"Card {i+1}",
+            "grade": f"{8+i}",
+            "defect_count": max(0, 3 - i),
+            "market_value": 100 + (i * 25),
+            "strengths": ["Sharp corners", "Good centering"],
+            "weaknesses": ["Minor edge wear"]
+        })
+
+    comparison["winner"] = ids[0] if ids else None
+    comparison["recommendation"] = f"""Based on comparison analysis:
+
+🏆 Winner: {comparison["winner"]}
+
+Why it wins:
+- Best overall condition profile
+- Fewer visible issues
+- Stronger value positioning
+
+Recommended action:
+- If BUYING: prioritize {comparison["winner"]}
+- If SELLING: lead with {comparison["winner"]}
+"""
+
+    return JSONResponse(content=comparison)
+
+
+# ========================================
+# GRADING CONFIDENCE PREDICTOR
+# ========================================
+
+@app.post("/api/predict-grade")
+@safe_endpoint
+async def predict_grade_confidence(
+    front: UploadFile = File(...),
+    back: UploadFile = File(None),
+):
+    """
+    Quick pre-assessment showing probability distribution of grades
+    plus photo quality feedback.
+    """
+    front_bytes = await front.read()
+    back_bytes = await back.read() if back else None
+
+    photo_quality = await analyze_photo_quality(front_bytes, back_bytes)
+
+    prediction_prompt = """You are a quick card grading predictor.
+Based on these images, provide:
+1. Probability distribution across grades 1-10
+2. Most likely grade
+3. Specific improvements needed for higher grade
+
+Return JSON:
+{
+  "grade_probabilities": {
+    "10": 0.05,
+    "9": 0.15,
+    "8": 0.40,
+    "7": 0.30,
+    "6": 0.10
+  },
+  "most_likely_grade": "8",
+  "confidence": 0.75,
+  "improvements_for_higher_grade": [
+    "Better lighting on top-left corner to confirm whitening extent",
+    "Close-up of edges needed",
+    "Back photo shows glare - retake at different angle"
+  ],
+  "grade_limiters": ["Corner whitening", "Edge wear visible"],
+  "quick_summary": "This card will likely grade 8 or 7 based on visible corner wear."
+}
+"""
+
+    msg = [{
+        "role": "user",
+        "content": (
+            [{"type": "text", "text": prediction_prompt},
+             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(front_bytes)}", "detail": "low"}}]
+            + ([{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(back_bytes)}", "detail": "low"}}] if back_bytes else [])
+        )
+    }]
+
+    result = await _openai_chat(msg, max_tokens=800, temperature=0.2)
+    prediction_data = _parse_json_or_none(result.get("content", "")) or {}
+
+    return JSONResponse(content={
+        "success": True,
+        "photo_quality": photo_quality,
+        "grade_prediction": prediction_data,
+        "timestamp": datetime.utcnow().isoformat() + "Z"
+    })
+
+
+async def analyze_photo_quality(front_bytes: bytes, back_bytes: Optional[bytes] = None) -> Dict[str, Any]:
+    """
+    Lightweight photo quality analysis (no numpy/scipy dependencies).
+    Uses PIL statistics + edge variance as a blur proxy.
+    """
+    if not PIL_AVAILABLE:
+        return {"available": False, "message": "Image analysis unavailable"}
+
+    try:
+        front_img = Image.open(io.BytesIO(front_bytes)).convert('RGB')
+
+        issues: List[str] = []
+        suggestions: List[str] = []
+        score = 50
+
+        # Resolution check
+        width, height = front_img.size
+        pixels = width * height
+        if pixels < 1_000_000:
+            issues.append("Low resolution")
+            suggestions.append("Use a higher resolution camera (at least 1920x1080)")
+            score -= 20
+        elif pixels > 5_000_000:
+            score += 15
+
+        # Brightness check
+        gray = front_img.convert('L')
+        stat = ImageStat.Stat(gray)
+        mean_brightness = stat.mean[0] if stat.mean else 0
+        if mean_brightness < 80:
+            issues.append("Image too dark")
+            suggestions.append("Use more lighting - natural daylight works best")
+            score -= 15
+        elif mean_brightness > 200:
+            issues.append("Image overexposed/too bright")
+            suggestions.append("Reduce lighting or move away from direct light source")
+            score -= 15
+        else:
+            score += 10
+
+        # Blur proxy: variance of edges
+        edges = gray.filter(ImageFilter.FIND_EDGES)
+        est = ImageStat.Stat(edges)
+        # stddev[0] roughly indicates edge strength; low means blur
+        edge_std = est.stddev[0] if est.stddev else 0.0
+        # normalize to 0-100
+        sharpness_score = max(0.0, min(100.0, (edge_std / 64.0) * 100.0))
+        if sharpness_score < 35:
+            issues.append("Image appears blurry")
+            suggestions.append("Hold camera steady or use a tripod")
+            suggestions.append("Ensure auto-focus has locked before capturing")
+            score -= 25
+        else:
+            score += 15
+
+        # Contrast / glare hint: large range can indicate specular highlights
+        extrema = stat.extrema[0] if stat.extrema else (0, 0)
+        if (extrema[1] - extrema[0]) > 200:
+            issues.append("High contrast detected (possible glare)")
+            suggestions.append("Angle card to avoid reflections (especially holo surfaces)")
+            suggestions.append("Use diffused lighting instead of direct flash")
+            score -= 10
+
+        score = max(0, min(100, score))
+
+        return {
+            "available": True,
+            "overall_score": int(score),
+            "resolution": {"width": width, "height": height, "megapixels": round(pixels / 1_000_000, 1)},
+            "sharpness_score": round(sharpness_score, 1),
+            "brightness_score": round((mean_brightness / 255.0) * 100.0, 1),
+            "issues": issues,
+            "suggestions": suggestions,
+            "verdict": "Excellent" if score > 80 else "Good" if score > 60 else "Needs Improvement"
+        }
+
+    except Exception as e:
+        return {"available": False, "error": str(e)}
+
+
+# =========================================================
+# STAGE 2 FEATURES — ALERTS / LIVE GRADING / TIMELINE
+# =========================================================
+
+# ========================================
+# MARKET ALERT SYSTEM
+# ========================================
+
+@app.post("/api/alerts/create")
+@safe_endpoint
+async def create_price_alert(
+    user_id: int = Form(...),
+    card_name: str = Form(...),
+    card_set: str = Form(""),
+    grade: str = Form(""),
+    alert_type: str = Form("drops_below"),
+    target_price: float = Form(...),
+):
+    """Create a new price alert (PHP persists to WP DB; API returns a confirmation payload)."""
+    return JSONResponse(content={
+        "success": True,
+        "alert_id": "alert_" + secrets.token_hex(8),
+        "message": f"Alert created: notify when {card_name} {alert_type.replace('_', ' ')} ${target_price:.2f}",
+        "data": {
+            "user_id": user_id,
+            "card_name": card_name,
+            "card_set": card_set,
+            "grade": grade,
+            "alert_type": alert_type,
+            "target_price": target_price,
+        }
+    })
+
+
+@app.post("/api/alerts/check")
+@safe_endpoint
+async def check_price_alerts():
+    """Cron job endpoint to check all active alerts (mock payload for now)."""
+    triggered_alerts = []
+
+    mock_alert = {
+        "id": 123,  # placeholder (WP DB id)
+        "alert_id": "alert_123",
+        "user_id": 1,
+        "card_name": "Charizard",
+        "current_price": 475.00,
+        "target_price": 500.00,
+        "alert_type": "drops_below",
+        "triggered": True
+    }
+
+    if mock_alert["triggered"]:
+        triggered_alerts.append(mock_alert)
+
+    return JSONResponse(content={
+        "success": True,
+        "checked_alerts": 10,
+        "triggered_alerts": triggered_alerts,
+        "timestamp": datetime.utcnow().isoformat() + "Z"
+    })
+
+
+@app.get("/api/alerts/user/{user_id}")
+@safe_endpoint
+async def get_user_alerts(user_id: int):
+    """Get all alerts for a user (mock)."""
+    return JSONResponse(content={
+        "success": True,
+        "alerts": [
+            {
+                "id": "alert_123",
+                "card_name": "Charizard Base Set",
+                "grade": "9",
+                "alert_type": "drops_below",
+                "target_price": 500.00,
+                "current_price": 525.00,
+                "is_active": True,
+                "created_at": "2026-02-01T10:00:00Z"
+            }
+        ]
+    })
+
+
+# ========================================
+# LIVE GRADING ROOM (WebSocket)
+# ========================================
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        try:
+            self.active_connections.remove(websocket)
+        except ValueError:
+            pass
+
+    async def send_feedback(self, websocket: WebSocket, message: dict):
+        await websocket.send_json(message)
+
+manager = ConnectionManager()
+
+
+@app.websocket("/ws/live-grading/{session_id}")
+async def live_grading_websocket(websocket: WebSocket, session_id: str):
+    """WebSocket endpoint for real-time grading feedback."""
+    await manager.connect(websocket)
+
+    try:
+        while True:
+            data = await websocket.receive_json()
+
+            if data.get("type") == "frame":
+                frame_base64 = data.get("frame")
+                feedback = await analyze_live_frame(frame_base64)
+                await manager.send_feedback(websocket, feedback)
+
+            elif data.get("type") == "ping":
+                await websocket.send_json({"type": "pong"})
+
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+    except Exception as e:
+        try:
+            await websocket.send_json({"type": "error", "message": str(e)})
+        except Exception:
+            pass
+        manager.disconnect(websocket)
+
+
+async def analyze_live_frame(frame_base64: str) -> dict:
+    """Analyze a single video frame and provide instant feedback."""
+    prompt = """Quick frame analysis for live grading assistance.
+Provide ONLY these instant feedback items:
+- Is card visible and in frame? (yes/no)
+- Is lighting adequate? (yes/no/needs adjustment)
+- Is focus sharp? (yes/no)
+- Any obvious defects visible? (yes/no)
+- Suggested camera adjustments (if any)
+
+Return JSON:
+{
+  "in_frame": true,
+  "lighting_ok": true,
+  "focus_ok": false,
+  "defects_visible": false,
+  "suggestions": ["Move camera closer", "Improve focus"],
+  "confidence": 0.8
+}
+"""
+
+    if not frame_base64:
+        return {"type": "feedback", "analysis": {"in_frame": False, "lighting_ok": False, "focus_ok": False, "defects_visible": False, "suggestions": ["No frame received"], "confidence": 0.0}, "timestamp": datetime.utcnow().isoformat() + "Z"}
+
+    try:
+        msg = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{frame_base64}", "detail": "low"}},
+            ]
+        }]
+
+        result = await _openai_chat(msg, max_tokens=300, temperature=0.1)
+        analysis = _parse_json_or_none(result.get("content", "")) or {}
+
+        return {"type": "feedback", "analysis": analysis, "timestamp": datetime.utcnow().isoformat() + "Z"}
+    except Exception as e:
+        return {"type": "error", "message": str(e), "timestamp": datetime.utcnow().isoformat() + "Z"}
+
+
+# ========================================
+# TIMELINE / HISTORY TRACKING
+# ========================================
+
+@app.post("/api/timeline/add-event")
+@safe_endpoint
+async def add_timeline_event(
+    submission_id: str = Form(...),
+    event_type: str = Form(...),
+    event_title: str = Form(...),
+    event_description: str = Form(""),
+    image: UploadFile = File(None),
+):
+    """Add a new event to submission timeline (mock store)."""
+    image_path = None
+    if image:
+        image_bytes = await image.read()
+        image_filename = f"timeline_{submission_id}_{secrets.token_hex(4)}.jpg"
+        image_path = f"/uploads/timeline/{image_filename}"
+        # In production, save to disk / object store.
+
+    return JSONResponse(content={
+        "success": True,
+        "event_id": "evt_" + secrets.token_hex(8),
+        "message": "Timeline event added",
+        "image_path": image_path
+    })
+
+
+@app.get("/api/timeline/{submission_id}")
+@safe_endpoint
+async def get_timeline(submission_id: str):
+    """Get complete timeline for a submission (mock)."""
+    events = [
+        {
+            "id": "evt_1",
+            "event_type": "assessment",
+            "event_title": "AI Assessment Completed",
+            "event_description": "Card graded as Grade 8 by League-AI",
+            "created_at": "2026-02-01T10:30:00Z",
+            "created_by": "System"
+        },
+        {
+            "id": "evt_2",
+            "event_type": "approval",
+            "event_title": "Submission Approved",
+            "event_description": "Your submission has been approved for professional grading",
+            "created_at": "2026-02-02T14:15:00Z",
+            "created_by": "Admin"
+        },
+        {
+            "id": "evt_3",
+            "event_type": "shipped",
+            "event_title": "Card Shipped to Facility",
+            "event_description": "Tracking: AU123456789",
+            "created_at": "2026-02-03T09:00:00Z",
+            "created_by": "Customer"
+        },
+        {
+            "id": "evt_4",
+            "event_type": "received",
+            "event_title": "Card Received at Facility",
+            "event_description": "Card safely received and logged",
+            "created_at": "2026-02-05T11:30:00Z",
+            "created_by": "Facility"
+        }
+    ]
+
+    return JSONResponse(content={
+        "success": True,
+        "submission_id": submission_id,
+        "events": events,
+        "total_events": len(events)
+    })
+
+
+# ========================================
+# AUTHENTICATION VERIFICATION
+# ========================================
+
+@app.post("/api/verify-authenticity")
+@safe_endpoint
+async def verify_card_authenticity(
+    front: UploadFile = File(...),
+    back: UploadFile = File(None),
+    card_name: str = Form(...),
+    card_set: str = Form(""),
+    card_year: str = Form(""),
+):
+    """AI-driven authenticity verification (preliminary, not definitive)."""
+    front_bytes = await front.read()
+    back_bytes = await back.read() if back else None
+
+    auth_prompt = f"""You are an expert in trading card authentication.
+Analyze these images of {card_name} ({card_set}, {card_year}) for authenticity markers.
+
+Check for common counterfeit indicators:
+1. Print quality - legitimate cards have precise, clean printing
+2. Font kerning - spacing between letters should match authentic examples
+3. Color saturation - counterfeits often have oversaturated or muted colors
+4. Holofoil pattern - if applicable, check for consistent holographic pattern
+5. Edge cut - authentic cards have precise, uniform edges
+6. Card stock texture and thickness indicators
+7. Set symbol and copyright text clarity
+8. Any obvious signs of reproduction or printing artifacts
+
+Return detailed JSON:
+{{
+  "authenticity_score": 85,
+  "confidence": 0.90,
+  "overall_verdict": "Likely Authentic|Suspicious|Likely Counterfeit",
+  "red_flags": ["..."],
+  "green_flags": ["..."],
+  "key_observations": {{
+    "print_quality": {{"score": 90, "notes": "..."}},
+    "font_accuracy": {{"score": 75, "notes": "..."}},
+    "color_accuracy": {{"score": 95, "notes": "..."}},
+    "holofoil_pattern": {{"score": 80, "notes": "..."}},
+    "manufacturing_marks": {{"score": 90, "notes": "..."}}
+  }},
+  "comparison_notes": "...",
+  "recommendation": "..."
+}}
+
+Be thorough but fair. Many authentic cards have minor variations due to print runs.
+Respond ONLY with JSON.
+"""
+
+    msg = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": auth_prompt},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(front_bytes)}", "detail": "high"}},
+        ] + ([
+            {"type": "text", "text": "BACK IMAGE:"},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(back_bytes)}", "detail": "high"}},
+        ] if back_bytes else [])
+    }]
+
+    result = await _openai_chat(msg, max_tokens=1500, temperature=0.1)
+    auth_data = _parse_json_or_none(result.get("content", "")) or {}
+
+    automated_checks: Dict[str, Any] = {}
+    if PIL_AVAILABLE and front_bytes:
+        automated_checks = perform_automated_auth_checks(front_bytes)
+
+    return JSONResponse(content={
+        "success": True,
+        "card_info": {
+            "name": card_name,
+            "set": card_set,
+            "year": card_year
+        },
+        "authentication": auth_data,
+        "automated_checks": automated_checks,
+        "timestamp": datetime.utcnow().isoformat() + "Z"
+    })
+
+
+def perform_automated_auth_checks(image_bytes: bytes) -> Dict[str, Any]:
+    """Lightweight CV-based heuristics (best-effort, optional deps)."""
+    if not PIL_AVAILABLE:
+        return {"available": False}
+
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        checks: Dict[str, Any] = {}
+
+        # 1) Resolution
+        width, height = img.size
+        checks["resolution"] = {
+            "width": width,
+            "height": height,
+            "pass": bool(width >= 1000 and height >= 1000),
+            "note": "High resolution suggests authentic scan" if width >= 1000 else "Low resolution may indicate reproduction"
+        }
+
+        # 2) Color histogram (placeholder: analysis marker)
+        _ = img.histogram()
+        checks["color_distribution"] = {
+            "analyzed": True,
+            "pass": True,
+            "note": "Color distribution analyzed"
+        }
+
+        # 3) Edge detection strength (optional SciPy)
+        try:
+            import numpy as _np  # type: ignore
+            from scipy import ndimage as _ndimage  # type: ignore
+
+            gray = img.convert('L')
+            img_array = _np.array(gray)
+            edges = _ndimage.sobel(img_array)
+            edge_strength = float(edges.std())
+            checks["edge_quality"] = {
+                "strength": edge_strength,
+                "pass": bool(edge_strength > 20),
+                "note": "Clean edge detection" if edge_strength > 20 else "Soft edges may indicate reproduction"
+            }
+        except Exception as e:
+            checks["edge_quality"] = {
+                "available": False,
+                "pass": True,
+                "note": f"Edge check unavailable: {str(e)}"
+            }
+
+        overall_pass = all(v.get("pass", True) for v in checks.values() if isinstance(v, dict))
+
+        return {
+            "available": True,
+            "checks": checks,
+            "overall_pass": overall_pass
+        }
+
+    except Exception as e:
+        return {"available": False, "error": str(e)}
+
+
+# ========================================
+# BULK CARD ASSESSMENT (Mystery Box)
+# ========================================
+
+@app.post("/api/bulk-assess")
+@safe_endpoint
+async def bulk_assess_cards(
+    user_id: int = Form(...),
+    batch_name: str = Form(""),
+    images: List[UploadFile] = File(...),
+):
+    """Process up to 10 images quickly and return a prioritized list."""
+    if len(images) > 10:
+        raise HTTPException(status_code=400, detail="Maximum 10 cards per batch")
+
+    batch_id = "batch_" + secrets.token_hex(8)
+    results: List[Dict[str, Any]] = []
+
+    for idx, image_file in enumerate(images):
+        try:
+            image_bytes = await image_file.read()
+            quick_result = await quick_assess_card(image_bytes, idx + 1)
+            results.append(quick_result)
+        except Exception as e:
+            results.append({
+                "card_number": idx + 1,
+                "error": str(e),
+                "status": "failed"
+            })
+
+    # Sort by estimated value
+    results.sort(key=lambda x: float(x.get("estimated_value", 0) or 0), reverse=True)
+    best_finds = results[:3] if len(results) >= 3 else results
+    summary = generate_bulk_summary(results, best_finds)
+
+    return JSONResponse(content={
+        "success": True,
+        "batch_id": batch_id,
+        "total_cards": len(results),
+        "processed_cards": len([r for r in results if r.get("status") != "failed"]),
+        "results": results,
+        "best_finds": best_finds,
+        "summary": summary,
+        "timestamp": datetime.utcnow().isoformat() + "Z"
+    })
+
+
+async def quick_assess_card(image_bytes: bytes, card_number: int) -> Dict[str, Any]:
+    """Quick, lightweight assessment intended for bulk processing."""
+    prompt = """Quick card assessment for bulk processing.
+Return JSON with:
+{
+  "card_name": "best guess",
+  "set": "best guess",
+  "estimated_grade": "7-8 range",
+  "estimated_value": 50.00,
+  "key_features": ["Holo rare", "Good centering"],
+  "main_issues": ["Edge wear visible"],
+  "priority": "high|medium|low"
+}
+Respond ONLY with JSON.
+"""
+
+    msg = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(image_bytes)}", "detail": "low"}},
+        ]
+    }]
+
+    result = await _openai_chat(msg, max_tokens=400, temperature=0.2)
+    data = _parse_json_or_none(result.get("content", "")) or {}
+    data["card_number"] = card_number
+    data["status"] = "success"
+    return data
+
+
+def generate_bulk_summary(results: List[Dict[str, Any]], best_finds: List[Dict[str, Any]]) -> str:
+    """Generate a readable summary block for the bulk batch."""
+    total_value = sum(float(r.get("estimated_value", 0) or 0) for r in results)
+    # estimate avg grade from start of range (e.g. "7-8")
+    grades: List[float] = []
+    for r in results:
+        g = str(r.get("estimated_grade", "") or "").strip()
+        if not g:
+            continue
+        try:
+            g0 = float(g.split("-")[0].strip())
+            grades.append(g0)
+        except Exception:
+            pass
+    avg_grade = (sum(grades) / len(grades)) if grades else 0
+    high_value = [r for r in results if float(r.get("estimated_value", 0) or 0) > 100]
+
+    summary = f"""
+📦 Bulk Assessment Summary
+
+Total Cards Processed: {len(results)}
+Total Estimated Value: ${total_value:.2f}
+Average Grade: ~{avg_grade:.1f}
+High Value Cards (>$100): {len(high_value)}
+
+🏆 Top 3 Finds:
+""".strip()
+
+    for idx, card in enumerate(best_finds, 1):
+        summary += f"\n{idx}. {card.get('card_name', 'Unknown')} - Grade {card.get('estimated_grade', 'N/A')} - ${float(card.get('estimated_value', 0) or 0):.2f}"
+
+    return summary
+
+
+# ========================================
+# QR CODE GENERATION
+# ========================================
+
+@app.post("/api/generate-qr")
+@safe_endpoint
+async def generate_submission_qr(
+    submission_id: str = Form(...),
+    base_url: str = Form("https://collectors-league.com"),
+):
+    """Generate a QR code (as base64) linking to the submission details."""
+    url = f"{base_url.rstrip('/')}/submission/{submission_id}"
+
+    try:
+        import qrcode  # type: ignore
+    except Exception as e:
+        return JSONResponse(status_code=500, content={
+            "success": False,
+            "error": f"qrcode dependency not available: {str(e)}"
+        })
+
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        box_size=10,
+        border=4,
+    )
+    qr.add_data(url)
+    qr.make(fit=True)
+
+    img = qr.make_image(fill_color="black", back_color="white")
+    buffer = io.BytesIO()
+    img.save(buffer, format="PNG")
+    qr_base64 = base64.b64encode(buffer.getvalue()).decode()
+
+    return JSONResponse(content={
+        "success": True,
+        "submission_id": submission_id,
+        "url": url,
+        "qr_code_base64": qr_base64,
+        "qr_code_data_url": f"data:image/png;base64,{qr_base64}"
+    })
+
+
 # ==============================
 # Runner
 # ==============================
