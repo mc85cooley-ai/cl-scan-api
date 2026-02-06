@@ -35,7 +35,6 @@ from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timedelta
 from statistics import mean, median
 from functools import wraps
-from fastapi import WebSocket
 import base64
 import io
 import os
@@ -5242,141 +5241,74 @@ Respond ONLY with JSON.
     })
 
 
+
 def perform_automated_auth_checks(image_bytes: bytes) -> Dict[str, Any]:
-    """Lightweight CV-based heuristics (best-effort, optional deps)."""
+    """
+    Automated computer vision checks for authenticity (NO SciPy).
+    Uses only Pillow + NumPy (best-effort heuristics).
+    """
     if not PIL_AVAILABLE:
         return {"available": False}
 
     try:
+        from PIL import ImageOps, ImageFilter, ImageStat
+
         img = Image.open(io.BytesIO(image_bytes))
         checks: Dict[str, Any] = {}
 
-        # 1) Resolution
+        # 1) Resolution check
         width, height = img.size
         checks["resolution"] = {
             "width": width,
             "height": height,
             "pass": bool(width >= 1000 and height >= 1000),
-            "note": "High resolution suggests authentic scan" if width >= 1000 else "Low resolution may indicate reproduction"
+            "note": "High resolution suggests authentic scan" if width >= 1000 else "Low resolution may indicate reproduction",
         }
 
-        # 2) Color histogram (placeholder: analysis marker)
+        # 2) Color histogram analysis (placeholder heuristic)
         _ = img.histogram()
         checks["color_distribution"] = {
             "analyzed": True,
             "pass": True,
-            "note": "Color distribution analyzed"
+            "note": "Color distribution analyzed",
         }
 
-        # 3) Edge detection strength (optional SciPy)
+        # 3) Edge detection (PIL-based)
         try:
-            import numpy as _np  # type: ignore
-            from scipy import ndimage as _ndimage  # type: ignore
+            gray = ImageOps.grayscale(img)
 
-            gray = img.convert('L')
-            img_array = _np.array(gray)
-            edges = _ndimage.sobel(img_array)
-            edge_strength = float(edges.std())
+            # FIND_EDGES tends to work well for print/sharpness heuristics
+            edges = gray.filter(ImageFilter.FIND_EDGES)
+            edge_strength = float(ImageStat.Stat(edges).mean[0])
+
+            # EDGE_ENHANCE_MORE can help on slightly soft images
+            edges_enhanced = gray.filter(ImageFilter.EDGE_ENHANCE_MORE)
+            enhanced_strength = float(ImageStat.Stat(edges_enhanced).mean[0])
+
+            # Combine heuristics (scaled to roughly match prior ranges)
+            final_strength = max(edge_strength, enhanced_strength * 0.5)
+
             checks["edge_quality"] = {
-                "strength": edge_strength,
-                "pass": bool(edge_strength > 20),
-                "note": "Clean edge detection" if edge_strength > 20 else "Soft edges may indicate reproduction"
+                "strength": float(final_strength),
+                "pass": bool(final_strength > 15),  # threshold tuned for PIL intensity space
+                "note": "Clean edge detection" if final_strength > 15 else "Soft edges may indicate reproduction",
+                "method": "PIL_ImageFilter",
             }
         except Exception as e:
             checks["edge_quality"] = {
                 "available": False,
                 "pass": True,
-                "note": f"Edge check unavailable: {str(e)}"
+                "note": f"Edge check unavailable: {str(e)}",
             }
 
-        overall_pass = all(v.get("pass", True) for v in checks.values() if isinstance(v, dict))
+        overall_pass = all(
+            v.get("pass", True) for v in checks.values() if isinstance(v, dict)
+        )
 
-        return {
-            "available": True,
-            "checks": checks,
-            "overall_pass": overall_pass
-        }
+        return {"available": True, "checks": checks, "overall_pass": overall_pass}
 
     except Exception as e:
         return {"available": False, "error": str(e)}
-
-
-# ========================================
-# BULK CARD ASSESSMENT (Mystery Box)
-# ========================================
-
-@app.post("/api/bulk-assess")
-@safe_endpoint
-async def bulk_assess_cards(
-    user_id: int = Form(...),
-    batch_name: str = Form(""),
-    images: List[UploadFile] = File(...),
-):
-    """Process up to 10 images quickly and return a prioritized list."""
-    if len(images) > 10:
-        raise HTTPException(status_code=400, detail="Maximum 10 cards per batch")
-
-    batch_id = "batch_" + secrets.token_hex(8)
-    results: List[Dict[str, Any]] = []
-
-    for idx, image_file in enumerate(images):
-        try:
-            image_bytes = await image_file.read()
-            quick_result = await quick_assess_card(image_bytes, idx + 1)
-            results.append(quick_result)
-        except Exception as e:
-            results.append({
-                "card_number": idx + 1,
-                "error": str(e),
-                "status": "failed"
-            })
-
-    # Sort by estimated value
-    results.sort(key=lambda x: float(x.get("estimated_value", 0) or 0), reverse=True)
-    best_finds = results[:3] if len(results) >= 3 else results
-    summary = generate_bulk_summary(results, best_finds)
-
-    return JSONResponse(content={
-        "success": True,
-        "batch_id": batch_id,
-        "total_cards": len(results),
-        "processed_cards": len([r for r in results if r.get("status") != "failed"]),
-        "results": results,
-        "best_finds": best_finds,
-        "summary": summary,
-        "timestamp": datetime.utcnow().isoformat() + "Z"
-    })
-
-
-async def quick_assess_card(image_bytes: bytes, card_number: int) -> Dict[str, Any]:
-    """Quick, lightweight assessment intended for bulk processing."""
-    prompt = """Quick card assessment for bulk processing.
-Return JSON with:
-{
-  "card_name": "best guess",
-  "set": "best guess",
-  "estimated_grade": "7-8 range",
-  "estimated_value": 50.00,
-  "key_features": ["Holo rare", "Good centering"],
-  "main_issues": ["Edge wear visible"],
-  "priority": "high|medium|low"
-}
-Respond ONLY with JSON.
-"""
-
-    msg = [{
-        "role": "user",
-        "content": [
-            {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(image_bytes)}", "detail": "low"}},
-        ]
-    }]
-
-    result = await _openai_chat(msg, max_tokens=400, temperature=0.2)
-    data = _parse_json_or_none(result.get("content", "")) or {}
-    data["card_number"] = card_number
-    data["status"] = "success"
-    return data
 
 
 def generate_bulk_summary(results: List[Dict[str, Any]], best_finds: List[Dict[str, Any]]) -> str:
