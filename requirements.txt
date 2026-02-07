@@ -1,11 +1,88 @@
+# ============================================================================
+# PRODUCTION REQUIREMENTS.TXT
+# Updated for real price history system with database
+# ============================================================================
+
+# Core FastAPI & Server
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 python-multipart==0.0.20
+
+# HTTP Client
 httpx==0.28.1
+
+# Environment Variables
 python-dotenv==1.0.1
+
+# AI/OpenAI
 openai==1.10.0
+
+# Web Scraping
 beautifulsoup4==4.12.3
 lxml==5.2.2
+
+# QR Codes
 qrcode[pil]==7.4.2
+
+# Image Processing
 Pillow>=11.0.0
+
+# Numerical Computing
 numpy==1.26.3
+
+# ============================================================================
+# DATABASE DEPENDENCIES (NEW - Required for Phase 1)
+# ============================================================================
+
+# PostgreSQL Database Driver
+psycopg2-binary==2.9.9
+
+# ORM (Object-Relational Mapping)
+sqlalchemy==2.0.25
+
+# Database Migrations
+alembic==1.13.1
+
+# ============================================================================
+# CACHING (NEW - Optional but Recommended)
+# ============================================================================
+
+# Redis for distributed caching
+redis==5.0.1
+
+# ============================================================================
+# AUTHENTICATION & SECURITY (NEW - For Simple Auth)
+# ============================================================================
+
+# JWT tokens and password hashing
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+
+# ============================================================================
+# MONITORING & LOGGING (OPTIONAL - Can add later)
+# ============================================================================
+
+# Prometheus metrics (uncomment when needed)
+# prometheus-client==0.19.0
+
+# Structured JSON logging (uncomment when needed)
+# python-json-logger==2.0.7
+
+# Error tracking (uncomment when needed)
+# sentry-sdk==1.40.0
+
+# ============================================================================
+# RATE LIMITING (OPTIONAL - Can add later)
+# ============================================================================
+
+# API rate limiting (uncomment when needed)
+# slowapi==0.1.9
+
+# ============================================================================
+# TESTING (OPTIONAL - For development)
+# ============================================================================
+
+# Testing framework (uncomment for development)
+# pytest==7.4.3
+# pytest-asyncio==0.21.1
+# httpx[test]==0.28.1
