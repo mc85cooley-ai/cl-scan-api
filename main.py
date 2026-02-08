@@ -4425,48 +4425,54 @@ async def get_market_trends(
         # ═══════════════════════════════════════════════════════
         logging.info(f"⚠️ DATABASE MISS: Only {len(db_history)} points, fetching from eBay")
 
-        # NEW: Smart search query builder
-        # If input doesn't have pipes, it's free-form search - extract just card name
-        if "|" not in ident:
-            # Free-form input like "mega lopunny ex Phantasmal flames"
-            # Extract just the card name (first 2-3 words usually)
-            words = card_name.split()
-
-            # Look for Pokemon-specific keywords to know where card name ends
-            keywords = ['ex', 'gx', 'vmax', 'vstar', 'v', 'mega', 'shining', 'rainbow']
-
-            # Find the main card name (usually first 2-4 words)
-            card_name_only = []
-            for i, word in enumerate(words):
-                card_name_only.append(word)
-                # Stop after we hit a keyword + the next word
-                if word.lower() in keywords and i < len(words) - 1:
-                    card_name_only.append(words[i + 1])  # Include word after keyword
-                    break
-                # Or stop after 4 words
-                if len(card_name_only) >= 4:
-                    break
-
-            search_query = " ".join(card_name_only) + " Pokemon"
-            logging.info(f"🔄 Free-form search detected, simplified: '{ident}' → '{search_query}'")
-        else:
-            # Pipe-delimited format - use just card name
-            search_query = f"{card_name} Pokemon"
-            logging.info(f"🔄 Pipe format detected: '{search_query}'")
-
-        # Add grade if specified
-        if grade and 'psa' in grade.lower():
-            search_query = f"{search_query} {grade}"
-
-        if not search_query:
-            raise HTTPException(status_code=400, detail="Could not build search query")
-
-        logging.info(f"🔍 Final eBay search query: '{search_query}'")
+        # Build query ladder - try multiple variations
+        words = card_name.split()
+        
+        # Build queries from most specific to most generic
+        queries = []
+        
+        # Try progressively simpler queries
+        if len(words) >= 4:
+            queries.append(" ".join(words[:4]) + " Pokemon")
+        if len(words) >= 3:
+            queries.append(" ".join(words[:3]) + " Pokemon")
+        if len(words) >= 2:
+            queries.append(" ".join(words[:2]) + " Pokemon")
+        if len(words) >= 1:
+            queries.append(words[0] + " Pokemon")
+        
+        # Add grade to first query if specified
+        if grade and 'psa' in grade.lower() and queries:
+            queries[0] = f"{queries[0]} {grade}"
+        
+        logging.info(f"🔍 Query ladder: {queries[:3]}")
+        
+        # Try each query until we get results
+        completed = {}
+        active = {}
+        successful_query = None
+        
+        for search_query in queries:
+            logging.info(f"🔄 Trying: '{search_query}'")
+            
+            completed = await _ebay_completed_stats(search_query, limit=50, days_lookback=30)
+            
+            if completed and completed.get("median") and completed.get("median") > 0:
+                successful_query = search_query
+                logging.info(f"✅ SUCCESS with: '{successful_query}'")
+                break
+            
+            active = await _ebay_active_stats(search_query, limit=30)
+            
+            if active and active.get("median") and active.get("median") > 0:
+                successful_query = search_query
+                logging.info(f"✅ SUCCESS with: '{successful_query}'")
+                break
+        
+        if not successful_query:
+            logging.warning(f"❌ All queries failed: {queries[:3]}")
 
         target_days = max(7, min(int(days or 90), 90))
-
-        completed = await _ebay_completed_stats(search_query, limit=50, days_lookback=30)
-        active = await _ebay_active_stats(search_query, limit=30)
 
         current_price = 0.0
         price_low = 0.0
@@ -4973,74 +4979,62 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
 
         logging.info(f"💰 Price lookup request: {card_name}")
 
-        # Build smart query (SAME logic as your market-trends fix)
+        # Build query ladder (same as market-trends)
         words = card_name.split()
-        keywords = ['ex', 'gx', 'vmax', 'vstar', 'v', 'mega', 'shining', 'rainbow']
-
-        card_name_only = []
-        for i, word in enumerate(words):
-            card_name_only.append(word)
-            # Stop after we hit a keyword + the next word
-            if word.lower() in keywords and i < len(words) - 1:
-                card_name_only.append(words[i + 1])
-                break
-            # Or stop after 4 words
-            if len(card_name_only) >= 4:
-                break
-
-        search_query = " ".join(card_name_only).strip()
-
-        # Optionally add set/number if provided (helps disambiguation without overfitting)
-        # Keep these light so eBay results don't get too narrow.
-        if card_set:
-            search_query = f"{search_query} {card_set}".strip()
-        if card_number:
-            search_query = f"{search_query} {card_number}".strip()
-
-        # Always add Pokemon to reduce noise
-        search_query = f"{search_query} Pokemon".strip()
-
-        # Add grade if specified
-        if grade and 'psa' in grade.lower():
-            search_query = f"{search_query} {grade}".strip()
-
-        if not search_query:
-            return {"current_price": 0, "source": "error", "error": "Could not build search query"}
-
-        logging.info(f"🔍 eBay query: '{search_query}'")
-
-        # Try completed (sold) listings first
-        completed = await _ebay_completed_stats(search_query, limit=50, days_lookback=30)
-
-        if completed and completed.get("median") and completed.get("median") > 0:
-            current_price = float(completed.get("median"))
-            logging.info(f"✅ Found price: ${current_price:.2f} (from {completed.get('count', 0)} sales)")
-            return {
-                "current_price": current_price,
-                "source": "ebay_completed",
-                "search_query": search_query,
-                "card_name": card_name,
-                "sales_count": completed.get("count", 0),
-                "last_updated": datetime.now().isoformat()
-            }
-
-        # If no completed, try active listings
-        active = await _ebay_active_stats(search_query, limit=30)
-
-        if active and active.get("median") and active.get("median") > 0:
-            current_price = float(active.get("median"))
-            logging.info(f"✅ Found price: ${current_price:.2f} (from {active.get('count', 0)} active listings)")
-            return {
-                "current_price": current_price,
-                "source": "ebay_active",
-                "search_query": search_query,
-                "card_name": card_name,
-                "listings_count": active.get("count", 0),
-                "last_updated": datetime.now().isoformat()
-            }
-
-        # No results from either source
-        logging.warning(f"❌ No eBay results for: {search_query}")
+        
+        queries = []
+        
+        if len(words) >= 4:
+            queries.append(" ".join(words[:4]) + " Pokemon")
+        if len(words) >= 3:
+            queries.append(" ".join(words[:3]) + " Pokemon")
+        if len(words) >= 2:
+            queries.append(" ".join(words[:2]) + " Pokemon")
+        if len(words) >= 1:
+            queries.append(words[0] + " Pokemon")
+        
+        # Add grade to first query if specified
+        if grade and 'psa' in grade.lower() and queries:
+            queries[0] = f"{queries[0]} {grade}"
+        
+        logging.info(f"🔍 Query ladder: {queries[:3]}")
+        
+        # Try each query until we get results
+        for search_query in queries:
+            logging.info(f"🔄 Trying: '{search_query}'")
+            
+            # Try completed (sold) listings first
+            completed = await _ebay_completed_stats(search_query, limit=50, days_lookback=30)
+            
+            if completed and completed.get("median") and completed.get("median") > 0:
+                current_price = float(completed.get("median"))
+                logging.info(f"✅ Found price: ${current_price:.2f} with '{search_query}'")
+                return {
+                    "current_price": current_price,
+                    "source": "ebay_completed",
+                    "search_query": search_query,
+                    "card_name": card_name,
+                    "sales_count": completed.get("count", 0),
+                    "last_updated": datetime.now().isoformat()
+                }
+            
+            # If no completed, try active listings
+            active = await _ebay_active_stats(search_query, limit=30)
+            
+            if active and active.get("median") and active.get("median") > 0:
+                current_price = float(active.get("median"))
+                logging.info(f"✅ Found price: ${current_price:.2f} with '{search_query}'")
+                return {
+                    "current_price": current_price,
+                    "source": "ebay_active",
+                    "search_query": search_query,
+                    "card_name": card_name,
+                    "listings_count": active.get("count", 0),
+                    "last_updated": datetime.now().isoformat()
+                }
+        
+        # No results from any query
+        logging.warning(f"❌ No price found from: {queries[:3]}")
         return {
             "current_price": 0,
             "source": "ebay_no_results",
