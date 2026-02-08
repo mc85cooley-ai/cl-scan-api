@@ -4420,20 +4420,48 @@ async def get_market_trends(
         # ═══════════════════════════════════════════════════════
         # STEP 2: Not enough DB data – fetch current price from eBay
         # ═══════════════════════════════════════════════════════
+                # ═══════════════════════════════════════════════════════
+        # STEP 2: Not enough DB data – fetch current price from eBay
+        # ═══════════════════════════════════════════════════════
         logging.info(f"⚠️ DATABASE MISS: Only {len(db_history)} points, fetching from eBay")
 
-        search_query = _norm_ws(" ".join([x for x in [card_name, set_name] if x]).strip())
+        # NEW: Smart search query builder
+        # If input doesn't have pipes, it's free-form search - extract just card name
+        if "|" not in ident:
+            # Free-form input like "mega lopunny ex Phantasmal flames"
+            # Extract just the card name (first 2-3 words usually)
+            words = card_name.split()
 
-        # eBay can be messy – simplify for some patterns
-        if any(keyword in search_query.lower() for keyword in ['ex', 'gx', 'vmax', 'vstar', ' v ', 'mega ']):
-            search_query = f"{card_name} Pokemon card"
-            logging.info(f"🔄 Simplified search: {search_query}")
+            # Look for Pokemon-specific keywords to know where card name ends
+            keywords = ['ex', 'gx', 'vmax', 'vstar', 'v', 'mega', 'shining', 'rainbow']
 
+            # Find the main card name (usually first 2-4 words)
+            card_name_only = []
+            for i, word in enumerate(words):
+                card_name_only.append(word)
+                # Stop after we hit a keyword + the next word
+                if word.lower() in keywords and i < len(words) - 1:
+                    card_name_only.append(words[i + 1])  # Include word after keyword
+                    break
+                # Or stop after 4 words
+                if len(card_name_only) >= 4:
+                    break
+
+            search_query = " ".join(card_name_only) + " Pokemon"
+            logging.info(f"🔄 Free-form search detected, simplified: '{ident}' → '{search_query}'")
+        else:
+            # Pipe-delimited format - use just card name
+            search_query = f"{card_name} Pokemon"
+            logging.info(f"🔄 Pipe format detected: '{search_query}'")
+
+        # Add grade if specified
         if grade and 'psa' in grade.lower():
             search_query = f"{search_query} {grade}"
 
         if not search_query:
             raise HTTPException(status_code=400, detail="Could not build search query")
+
+        logging.info(f"🔍 Final eBay search query: '{search_query}'")
 
         target_days = max(7, min(int(days or 90), 90))
 
@@ -4932,81 +4960,97 @@ class MarketPriceLookupRequest(BaseModel):
 async def market_price_lookup(request: MarketPriceLookupRequest):
     """
     Look up current market price for a specific card/item.
-    Primary source: PriceCharting API (requires PRICECHARTING_TOKEN).
-    Accepts JSON request body.
+    NOW USES EBAY (same smart query logic as market-trends).
     """
     try:
-        pc_token = os.getenv("PRICECHARTING_TOKEN", "") or ""
-        if not pc_token:
-            return {"current_price": 0, "source": "none", "error": "No PriceCharting token configured"}
+        card_name = (request.card_name or "").strip()
+        card_set = (request.card_set or "").strip()
+        card_number = (request.card_number or "").strip()
+        grade = (request.grade or "").strip()
 
-        # Build search query
-        search_query = request.card_name.strip()
-        if request.card_set:
-            search_query += f" {request.card_set}"
-        if request.card_year:
-            search_query += f" {request.card_year}"
-        if request.card_number:
-            search_query += f" #{request.card_number}"
+        if not card_name:
+            return {"current_price": 0, "source": "error", "error": "card_name required"}
 
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                "https://www.pricecharting.com/api/products",
-                params={
-                    "t": pc_token,
-                    "q": search_query,
-                },
-                timeout=15
-            )
+        logging.info(f"💰 Price lookup request: {card_name}")
 
-        if resp.status_code != 200:
-            return {"current_price": 0, "source": "error", "error": f"PriceCharting HTTP {resp.status_code}"}
+        # Build smart query (SAME logic as your market-trends fix)
+        words = card_name.split()
+        keywords = ['ex', 'gx', 'vmax', 'vstar', 'v', 'mega', 'shining', 'rainbow']
 
-        data = resp.json() if resp.text else {}
-        products = data.get("products") or []
-        if not products:
-            return {"current_price": 0, "source": "none", "error": "No results found"}
+        card_name_only = []
+        for i, word in enumerate(words):
+            card_name_only.append(word)
+            # Stop after we hit a keyword + the next word
+            if word.lower() in keywords and i < len(words) - 1:
+                card_name_only.append(words[i + 1])
+                break
+            # Or stop after 4 words
+            if len(card_name_only) >= 4:
+                break
 
-        product = products[0] or {}
+        search_query = " ".join(card_name_only).strip()
 
-        # PriceCharting fields vary by category. Prefer graded if available and grade requested.
-        current_price = 0
-        if request.grade:
-            g = str(request.grade).lower().strip()
-            g_key = g.replace(" ", "-")
-            for key in [f"price-{g_key}", f"price-{g_key}-new", "price-graded"]:
-                if key in product and product.get(key):
-                    current_price = product.get(key)
-                    break
+        # Optionally add set/number if provided (helps disambiguation without overfitting)
+        # Keep these light so eBay results don't get too narrow.
+        if card_set:
+            search_query = f"{search_query} {card_set}".strip()
+        if card_number:
+            search_query = f"{search_query} {card_number}".strip()
 
-        if not current_price:
-            for key in ["price-graded", "price-new", "price-cib", "price-loose"]:
-                if key in product and product.get(key):
-                    current_price = product.get(key)
-                    break
+        # Always add Pokemon to reduce noise
+        search_query = f"{search_query} Pokemon".strip()
 
-        try:
-            current_price_val = float(current_price) if current_price else 0.0
-        except Exception:
-            current_price_val = 0.0
+        # Add grade if specified
+        if grade and 'psa' in grade.lower():
+            search_query = f"{search_query} {grade}".strip()
 
+        if not search_query:
+            return {"current_price": 0, "source": "error", "error": "Could not build search query"}
+
+        logging.info(f"🔍 eBay query: '{search_query}'")
+
+        # Try completed (sold) listings first
+        completed = await _ebay_completed_stats(search_query, limit=50, days_lookback=30)
+
+        if completed and completed.get("median") and completed.get("median") > 0:
+            current_price = float(completed.get("median"))
+            logging.info(f"✅ Found price: ${current_price:.2f} (from {completed.get('count', 0)} sales)")
+            return {
+                "current_price": current_price,
+                "source": "ebay_completed",
+                "search_query": search_query,
+                "card_name": card_name,
+                "sales_count": completed.get("count", 0),
+                "last_updated": datetime.now().isoformat()
+            }
+
+        # If no completed, try active listings
+        active = await _ebay_active_stats(search_query, limit=30)
+
+        if active and active.get("median") and active.get("median") > 0:
+            current_price = float(active.get("median"))
+            logging.info(f"✅ Found price: ${current_price:.2f} (from {active.get('count', 0)} active listings)")
+            return {
+                "current_price": current_price,
+                "source": "ebay_active",
+                "search_query": search_query,
+                "card_name": card_name,
+                "listings_count": active.get("count", 0),
+                "last_updated": datetime.now().isoformat()
+            }
+
+        # No results from either source
+        logging.warning(f"❌ No eBay results for: {search_query}")
         return {
-            "current_price": current_price_val,
-            "source": "pricecharting",
-            "product_name": product.get("product-name", "") or product.get("product_name", ""),
-            "console_name": product.get("console-name", "") or product.get("console_name", ""),
-            "last_updated": datetime.now().isoformat(),
-            "available_prices": {
-                "loose": product.get("price-loose"),
-                "cib": product.get("price-cib"),
-                "new": product.get("price-new"),
-                "graded": product.get("price-graded"),
-            },
-            "raw": product
+            "current_price": 0,
+            "source": "ebay_no_results",
+            "error": "No eBay listings found",
+            "search_query": search_query,
+            "card_name": card_name
         }
 
     except Exception as e:
-        logging.error(f"Price lookup error: {e}")
+        logging.error(f"❌ Price lookup error: {e}")
         return {"current_price": 0, "source": "error", "error": str(e)}
 
 @app.post("/api/collection/update-values")
