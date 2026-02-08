@@ -28,7 +28,8 @@ Env vars
 - USE_EBAY_API=0/1 (default 0) + EBAY_APP_ID/EBAY_CERT_ID/EBAY_DEV_ID/EBAY_OAUTH_TOKEN (optional; scaffold only)
 """
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Depends, Security, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional, Dict, Any, List, Tuple
@@ -516,11 +517,69 @@ POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
 PRICECHARTING_TOKEN = os.getenv("PRICECHARTING_TOKEN", "").strip()
 ADMIN_TOKEN = os.getenv("CL_ADMIN_TOKEN", "").strip()  # optional
 
+# ═══════════════════════════════════════════════════════
+# SIMPLE API KEY AUTHENTICATION (Render env vars)
+# ═══════════════════════════════════════════════════════
+
+security = HTTPBearer(auto_error=False)
+
+def get_valid_api_keys() -> List[str]:
+    """Get list of valid API keys from environment."""
+    keys: List[str] = []
+    wp_key = os.getenv("WORDPRESS_API_KEY", "").strip()
+    if wp_key:
+        keys.append(wp_key)
+    admin_key = os.getenv("ADMIN_API_KEY", "").strip()
+    if admin_key:
+        keys.append(admin_key)
+    return keys
+
+async def verify_api_key(credentials: HTTPAuthorizationCredentials = Security(security)) -> str:
+    """Verify API key from Authorization: Bearer <key>."""
+    if not credentials or not (credentials.credentials or "").strip():
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing API key",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    valid = get_valid_api_keys()
+    if not valid:
+        # Dev mode: allow if no keys configured
+        logging.warning("⚠️ No API keys configured (WORDPRESS_API_KEY / ADMIN_API_KEY). Running in open mode.")
+        return "development"
+
+    tok = credentials.credentials.strip()
+    if tok not in valid:
+        logging.warning(f"❌ Invalid API key attempt: {tok[:10]}...")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API key",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    logging.info(f"✅ Authenticated: {tok[:10]}...")
+    return tok
+
+async def verify_api_key_optional(credentials: HTTPAuthorizationCredentials = Security(security)) -> Optional[str]:
+    """Optional auth – allows public read endpoints."""
+    if not credentials or not (credentials.credentials or "").strip():
+        return None
+    return await verify_api_key(credentials)
+
+
 # PriceCharting local storage (even if eBay is primary, some endpoints still reference these)
 PRICECHARTING_CACHE_DIR = os.getenv("PRICECHARTING_CACHE_DIR", "/tmp/pricecharting_cache").strip() or "/tmp/pricecharting_cache"
-PRICECHARTING_DB_PATH = os.getenv("PRICECHARTING_DB_PATH", "/tmp/pricecharting.db").strip() or "/tmp/pricecharting.db"
+PRICECHARTING_DB_PATH = (os.getenv("PRICECHARTING_DB_PATH")
+                       or os.getenv("PRICE_HISTORY_DB_PATH")
+                       or "/opt/render/project/data/pricecharting.db").strip() or "/opt/render/project/data/pricecharting.db"
 try:
     os.makedirs(PRICECHARTING_CACHE_DIR, exist_ok=True)
+except Exception:
+    pass
+
+try:
+    os.makedirs(os.path.dirname(PRICECHARTING_DB_PATH), exist_ok=True)
 except Exception:
     pass
 
@@ -726,6 +785,148 @@ try:
     _pc_init_db()
 except Exception as _e:
     print(f"INFO: PriceCharting DB init skipped: {_e}")
+
+# ═══════════════════════════════════════════════════════
+# PRICE HISTORY (persistent snapshots for market-trends)
+# Stored in SQLite (defaults to the same DB file as PriceCharting)
+# ═══════════════════════════════════════════════════════
+
+PRICE_HISTORY_DB_PATH = os.getenv("PRICE_HISTORY_DB_PATH", PRICECHARTING_DB_PATH).strip() or PRICECHARTING_DB_PATH
+
+def _ph_db():
+    con = sqlite3.connect(PRICE_HISTORY_DB_PATH)
+    con.row_factory = sqlite3.Row
+    return con
+
+def _ph_init_db():
+    con = _ph_db()
+    cur = con.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS price_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            card_identifier TEXT NOT NULL,
+            card_name TEXT,
+            card_set TEXT,
+            card_number TEXT,
+            grade TEXT,
+            price_current REAL,
+            price_low REAL,
+            price_median REAL,
+            price_high REAL,
+            volume INTEGER,
+            source TEXT,
+            data_quality TEXT,
+            recorded_date TEXT NOT NULL
+        )
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_price_history_ident_date ON price_history(card_identifier, recorded_date)")
+    con.commit()
+    con.close()
+
+try:
+    _ph_init_db()
+except Exception as _e:
+    print(f"INFO: Price history DB init skipped: {_e}")
+
+def record_price_history(
+    card_identifier: str,
+    card_name: str = "",
+    card_set: str = "",
+    card_number: str = "",
+    grade: str = "",
+    price_current: float = 0.0,
+    price_low: float = 0.0,
+    price_median: float = 0.0,
+    price_high: float = 0.0,
+    volume: int = 0,
+    source: str = "",
+    data_quality: str = "verified",
+    recorded_date: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Insert a price snapshot and return the inserted row (as dict)."""
+    ident = (card_identifier or "").strip()
+    if not ident:
+        raise ValueError("card_identifier required")
+    rd = recorded_date or (datetime.utcnow().replace(microsecond=0).isoformat() + "Z")
+    con = _ph_db()
+    cur = con.cursor()
+    cur.execute(
+        """
+        INSERT INTO price_history (
+            card_identifier, card_name, card_set, card_number, grade,
+            price_current, price_low, price_median, price_high,
+            volume, source, data_quality, recorded_date
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            ident,
+            (card_name or "").strip(),
+            (card_set or "").strip(),
+            (card_number or "").strip(),
+            (grade or "").strip(),
+            float(price_current or 0.0),
+            float(price_low or 0.0),
+            float(price_median or 0.0),
+            float(price_high or 0.0),
+            int(volume or 0),
+            (source or "").strip(),
+            (data_quality or "").strip(),
+            rd,
+        ),
+    )
+    con.commit()
+    new_id = int(cur.lastrowid or 0)
+    con.close()
+    return {
+        "id": new_id,
+        "card_identifier": ident,
+        "card_name": (card_name or "").strip(),
+        "card_set": (card_set or "").strip(),
+        "card_number": (card_number or "").strip(),
+        "grade": (grade or "").strip(),
+        "price_current": float(price_current or 0.0),
+        "price_low": float(price_low or 0.0),
+        "price_median": float(price_median or 0.0),
+        "price_high": float(price_high or 0.0),
+        "volume": int(volume or 0),
+        "source": (source or "").strip(),
+        "data_quality": (data_quality or "").strip(),
+        "recorded_date": rd,
+    }
+
+def get_price_history(card_identifier: str, days: int = 90) -> List[Dict[str, Any]]:
+    """Return up to `days` records, newest-first, for this identifier."""
+    ident = (card_identifier or "").strip()
+    if not ident:
+        return []
+    try:
+        days_i = int(days or 90)
+    except Exception:
+        days_i = 90
+    days_i = max(1, min(365, days_i))
+
+    # SQLite date filter using ISO strings: compare by recorded_date text (UTC ISO)
+    cutoff = (datetime.utcnow() - timedelta(days=days_i)).replace(microsecond=0).isoformat() + "Z"
+
+    con = _ph_db()
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT *
+        FROM price_history
+        WHERE card_identifier = ?
+          AND recorded_date >= ?
+        ORDER BY recorded_date DESC
+        LIMIT ?
+        """,
+        (ident, cutoff, max(7, days_i * 2)),
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    con.close()
+    return rows
+
 
 
 def _pc_row_hash(row: dict) -> str:
@@ -4151,76 +4352,199 @@ async def _ebay_sold_prices_stub(query: str) -> Dict[str, Any]:
 
 @app.get("/api/market-trends/{card_identifier}")
 @safe_endpoint
-async def get_market_trends(card_identifier: str, days: int = 90):
+async def get_market_trends(
+    card_identifier: str,
+    days: int = 90,
+    api_key: Optional[str] = Depends(verify_api_key_optional),  # optional (read endpoint)
+):
     """
-    Get historical price data from eBay and generate predictions.
-    card_identifier format: "CardName|SetName|Grade" or just "CardName SetName"
+    Get historical price data.
 
-    Now uses REAL eBay sold listings data instead of mock data.
+    STRATEGY:
+    1. Check DB for real logged history FIRST
+    2. If 7+ days of data, use that (REAL history)
+    3. If <7 days, fetch current eBay price as fallback
+    4. Log current price to DB for future
     """
     try:
         ident = (card_identifier or "").strip()
         if not ident:
             raise HTTPException(status_code=400, detail="card_identifier required")
 
-        # Parse "CardName|SetName|Grade" (best-effort)
+        # Parse identifier: "CardName|SetName|Grade"
         parts = [p.strip() for p in ident.split("|")] if "|" in ident else [ident]
         card_name = parts[0] if len(parts) > 0 else ""
         set_name = parts[1] if len(parts) > 1 else ""
         grade = parts[2] if len(parts) > 2 else ""
 
-        # Build a conservative eBay query
-        search_query = _norm_ws(" ".join([x for x in [card_name, set_name] if x]).strip())
-        if grade:
-            # Add grading hint (PSA is the most common; this is only a search hint)
-            search_query = _norm_ws(f"{search_query} PSA {grade}")
+        logging.info(f"🔍 Market trends request: {ident}")
 
-        if not search_query:
-            raise HTTPException(status_code=400, detail="Could not build search query from card_identifier")
+        # ═══════════════════════════════════════════════════════
+        # STEP 1: Check DB for REAL logged history
+        # ═══════════════════════════════════════════════════════
+        db_history = get_price_history(card_identifier=ident, days=int(days or 90))
 
-        # eBay FindingService completed listings effectively cover ~90 days
-        target_days = max(7, min(int(days or 90), 90))
-        ebay_days = target_days
-        # Pull REAL eBay completed + active (if enabled/configured)
-        completed = await _ebay_completed_stats(search_query, limit=200, days_lookback=ebay_days)
-        active = await _ebay_active_stats(search_query, limit=120)
+        if len(db_history) >= 7:
+            logging.info(f"✅ DATABASE HIT: {len(db_history)} real data points")
 
-        historical_prices = process_ebay_to_timeseries(completed, active, target_days=target_days)
+            historical_prices = [
+                {
+                    "date": (str(entry.get("recorded_date") or "")[:10]),
+                    "price_low": float(entry.get("price_low") or entry.get("price_current") or 0.0),
+                    "price_median": float(entry.get("price_median") or entry.get("price_current") or 0.0),
+                    "price_high": float(entry.get("price_high") or entry.get("price_current") or 0.0),
+                    "volume": int(entry.get("volume") or 0),
+                }
+                for entry in db_history
+            ]
+            historical_prices = [x for x in historical_prices if x.get("date")]
 
-        if not historical_prices or len(historical_prices) < 7:
+            historical_prices.sort(key=lambda x: x["date"])
+
+            prediction = predict_future_prices(historical_prices)
+            seasonality = detect_seasonality(historical_prices)
+
             return JSONResponse(content={
-                "success": False,
-                "error": "Not enough eBay sales data found for this card",
+                "success": True,
                 "card_identifier": ident,
-                "search_query": search_query,
-                "data_source": "ebay_completed_listings",
-                "analysis_period_days": int(target_days),
-                "actual_data_points": len(historical_prices or []),
-                "ebay_listings_analyzed": int((completed or {}).get("count") or 0),
+                "data_source": "database_logged_history",
+                "historical_data": historical_prices,
+                "prediction": prediction,
+                "seasonality": seasonality,
+                "analysis_period_days": int(days or 90),
+                "actual_data_points": len(historical_prices),
+                "note": "✅ Using genuine accumulated price history",
                 "timestamp": datetime.utcnow().isoformat() + "Z",
             })
 
-        prediction = predict_future_prices(historical_prices)
-        seasonality = detect_seasonality(historical_prices)
+        # ═══════════════════════════════════════════════════════
+        # STEP 2: Not enough DB data – fetch current price from eBay
+        # ═══════════════════════════════════════════════════════
+        logging.info(f"⚠️ DATABASE MISS: Only {len(db_history)} points, fetching from eBay")
+
+        search_query = _norm_ws(" ".join([x for x in [card_name, set_name] if x]).strip())
+
+        # eBay can be messy – simplify for some patterns
+        if any(keyword in search_query.lower() for keyword in ['ex', 'gx', 'vmax', 'vstar', ' v ', 'mega ']):
+            search_query = f"{card_name} Pokemon card"
+            logging.info(f"🔄 Simplified search: {search_query}")
+
+        if grade and 'psa' in grade.lower():
+            search_query = f"{search_query} {grade}"
+
+        if not search_query:
+            raise HTTPException(status_code=400, detail="Could not build search query")
+
+        target_days = max(7, min(int(days or 90), 90))
+
+        completed = await _ebay_completed_stats(search_query, limit=50, days_lookback=30)
+        active = await _ebay_active_stats(search_query, limit=30)
+
+        current_price = 0.0
+        price_low = 0.0
+        price_high = 0.0
+        volume = 0
+
+        if completed and completed.get("median"):
+            current_price = float(completed.get("median") or 0.0)
+            price_low = float(completed.get("low") or (current_price * 0.9))
+            price_high = float(completed.get("high") or (current_price * 1.1))
+            volume = int(completed.get("count") or 0)
+            logging.info(f"📊 eBay sold: ${current_price:.2f} ({volume} sales)")
+        elif active and active.get("median"):
+            current_price = float(active.get("median") or 0.0)
+            price_low = current_price * 0.9
+            price_high = current_price * 1.1
+            volume = int(active.get("count") or 0)
+            logging.info(f"📊 eBay active: ${current_price:.2f} ({volume} listings)")
+
+        if current_price <= 0:
+            logging.warning(f"❌ No eBay data found for: {search_query}")
+            return JSONResponse(content={
+                "success": False,
+                "error": "No price data found for this card",
+                "card_identifier": ident,
+                "search_query": search_query,
+                "data_source": "ebay_attempted",
+                "suggestions": [
+                    "Card may be too new or too rare",
+                    "Try searching with simpler name (just card name)",
+                    "Check spelling",
+                    "Check again tomorrow - building price history"
+                ],
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+            })
+
+        # ═══════════════════════════════════════════════════════
+        # STEP 3: Log current price to DB for future
+        # ═══════════════════════════════════════════════════════
+        try:
+            entry = record_price_history(
+                card_identifier=ident,
+                card_name=card_name,
+                card_set=set_name,
+                card_number="",
+                grade=grade,
+                price_current=current_price,
+                price_low=price_low,
+                price_median=current_price,
+                price_high=price_high,
+                volume=volume,
+                source="ebay",
+                data_quality="verified",
+            )
+            logging.info(f"✅ LOGGED TO DB: ${current_price:.2f} (Entry ID: {entry['id']})")
+        except Exception as e:
+            logging.warning(f"⚠️ Failed to log price to DB: {e}")
+
+        historical_data = []
+        if db_history:
+            historical_data = [
+                {
+                    "date": (str(entry.get("recorded_date") or "")[:10]),
+                    "price_median": float(entry.get("price_median") or entry.get("price_current") or 0.0),
+                    "price_low": float(entry.get("price_low") or entry.get("price_current") or 0.0),
+                    "price_high": float(entry.get("price_high") or entry.get("price_current") or 0.0),
+                    "volume": int(entry.get("volume") or 0),
+                }
+                for entry in db_history
+            ]
+            historical_data = [x for x in historical_data if x.get("date")]
+
+        historical_data.append({
+            "date": datetime.utcnow().strftime("%Y-%m-%d"),
+            "price_median": current_price,
+            "price_low": price_low,
+            "price_high": price_high,
+            "volume": volume
+        })
+
+        historical_data.sort(key=lambda x: x["date"])
 
         return JSONResponse(content={
             "success": True,
             "card_identifier": ident,
             "search_query": search_query,
-            "data_source": "ebay_completed_listings",
-            "historical_data": historical_prices,
-            "prediction": prediction,
-            "seasonality": seasonality,
-            "analysis_period_days": int(target_days),
-            "actual_data_points": len(historical_prices),
-            "ebay_listings_analyzed": int((completed or {}).get("count") or 0),
+            "data_source": "ebay_current_snapshot",
+            "current_price": current_price,
+            "price_range": {
+                "low": price_low,
+                "median": current_price,
+                "high": price_high
+            },
+            "historical_data": historical_data,
+            "actual_data_points": len(historical_data),
+            "ebay_listings_analyzed": volume,
+            "note": f"Building history ({len(db_history)} days logged). Check again tomorrow for trend analysis!",
             "timestamp": datetime.utcnow().isoformat() + "Z",
         })
 
     except HTTPException:
         raise
     except Exception as e:
-        logging.error(f"Market trends error for {card_identifier}: {e}")
+        logging.error(f"❌ Market trends error for {card_identifier}: {e}")
+        import traceback
+        traceback.print_exc()
         return JSONResponse(content={
             "success": False,
             "error": str(e),
@@ -4544,16 +4868,52 @@ async def record_market_price(
     price_high: float = Form(...),
     volume: int = Form(0),
     source: str = Form("pricecharting"),
+    api_key: str = Depends(verify_api_key),  # required (write endpoint)
 ):
     """
     Record a price snapshot for historical tracking.
-    NOTE: This is a stub until WordPress DB integration is wired.
+    NOW ACTUALLY SAVES TO DATABASE (SQLite).
     """
-    return JSONResponse(content={
-        "success": True,
-        "message": "Price snapshot recorded (stub)",
-        "timestamp": datetime.utcnow().isoformat() + "Z"
-    })
+    try:
+        entry = record_price_history(
+            card_identifier=card_identifier,
+            card_name=card_name,
+            card_set=card_set,
+            card_number=card_number,
+            grade=grade,
+            price_current=float(price_median or 0.0),
+            price_low=float(price_low or price_median or 0.0),
+            price_median=float(price_median or 0.0),
+            price_high=float(price_high or price_median or 0.0),
+            volume=int(volume or 0),
+            source=source,
+            data_quality="verified",
+        )
+
+        logging.info(f"✅ PRICE LOGGED: {card_name} = ${float(price_median or 0.0):.2f} (ID: {entry['id']})")
+
+        return JSONResponse(content={
+            "success": True,
+            "message": "Price snapshot recorded successfully",
+            "entry_id": entry["id"],
+            "card_identifier": entry["card_identifier"],
+            "recorded_date": entry["recorded_date"],
+            "price": float(entry["price_current"]),
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        })
+
+    except Exception as e:
+        logging.error(f"❌ PRICE RECORDING FAILED: {card_identifier} - {str(e)}")
+        return JSONResponse(
+            content={
+                "success": False,
+                "error": str(e),
+                "card_identifier": (card_identifier or ""),
+                "timestamp": datetime.utcnow().isoformat() + "Z"
+            },
+            status_code=500
+        )
+
 
 
 # ========================================
@@ -5281,6 +5641,81 @@ async def get_user_alerts(user_id: int):
         ]
     })
 
+
+
+
+class AlertComposeRequest(BaseModel):
+    card_name: str
+    card_set: Optional[str] = None
+    grade: Optional[str] = None
+    direction: str  # "up" or "down"
+    pct_change: float
+    old_price: Optional[float] = None
+    new_price: Optional[float] = None
+    currency: str = "AUD"
+    user_name: Optional[str] = None
+    source: Optional[str] = None
+
+
+@app.post("/api/alerts/compose-message")
+@safe_endpoint
+async def compose_alert_message(
+    request: AlertComposeRequest,
+    api_key: str = Depends(verify_api_key),  # required (used by WP to generate email text)
+):
+    """Generate a modern spoken-word style alert message for an email notification."""
+    try:
+        card_bits = " ".join([b for b in [request.card_name, request.card_set or "", request.grade or ""] if b]).strip()
+        direction_word = "jumped" if (request.direction or "").lower() == "up" else "dropped"
+        pct = float(request.pct_change or 0.0)
+        old_p = request.old_price
+        new_p = request.new_price
+        currency = (request.currency or "AUD").strip().upper()
+        who = (request.user_name or "").strip()
+
+        # Fallback message (used if OpenAI is not configured)
+        fallback = (
+            f"{'Hey ' + who + ', ' if who else ''}"
+            f"your {card_bits} just {direction_word} {abs(pct):.1f}% "
+            f"({currency} {old_p:.2f} → {currency} {new_p:.2f})" if (old_p is not None and new_p is not None) else
+            f"your {card_bits} just {direction_word} {abs(pct):.1f}%" 
+        )
+
+        prompt = f"""Write a short, modern spoken-word style message to a collectibles collector.
+Tone: confident, hype-but-classy, not cringe. 60–90 words. No financial advice. No ROI language.
+
+Context:
+- Item: {card_bits}
+- Move: {direction_word} {abs(pct):.1f}%
+- Old price: {currency} {old_p:.2f} (if provided)
+- New price: {currency} {new_p:.2f} (if provided)
+- Source: {request.source or 'collection update'}
+
+Requirements:
+- Mention the % move clearly.
+- If old/new prices provided, include them once in brackets.
+- End with a single, simple action line (e.g. “Check your collection snapshot.”).
+Return plain text only (no JSON)."""
+
+        msg = [{"role": "user", "content": prompt}]
+        result = await _openai_chat(msg, max_tokens=220, temperature=0.7)
+
+        text = (result.get("content") or "").strip()
+        if not text:
+            text = fallback
+
+        return JSONResponse(content={
+            "success": True,
+            "message": text,
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        })
+    except Exception as e:
+        logging.error(f"❌ compose_alert_message failed: {e}")
+        return JSONResponse(content={
+            "success": False,
+            "error": str(e),
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }, status_code=500)
 
 # ========================================
 # LIVE GRADING ROOM (WebSocket)
