@@ -1135,9 +1135,16 @@ def _canonicalize_set(set_code: Optional[str], set_name: Optional[str]) -> Dict[
 
 
 # eBay API scaffolding (disabled by default)
-USE_EBAY_API = os.getenv("USE_EBAY_API", "0").strip() in ("1", "true", "TRUE", "yes", "YES")
-# Finding/Legacy (SOLD) uses "Dev ID" as AppID for FindingService
+_USE_EBAY_ENV = os.getenv("USE_EBAY_API", "").strip().lower()
+# Finding/Legacy (SOLD) uses EBAY_APP_ID for FindingService
 EBAY_APP_ID = os.getenv("EBAY_APP_ID", "").strip()
+# Auto-enable eBay if EBAY_APP_ID is present and USE_EBAY_API is not explicitly set.
+if _USE_EBAY_ENV == "":
+    USE_EBAY_API = bool(EBAY_APP_ID)
+elif _USE_EBAY_ENV in ("0","false","no","off"):
+    USE_EBAY_API = False
+else:
+    USE_EBAY_API = _USE_EBAY_ENV in ("1","true","yes","y","on")
 
 # Browse/Buy APIs (ACTIVE) use OAuth application token.
 # Prefer auto-fetch via client credentials; EBAY_OAUTH_TOKEN remains as a fallback/manual override.
