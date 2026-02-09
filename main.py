@@ -593,42 +593,118 @@ UA = "CollectorsLeagueScan/6.6 (+https://collectors-league.com)"
 def _build_ebay_search_query(card_name: str, card_set: str = "", card_number: str = "", grade: str = "") -> str:
     """Build a robust eBay keyword query for Pokemon cards.
 
-    Keeps the full card name (no aggressive truncation), lightly adds set/number when useful,
-    appends 'Pokemon' to reduce noise, and optionally appends PSA grade.
+    Goals:
+      - Prefer recall over precision (too-specific queries cause 'no results')
+      - Strip punctuation / years / bracket noise coming from UI labels like "(2025)"
+      - Avoid placeholder or obviously-wrong set names
+      - Keep full card name (don't truncate aggressively)
+      - Optionally add PSA grade (only when explicitly PSA)
     """
-    name = (card_name or "").strip()
-    if not name:
+    name_raw = (card_name or "").strip()
+    if not name_raw:
         return ""
 
-    set_name = (card_set or "").strip()
-    num = (card_number or "").strip()
+    set_raw = (card_set or "").strip()
+    num_raw = (card_number or "").strip()
     g = (grade or "").strip()
 
-    # Clean common noisy fragments
-    # Remove standalone year markers like "(2025)" or "(1999)"
-    name = re.sub(r"\(\s*\d{4}\s*\)", "", name).strip()
-    set_name = re.sub(r"\(\s*\d{4}\s*\)", "", set_name).strip()
+    def _clean_text(s: str) -> str:
+        s = s or ""
+        # Remove bracketed years and any bracketed noise
+        s = re.sub(r"\(\s*\d{4}\s*\)", " ", s)
+        s = re.sub(r"\[[^\]]*\]", " ", s)
+        s = re.sub(r"\([^\)]*\)", " ", s)  # remove remaining (...) safely
+        # Drop common UI artefacts
+        s = re.sub(r"\b(pre[-\s]?grade|draft|collecting|submitted|graded)\b", " ", s, flags=re.I)
+        # Replace punctuation with spaces (keep + and / out)
+        s = re.sub(r"[^A-Za-z0-9\s\-]", " ", s)
+        return _norm_ws(s)
 
-    # Avoid adding placeholder set names that don't help searching
-    bad_sets = {"pokemon", "pokémon", "tcg", "card", "cards", "other", "unknown", ""}
-    if set_name.lower() in bad_sets:
+    name = _clean_text(name_raw)
+
+    # Normalize common Pokemon card naming variations
+    # eBay often uses "M Charizard EX" for Mega Charizard EX cards
+    name = re.sub(r"\bMega\b", "M", name, flags=re.I)
+
+    # Clean set/number lightly (but we will only include when it helps)
+    set_name = _clean_text(set_raw)
+    num = _clean_text(num_raw)
+
+    # Avoid adding placeholder / generic / suspicious set values that reduce recall
+    bad_sets = {
+        "pokemon", "pokémon", "tcg", "card", "cards", "other", "unknown", "none", "n/a", "-",
+        "base", "set", "promo", "draft"
+    }
+    set_lower = set_name.lower().strip()
+    if not set_lower or set_lower in bad_sets:
+        set_name = ""
+    # If set contains digits or looks like a year label, drop it (often UI noise e.g. "(2025)")
+    if re.search(r"\b(19|20)\d{2}\b", set_name):
         set_name = ""
 
+    # Build query: start with card name only (best recall)
     parts = [name]
-    if set_name and set_name.lower() not in name.lower():
+
+    # Only append set if it doesn't already appear in the name and is short/clean
+    if set_name and set_name.lower() not in name.lower() and len(set_name) <= 30:
         parts.append(set_name)
-    if num:
+
+    # Card numbers are often useful but can also overfilter; include only if short
+    if num and len(num) <= 12:
         parts.append(num)
 
-    parts.append("Pokemon")
+    # Always add Pokemon context
+    parts.append("Pokemon card")
 
     q = _norm_ws(" ".join([p for p in parts if p]).strip())
 
-    # Add PSA grade only (keeps eBay results usable; other grades vary too much)
+    # Add PSA grade only (other grades vary too much)
     if g and "psa" in g.lower():
         q = _norm_ws(f"{q} {g}")
 
     return q.strip()
+
+
+def _build_ebay_query_ladder(card_name: str, card_set: str = "", card_number: str = "", grade: str = "") -> list:
+    """
+    Return a small ladder of increasingly-broad eBay keyword queries.
+    We try precise-ish first, then relax (set removed), then name-only.
+    """
+    base = _build_ebay_search_query(card_name=card_name, card_set=card_set, card_number=card_number, grade="")  # grade handled separately
+    name_only = _build_ebay_search_query(card_name=card_name, card_set="", card_number="", grade="")
+
+    # Normalize grade into a PSA token when possible
+    g = (grade or "").strip()
+    psa_token = ""
+    if g:
+        if "psa" in g.lower():
+            psa_token = g.strip()
+        else:
+            # numeric grade like "9"
+            if re.fullmatch(r"(10|[1-9](?:\.5)?)", g):
+                psa_token = f"PSA {g}"
+
+    ladder = []
+    for q in [base, name_only]:
+        q = _norm_ws(q)
+        if not q:
+            continue
+        if psa_token:
+            ladder.append(_norm_ws(f"{q} {psa_token}"))
+        ladder.append(q)
+
+    # Final ultra-broad fallback (sometimes "card" hurts recall)
+    if card_name:
+        ladder.append(_norm_ws(f"{card_name} Pokemon"))
+
+    # Deduplicate while preserving order
+    seen = set()
+    out = []
+    for q in ladder:
+        if q and q not in seen:
+            out.append(q)
+            seen.add(q)
+    return out
 
 async def _fx_usd_to_aud() -> float:
     """Return live-ish USD->AUD rate with a short cache. Falls back to 1.50 if unavailable."""
@@ -679,7 +755,7 @@ async def _ebay_completed_stats(keyword_query: str, limit: int = 120, days_lookb
       - low/high are p20/p80 to reduce outlier impact.
     """
     q = _norm_ws(keyword_query or "")
-    if not q or not USE_EBAY_API or not EBAY_APP_ID:
+    if not q or not EBAY_APP_ID:
         return {}
 
     # Cache per query+limit+lookback
@@ -703,7 +779,7 @@ async def _ebay_completed_stats(keyword_query: str, limit: int = 120, days_lookb
             params = {
                 "OPERATION-NAME": "findCompletedItems",
                 "SERVICE-VERSION": "1.13.0",
-                "SECURITY-APPNAME": EBAY_APP_ID,
+                "GLOBAL-ID": "EBAY-AU",
                 "RESPONSE-DATA-FORMAT": "JSON",
                 "REST-PAYLOAD": "true",
                 "keywords": q,
@@ -732,7 +808,7 @@ async def _ebay_completed_stats(keyword_query: str, limit: int = 120, days_lookb
             for it in items or []:
                 try:
                     selling = it.get("sellingStatus", [{}])[0]
-                    cp = selling.get("currentPrice", [{}])[0]
+                    cp = (selling.get("convertedCurrentPrice", [{}]) or [{}])[0] or (selling.get("currentPrice", [{}]) or [{}])[0]
                     val = float(cp.get("__value__", 0.0))
                     cur = str(cp.get("@currencyId", "")).upper()
                     if val <= 0:
@@ -1527,7 +1603,7 @@ async def _ebay_active_stats(keyword_query: str, limit: int = 120) -> dict:
     Returns same shape as _ebay_completed_stats but represents current asking prices.
     """
     q = _norm_ws(keyword_query or "")
-    if not q or not USE_EBAY_API or not EBAY_APP_ID:
+    if not q or not EBAY_APP_ID:
         return {}
 
     cache_key = f"ebay_active:{q}:{limit}"
@@ -1548,7 +1624,7 @@ async def _ebay_active_stats(keyword_query: str, limit: int = 120) -> dict:
             params = {
                 "OPERATION-NAME": "findItemsAdvanced",
                 "SERVICE-VERSION": "1.13.0",
-                "SECURITY-APPNAME": EBAY_APP_ID,
+                "GLOBAL-ID": "EBAY-AU",
                 "RESPONSE-DATA-FORMAT": "JSON",
                 "REST-PAYLOAD": "true",
                 "keywords": q,
@@ -1577,7 +1653,7 @@ async def _ebay_active_stats(keyword_query: str, limit: int = 120) -> dict:
             for it in items:
                 try:
                     selling = (it.get("sellingStatus") or [{}])[0]
-                    cp = (selling.get("currentPrice") or [{}])[0]
+                    cp = (selling.get("convertedCurrentPrice") or selling.get("currentPrice") or [{}])[0]
                     p = float(cp.get("__value__", 0.0))
                     cur = cp.get("@currencyId", "USD")
                     if p <= 0:
@@ -4470,24 +4546,29 @@ async def get_market_trends(
         # ═══════════════════════════════════════════════════════
         logging.info(f"⚠️ DATABASE MISS: Only {len(db_history)} points, fetching from eBay")
 
-        # Build eBay search query (use helper; avoid over-truncation).
+        # Build eBay query ladder (specific -> broad)
         if "|" in ident:
-            # Pipe-delimited: use card name + set if available
-            search_query = _build_ebay_search_query(card_name=card_name, card_set=set_name, grade=grade)
+            queries = _build_ebay_query_ladder(card_name=card_name, card_set=set_name, grade=grade)
         else:
-            # Free-form: treat ident as the name and search broadly
-            search_query = _build_ebay_search_query(card_name=ident, card_set="", grade=grade)
+            queries = _build_ebay_query_ladder(card_name=ident, card_set="", grade=grade)
 
-        if not search_query:
+        if not queries:
             raise HTTPException(status_code=400, detail="Could not build search query")
 
-        logging.info(f"🔍 Final eBay search query: '{search_query}'")
-
+        logging.info(f"🔍 eBay queries: {queries}")
         target_days = max(7, min(int(days or 90), 90))
 
-        completed = await _ebay_completed_stats(search_query, limit=50, days_lookback=30)
-        active = await _ebay_active_stats(search_query, limit=30)
+        completed = {}
+        active = {}
+        chosen_query = ""
 
+        for q in queries:
+            chosen_query = q
+            completed = await _ebay_completed_stats(q, limit=50, days_lookback=30) or {}
+            active = await _ebay_active_stats(q, limit=30) or {}
+            if (completed.get("median") and completed.get("median") > 0) or (active.get("median") and active.get("median") > 0):
+                break
+        search_query = chosen_query
         current_price = 0.0
         price_low = 0.0
         price_high = 0.0
@@ -4993,45 +5074,51 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
 
         logging.info(f"💰 Price lookup request: {card_name}")
 
-        # Build smart query (safe: keep full card name; avoid placeholder set values)
-        search_query = _build_ebay_search_query(card_name=card_name, card_set=card_set, grade=grade)
+                # Build smart query ladder (try specific -> broad)
+        queries = _build_ebay_query_ladder(card_name=card_name, card_set=card_set, card_number=card_number, grade=grade)
 
-        if not search_query:
+        if not queries:
             return {"current_price": 0, "source": "error", "error": "Could not build search query"}
 
-        logging.info(f"🔍 eBay query: '{search_query}'")
+        last_completed = None
+        last_active = None
 
-        # Try completed (sold) listings first
-        completed = await _ebay_completed_stats(search_query, limit=50, days_lookback=30)
+        for search_query in queries:
+            logging.info(f"🔍 eBay query: '{search_query}'")
 
-        if completed and completed.get("median") and completed.get("median") > 0:
-            current_price = float(completed.get("median"))
-            logging.info(f"✅ Found price: ${current_price:.2f} (from {completed.get('count', 0)} sales)")
-            return {
-                "current_price": current_price,
-                "source": "ebay_completed",
-                "search_query": search_query,
-                "card_name": card_name,
-                "sales_count": completed.get("count", 0),
-                "last_updated": datetime.now().isoformat()
-            }
+            # Try completed (sold) listings first
+            completed = await _ebay_completed_stats(search_query, limit=50, days_lookback=30)
+            last_completed = completed or last_completed
 
-        # If no completed, try active listings
-        active = await _ebay_active_stats(search_query, limit=30)
+            if completed and completed.get("median") and completed.get("median") > 0:
+                current_price = float(completed.get("median"))
+                logging.info(f"✅ Found price: ${current_price:.2f} (from {completed.get('count', 0)} sales)")
+                return {
+                    "current_price": current_price,
+                    "source": "ebay_completed",
+                    "search_query": search_query,
+                    "queries_tried": queries,
+                    "card_name": card_name,
+                    "sales_count": completed.get("count", 0),
+                    "last_updated": datetime.now().isoformat()
+                }
 
-        if active and active.get("median") and active.get("median") > 0:
-            current_price = float(active.get("median"))
-            logging.info(f"✅ Found price: ${current_price:.2f} (from {active.get('count', 0)} active listings)")
-            return {
-                "current_price": current_price,
-                "source": "ebay_active",
-                "search_query": search_query,
-                "card_name": card_name,
-                "listings_count": active.get("count", 0),
-                "last_updated": datetime.now().isoformat()
-            }
+            # If no completed, try active listings
+            active = await _ebay_active_stats(search_query, limit=30)
+            last_active = active or last_active
 
-        # No results from either source
+            if active and active.get("median") and active.get("median") > 0:
+                current_price = float(active.get("median"))
+                logging.info(f"✅ Found price: ${current_price:.2f} (from {active.get('count', 0)} active listings)")
+                return {
+                    "current_price": current_price,
+                    "source": "ebay_active",
+                    "search_query": search_query,
+                    "queries_tried": queries,
+                    "card_name": card_name,
+                    "listings_count": active.get("count", 0),
+                    "last_updated": datetime.now().isoformat()
+                }# No results from either source
         logging.warning(f"❌ No eBay results for: {search_query}")
         return {
             "current_price": 0,
