@@ -4038,7 +4038,7 @@ async def market_context(
     best_debug: Dict[str, Any] = {}
 
     for q in ladder:
-        cand = await _browse_active(q, limit=50)
+        cand = await _browse_active(q, limit=10)
         if not cand:
             continue
         # merge pool
@@ -4100,7 +4100,7 @@ async def market_context(
     # Pull a separate graded pool (do NOT exclude graded)
     graded_query_base = " ".join([x for x in [n, sname] if x]).strip()
     graded_query = _norm_ws(f"{graded_query_base} graded psa cgc bgs")
-    graded_pool = await _browse_active(graded_query, limit=50)
+    graded_pool = await _browse_active(graded_query, limit=10)
 
     graded_buckets = {"10": [], "9": [], "8": []}
     for it in graded_pool:
@@ -4564,8 +4564,8 @@ async def get_market_trends(
 
         for q in queries:
             chosen_query = q
-            completed = await _ebay_completed_stats(q, limit=50, days_lookback=30) or {}
-            active = await _ebay_active_stats(q, limit=30) or {}
+            completed = await _ebay_completed_stats(q, limit=10, days_lookback=30) or {}
+            active = await _ebay_active_stats(q, limit=10) or {}
             if (completed.get("median") and completed.get("median") > 0) or (active.get("median") and active.get("median") > 0):
                 break
         search_query = chosen_query
@@ -5087,7 +5087,7 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
             logging.info(f"🔍 eBay query: '{search_query}'")
 
             # Try completed (sold) listings first
-            completed = await _ebay_completed_stats(search_query, limit=50, days_lookback=30)
+            completed = await _ebay_completed_stats(search_query, limit=10, days_lookback=30)
             last_completed = completed or last_completed
 
             if completed and completed.get("median") and completed.get("median") > 0:
@@ -5104,7 +5104,7 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                 }
 
             # If no completed, try active listings
-            active = await _ebay_active_stats(search_query, limit=30)
+            active = await _ebay_active_stats(search_query, limit=10)
             last_active = active or last_active
 
             if active and active.get("median") and active.get("median") > 0:
