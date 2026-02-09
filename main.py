@@ -589,6 +589,47 @@ except Exception:
 # ==============================
 UA = "CollectorsLeagueScan/6.6 (+https://collectors-league.com)"
 
+
+def _build_ebay_search_query(card_name: str, card_set: str = "", card_number: str = "", grade: str = "") -> str:
+    """Build a robust eBay keyword query for Pokemon cards.
+
+    Keeps the full card name (no aggressive truncation), lightly adds set/number when useful,
+    appends 'Pokemon' to reduce noise, and optionally appends PSA grade.
+    """
+    name = (card_name or "").strip()
+    if not name:
+        return ""
+
+    set_name = (card_set or "").strip()
+    num = (card_number or "").strip()
+    g = (grade or "").strip()
+
+    # Clean common noisy fragments
+    # Remove standalone year markers like "(2025)" or "(1999)"
+    name = re.sub(r"\(\s*\d{4}\s*\)", "", name).strip()
+    set_name = re.sub(r"\(\s*\d{4}\s*\)", "", set_name).strip()
+
+    # Avoid adding placeholder set names that don't help searching
+    bad_sets = {"pokemon", "pokémon", "tcg", "card", "cards", "other", "unknown", ""}
+    if set_name.lower() in bad_sets:
+        set_name = ""
+
+    parts = [name]
+    if set_name and set_name.lower() not in name.lower():
+        parts.append(set_name)
+    if num:
+        parts.append(num)
+
+    parts.append("Pokemon")
+
+    q = _norm_ws(" ".join([p for p in parts if p]).strip())
+
+    # Add PSA grade only (keeps eBay results usable; other grades vary too much)
+    if g and "psa" in g.lower():
+        q = _norm_ws(f"{q} {g}")
+
+    return q.strip()
+
 async def _fx_usd_to_aud() -> float:
     """Return live-ish USD->AUD rate with a short cache. Falls back to 1.50 if unavailable."""
     try:
