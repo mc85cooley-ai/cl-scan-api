@@ -4427,43 +4427,15 @@ async def get_market_trends(
         # ═══════════════════════════════════════════════════════
         # STEP 2: Not enough DB data – fetch current price from eBay
         # ═══════════════════════════════════════════════════════
-                # ═══════════════════════════════════════════════════════
-        # STEP 2: Not enough DB data – fetch current price from eBay
-        # ═══════════════════════════════════════════════════════
         logging.info(f"⚠️ DATABASE MISS: Only {len(db_history)} points, fetching from eBay")
 
-        # NEW: Smart search query builder
-        # If input doesn't have pipes, it's free-form search - extract just card name
-        if "|" not in ident:
-            # Free-form input like "mega lopunny ex Phantasmal flames"
-            # Extract just the card name (first 2-3 words usually)
-            words = card_name.split()
-
-            # Look for Pokemon-specific keywords to know where card name ends
-            keywords = ['ex', 'gx', 'vmax', 'vstar', 'v', 'mega', 'shining', 'rainbow']
-
-            # Find the main card name (usually first 2-4 words)
-            card_name_only = []
-            for i, word in enumerate(words):
-                card_name_only.append(word)
-                # Stop after we hit a keyword + the next word
-                if word.lower() in keywords and i < len(words) - 1:
-                    card_name_only.append(words[i + 1])  # Include word after keyword
-                    break
-                # Or stop after 4 words
-                if len(card_name_only) >= 4:
-                    break
-
-            search_query = " ".join(card_name_only) + " Pokemon"
-            logging.info(f"🔄 Free-form search detected, simplified: '{ident}' → '{search_query}'")
+        # Build eBay search query (use helper; avoid over-truncation).
+        if "|" in ident:
+            # Pipe-delimited: use card name + set if available
+            search_query = _build_ebay_search_query(card_name=card_name, card_set=set_name, grade=grade)
         else:
-            # Pipe-delimited format - use just card name
-            search_query = f"{card_name} Pokemon"
-            logging.info(f"🔄 Pipe format detected: '{search_query}'")
-
-        # Add grade if specified
-        if grade and 'psa' in grade.lower():
-            search_query = f"{search_query} {grade}"
+            # Free-form: treat ident as the name and search broadly
+            search_query = _build_ebay_search_query(card_name=ident, card_set="", grade=grade)
 
         if not search_query:
             raise HTTPException(status_code=400, detail="Could not build search query")
@@ -4980,36 +4952,8 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
 
         logging.info(f"💰 Price lookup request: {card_name}")
 
-        # Build smart query (SAME logic as your market-trends fix)
-        words = card_name.split()
-        keywords = ['ex', 'gx', 'vmax', 'vstar', 'v', 'mega', 'shining', 'rainbow']
-
-        card_name_only = []
-        for i, word in enumerate(words):
-            card_name_only.append(word)
-            # Stop after we hit a keyword + the next word
-            if word.lower() in keywords and i < len(words) - 1:
-                card_name_only.append(words[i + 1])
-                break
-            # Or stop after 4 words
-            if len(card_name_only) >= 4:
-                break
-
-        search_query = " ".join(card_name_only).strip()
-
-        # Optionally add set/number if provided (helps disambiguation without overfitting)
-        # Keep these light so eBay results don't get too narrow.
-        if card_set:
-            search_query = f"{search_query} {card_set}".strip()
-        if card_number:
-            search_query = f"{search_query} {card_number}".strip()
-
-        # Always add Pokemon to reduce noise
-        search_query = f"{search_query} Pokemon".strip()
-
-        # Add grade if specified
-        if grade and 'psa' in grade.lower():
-            search_query = f"{search_query} {grade}".strip()
+        # Build smart query (safe: keep full card name; avoid placeholder set values)
+        search_query = _build_ebay_search_query(card_name=card_name, card_set=card_set, grade=grade)
 
         if not search_query:
             return {"current_price": 0, "source": "error", "error": "Could not build search query"}
