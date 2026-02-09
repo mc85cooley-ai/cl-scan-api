@@ -3614,7 +3614,7 @@ async def market_context(
     # Query ladder (Google-like)
     # --------------------------
     set_code_hint = _norm_ws((item_set or "")).strip()
-    ladder = _build_ebay_query_ladder(n, sname, set_code_hint, num_display, ctype)
+    ladder = _build_ebay_query_ladder_rich(n, sname, set_code_hint, num_display, ctype)
     ladder = ladder[:12] if ladder else [_norm_ws(n)]
 
     exclude_graded_effective = EXCLUDE_GRADED_DEFAULT if exclude_graded is None else bool(exclude_graded)
@@ -5074,8 +5074,13 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
 
         logging.info(f"💰 Price lookup request: {card_name}")
 
-                # Build smart query ladder (try specific -> broad)
-        queries = _build_ebay_query_ladder(card_name=card_name, card_set=card_set, card_number=card_number, grade=grade)
+        # Build smart query ladder (try specific -> broad)
+        queries = _build_ebay_query_ladder(
+            card_name=card_name,
+            card_set=card_set,
+            card_number=card_number,
+            grade=grade,
+        )
 
         if not queries:
             return {"current_price": 0, "source": "error", "error": "Could not build search query"}
@@ -5118,14 +5123,17 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                     "card_name": card_name,
                     "listings_count": active.get("count", 0),
                     "last_updated": datetime.now().isoformat()
-                }# No results from either source
-        logging.warning(f"❌ No eBay results for: {search_query}")
+                }
+
+        # No results from either source
+        logging.warning(f"❌ No eBay results for any query tried: {queries}")
         return {
             "current_price": 0,
             "source": "ebay_no_results",
             "error": "No eBay listings found",
-            "search_query": search_query,
-            "card_name": card_name
+            "search_query": queries[-1] if queries else "",
+            "queries_tried": queries,
+            "card_name": card_name,
         }
 
     except Exception as e:
@@ -5343,7 +5351,7 @@ def _dedupe_tokens(q: str) -> str:
     q = re.sub(r"\s+", " ", q).strip()
     return q
 
-def _build_ebay_query_ladder(card_name: str, set_name: str, set_code: str, card_number: str, card_type: str) -> List[str]:
+def _build_ebay_query_ladder_rich(card_name: str, set_name: str, set_code: str, card_number: str, card_type: str) -> List[str]:
     """
     Build a resilient eBay keyword ladder. Start specific, progressively relax:
       1) name + set + number (number variants)
