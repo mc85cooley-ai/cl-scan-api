@@ -665,12 +665,28 @@ def _build_ebay_search_query(card_name: str, card_set: str = "", card_number: st
     return q.strip()
 
 
-def _build_ebay_query_ladder(card_name: str, card_set: str = "", card_number: str = "", grade: str = "") -> list:
+def _build_ebay_query_ladder(
+    card_name: str,
+    set_name: str = "",
+    card_number: str = "",
+    grade: str = "",
+    **kwargs,
+) -> list:
     """
     Return a small ladder of increasingly-broad eBay keyword queries.
-    We try precise-ish first, then relax (set removed), then name-only.
+
+    Compatible with older call-sites that pass `card_set=...`.
     """
-    base = _build_ebay_search_query(card_name=card_name, card_set=card_set, card_number=card_number, grade="")  # grade handled separately
+    # Back-compat for older kwarg name
+    if not set_name and isinstance(kwargs.get("card_set"), str):
+        set_name = kwargs.get("card_set", "") or ""
+
+    base = _build_ebay_search_query(
+        card_name=card_name,
+        card_set=set_name,
+        card_number=card_number,
+        grade="",  # grade handled separately below
+    )
     name_only = _build_ebay_search_query(card_name=card_name, card_set="", card_number="", grade="")
 
     # Normalize grade into a PSA token when possible
@@ -680,7 +696,7 @@ def _build_ebay_query_ladder(card_name: str, card_set: str = "", card_number: st
         if "psa" in g.lower():
             psa_token = g.strip()
         else:
-            # numeric grade like "9"
+            # numeric grade like "9" or "9.5"
             if re.fullmatch(r"(10|[1-9](?:\.5)?)", g):
                 psa_token = f"PSA {g}"
 
@@ -689,6 +705,7 @@ def _build_ebay_query_ladder(card_name: str, card_set: str = "", card_number: st
         q = _norm_ws(q)
         if not q:
             continue
+        # Try with grade token first (if any), then without
         if psa_token:
             ladder.append(_norm_ws(f"{q} {psa_token}"))
         ladder.append(q)
@@ -705,7 +722,6 @@ def _build_ebay_query_ladder(card_name: str, card_set: str = "", card_number: st
             out.append(q)
             seen.add(q)
     return out
-
 async def _fx_usd_to_aud() -> float:
     """Return live-ish USD->AUD rate with a short cache. Falls back to 1.50 if unavailable."""
     try:
@@ -782,6 +798,7 @@ async def _ebay_completed_stats(keyword_query: str, limit: int = 120, days_lookb
                 "GLOBAL-ID": "EBAY-AU",
                 "RESPONSE-DATA-FORMAT": "JSON",
                 "REST-PAYLOAD": "true",
+                "SECURITY-APPNAME": EBAY_APP_ID,
                 "keywords": q,
                 "itemFilter(0).name": "SoldItemsOnly",
                 "itemFilter(0).value": "true",
@@ -1627,6 +1644,7 @@ async def _ebay_active_stats(keyword_query: str, limit: int = 120) -> dict:
                 "GLOBAL-ID": "EBAY-AU",
                 "RESPONSE-DATA-FORMAT": "JSON",
                 "REST-PAYLOAD": "true",
+                "SECURITY-APPNAME": EBAY_APP_ID,
                 "keywords": q,
                 "paginationInput.entriesPerPage": "100",
                 "paginationInput.pageNumber": str(page),
