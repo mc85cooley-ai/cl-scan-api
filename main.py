@@ -1642,74 +1642,123 @@ async def _openai_chat(messages: List[Dict[str, Any]], max_tokens: int = 1200, t
 
 async def _ebay_active_stats(keyword_query: str, limit: int = 120) -> dict:
     """
-    Fetch eBay ACTIVE listings stats using FindingService (AppID only).
-    Returns same shape as _ebay_completed_stats but represents current asking prices.
+    Fetch eBay ACTIVE listings stats.
+
+    Prefer Buy/Browse API (OAuth) when available.
+    Falls back to FindingService (AppID) if OAuth creds are missing.
     """
     q = _norm_ws(keyword_query or "")
-    if not q or not EBAY_APP_ID:
+    if not q:
         return {}
 
-    cache_key = f"ebay_active:{q}:{limit}"
+    cache_key = f"ebay_active2:{q}:{int(limit or 0)}"
     now = int(time.time())
     cached = _EBAY_CACHE.get(cache_key)
-    if cached and (now - int(cached.get("ts", 0))) < 900:  # 15 min
+    if cached and (now - int(cached.get("ts", 0))) < 900:
         return cached.get("data", {}) or {}
 
-    target = max(1, int(limit))
-    pages = min(5, max(1, (target + 99) // 100))
-    prices = []
+    target = max(1, int(limit or 120))
+    prices: List[float] = []
 
-    url = "https://svcs.ebay.com/services/search/FindingService/v1"
-    headers = {"User-Agent": UA}
-
-    async with httpx.AsyncClient(timeout=20.0, headers=headers) as client:
-        for page in range(1, pages + 1):
-            params = {
-                "OPERATION-NAME": "findItemsAdvanced",
-                "SERVICE-VERSION": "1.13.0",
-                "GLOBAL-ID": "EBAY-AU",
-                "RESPONSE-DATA-FORMAT": "JSON",
-                "REST-PAYLOAD": "true",
-                "SECURITY-APPNAME": EBAY_APP_ID,
-                "keywords": q,
-                "paginationInput.entriesPerPage": "100",
-                "paginationInput.pageNumber": str(page),
-                # Prefer fixed price + auction; don't restrict too hard.
-                "itemFilter(0).name": "HideDuplicateItems",
-                "itemFilter(0).value": "true",
+    # --- Path A: Browse API (preferred) ---
+    token, _dbg = await _get_ebay_app_token()
+    if token:
+        try:
+            # Browse API supports up to 200 per request; we page cautiously
+            per_page = min(50, target)
+            pages = min(6, max(1, (target + per_page - 1) // per_page))
+            url = "https://api.ebay.com/buy/browse/v1/item_summary/search"
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "X-EBAY-C-MARKETPLACE-ID": EBAY_MARKETPLACE_ID,
+                "Accept": "application/json",
+                "User-Agent": UA,
             }
-            try:
-                r = await client.get(url, params=params)
-                r.raise_for_status()
-                j = r.json()
-            except Exception:
-                continue
 
-            try:
-                items = (
-                    j.get("findItemsAdvancedResponse", [{}])[0]
-                     .get("searchResult", [{}])[0]
-                     .get("item", [])
-                )
-            except Exception:
-                items = []
+            async with httpx.AsyncClient(timeout=25.0, headers=headers) as client:
+                for page in range(pages):
+                    params = {
+                        "q": q,
+                        "limit": str(per_page),
+                        "offset": str(page * per_page),
+                    }
+                    r = await client.get(url, params=params)
+                    if r.status_code == 401:
+                        # refresh once
+                        token2, _ = await _get_ebay_app_token(force_refresh=True)
+                        if token2:
+                            headers["Authorization"] = f"Bearer {token2}"
+                            r = await client.get(url, params=params)
+                    if r.status_code != 200:
+                        break
+                    j = r.json() or {}
+                    items = j.get("itemSummaries") or []
+                    for it in items:
+                        try:
+                            pr = (it.get("price") or {})
+                            val = float(pr.get("value") or 0.0)
+                            cur = str(pr.get("currency") or DEFAULT_CURRENCY).upper()
+                            if val <= 0:
+                                continue
+                            if cur == "USD":
+                                val = float(_usd_to_aud_simple(val) or 0.0)
+                            if val <= 0 or val > 1_000_000:
+                                continue
+                            prices.append(val)
+                        except Exception:
+                            continue
+                    if len(prices) >= target:
+                        break
+        except Exception:
+            prices = []
 
-            for it in items:
-                try:
-                    selling = (it.get("sellingStatus") or [{}])[0]
-                    cp = (selling.get("convertedCurrentPrice") or selling.get("currentPrice") or [{}])[0]
-                    p = float(cp.get("__value__", 0.0))
-                    cur = cp.get("@currencyId", "USD")
-                    if p <= 0:
+    # --- Path B: FindingService fallback (AppID) ---
+    if not prices and EBAY_APP_ID:
+        try:
+            target2 = max(1, int(target))
+            pages = min(5, max(1, (target2 + 99) // 100))
+            url = "https://svcs.ebay.com/services/search/FindingService/v1"
+            headers = {"User-Agent": UA}
+
+            async with httpx.AsyncClient(timeout=20.0, headers=headers) as client:
+                for page in range(1, pages + 1):
+                    params = {
+                        "OPERATION-NAME": "findItemsAdvanced",
+                        "SERVICE-VERSION": "1.13.0",
+                        "GLOBAL-ID": "EBAY-AU",
+                        "RESPONSE-DATA-FORMAT": "JSON",
+                        "REST-PAYLOAD": "true",
+                        "SECURITY-APPNAME": EBAY_APP_ID,
+                        "keywords": q,
+                        "paginationInput.entriesPerPage": "100",
+                        "paginationInput.pageNumber": str(page),
+                        "itemFilter(0).name": "HideDuplicateItems",
+                        "itemFilter(0).value": "true",
+                    }
+                    r = await client.get(url, params=params)
+                    if r.status_code != 200:
                         continue
-                    if str(cur).upper() == "USD":
-                        p = _usd_to_aud_simple(p)
-                    prices.append(p)
-                except Exception:
-                    continue
-
-            if len(prices) >= target:
-                break
+                    j = r.json()
+                    items = (j.get("findItemsAdvancedResponse", [{}])[0].get("searchResult", [{}])[0].get("item", [])) or []
+                    for it in items:
+                        try:
+                            selling = (it.get("sellingStatus") or [{}])[0]
+                            cp = (selling.get("convertedCurrentPrice") or selling.get("currentPrice") or [{}])[0]
+                            p = float(cp.get("__value__", 0.0))
+                            cur = str(cp.get("@currencyId", "USD")).upper()
+                            if p <= 0:
+                                continue
+                            if cur == "USD":
+                                p = float(_usd_to_aud_simple(p) or 0.0)
+                            if p <= 0 or p > 1_000_000:
+                                continue
+                            prices.append(p)
+                        except Exception:
+                            continue
+                    if len(prices) >= target2:
+                        break
+        except Exception:
+            prices = []
 
     prices = sorted(prices)
     count = len(prices)
@@ -1727,7 +1776,7 @@ async def _ebay_active_stats(keyword_query: str, limit: int = 120) -> dict:
         "query": q,
         "count": count,
         "currency": "AUD",
-        "prices": prices,
+        "prices": prices[:target],
         "low": pct(0.20),
         "median": pct(0.50),
         "high": pct(0.80),
@@ -1740,102 +1789,141 @@ async def _ebay_active_stats(keyword_query: str, limit: int = 120) -> dict:
     _EBAY_CACHE[cache_key] = {"ts": now, "data": out}
     return out
 
-
 async def _ebay_find_items(keyword_query: str, limit: int = 5, sold: bool = False, days_lookback: int = 30) -> List[Dict[str, Any]]:
     """Return a small list of eBay items to allow manual disambiguation on the front-end.
 
-    Uses FindingService (AppID only). This is deliberately lightweight and cached.
+    Prefer Buy/Browse API (OAuth). Falls back to FindingService (AppID) when OAuth is missing.
+    Note: Browse does not provide SOLD/COMPLETED; when sold=True and AppID is missing we return ACTIVE items.
     """
     q = _norm_ws(keyword_query or "")
-    if not q or not EBAY_APP_ID:
+    if not q:
         return []
 
     limit = max(1, min(int(limit or 5), 20))
-    cache_key = f"ebay_items:{'sold' if sold else 'active'}:{q}:{limit}:{int(days_lookback or 30)}"
+    cache_key = f"ebay_items2:{'sold' if sold else 'active'}:{q}:{limit}:{int(days_lookback or 30)}"
     now = int(time.time())
     cached = _EBAY_CACHE.get(cache_key)
     if cached and (now - int(cached.get('ts', 0))) < 900:
         return cached.get('data', []) or []
 
-    url = "https://svcs.ebay.com/services/search/FindingService/v1"
-    headers = {"User-Agent": UA}
-
-    op = "findCompletedItems" if sold else "findItemsAdvanced"
-    params = {
-        "OPERATION-NAME": op,
-        "SERVICE-VERSION": "1.13.0",
-        "GLOBAL-ID": "EBAY-AU",
-        "RESPONSE-DATA-FORMAT": "JSON",
-        "REST-PAYLOAD": "true",
-        "SECURITY-APPNAME": EBAY_APP_ID,
-        "keywords": q,
-        "paginationInput.entriesPerPage": str(min(100, limit)),
-        "paginationInput.pageNumber": "1",
-        "itemFilter(0).name": "HideDuplicateItems",
-        "itemFilter(0).value": "true",
-    }
-
-    if sold:
-        params.update({
-            "itemFilter(1).name": "SoldItemsOnly",
-            "itemFilter(1).value": "true",
-        })
-
     items: List[Dict[str, Any]] = []
-    try:
-        async with httpx.AsyncClient(timeout=20.0, headers=headers) as client:
-            r = await client.get(url, params=params)
-            r.raise_for_status()
-            j = r.json()
-    except Exception:
-        _EBAY_CACHE[cache_key] = {"ts": now, "data": []}
-        return []
 
-    try:
-        resp = (j.get("findItemsAdvancedResponse") or j.get("findCompletedItemsResponse") or [])[0] or {}
-        search = (resp.get("searchResult") or [])[0] or {}
-        raw_items = search.get("item") or []
-    except Exception:
-        raw_items = []
-
-    for it in raw_items[:limit]:
+    # --- Path A: Browse API (preferred) ---
+    token, _dbg = await _get_ebay_app_token()
+    if token:
         try:
-            title = (it.get("title") or [""])[0]
-            item_id = (it.get("itemId") or [""])[0]
-            view_url = (it.get("viewItemURL") or [""])[0]
-            gallery = (it.get("galleryURL") or [""])[0]
-
-            selling = (it.get("sellingStatus") or [{}])[0] or {}
-            curp = (selling.get("currentPrice") or [{}])[0] or {}
-            price = float(curp.get("__value__") or 0.0)
-            currency = str(curp.get("@currencyId") or "AUD")
-
-            if currency.upper() == "USD":
-                price = _usd_to_aud_simple(price)
-                currency = "AUD"
-
-            listing = (it.get("listingInfo") or [{}])[0] or {}
-            listing_type = (listing.get("listingType") or [""])[0]
-            end_time = (listing.get("endTime") or [""])[0]
-
-            items.append({
-                "item_id": item_id,
-                "title": title,
-                "price": round(price, 2),
-                "currency": currency,
-                "listing_type": listing_type,
-                "end_time": end_time,
-                "view_url": view_url,
-                "image": gallery,
-                "source": "ebay_finding_service",
-                "sold": bool(sold),
-            })
+            url = "https://api.ebay.com/buy/browse/v1/item_summary/search"
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "X-EBAY-C-MARKETPLACE-ID": EBAY_MARKETPLACE_ID,
+                "Accept": "application/json",
+                "User-Agent": UA,
+            }
+            async with httpx.AsyncClient(timeout=25.0, headers=headers) as client:
+                params = {"q": q, "limit": str(min(50, limit)), "offset": "0"}
+                r = await client.get(url, params=params)
+                if r.status_code == 401:
+                    token2, _ = await _get_ebay_app_token(force_refresh=True)
+                    if token2:
+                        headers["Authorization"] = f"Bearer {token2}"
+                        r = await client.get(url, params=params)
+                if r.status_code == 200:
+                    j = r.json() or {}
+                    for it in (j.get("itemSummaries") or [])[:limit]:
+                        try:
+                            title = str(it.get("title") or "")
+                            item_id = str(it.get("itemId") or "")
+                            view_url = str(it.get("itemWebUrl") or "")
+                            img = ""
+                            img_obj = it.get("image") or {}
+                            if isinstance(img_obj, dict):
+                                img = str(img_obj.get("imageUrl") or "")
+                            pr = it.get("price") or {}
+                            price = float(pr.get("value") or 0.0)
+                            currency = str(pr.get("currency") or DEFAULT_CURRENCY).upper()
+                            if currency == "USD":
+                                price = float(_usd_to_aud_simple(price) or 0.0)
+                                currency = "AUD"
+                            condition = str(it.get("condition") or "")
+                            items.append({
+                                "item_id": item_id,
+                                "title": title,
+                                "price": round(price, 2),
+                                "currency": currency,
+                                "view_url": view_url,
+                                "image": img,
+                                "condition": condition,
+                                "source": "ebay_browse_api",
+                                "sold": bool(sold and EBAY_APP_ID),  # only truly sold when using Finding completed
+                            })
+                        except Exception:
+                            continue
         except Exception:
-            continue
+            items = []
+
+    # --- Path B: FindingService (AppID) for sold or when Browse missing ---
+    if (not items) and EBAY_APP_ID:
+        try:
+            url = "https://svcs.ebay.com/services/search/FindingService/v1"
+            headers = {"User-Agent": UA}
+            op = "findCompletedItems" if sold else "findItemsAdvanced"
+            params = {
+                "OPERATION-NAME": op,
+                "SERVICE-VERSION": "1.13.0",
+                "GLOBAL-ID": "EBAY-AU",
+                "RESPONSE-DATA-FORMAT": "JSON",
+                "REST-PAYLOAD": "true",
+                "SECURITY-APPNAME": EBAY_APP_ID,
+                "keywords": q,
+                "paginationInput.entriesPerPage": str(min(100, limit)),
+                "paginationInput.pageNumber": "1",
+                "itemFilter(0).name": "HideDuplicateItems",
+                "itemFilter(0).value": "true",
+            }
+            if sold:
+                params.update({"itemFilter(1).name": "SoldItemsOnly", "itemFilter(1).value": "true"})
+            async with httpx.AsyncClient(timeout=20.0, headers=headers) as client:
+                r = await client.get(url, params=params)
+                r.raise_for_status()
+                j = r.json()
+            resp = (j.get("findItemsAdvancedResponse") or j.get("findCompletedItemsResponse") or [])[0] or {}
+            search = (resp.get("searchResult") or [])[0] or {}
+            raw_items = search.get("item") or []
+            for it in raw_items[:limit]:
+                try:
+                    title = (it.get("title") or [""])[0]
+                    item_id = (it.get("itemId") or [""])[0]
+                    view_url = (it.get("viewItemURL") or [""])[0]
+                    gallery = (it.get("galleryURL") or [""])[0]
+                    selling = (it.get("sellingStatus") or [{}])[0] or {}
+                    curp = (selling.get("currentPrice") or [{}])[0] or {}
+                    price = float(curp.get("__value__") or 0.0)
+                    currency = str(curp.get("@currencyId") or "AUD").upper()
+                    if currency == "USD":
+                        price = float(_usd_to_aud_simple(price) or 0.0)
+                        currency = "AUD"
+                    condition = ""
+                    cond = (it.get("condition") or [{}])
+                    if cond and isinstance(cond, list) and cond[0]:
+                        condition = (cond[0].get("conditionDisplayName") or [""])[0] if isinstance(cond[0].get("conditionDisplayName"), list) else str(cond[0].get("conditionDisplayName") or "")
+                    items.append({
+                        "item_id": item_id,
+                        "title": title,
+                        "price": round(price, 2),
+                        "currency": currency,
+                        "view_url": view_url,
+                        "image": gallery,
+                        "condition": condition,
+                        "source": "ebay_finding_service",
+                        "sold": bool(sold),
+                    })
+                except Exception:
+                    continue
+        except Exception:
+            items = items or []
 
     _EBAY_CACHE[cache_key] = {"ts": now, "data": items}
     return items
-
 
 async def _fetch_html(url: str) -> str:
     """Fetch text content from a URL (used for CSV downloads)."""
