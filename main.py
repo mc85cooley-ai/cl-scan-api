@@ -28,7 +28,7 @@ Env vars
 - USE_EBAY_API=0/1 (default 0) + EBAY_APP_ID/EBAY_CERT_ID/EBAY_DEV_ID/EBAY_OAUTH_TOKEN (optional; scaffold only)
 """
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Depends, Security, status
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Depends, Security, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -709,6 +709,32 @@ def _build_ebay_query_ladder(
         if psa_token:
             ladder.append(_norm_ws(f"{q} {psa_token}"))
         ladder.append(q)
+
+
+    # Extra variants to improve recall on messy user-entered names/sets
+    # - Some sellers omit the word "card"
+    # - ex/EX casing varies
+    # - Mega cards are often listed as "M <name> EX"
+    expanded = []
+    for q in list(ladder):
+        if not q:
+            continue
+        if "Pokemon card" in q:
+            expanded.append(_norm_ws(q.replace("Pokemon card", "Pokemon")))
+            expanded.append(_norm_ws(q.replace("Pokemon card", "Pokemon TCG")))
+            expanded.append(_norm_ws(q.replace("Pokemon card", "").strip()))
+        # ex/EX normalization
+        expanded.append(_norm_ws(re.sub(r"\bex\b", "EX", q, flags=re.I)))
+        # Mega/XY-era normalization: "Mega Charizard X ex" -> "M Charizard EX" / "M Charizard X EX"
+        if re.search(r"\bCharizard\b", q, flags=re.I) and re.search(r"\b(Mega|\bM\b)\b", q, flags=re.I):
+            expanded.append(_norm_ws(re.sub(r"\bX\b", "", q, flags=re.I)))
+            expanded.append(_norm_ws(re.sub(r"\bY\b", "", q, flags=re.I)))
+            expanded.append(_norm_ws(re.sub(r"\bCharizard\s+X\b", "Charizard", q, flags=re.I)))
+            expanded.append(_norm_ws("M Charizard EX Pokemon"))
+            expanded.append(_norm_ws("M Charizard EX Pokemon card"))
+    for q2 in expanded:
+        if q2:
+            ladder.append(q2)
 
     # Final ultra-broad fallback (sometimes "card" hurts recall)
     if card_name:
@@ -1713,6 +1739,102 @@ async def _ebay_active_stats(keyword_query: str, limit: int = 120) -> dict:
     }
     _EBAY_CACHE[cache_key] = {"ts": now, "data": out}
     return out
+
+
+async def _ebay_find_items(keyword_query: str, limit: int = 5, sold: bool = False, days_lookback: int = 30) -> List[Dict[str, Any]]:
+    """Return a small list of eBay items to allow manual disambiguation on the front-end.
+
+    Uses FindingService (AppID only). This is deliberately lightweight and cached.
+    """
+    q = _norm_ws(keyword_query or "")
+    if not q or not EBAY_APP_ID:
+        return []
+
+    limit = max(1, min(int(limit or 5), 20))
+    cache_key = f"ebay_items:{'sold' if sold else 'active'}:{q}:{limit}:{int(days_lookback or 30)}"
+    now = int(time.time())
+    cached = _EBAY_CACHE.get(cache_key)
+    if cached and (now - int(cached.get('ts', 0))) < 900:
+        return cached.get('data', []) or []
+
+    url = "https://svcs.ebay.com/services/search/FindingService/v1"
+    headers = {"User-Agent": UA}
+
+    op = "findCompletedItems" if sold else "findItemsAdvanced"
+    params = {
+        "OPERATION-NAME": op,
+        "SERVICE-VERSION": "1.13.0",
+        "GLOBAL-ID": "EBAY-AU",
+        "RESPONSE-DATA-FORMAT": "JSON",
+        "REST-PAYLOAD": "true",
+        "SECURITY-APPNAME": EBAY_APP_ID,
+        "keywords": q,
+        "paginationInput.entriesPerPage": str(min(100, limit)),
+        "paginationInput.pageNumber": "1",
+        "itemFilter(0).name": "HideDuplicateItems",
+        "itemFilter(0).value": "true",
+    }
+
+    if sold:
+        params.update({
+            "itemFilter(1).name": "SoldItemsOnly",
+            "itemFilter(1).value": "true",
+        })
+
+    items: List[Dict[str, Any]] = []
+    try:
+        async with httpx.AsyncClient(timeout=20.0, headers=headers) as client:
+            r = await client.get(url, params=params)
+            r.raise_for_status()
+            j = r.json()
+    except Exception:
+        _EBAY_CACHE[cache_key] = {"ts": now, "data": []}
+        return []
+
+    try:
+        resp = (j.get("findItemsAdvancedResponse") or j.get("findCompletedItemsResponse") or [])[0] or {}
+        search = (resp.get("searchResult") or [])[0] or {}
+        raw_items = search.get("item") or []
+    except Exception:
+        raw_items = []
+
+    for it in raw_items[:limit]:
+        try:
+            title = (it.get("title") or [""])[0]
+            item_id = (it.get("itemId") or [""])[0]
+            view_url = (it.get("viewItemURL") or [""])[0]
+            gallery = (it.get("galleryURL") or [""])[0]
+
+            selling = (it.get("sellingStatus") or [{}])[0] or {}
+            curp = (selling.get("currentPrice") or [{}])[0] or {}
+            price = float(curp.get("__value__") or 0.0)
+            currency = str(curp.get("@currencyId") or "AUD")
+
+            if currency.upper() == "USD":
+                price = _usd_to_aud_simple(price)
+                currency = "AUD"
+
+            listing = (it.get("listingInfo") or [{}])[0] or {}
+            listing_type = (listing.get("listingType") or [""])[0]
+            end_time = (listing.get("endTime") or [""])[0]
+
+            items.append({
+                "item_id": item_id,
+                "title": title,
+                "price": round(price, 2),
+                "currency": currency,
+                "listing_type": listing_type,
+                "end_time": end_time,
+                "view_url": view_url,
+                "image": gallery,
+                "source": "ebay_finding_service",
+                "sold": bool(sold),
+            })
+        except Exception:
+            continue
+
+    _EBAY_CACHE[cache_key] = {"ts": now, "data": items}
+    return items
 
 
 async def _fetch_html(url: str) -> str:
@@ -5145,13 +5267,35 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
 
         # No results from either source
         logging.warning(f"❌ No eBay results for any query tried: {queries}")
+        best_q = queries[-1] if queries else card_name
+        simple_q = _norm_ws(f"{card_name} Pokemon") if card_name else best_q
+
+        candidates_sold = await _ebay_find_items(best_q, limit=5, sold=True, days_lookback=30)
+        candidates_active = await _ebay_find_items(best_q, limit=5, sold=False)
+
+        # If nothing came back, also try the simplified query as a last-gasp recall boost
+        if simple_q and simple_q != best_q:
+            more_sold = await _ebay_find_items(simple_q, limit=5, sold=True, days_lookback=30)
+            more_active = await _ebay_find_items(simple_q, limit=5, sold=False)
+
+            seen = set([x.get("item_id") for x in (candidates_sold + candidates_active) if x.get("item_id")])
+            for it in more_sold:
+                if it.get("item_id") and it["item_id"] not in seen and len(candidates_sold) < 5:
+                    candidates_sold.append(it); seen.add(it["item_id"])
+            for it in more_active:
+                if it.get("item_id") and it["item_id"] not in seen and len(candidates_active) < 5:
+                    candidates_active.append(it); seen.add(it["item_id"])
+
         return {
             "current_price": 0,
             "source": "ebay_no_results",
             "error": "No eBay listings found",
-            "search_query": queries[-1] if queries else "",
+            "search_query": best_q,
             "queries_tried": queries,
             "card_name": card_name,
+            "candidates_sold": candidates_sold,
+            "candidates_active": candidates_active,
+            "hint": "If the name/set is wrong, pick the closest match from candidates and save that price in WordPress.",
         }
 
     except Exception as e:
@@ -5160,29 +5304,110 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
 
 @app.post("/api/collection/update-values")
 @safe_endpoint
-async def update_collection_market_values(
-    user_id: int = Form(...),
-):
+async def update_collection_market_values(request: Request):
     """
-    Fetch current market values for all items in a user's collection.
-    NOTE: WordPress is the source of truth for collections. This endpoint is a stub
-    kept for backwards compatibility with older front-ends.
+    Fetch current market values for a batch of items.
+
+    WHY THIS EXISTS:
+    - Older front-ends call this endpoint directly.
+    - WordPress is still the source of truth, but this endpoint can return prices + candidate matches
+      so the WP UI can save the selected value.
+
+    INPUT (preferred JSON):
+      {
+        "user_id": 123,
+        "items": [
+          {"item_id":"4","card_name":"Mega Charizard X ex","card_set":"", "card_number":"", "grade":""}
+        ]
+      }
+
+    INPUT (legacy form):
+      user_id=<int>
+      items_json=<json string as above items list>
     """
     try:
-        # WordPress now performs updates via AJAX (cg_update_collection_values).
+        payload: Dict[str, Any] = {}
+
+        ct = (request.headers.get("content-type") or "").lower()
+        if "application/json" in ct:
+            try:
+                payload = await request.json()
+            except Exception:
+                payload = {}
+        else:
+            form = await request.form()
+            payload = dict(form) if form else {}
+
+        # Parse fields
+        user_id = int(payload.get("user_id") or 0)
+        items = payload.get("items") or payload.get("items_json") or payload.get("itemsJson") or []
+
+        if isinstance(items, str):
+            try:
+                items = json.loads(items)
+            except Exception:
+                items = []
+
+        if not isinstance(items, list) or not items:
+            return {
+                "success": False,
+                "updated_count": 0,
+                "total_value": "0.00",
+                "change_24h": "0.00",
+                "change_percent": "0.0",
+                "errors": [
+                    {"item_id": "", "card": "", "error": "No items provided. Send JSON body with an items[] array (or form items_json)."}
+                ],
+                "note": "This endpoint cannot pull collection items from WordPress automatically. The front-end must send the items to price.",
+            }
+
+        updated_count = 0
+        total_value = 0.0
+        errors: List[Dict[str, Any]] = []
+        results: List[Dict[str, Any]] = []
+
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            item_id = str(it.get("item_id") or it.get("id") or "")
+            card_name = str(it.get("card_name") or it.get("card") or "").strip()
+            card_set = str(it.get("card_set") or it.get("set") or "").strip()
+            card_number = str(it.get("card_number") or it.get("number") or "").strip()
+            grade = str(it.get("grade") or "").strip()
+
+            if not card_name:
+                errors.append({"item_id": item_id, "card": "", "error": "Missing card_name"})
+                continue
+
+            market = await market_price_lookup(MarketPriceLookupRequest(
+                card_name=card_name,
+                card_set=card_set or None,
+                card_number=card_number or None,
+                grade=grade or None,
+            ))
+
+            price = float(market.get("current_price") or 0.0)
+            if price > 0:
+                updated_count += 1
+                total_value += price
+                results.append({"item_id": item_id, "card": card_name, "current_price": round(price, 2), "market": market})
+            else:
+                errors.append({"item_id": item_id, "card": card_name, "error": "No price returned", "market": market})
+
         return {
             "success": True,
-            "updated_count": 0,
-            "total_value": "0.00",
+            "user_id": user_id,
+            "updated_count": updated_count,
+            "total_value": f"{total_value:.2f}",
             "change_24h": "0.00",
             "change_percent": "0.0",
-            "note": "Use WordPress AJAX action cg_update_collection_values for live updates."
+            "results": results,
+            "errors": errors,
         }
+
     except Exception as e:
-        logging.error(f"Market value update error: {e}")
+        logging.error(f"❌ update-values error: {e}")
         return {"success": False, "error": str(e)}
-
-
 @app.post("/api/generate-heatmap")
 @safe_endpoint
 async def generate_defect_heatmap(
