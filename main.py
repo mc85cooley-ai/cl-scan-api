@@ -1640,6 +1640,75 @@ async def _openai_chat(messages: List[Dict[str, Any]], max_tokens: int = 1200, t
         return {"error": True, "status": 0, "message": str(e)}
 
 
+# ==============================
+# OpenAI helper (text)
+# ==============================
+async def _openai_text(messages: List[Dict[str, Any]], max_tokens: int = 220, temperature: float = 0.6) -> Dict[str, Any]:
+    """Lightweight text generation helper (no JSON response_format)."""
+    if not OPENAI_API_KEY:
+        return {"error": True, "status": 0, "message": "OpenAI API key not configured"}
+
+    url = "https://api.openai.com/v1/chat/completions"
+    model = os.getenv("OPENAI_TEXT_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    payload = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature}
+
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            r = await client.post(url, headers=headers, json=payload)
+            if r.status_code != 200:
+                return {"error": True, "status": r.status_code, "message": r.text[:700]}
+            data = r.json()
+            content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+            return {"error": False, "content": (content or "").strip()}
+    except Exception as e:
+        return {"error": True, "status": 0, "message": str(e)}
+
+
+async def _generate_market_spoken_brief(
+    *,
+    card_identifier: str,
+    price_low: float,
+    price_median: float,
+    price_high: float,
+    volume: int,
+    history_days_logged: int,
+    data_source: str,
+) -> str:
+    """Generate a short, spoken-word style market brief (not a template)."""
+    sys = (
+        "You are a collectibles market analyst for Collectors League. "
+        "Write a natural, spoken-word brief that a host could read out loud. "
+        "No bullet points, no headings, no placeholders. "
+        "Mention the low/median/high range in AUD, what it implies, and a cautious short-term outlook. "
+        "If history is limited, say that clearly and explain what would make the outlook more confident. "
+        "Avoid financial advice language; keep it informational."
+    )
+
+    user = (
+        f"Card identifier: {card_identifier}\n"
+        f"Data source: {data_source}\n"
+        f"Low/Median/High (AUD): {price_low:.2f} / {price_median:.2f} / {price_high:.2f}\n"
+        f"Listings/Sales counted: {int(volume or 0)}\n"
+        f"Days logged in database (so far): {int(history_days_logged or 0)}\n"
+        "Write ~70-110 words."
+    )
+
+    out = await _openai_text(
+        [
+            {"role": "system", "content": sys},
+            {"role": "user", "content": user},
+        ],
+        max_tokens=260,
+        temperature=0.65,
+    )
+
+    if out.get("error"):
+        return ""
+    return (out.get("content") or "").strip()
+
+
 async def _ebay_active_stats(keyword_query: str, limit: int = 120) -> dict:
     """
     Fetch eBay ACTIVE listings stats.
@@ -4756,6 +4825,22 @@ async def get_market_trends(
             prediction = predict_future_prices(historical_prices)
             seasonality = detect_seasonality(historical_prices)
 
+            # Last known range (for spoken brief)
+            last_point = historical_prices[-1] if historical_prices else None
+            lp_low = float((last_point or {}).get("price_low") or (last_point or {}).get("price_median") or 0.0)
+            lp_med = float((last_point or {}).get("price_median") or 0.0)
+            lp_high = float((last_point or {}).get("price_high") or (last_point or {}).get("price_median") or 0.0)
+            lp_vol = int((last_point or {}).get("volume") or 0)
+            spoken_brief = await _generate_market_spoken_brief(
+                card_identifier=ident,
+                price_low=lp_low,
+                price_median=lp_med,
+                price_high=lp_high,
+                volume=lp_vol,
+                history_days_logged=len(historical_prices),
+                data_source="database_logged_history",
+            )
+
             return JSONResponse(content={
                 "success": True,
                 "card_identifier": ident,
@@ -4763,9 +4848,13 @@ async def get_market_trends(
                 "historical_data": historical_prices,
                 "prediction": prediction,
                 "seasonality": seasonality,
+                "db_log": {"saved": True, "points": len(historical_prices), "last_recorded_date": historical_prices[-1]["date"] if historical_prices else None},
+                "spoken_brief": spoken_brief if "spoken_brief" in locals() else "",
                 "analysis_period_days": int(days or 90),
                 "actual_data_points": len(historical_prices),
                 "note": "✅ Using genuine accumulated price history",
+                "history_meta": {"db_points": len(historical_prices), "first_date": (historical_prices[0]["date"] if historical_prices else None), "last_date": (historical_prices[-1]["date"] if historical_prices else None)},
+                "spoken_brief": (await _generate_spoken_market_brief(card_identifier=ident, card_name=card_name, set_name=set_name, grade=grade, price_low=(historical_prices[-1]["price_low"] if historical_prices else None), price_median=(historical_prices[-1]["price_median"] if historical_prices else None), price_high=(historical_prices[-1]["price_high"] if historical_prices else None), volume=(historical_prices[-1]["volume"] if historical_prices else None), history_days=len(historical_prices))) ,
                 "timestamp": datetime.utcnow().isoformat() + "Z",
             })
 
@@ -4854,6 +4943,23 @@ async def get_market_trends(
         except Exception as e:
             logging.warning(f"⚠️ Failed to log price to DB: {e}")
 
+        # Expose DB logging status so the frontend can confirm it really saved
+        db_log = {
+            "saved": bool(entry) if "entry" in locals() else False,
+            "id": (entry.get("id") if ("entry" in locals() and isinstance(entry, dict)) else None),
+            "recorded_date": (entry.get("recorded_date") if ("entry" in locals() and isinstance(entry, dict)) else None),
+        }
+
+        spoken_brief = await _generate_market_spoken_brief(
+            card_identifier=ident,
+            price_low=float(price_low or 0.0),
+            price_median=float(current_price or 0.0),
+            price_high=float(price_high or 0.0),
+            volume=int(volume or 0),
+            history_days_logged=len(db_history) + 1,
+            data_source="ebay_current_snapshot",
+        )
+
         historical_data = []
         if db_history:
             historical_data = [
@@ -4889,10 +4995,14 @@ async def get_market_trends(
                 "median": current_price,
                 "high": price_high
             },
+            "db_log": db_log if "db_log" in locals() else {"saved": False},
+            "spoken_brief": spoken_brief if "spoken_brief" in locals() else "",
             "historical_data": historical_data,
             "actual_data_points": len(historical_data),
             "ebay_listings_analyzed": volume,
             "note": f"Building history ({len(db_history)} days logged). Check again tomorrow for trend analysis!",
+            "db_log": {"saved": bool(entry) if 'entry' in locals() else False, "id": (entry.get('id') if 'entry' in locals() and isinstance(entry, dict) else None), "recorded_date": (str(entry.get('recorded_date')) if 'entry' in locals() and isinstance(entry, dict) else None)},
+            "spoken_brief": (await _generate_spoken_market_brief(card_identifier=ident, card_name=card_name, set_name=set_name, grade=grade, price_low=price_low, price_median=current_price, price_high=price_high, volume=volume, history_days=(len(db_history)+1))),
             "timestamp": datetime.utcnow().isoformat() + "Z",
         })
 
