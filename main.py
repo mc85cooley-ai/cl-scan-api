@@ -1716,8 +1716,7 @@ async def _generate_market_spoken_brief(
 # Backward-compat alias (some routes still call the old name)
 async def _generate_spoken_market_brief(**kwargs):
     return await _generate_market_spoken_brief(**kwargs)
-async def _generate_market_spoken_brief(**kwargs):
-    return await _generate_market_spoken_brief(**kwargs)
+# NOTE: do not redefine _generate_market_spoken_brief here (would cause recursion)
 
 async def _ebay_active_stats(keyword_query: str, limit: int = 120) -> dict:
     """
@@ -4864,7 +4863,6 @@ async def get_market_trends(
                 "actual_data_points": len(historical_prices),
                 "note": "✅ Using genuine accumulated price history",
                 "history_meta": {"db_points": len(historical_prices), "first_date": (historical_prices[0]["date"] if historical_prices else None), "last_date": (historical_prices[-1]["date"] if historical_prices else None)},
-                "spoken_brief": (await _generate_market_spoken_brief(card_identifier=ident, card_name=card_name, set_name=set_name, grade=grade, price_low=(historical_prices[-1]["price_low"] if historical_prices else None), price_median=(historical_prices[-1]["price_median"] if historical_prices else None), price_high=(historical_prices[-1]["price_high"] if historical_prices else None), volume=(historical_prices[-1]["volume"] if historical_prices else None), history_days=len(historical_prices))) ,
                 "timestamp": datetime.utcnow().isoformat() + "Z",
             })
 
@@ -5012,7 +5010,6 @@ async def get_market_trends(
             "ebay_listings_analyzed": volume,
             "note": f"Building history ({len(db_history)} days logged). Check again tomorrow for trend analysis!",
             "db_log": {"saved": bool(entry) if 'entry' in locals() else False, "id": (entry.get('id') if 'entry' in locals() and isinstance(entry, dict) else None), "recorded_date": (str(entry.get('recorded_date')) if 'entry' in locals() and isinstance(entry, dict) else None)},
-            "spoken_brief": (await _generate_market_spoken_brief(card_identifier=ident, card_name=card_name, set_name=set_name, grade=grade, price_low=price_low, price_median=current_price, price_high=price_high, volume=volume, history_days=(len(db_history)+1))),
             "timestamp": datetime.utcnow().isoformat() + "Z",
         })
 
