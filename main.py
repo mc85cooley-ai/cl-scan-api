@@ -4884,14 +4884,20 @@ async def get_market_trends(
         logging.info(f"🔍 eBay queries: {queries}")
         target_days = max(7, min(int(days or 90), 90))
 
+        LISTINGS_TARGET = 5  # how many comps we *aim* to base the snapshot on (cannot exceed what's available)
         completed = {}
         active = {}
         chosen_query = ""
+        listings_analyzed = 0
 
+        # We fetch a deeper pool (limit=50) to improve percentile stability, then *report* up to LISTINGS_TARGET.
         for q in queries:
             chosen_query = q
-            completed = await _ebay_completed_stats(q, limit=10, days_lookback=30) or {}
-            active = await _ebay_active_stats(q, limit=10) or {}
+            completed = await _ebay_completed_stats(q, limit=50, days_lookback=30) or {}
+            active = await _ebay_active_stats(q, limit=50) or {}
+            # Prefer sold comps if available; otherwise fall back to active listings
+            comp_count = int((completed.get("count") or 0) if (completed.get("median") and completed.get("median") > 0) else (active.get("count") or 0))
+            listings_analyzed = min(LISTINGS_TARGET, max(0, comp_count))
             if (completed.get("median") and completed.get("median") > 0) or (active.get("median") and active.get("median") > 0):
                 break
         search_query = chosen_query
@@ -5008,7 +5014,7 @@ async def get_market_trends(
             "spoken_brief": spoken_brief if "spoken_brief" in locals() else "",
             "historical_data": historical_data,
             "actual_data_points": len(historical_data),
-            "ebay_listings_analyzed": volume,
+            "ebay_listings_analyzed": int(listings_analyzed) if 'listings_analyzed' in locals() else int(volume),
             "note": f"Building history ({len(db_history)} days logged). Check again tomorrow for trend analysis!",
             "db_log": {"saved": bool(entry) if 'entry' in locals() else False, "id": (entry.get('id') if 'entry' in locals() and isinstance(entry, dict) else None), "recorded_date": (str(entry.get('recorded_date')) if 'entry' in locals() and isinstance(entry, dict) else None)},
             "timestamp": datetime.utcnow().isoformat() + "Z",
