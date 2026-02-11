@@ -1678,12 +1678,13 @@ async def _generate_market_spoken_brief(
 ) -> str:
     """Generate a short, spoken-word style market brief (not a template)."""
     sys = (
-        "You are a collectibles market analyst for Collectors League. "
-        "Write a natural, spoken-word brief that a host could read out loud. "
+        "You are a modern card collector and market watcher for Collectors League. "
+        "Write a natural, spoken-word brief that a host could read out loud — upbeat, confident, and collector-style, but still factual. "
         "No bullet points, no headings, no placeholders. "
-        "Mention the low/median/high range in AUD, what it implies, and a cautious short-term outlook. "
-        "If history is limited, say that clearly and explain what would make the outlook more confident. "
-        "Avoid financial advice language; keep it informational."
+        "Mention the low/median/high range in AUD and what that range suggests about where the market is sitting right now. "
+        "Base the outlook only on the data provided (range, volume, and how many days are logged). "
+        "If history is limited, frame it positively (we're building the track record) and say what extra data would firm up the trend. "
+        "Avoid financial advice language; keep it informational and community-friendly."
     )
 
     user = (
