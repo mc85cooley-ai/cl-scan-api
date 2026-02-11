@@ -6203,31 +6203,103 @@ async def create_price_alert(
 
 @app.post("/api/alerts/check")
 @safe_endpoint
-async def check_price_alerts():
-    """Cron job endpoint to check all active alerts (mock payload for now)."""
-    triggered_alerts = []
+async def check_price_alerts(payload: dict = Body(...)):
+    """Check a batch of alerts and return updated pricing + trigger state.
 
-    mock_alert = {
-        "id": 123,  # placeholder (WP DB id)
-        "alert_id": "alert_123",
-        "user_id": 1,
-        "card_name": "Charizard",
-        "current_price": 475.00,
-        "target_price": 500.00,
-        "alert_type": "drops_below",
-        "triggered": True
-    }
+    Expected payload from WordPress:
+      {
+        "alerts": [
+          {
+            "id": 123,
+            "user_id": 1,
+            "card_name": "M Charizard X ex",
+            "card_set": "Pokemon",
+            "card_number": "",
+            "grade": "10",
+            "alert_type": "drops_below" | "rises_above" | "changes_by",
+            "target_price": 250.0,
+            "current_price": 275.0,         # previous known price (optional)
+            "baseline_price": 275.0         # optional; used for changes_by
+          }
+        ],
+        "max_matches": 10
+      }
+    """
+    alerts = payload.get("alerts") or []
+    max_matches = int(payload.get("max_matches") or 10)
+    now = datetime.utcnow().isoformat() + "Z"
 
-    if mock_alert["triggered"]:
-        triggered_alerts.append(mock_alert)
+    updated = []
+    for a in alerts:
+        a2 = dict(a)
 
-    return JSONResponse(content={
-        "success": True,
-        "checked_alerts": 10,
-        "triggered_alerts": triggered_alerts,
-        "timestamp": datetime.utcnow().isoformat() + "Z"
-    })
+        card_name = (a.get("card_name") or "").strip()
+        card_set = (a.get("card_set") or "").strip()
+        card_number = (a.get("card_number") or "").strip()
+        grade = (a.get("grade") or "").strip()
 
+        ident = " ".join([x for x in [card_name, card_number] if x]).strip()
+        queries = _build_ebay_query_ladder(card_name=ident or card_name, card_set=card_set, grade=grade)
+
+        best_query = ""
+        matched = 0
+        current_price = None
+
+        for q in queries:
+            try:
+                stats = await _ebay_active_stats(q, target=max_matches, cache_minutes=30)
+            except Exception:
+                stats = None
+            if stats and (stats.get("matched") or 0) > 0 and stats.get("median") is not None:
+                best_query = q
+                matched = int(stats.get("matched") or 0)
+                current_price = float(stats["median"])
+                break
+
+        # Fallback: if we got matches but median is missing, still return something meaningful
+        if current_price is None and queries:
+            best_query = best_query or queries[0]
+
+        alert_type = (a.get("alert_type") or "").strip().lower()
+        try:
+            target_price = float(a.get("target_price")) if a.get("target_price") is not None else None
+        except Exception:
+            target_price = None
+
+        triggered = False
+        change_pct = None
+
+        if current_price is not None and target_price is not None:
+            if alert_type == "drops_below":
+                triggered = current_price <= target_price
+            elif alert_type == "rises_above":
+                triggered = current_price >= target_price
+            elif alert_type == "changes_by":
+                # target_price is treated as % threshold (e.g. 10 means 10%)
+                base = a.get("baseline_price")
+                if base is None:
+                    base = a.get("previous_price")
+                if base is None:
+                    base = a.get("current_price")  # prior known
+                try:
+                    base = float(base) if base is not None else None
+                except Exception:
+                    base = None
+                if base and base > 0:
+                    change_pct = abs((current_price - base) / base) * 100.0
+                    triggered = change_pct >= target_price
+
+        a2["current_price"] = current_price
+        a2["matched"] = matched
+        a2["triggered"] = bool(triggered)
+        a2["checked_at"] = now
+        a2["query_used"] = best_query
+        if change_pct is not None:
+            a2["change_pct"] = round(change_pct, 2)
+
+        updated.append(a2)
+
+    return {"success": True, "updated_alerts": updated}
 
 @app.get("/api/alerts/user/{user_id}")
 @safe_endpoint
