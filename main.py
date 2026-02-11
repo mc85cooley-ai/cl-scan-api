@@ -28,7 +28,7 @@ Env vars
 - USE_EBAY_API=0/1 (default 0) + EBAY_APP_ID/EBAY_CERT_ID/EBAY_DEV_ID/EBAY_OAUTH_TOKEN (optional; scaffold only)
 """
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Depends, Security, status, Request
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Depends, Security, status, Request, Body
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
