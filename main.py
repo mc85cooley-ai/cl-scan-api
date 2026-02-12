@@ -38,6 +38,7 @@ from datetime import datetime, timedelta
 from statistics import mean, median
 from functools import wraps
 from fastapi import WebSocket
+from starlette.websockets import WebSocketDisconnect
 import base64
 import io
 import os
@@ -478,7 +479,6 @@ ALLOWED_ORIGINS = [
     "http://localhost",
     "http://localhost:3000",
     "http://localhost:5173",
-    "*",
 ]
 
 app.add_middleware(
@@ -510,7 +510,7 @@ def safe_endpoint(func):
 # ==============================
 # Config
 # ==============================
-APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-01-31-v6.5.0")
+APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-02-05-v6.7.7")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
@@ -813,8 +813,11 @@ async def _ebay_completed_stats(keyword_query: str, limit: int = 120, days_lookb
 
     prices: list[float] = []
 
+    # Fetch live FX rate once for the whole batch (falls back to static if unavailable)
+    aud_rate = await _fx_usd_to_aud()
+
     url = "https://svcs.ebay.com/services/search/FindingService/v1"
-    headers = {"User-Agent": UA} if "UA" in globals() else None
+    headers = {"User-Agent": UA}
 
     async with httpx.AsyncClient(timeout=20.0, headers=headers) as client:
         for page in range(1, pages + 1):
@@ -1226,7 +1229,6 @@ def _pc_trend(product_id: str, days: int = 30) -> dict:
     # Use last value and value from ~days ago (closest earlier)
     last_date, last_val = series[-1]
     # find earliest >= days back: since we store weekly, just pick first in window
-    from datetime import datetime, timedelta
     try:
         last_dt = datetime.fromisoformat(last_date.replace("Z",""))
     except Exception:
@@ -1274,7 +1276,8 @@ SET_CODE_MAP: Dict[str, str] = {
     "MEW": "Scarlet & Violet-151",
     "OBF": "Obsidian Flames",
     "SVI": "Scarlet & Violet",
-    "PFL": "Phantasmal Flames",
+    "PAF": "Paldean Fates",
+    "PAR": "Paradox Rift",
     "BS": "Base Set",
 }
 
@@ -1396,11 +1399,6 @@ EXCLUDE_GRADED_DEFAULT = os.getenv("EXCLUDE_GRADED_DEFAULT", "1").strip() in ("1
 STRICT_CARD_NUMBER = os.getenv("STRICT_CARD_NUMBER", "1").strip() in ("1","true","TRUE","yes","YES")
 
 
-UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0 Safari/537.36"
-)
 
 if not OPENAI_API_KEY:
     print("WARNING: OPENAI_API_KEY not set! Vision ID/assessment will fail.")
@@ -1428,8 +1426,7 @@ def _make_defect_filter_variants(img_bytes: bytes) -> Dict[str, bytes]:
     if not img_bytes or Image is None:
         return {}
     try:
-        from io import BytesIO
-        im = Image.open(BytesIO(img_bytes)).convert("RGB")
+        im = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         variants: Dict[str, bytes] = {}
 
         # Variant 1: grayscale + autocontrast (good for print lines / scratches)
@@ -1460,8 +1457,7 @@ def _make_basic_hotspot_snaps(img_bytes: bytes, side: str, max_snaps: int = 6) -
     if not img_bytes or Image is None:
         return []
     try:
-        from io import BytesIO
-        im = Image.open(BytesIO(img_bytes)).convert("RGB")
+        im = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         w, h = im.size
 
         def _crop_norm(x0, y0, x1, y1):
@@ -1508,8 +1504,12 @@ def _norm_ws(s: str) -> str:
 
 
 def _is_blankish(s: str) -> bool:
+    """Return True if s is empty or a common placeholder/unknown value."""
     s2 = _norm_ws(s or "").lower()
-    return (not s2) or s2 in ("unknown", "n/a", "na", "none", "null", "undefined")
+    return (not s2) or s2 in (
+        "unknown", "n/a", "na", "none", "null", "undefined",
+        "not sure", "unsure",
+    )
 
 def _safe_json_extract(text: str) -> dict | None:
     """Best-effort extraction of a JSON object from a model response."""
@@ -1558,9 +1558,6 @@ def _normalize_card_type(card_type: str) -> str:
     return "Other"
 
 
-def _is_blankish(s: str) -> bool:
-    s=(s or "").strip().lower()
-    return s in ("", "unknown", "n/a", "na", "none", "not sure", "unsure")
 
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
@@ -1738,6 +1735,9 @@ async def _ebay_active_stats(keyword_query: str, limit: int = 120) -> dict:
 
     target = max(1, int(limit or 120))
     prices: List[float] = []
+
+    # Warm the FX cache so _usd_to_aud_simple picks up the live rate
+    await _fx_usd_to_aud()
 
     # --- Path A: Browse API (preferred) ---
     token, _dbg = await _get_ebay_app_token()
@@ -2177,10 +2177,18 @@ async def _pc_product(product_id: str) -> Dict[str, Any]:
 AUD_MULTIPLIER = float(os.getenv("CL_USD_TO_AUD_MULTIPLIER", "1.44"))
 
 def _usd_to_aud_simple(amount: Any) -> Optional[float]:
+    """Convert USD to AUD.  Uses the live-rate cache populated by _fx_usd_to_aud()
+    when available, so callers automatically benefit once the async helper has run.
+    Falls back to AUD_MULTIPLIER (configurable via CL_USD_TO_AUD_MULTIPLIER env var).
+    """
     try:
         v = float(amount)
     except Exception:
         return None
+    # Use cached live rate if fresh (populated by _fx_usd_to_aud)
+    cached_rate = _FX_CACHE.get("usd_aud")
+    if cached_rate and float(cached_rate) > 0.5:
+        return round(v * float(cached_rate), 2)
     return round(v * AUD_MULTIPLIER, 2)
 
 
@@ -6247,7 +6255,7 @@ async def check_price_alerts(payload: dict = Body(...)):
 
         for q in queries:
             try:
-                stats = await _ebay_active_stats(q, target=max_matches, cache_minutes=30)
+                stats = await _ebay_active_stats(q, limit=max(1, int(max_matches or 10)))
             except Exception:
                 stats = None
             if stats and (stats.get("matched") or 0) > 0 and stats.get("median") is not None:
@@ -6378,7 +6386,7 @@ Requirements:
 Return plain text only (no JSON)."""
 
         msg = [{"role": "user", "content": prompt}]
-        result = await _openai_chat(msg, max_tokens=220, temperature=0.7)
+        result = await _openai_text(msg, max_tokens=220, temperature=0.7)
 
         text = (result.get("content") or "").strip()
         if not text:
