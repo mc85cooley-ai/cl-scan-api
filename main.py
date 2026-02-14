@@ -5544,6 +5544,111 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
         logging.error(f"❌ Price lookup error: {e}")
         return {"current_price": 0, "source": "error", "error": str(e)}
 
+
+@app.post("/api/market/active-listings")
+@safe_endpoint
+async def get_active_listings(
+    card_name: str = Form(...),
+    set_name: str = Form(""),
+    card_number: str = Form(""),
+    card_type: str = Form("Pokemon"),
+    max_results: int = Form(12),
+):
+    '''Return current eBay active listings for the given card.'''
+    try:
+        queries = _build_ebay_query_ladder(card_name=card_name, set_name=set_name, card_number=card_number, grade="")
+    except TypeError:
+        queries = [f"{card_name} {set_name} {card_number}".strip()]
+
+    listings = []
+    query_used = queries[0] if queries else card_name
+
+    for q in (queries or [])[:3]:
+        try:
+            results = await _ebay_find_items(q, sold=False, max_results=max_results)
+            if results:
+                listings = results
+                query_used = q
+                break
+        except Exception:
+            continue
+
+    return JSONResponse(content={
+        "success": True,
+        "listings": listings,
+        "query_used": query_used,
+        "total": len(listings),
+    })
+
+
+@app.post("/api/market/sell-plan")
+@safe_endpoint
+async def generate_sell_plan(
+    card_name: str = Form(...),
+    set_name: str = Form(""),
+    grade: str = Form(""),
+    price_low: float = Form(0),
+    price_median: float = Form(0),
+    price_high: float = Form(0),
+    trend_direction: str = Form("stable"),
+):
+    '''Generate a sell plan with recommended pricing and timing.'''
+    prompt = f'''You are an expert collectibles market advisor.
+
+Card: {card_name} ({set_name})
+Grade: {grade}
+Current market (AUD): Low {price_low:.2f} | Median {price_median:.2f} | High {price_high:.2f}
+Trend: {trend_direction}
+
+Return JSON ONLY with keys:
+- recommended_list_price: {{low: number, high: number}}
+- suggested_timing: string
+- timing_reasoning: string
+- listing_tips: array of strings (3-6)
+- platform_recommendation: string
+- price_strategy: string
+'''
+
+    plan = None
+
+    try:
+        import openai  # type: ignore
+        api_key = os.getenv("OPENAI_API_KEY", "")
+        if api_key:
+            client = openai.OpenAI(api_key=api_key)
+            resp = client.chat.completions.create(
+                model=os.getenv("OPENAI_MODEL_SELL_PLAN", "gpt-4o-mini"),
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+                max_tokens=700,
+            )
+            plan = json.loads(resp.choices[0].message.content)
+    except Exception:
+        plan = None
+
+    if not isinstance(plan, dict):
+        markup = 1.10 if trend_direction == "up" else (0.95 if trend_direction == "down" else 1.02)
+        plan = {
+            "recommended_list_price": {
+                "low": round(float(price_median) * 0.95, 2) if price_median else round(float(price_low) * 1.05, 2),
+                "high": round(float(price_high) * markup, 2) if price_high else round(float(price_median) * 1.05, 2),
+            },
+            "suggested_timing": "Now" if trend_direction != "down" else "Wait 2–4 weeks",
+            "timing_reasoning": f"Market trend appears {trend_direction}.",
+            "listing_tips": [
+                "Use high-quality front and back photos",
+                "Include grade and certification details in the title",
+                "Price at the top of the range, allow offers",
+                "List during peak traffic (weekend evenings)",
+            ],
+            "platform_recommendation": "eBay Australia",
+            "price_strategy": "Start high with Best Offer; reduce gradually if no interest.",
+        }
+
+    return JSONResponse(content={"success": True, "sell_plan": plan})
+
+
+
 @app.post("/api/collection/update-values")
 @safe_endpoint
 async def update_collection_market_values(request: Request):
