@@ -5565,7 +5565,7 @@ async def get_active_listings(
 
     for q in (queries or [])[:3]:
         try:
-            results = await _ebay_find_items(q, sold=False, max_results=max_results)
+            results = await _ebay_find_items(q, sold=False, limit=max_results)
             if results:
                 listings = results
                 query_used = q
