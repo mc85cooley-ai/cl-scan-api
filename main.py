@@ -6280,6 +6280,80 @@ async def analyze_photo_quality(front_bytes: bytes, back_bytes: Optional[bytes] 
         return {"available": False, "error": str(e)}
 
 
+# ========================================
+# BULK ASSESSMENT (Item 5)
+# ========================================
+
+@app.post("/api/bulk-assess")
+@safe_endpoint
+async def bulk_assess(
+    images: List[UploadFile] = File(...),
+    user_id: int = Form(0),
+    batch_name: str = Form("Untitled Batch"),
+):
+    """Process 2-10 card images for quick identification and grading."""
+    if len(images) < 2 or len(images) > 10:
+        raise HTTPException(status_code=400, detail="Must provide 2-10 images")
+
+    results = []
+    for idx, img_file in enumerate(images):
+        img_bytes = await img_file.read()
+
+        prompt = """Identify this card and provide a quick assessment.
+Return JSON:
+{
+  "card_name": "...",
+  "set": "...",
+  "estimated_grade": "8",
+  "estimated_value": 25.00,
+  "priority": "high|medium|low",
+  "key_features": ["...", "..."],
+  "main_issues": ["...", "..."]
+}
+Respond ONLY with JSON."""
+
+        msg = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(img_bytes)}", "detail": "low"}},
+            ]
+        }]
+
+        try:
+            result = await _openai_chat(msg, max_tokens=400, temperature=0.2)
+            card_data = _parse_json_or_none(result.get("content", "")) or {}
+        except Exception:
+            card_data = {"card_name": f"Card {idx+1}", "estimated_grade": "N/A", "estimated_value": 0, "priority": "low"}
+
+        card_data.setdefault("card_name", f"Card {idx+1}")
+        card_data.setdefault("estimated_value", 0)
+        card_data.setdefault("priority", "low")
+        results.append(card_data)
+
+    # Sort by estimated value descending
+    results.sort(key=lambda c: float(c.get("estimated_value", 0) or 0), reverse=True)
+
+    total_value = sum(float(c.get("estimated_value", 0) or 0) for c in results)
+    high_priority = sum(1 for c in results if (c.get("priority") or "").lower() == "high")
+
+    summary = f"Batch: {batch_name}\n"
+    summary += f"Cards Assessed: {len(results)}\n"
+    summary += f"Estimated Total Value: ${total_value:.2f}\n"
+    summary += f"High Priority Cards: {high_priority}\n"
+
+    best_finds = [c for c in results if (c.get("priority") or "").lower() in ("high", "medium")][:5]
+
+    return JSONResponse(content={
+        "success": True,
+        "batch_name": batch_name,
+        "results": results,
+        "best_finds": best_finds,
+        "summary": summary,
+        "total_value": total_value,
+    })
+
+
 # =========================================================
 # STAGE 2 FEATURES — ALERTS / LIVE GRADING / TIMELINE
 # =========================================================
