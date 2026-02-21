@@ -1,18 +1,24 @@
 """
 The Collectors League Australia - Scan API
-Futureproof v6.7.7 (2026-02-05)
+Futureproof v6.8.0 (2026-02-21)
 
-What changed vs v6.7.5 (2026-02-03)
-- ✅ Intent-aware grading language (BUYING vs SELLING) for BOTH cards + memorabilia prompts:
-  - Buyer mode: negotiation leverage, red flags, verification steps, fair buy guidance
-  - Seller mode: listing optimisation, disclosure strategy, pricing guidance
-  - CRITICAL: grading logic remains objective; only advice framing changes
-- ✅ Expanded card grading scale guidance:
-  - Allows true GEM MINT 10 when warranted (no psychological “cap at 9”)
-  - Adds Grade 12 “Collectors League Ultra Flawless” (rare, must be awarded when warranted)
-  - JSON schema hint updated: pregrade "1-12" with 12 criteria note
-- ✅ Memorabilia assessment stability fix:
-  - Corrected indentation in assess_memorabilia defect thumbnail logic (defect_snaps) to prevent syntax/runtime errors
+What changed vs v6.7.7 (2026-02-05)
+- ✅ FIX: _grade_bucket() now supports Grade 12 (CL Ultra Flawless) — was silently dropping to N/A
+- ✅ FIX: Removed duplicate /api/collection/update-values endpoint (mock was overwriting real)
+- ✅ FIX: Memorabilia assessment now uses detail:high images (was low — couldn't see seal damage)
+- ✅ FIX: Assessment prompt rule numbering corrected (was 1,2,3,5,4)
+- ✅ FIX: _grade_distribution() now covers full grade range 1-12 (was only 8-10)
+- ✅ FIX: predict-grade endpoint updated for half-grades and full range
+- ✅ FIX: Assessment max_tokens bumped 2200→3000 for expanded output
+- ✅ NEW: Half-grade support (9.5, 8.5, 7.5 etc.) — _parse_half_grade(), pregrade normalization
+- ✅ NEW: Grading standard selector (PSA/BGS/CGC/CL) via grading_standard param on /api/verify
+- ✅ NEW: Error card / misprint / factory defect detection (miscut, crimped, wrong-back, holo bleed etc.)
+- ✅ NEW: Expanded surface condition factors (silvering vs whitening, yellowing, foxing, ink transfer, warp, gloss)
+- ✅ NEW: Rarity / variant / edition / finish / artist / promo / error detection in /api/identify
+- ✅ NEW: Sleeve/toploader detection in assessment (accounts for artifacts)
+- ✅ NEW: Card warp/bowing + back pattern awareness
+- ✅ NEW: Expanded _normalize_card_type() — 20+ TCGs + specific sports (AFL, NRL, Cricket, NBA etc.)
+- ✅ NEW: Expanded authenticity checks — rosette pattern, card stock, back pattern, light/weight test guidance
 
 Market data architecture (unchanged)
 - ✅ PriceCharting API as primary market source for cards + sealed/memorabilia (current prices).
@@ -510,7 +516,7 @@ def safe_endpoint(func):
 # ==============================
 # Config
 # ==============================
-APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-02-05-v6.7.7")
+APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-02-21-v6.8.0")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
@@ -1537,24 +1543,71 @@ def _safe_json_extract(text: str) -> dict | None:
 
 
 def _normalize_card_type(card_type: str) -> str:
-    """Force card_type into the allowed enum."""
+    """Force card_type into the allowed enum. Covers all major TCGs + sports."""
     s = _norm_ws(card_type or "").lower()
     if not s:
         return "Other"
-    # common variants
-    if "pokemon" in s or s in ("pkmn", "poke", "pokémon"):
+    # ── Major TCGs ──────────────────────
+    if "pokemon" in s or s in ("pkmn", "poke", "pokémon", "ptcg"):
         return "Pokemon"
-    if "magic" in s or "mtg" in s:
+    if "magic" in s or "mtg" in s or "magic the gathering" in s or "magic: the gathering" in s:
         return "Magic"
-    if "yug" in s or "yu-gi" in s or "yugi" in s:
+    if "yug" in s or "yu-gi" in s or "yugi" in s or "ygo" in s:
         return "YuGiOh"
-    if "one piece" in s or "onepiece" in s:
+    if "one piece" in s or "onepiece" in s or "opcg" in s:
         return "OnePiece"
-    if "sport" in s:
+    if "dragon ball" in s or "dragonball" in s or "dbs" in s or "dbz" in s:
+        return "DragonBall"
+    if "digimon" in s or "dcg" in s:
+        return "Digimon"
+    if "lorcana" in s:
+        return "Lorcana"
+    if "flesh and blood" in s or "fab" in s:
+        return "FleshAndBlood"
+    if "weiss" in s or "schwarz" in s or "ws" == s:
+        return "WeissSchwarz"
+    if "cardfight" in s or "vanguard" in s:
+        return "Vanguard"
+    if "star wars" in s or "swu" in s:
+        return "StarWars"
+    if "union arena" in s:
+        return "UnionArena"
+    if "metazoo" in s:
+        return "MetaZoo"
+    if "my hero" in s or "mha" in s:
+        return "MyHeroAcademia"
+    if "gundam" in s:
+        return "Gundam"
+    if "naruto" in s or "boruto" in s:
+        return "Naruto"
+    # ── Sports ──────────────────────────
+    if "afl" in s or "australian football" in s:
+        return "Sports_AFL"
+    if "nrl" in s or "rugby league" in s:
+        return "Sports_NRL"
+    if "cricket" in s:
+        return "Sports_Cricket"
+    if "nba" in s or "basketball" in s:
+        return "Sports_Basketball"
+    if "nfl" in s or "american football" in s:
+        return "Sports_NFL"
+    if "mlb" in s or "baseball" in s:
+        return "Sports_Baseball"
+    if "nhl" in s or "hockey" in s:
+        return "Sports_Hockey"
+    if "soccer" in s or "football" in s or "epl" in s or "a-league" in s or "fifa" in s:
+        return "Sports_Soccer"
+    if "f1" in s or "formula" in s or "motorsport" in s:
+        return "Sports_Motorsport"
+    if "ufc" in s or "mma" in s or "boxing" in s or "wwe" in s or "wrestling" in s:
+        return "Sports_Combat"
+    if "tennis" in s or "golf" in s or "olympic" in s:
+        return "Sports_Other"
+    if "sport" in s or "panini" in s or "topps" in s or "upper deck" in s or "bowman" in s:
         return "Sports"
+    # ── Generic / fallback ──────────────
     if s in ("other", "other tcg", "tcg", "trading card", "tradingcard"):
         return "Other"
-    # fallback: title-case but keep enum
     return "Other"
 
 
@@ -2253,22 +2306,72 @@ def _grade_bucket_key(g: Optional[float]) -> Optional[str]:
     return s if s else None
 
 def _grade_bucket(predicted_grade: str) -> Optional[int]:
-    m = re.search(r"(10|[1-9])", (predicted_grade or "").strip())
+    """Parse an integer grade from a string. Supports 1-10 and 12 (CL Ultra Flawless).
+    Grade 11 does not exist — skip it. Half-grades are rounded to the nearest int."""
+    s = (predicted_grade or "").strip()
+    # Try exact 12 first (our proprietary Ultra Flawless grade)
+    if re.search(r"\b12\b", s):
+        return 12
+    # Then try standard grades with optional .5
+    m = re.search(r"\b(10|[1-9])(?:\.5)?\b", s)
     if not m:
         return None
     g = int(m.group(1))
     return g if 1 <= g <= 10 else None
 
+
+def _parse_half_grade(predicted_grade: str) -> Optional[str]:
+    """Parse a grade string that may include half-grades (e.g. '9.5', '8', '10', '12').
+    Returns the normalized string grade (e.g. '9.5', '8', '12') or None.
+    Valid grades: 1-10 in whole or half steps, plus 12 (CL Ultra Flawless).
+    Grade 11 does not exist."""
+    s = (predicted_grade or "").strip()
+    if not s:
+        return None
+    # Grade 12 (Ultra Flawless)
+    if re.search(r"\b12\b", s):
+        return "12"
+    # Try float match: 10, 9.5, 9, 8.5, ..., 1.5, 1
+    m = re.search(r"\b(10|[1-9])(?:\.(0|5))?\b", s)
+    if not m:
+        return None
+    whole = int(m.group(1))
+    decimal = m.group(2)
+    if whole < 1 or whole > 10:
+        return None
+    if decimal == "5":
+        return f"{whole}.5"
+    return str(whole)
+
 def _grade_distribution(predicted_grade: int, confidence: float) -> Dict[str, float]:
+    """Build probability distribution across grades. Supports 1-10 + 12 (CL Ultra Flawless)."""
     c = _clamp(confidence, 0.05, 0.95)
     p_pred = 0.45 + 0.50 * c
     remainder = 1.0 - p_pred
-    if predicted_grade >= 10:
-        dist = {"10": p_pred, "9": remainder * 0.75, "8": remainder * 0.25}
+
+    if predicted_grade == 12:
+        # Ultra Flawless — very tight distribution
+        dist = {"12": p_pred, "10": remainder * 0.80, "9": remainder * 0.20}
+    elif predicted_grade == 10:
+        dist = {"12": remainder * 0.05, "10": p_pred, "9": remainder * 0.70, "8": remainder * 0.25}
     elif predicted_grade == 9:
-        dist = {"10": remainder * 0.25, "9": p_pred, "8": remainder * 0.75}
+        dist = {"10": remainder * 0.20, "9": p_pred, "8": remainder * 0.55, "7": remainder * 0.25}
+    elif predicted_grade == 8:
+        dist = {"9": remainder * 0.15, "8": p_pred, "7": remainder * 0.55, "6": remainder * 0.30}
+    elif predicted_grade == 7:
+        dist = {"8": remainder * 0.15, "7": p_pred, "6": remainder * 0.55, "5": remainder * 0.30}
+    elif predicted_grade == 6:
+        dist = {"7": remainder * 0.15, "6": p_pred, "5": remainder * 0.55, "4": remainder * 0.30}
+    elif predicted_grade == 5:
+        dist = {"6": remainder * 0.15, "5": p_pred, "4": remainder * 0.55, "3": remainder * 0.30}
+    elif predicted_grade <= 4:
+        g = max(1, predicted_grade)
+        upper = str(min(10, g + 1))
+        lower = str(max(1, g - 1))
+        dist = {upper: remainder * 0.20, str(g): p_pred, lower: remainder * 0.80}
     else:
         dist = {"10": remainder * 0.10, "9": remainder * 0.30, "8": p_pred + remainder * 0.60}
+
     total = sum(dist.values()) or 1.0
     return {k: round(v / total, 4) for k, v in dist.items()}
 
@@ -2281,6 +2384,8 @@ def _condition_bucket_from_pregrade(g: Optional[int]) -> str:
         gi = int(g)
     except Exception:
         return "unknown"
+    if gi >= 12:
+        return "ultra_flawless"
     if gi >= 9:
         return "mint_like"
     if gi >= 7:
@@ -2314,7 +2419,7 @@ def health():
         "use_ebay_api": bool(USE_EBAY_API and EBAY_APP_ID),
         "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
         "allowed_origins": ALLOWED_ORIGINS,
-        "supports": ["cards", "memorabilia", "sealed_products", "market_context_click_only"],
+        "supports": ["cards", "memorabilia", "sealed_products", "market_context_click_only", "half_grades", "error_card_detection", "grading_standard_selector", "expanded_tcg_support"],
     }
 
 @app.head("/health")
@@ -2456,15 +2561,24 @@ async def identify(front: UploadFile = File(...), back: UploadFile | None = File
         )
 
     system = (
-        "You are an expert collectibles identifier. "
+        "You are an expert collectibles identifier specialising in trading cards (Pokemon, Magic, Yu-Gi-Oh, One Piece, Dragon Ball, Digimon, Lorcana, Flesh and Blood, Sports, and more). "
         "Return ONLY valid JSON. Be conservative; if unsure, leave fields empty rather than hallucinating."
     )
     user = (
         "Identify the card/item from the image(s). "
         "Return JSON with keys: "
         "card_name, card_type, game, year, card_number, set_code, set_name, manufacturer, language, "
+        "rarity (e.g. Common/Uncommon/Rare/Holo Rare/Ultra Rare/Secret Rare/Illustration Rare/Special Art Rare/Hyper Rare/Crown Rare/Full Art/Alt Art), "
+        "variant_type (e.g. Regular/Holo/Reverse Holo/Full Art/Alt Art/Rainbow/Gold/Textured/Cosmos Holo/Master Ball/Art Rare/Special Art Rare/Standard/Promo/Parallel), "
+        "edition (e.g. 1st Edition/Unlimited/Shadowless/Limited/Collector's Edition or empty), "
+        "finish (e.g. Standard/Holofoil/Reverse Holofoil/Textured/Etched/Glossy/Matte or empty), "
+        "is_promo (true/false), promo_source (e.g. 'League Promo', 'Box Topper', 'Tournament Prize' or empty), "
+        "card_category (e.g. Pokemon/Trainer/Energy for Pokemon; Creature/Spell/Land for MTG; Monster/Spell/Trap for YuGiOh; or empty), "
+        "artist (artist name if visible, else empty), "
+        "is_error_card (true if visibly misprinted/miscut/wrong-back/crimped/factory error), "
+        "error_description (describe the error if is_error_card is true, else empty), "
         "confidence (0-1), reasoning (short). "
-        "For Pokemon, set_code should be the PT-CGO set code if visible (e.g., MEW), else empty."
+        "For Pokemon, set_code should be the PTCGO set code if visible (e.g., MEW), else empty."
     )
 
     messages = [
@@ -2492,6 +2606,16 @@ async def identify(front: UploadFile = File(...), back: UploadFile | None = File
         "set_name": _norm_ws(str(data.get("set_name", ""))),
         "manufacturer": _norm_ws(str(data.get("manufacturer", ""))),
         "language": _norm_ws(str(data.get("language", ""))),
+        "rarity": _norm_ws(str(data.get("rarity", ""))),
+        "variant_type": _norm_ws(str(data.get("variant_type", ""))),
+        "edition": _norm_ws(str(data.get("edition", ""))),
+        "finish": _norm_ws(str(data.get("finish", ""))),
+        "is_promo": bool(data.get("is_promo", False)),
+        "promo_source": _norm_ws(str(data.get("promo_source", ""))),
+        "card_category": _norm_ws(str(data.get("card_category", ""))),
+        "artist": _norm_ws(str(data.get("artist", ""))),
+        "is_error_card": bool(data.get("is_error_card", False)),
+        "error_description": _norm_ws(str(data.get("error_description", ""))),
         "confidence": _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0),
         "reasoning": _norm_ws(str(data.get("reasoning", ""))),
     }
@@ -2524,6 +2648,7 @@ async def verify(
     card_type: Optional[str] = Form(None),
     set_code: Optional[str] = Form(None),
     intent: Optional[str] = Form(None),
+    grading_standard: Optional[str] = Form(None),  # PSA / BGS / CGC / CL (Collectors League)
 ):
     front_bytes = await front.read()
     back_bytes = await back.read()
@@ -2559,7 +2684,50 @@ async def verify(
     intent_norm = (intent or '').strip().lower()
     intent_context = 'BUYING' if intent_norm == 'buying' else ('SELLING' if intent_norm == 'selling' else 'UNSPECIFIED')
 
+    # Grading standard context
+    gs = (grading_standard or '').strip().upper()
+    if gs in ('BGS', 'BECKETT'):
+        grading_std_context = 'BGS'
+        grading_std_note = (
+            "GRADING STANDARD: BGS (Beckett Grading Services)\n"
+            "- Uses half-grades: 10 (Pristine/Black Label), 9.5 (Gem Mint), 9, 8.5, 8, 7.5, 7, 6.5, 6, 5.5, 5, 4, 3, 2, 1\n"
+            "- Sub-grades for: Centering, Corners, Edges, Surface (each 1-10 with half-grades)\n"
+            "- BGS 10 = Pristine (nearly impossible), BGS 9.5 = Gem Mint (highest realistic)\n"
+            "- Centering: 50/50-55/45 = 10, 55/45-60/40 = 9.5, 60/40-65/35 = 9\n"
+            "- OUTPUT pregrade as a half-grade (e.g. '9.5', '8', '7.5')\n"
+        )
+    elif gs == 'CGC':
+        grading_std_context = 'CGC'
+        grading_std_note = (
+            "GRADING STANDARD: CGC (Certified Guaranty Company)\n"
+            "- Uses half-grades: 10 (Pristine), 9.5, 9, 8.5, 8, 7.5, 7, 6.5, 6, 5.5, 5, 4.5, 4, 3.5, 3, 2, 1\n"
+            "- Sub-grades for: Surface, Corners, Edges (each scored)\n"
+            "- CGC 10 = Pristine (very rare), CGC 9.5 = Gem Mint\n"
+            "- OUTPUT pregrade as a half-grade (e.g. '9.5', '8', '7.5')\n"
+        )
+    elif gs == 'CL':
+        grading_std_context = 'CL'
+        grading_std_note = (
+            "GRADING STANDARD: CL (Collectors League Australia)\n"
+            "- Uses whole grades 1-10, plus Grade 12 (CL Ultra Flawless). There is NO grade 11.\n"
+            "- Grade 10 = GEM MINT (modern standard perfection — award it when warranted)\n"
+            "- Grade 12 = CL ULTRA FLAWLESS (exceeds all expectations, near-impossible perfection — award ONLY when truly warranted)\n"
+            "- Sub-grades for: Centering, Corners, Edges, Surface\n"
+            "- OUTPUT pregrade as whole number or '12' for Ultra Flawless\n"
+        )
+    else:
+        grading_std_context = 'PSA'
+        grading_std_note = (
+            "GRADING STANDARD: PSA (Professional Sports Authenticator) — default\n"
+            "- Uses whole grades: 10 (Gem Mint), 9, 8, 7, 6, 5, 4, 3, 2, 1\n"
+            "- PSA 10 = Gem Mint (highest grade, requires near-perfection)\n"
+            "- Centering: 60/40 or better front, 75/25 or better back for PSA 10\n"
+            "- OUTPUT pregrade as whole number (e.g. '10', '9', '8')\n"
+        )
+
     prompt = f"""You are a professional trading card grader with 15+ years experience.
+
+{grading_std_note}
 
 Analyze the provided images with EXTREME scrutiny.
 You will receive FRONT and BACK images, and MAY receive a third ANGLED image used to rule out glare / light refraction artifacts (holo sheen) vs true whitening / scratches / print lines. Write as if speaking directly to a collector who needs honest, specific feedback about their card.
@@ -2612,7 +2780,7 @@ CRITICAL RULES:
    - For EACH of the 8 corners (4 front + 4 back), describe what you observe
    - Examples: "Front top-left corner is perfectly sharp", "Back bottom-right shows minor whitening about 1mm deep"
 
-3) Grade must reflect worst visible defect (conservative PSA-style):
+3) Grade must reflect worst visible defect (conservative {grading_std_context}-style):
    - Any crease/fold/tear/major dent → pregrade 4 or lower
    - Any bend/ding/impression, heavy rounding → pregrade 5 or lower
    - Moderate whitening across multiple corners/edges → pregrade 6-7
@@ -2633,27 +2801,55 @@ CRITICAL RULES:
      * Exceptional print quality with vivid colors and perfect registration
      * Zero factory defects (no print dots, lines, or imperfections)
      * Card presents as if it's never been touched by human hands
-     This grade should be RARE (perhaps 1 in 1000 cards) but MUST be awarded when warranted
+     This grade should be RARE (perhaps 1 in 1000 cards) but MUST be awarded when warranted. There is NO grade 11.
 
-
-5) Do NOT confuse holo sheen / light refraction / texture for damage:
+4) Do NOT confuse holo sheen / light refraction / texture for damage:
    - If a mark disappears or changes drastically in the ANGLED shot, treat it as glare/reflection, NOT whitening/damage.
    - Print lines are typically straight and consistent across lighting; glare moves with angle.
    - Card texture (especially modern) is not damage unless there is a true crease, indentation, or paper break.
+   - If the card appears to be inside a SLEEVE, TOPLOADER, or SEMI-RIGID, account for sleeve-induced glare, refraction artifacts, and edge distortion. Note this in your assessment.
 
-4) Write the assessment summary in first person, conversational style (5-8 sentences):
+5) Write the assessment summary in first person, conversational style (5-8 sentences):
    - Open with overall impression: "Looking at your card..."
    - Discuss specific observations: "The front presents beautifully, with..."
    - Compare front vs back: "While the front is near-perfect, the back shows..."
    - Explain grade rationale: "The grade of X is primarily limited by..."
    - End with realistic expectation: "If you're considering grading..."
 
+6) SURFACE — assess ALL of the following factors (mention each that applies):
+   - Print quality: registration alignment, ink density/consistency, print dots, roller lines
+   - Gloss/coating: dulling, clouding, tackiness, or loss of original sheen
+   - Scratches: location, direction, depth, visibility under different lighting
+   - Whitening vs Silvering: whitening = paper fiber exposure at edges/corners; silvering = foil layer showing through surface (different defect, note which it is)
+   - Staining: water damage rings, yellowing from UV exposure, foxing (age spots), ink transfer from adjacent cards
+   - Indentation/pressure marks: from stacking without sleeves, rubber bands, or other storage damage
+   - Card warp/bowing: concave or convex curl (minor bow is common and acceptable; severe warp affects grade)
+
+7) ERROR CARD / MISPRINT / FACTORY DEFECT detection:
+   - If you observe any of the following, flag it in the "error_card" field:
+     * Miscut (off-center die cut, visible border of adjacent card)
+     * Crimped card (factory crimp from packaging machine)
+     * Wrong back (different card's back printed on reverse)
+     * Missing ink / wrong color (partial print, color shift, missing layer)
+     * Holo bleed (foil pattern visible outside intended holofoil area)
+     * Double print / ghost image
+     * Square-cut (proof/test cut without rounded corners)
+     * Off-center print (text/art shifted within normal card borders)
+     * Misregistered layers (CMYK layers visibly offset)
+   - IMPORTANT: Error cards often carry a PREMIUM among collectors. Note this in assessment_summary.
+   - If it's a factory defect that adds value, say so. If it's damage that looks like an error, clarify.
+
+8) CARD BACK PATTERN awareness:
+   - Different TCGs and eras have different back designs
+   - Note if the back pattern is consistent with the identified card (e.g., old Pokemon Energy back vs modern standard)
+   - Wrong-back cards are valuable errors — flag them
+
 {context}
 
 Return ONLY valid JSON with this EXACT structure:
 
 {{
-  "pregrade": "1-12 (use 12 ONLY for Ultra Flawless cards that exceed all expectations)",
+  "pregrade": "Grade as appropriate for {grading_std_context}. Use half-grades (e.g. 9.5) for BGS/CGC. Use 12 ONLY for CL Ultra Flawless.",
   "confidence": 0.0-1.0,
   "centering": {{
     "front": {{
@@ -2661,26 +2857,26 @@ Return ONLY valid JSON with this EXACT structure:
       "notes": "Detailed observation: slightly off-center towards [direction], approximately [measurement]. [Impact on grade]."
     }},
     "back": {{
-      "grade": "60/40", 
+      "grade": "60/40",
       "notes": "Detailed observation: [specific description of centering quality]."
     }}
   }},
   "corners": {{
     "front": {{
       "top_left": {{
-        "condition": "sharp/minor_whitening/whitening/bend/ding/crease",
+        "condition": "sharp/minor_whitening/whitening/silvering/bend/ding/crease",
         "notes": "Specific description: [exactly what you see, be detailed]"
       }},
       "top_right": {{
-        "condition": "sharp/minor_whitening/whitening/bend/ding/crease",
+        "condition": "sharp/minor_whitening/whitening/silvering/bend/ding/crease",
         "notes": "Specific description: [exactly what you see]"
       }},
       "bottom_left": {{
-        "condition": "sharp/minor_whitening/whitening/bend/ding/crease",
+        "condition": "sharp/minor_whitening/whitening/silvering/bend/ding/crease",
         "notes": "Specific description: [exactly what you see]"
       }},
       "bottom_right": {{
-        "condition": "sharp/minor_whitening/whitening/bend/ding/crease",
+        "condition": "sharp/minor_whitening/whitening/silvering/bend/ding/crease",
         "notes": "Specific description: [exactly what you see]"
       }}
     }},
@@ -2694,7 +2890,7 @@ Return ONLY valid JSON with this EXACT structure:
   "edges": {{
     "front": {{
       "grade": "Mint/Near Mint/Excellent/Good/Poor",
-      "notes": "Walk around all 4 edges: top edge [description], right edge [description], bottom [description], left [description]. Be specific about location and severity."
+      "notes": "Walk around all 4 edges: top edge [description], right edge [description], bottom [description], left [description]. Note whitening vs silvering."
     }},
     "back": {{
       "grade": "Mint/Near Mint/Excellent/Good/Poor",
@@ -2704,29 +2900,47 @@ Return ONLY valid JSON with this EXACT structure:
   "surface": {{
     "front": {{
       "grade": "Mint/Near Mint/Excellent/Good/Poor",
-      "notes": "Describe surface quality in detail: holographic pattern quality, any print lines, scratches (with location), scuffs, gloss level."
+      "notes": "Describe ALL surface factors: holographic pattern quality, print registration/alignment, ink density, scratches (location + direction), scuffs, gloss level, dulling/clouding, staining, yellowing, indentation/pressure marks, warp/bowing."
     }},
     "back": {{
       "grade": "Mint/Near Mint/Excellent/Good/Poor",
-      "notes": "Detailed surface assessment."
+      "notes": "Detailed surface assessment. Distinguish whitening from silvering. Check for yellowing, foxing (age spots), ink transfer, pressure marks, warp."
     }}
   }},
   "defects": [
     "Each defect as a complete sentence: [SIDE] [precise location] shows [type of defect] [severity]. Example: 'Front top-left corner shows moderate whitening extending approximately 2mm into the card surface.'"
   ],
   "flags": [
-    "Short flags for important issues (crease, bend, edge chipping, etc.)"
+    "Short flags for important issues (crease, bend, edge chipping, silvering, warp, print_line, staining, yellowing, miscut, error_card, etc.)"
   ],
-  "assessment_summary": "Write 5-8 sentences in first person, conversational style. Start with: 'Looking at your [card name]...' Then describe specific observations, compare front vs back, explain what limits the grade, and give realistic grading expectations. Be honest but professional.",
-    "spoken_word": "A punchy spoken-word version of the assessment summary (about 20-45 seconds). First person, conversational. Mention the best features, the main grade limiters, and end with what grade you’d realistically expect.",
+  "error_card": {{
+    "is_error": false,
+    "error_type": "none/miscut/crimped/wrong_back/missing_ink/holo_bleed/double_print/square_cut/off_center_print/misregistered/other",
+    "error_description": "Describe the error if detected, else empty string",
+    "value_impact": "premium/neutral/negative — most genuine factory errors carry a collector premium"
+  }},
+  "card_condition_extras": {{
+    "warp": "none/minor_bow/moderate_curve/severe_warp",
+    "sleeve_detected": false,
+    "yellowing": "none/minor/moderate/severe",
+    "gloss_level": "high/medium/low/dulled"
+  }},
+  "assessment_summary": "Write 5-8 sentences in first person, conversational style. Start with: 'Looking at your [card name]...' Describe specific observations, compare front vs back, explain what limits the grade, give realistic expectations. If error card detected, mention the potential collector premium.",
+  "spoken_word": "A punchy spoken-word version of the assessment summary (about 20-45 seconds). First person, conversational. Mention the best features, the main grade limiters, and end with what grade you'd realistically expect.",
   "observed_id": {{
     "card_name": "best-effort from images",
     "set_code": "only if clearly visible",
     "set_name": "best-effort",
     "card_number": "preserve leading zeros",
     "year": "best-effort",
-    "card_type": "Pokemon/Magic/YuGiOh/Sports/OnePiece/Other"
+    "card_type": "Pokemon/Magic/YuGiOh/Sports/OnePiece/DragonBall/Digimon/Lorcana/FleshAndBlood/WeissSchwarz/Vanguard/StarWars/Other",
+    "rarity": "Common/Uncommon/Rare/Holo Rare/Ultra Rare/Secret Rare/Illustration Rare/Special Art Rare/Hyper Rare/Crown Rare/Other or empty",
+    "variant_type": "Regular/Holo/Reverse Holo/Full Art/Alt Art/Rainbow/Gold/Textured/Cosmos Holo/Other or empty",
+    "edition": "1st Edition/Unlimited/Shadowless or empty",
+    "finish": "Standard/Holofoil/Reverse Holofoil/Textured/Etched or empty",
+    "is_error_card": false
   }}
+
 }}
 
 CRITICAL REMINDERS:
@@ -2735,6 +2949,10 @@ CRITICAL REMINDERS:
 - Assessment summary must be conversational (first person, like talking to the owner)
 - Do NOT miss obvious damage - be brutally honest
 - If you can't see something clearly due to glare/blur, say so in notes
+- Distinguish WHITENING (paper fiber exposure) from SILVERING (foil showing through surface) — these are different defects
+- Check for ERROR CARD indicators (miscut, crimped, wrong back, holo bleed, etc.) and flag in error_card field
+- Note card warp/bowing, yellowing, and gloss level in card_condition_extras
+- If card is in a sleeve/toploader, note this in card_condition_extras.sleeve_detected and account for artifacts
 
 Respond ONLY with JSON, no extra text.
 """
@@ -2754,7 +2972,7 @@ Respond ONLY with JSON, no extra text.
         ),
     }]
 
-    result = await _openai_chat(msg, max_tokens=2200, temperature=0.1)
+    result = await _openai_chat(msg, max_tokens=3000, temperature=0.1)
     if result.get("error"):
         return JSONResponse(content={"error": True, "message": "AI grading failed", "details": result.get("message", "")}, status_code=502)
 
@@ -3159,14 +3377,26 @@ Return ONLY valid JSON:
         for f in flags_list_out
     )
 
+    # Detect if error card was flagged by AI
+    error_card_data = data.get("error_card", {})
+    if isinstance(error_card_data, dict) and error_card_data.get("is_error"):
+        if "error_card" not in flags_list_out:
+            flags_list_out.append("error_card")
+        error_type = str(error_card_data.get("error_type", "")).strip()
+        if error_type and error_type != "none" and error_type not in flags_list_out:
+            flags_list_out.append(error_type)
+
 
 
     raw_pregrade = str(data.get("pregrade", "")).strip()
+    # Parse half-grade first (e.g. "9.5"), fallback to integer bucket
+    half_grade_str = _parse_half_grade(raw_pregrade)
     g = _grade_bucket(raw_pregrade)
     # NOTE: We intentionally do NOT cap the AI-assessed pregrade here.
     # Any condition-based value adjustments are applied in /api/market-context only.
 
-    pregrade_norm = str(g) if g is not None else ""
+    # Use half-grade string for display, integer bucket for logic
+    pregrade_norm = half_grade_str or (str(g) if g is not None else "")
 
     # Condition anchor for downstream market logic (trust gate)
     g_int = None
@@ -3174,7 +3404,7 @@ Return ONLY valid JSON:
         g_int = int(round(float(pregrade_norm))) if pregrade_norm else None
     except Exception:
         g_int = None
-    condition_anchor = "damaged" if (has_structural_damage or (g_int is not None and g_int <= 4)) else ("low" if (g_int is not None and g_int <= 6) else ("mid" if (g_int is not None and g_int <= 8) else "high"))
+    condition_anchor = "damaged" if (has_structural_damage or (g_int is not None and g_int <= 4)) else ("low" if (g_int is not None and g_int <= 6) else ("mid" if (g_int is not None and g_int <= 8) else ("ultra" if (g_int is not None and g_int >= 12) else "high")))
     
 
     # Ensure assessment_summary is detailed enough (UI-friendly)
@@ -3212,12 +3442,15 @@ Return ONLY valid JSON:
     resp = {
         "pregrade": pregrade_norm or "N/A",
         "confidence": _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0),
+        "grading_standard": grading_std_context,
         "centering": data.get("centering", {"front": {"grade": "", "notes": ""}, "back": {"grade": "", "notes": ""}}),
         "corners": data.get("corners", {"front": {}, "back": {}}),
         "edges": data.get("edges", {"front": {"grade": "", "notes": ""}, "back": {"grade": "", "notes": ""}}),
         "surface": data.get("surface", {"front": {"grade": "", "notes": ""}, "back": {"grade": "", "notes": ""}}),
         "defects": defects_list_out,
         "flags": flags_list_out,
+        "error_card": data.get("error_card", {"is_error": False, "error_type": "none", "error_description": "", "value_impact": "neutral"}) if isinstance(data.get("error_card"), dict) else {"is_error": False, "error_type": "none", "error_description": "", "value_impact": "neutral"},
+        "card_condition_extras": data.get("card_condition_extras", {"warp": "none", "sleeve_detected": False, "yellowing": "none", "gloss_level": "high"}) if isinstance(data.get("card_condition_extras"), dict) else {"warp": "none", "sleeve_detected": False, "yellowing": "none", "gloss_level": "high"},
         "second_pass": second_pass,
         "defect_snaps": defect_snaps,
         "glare_suspects": data.get("glare_suspects", []) if isinstance(data.get("glare_suspects", []), list) else [],
@@ -3587,7 +3820,7 @@ Keep grading logic identical; only tailor advice tone and context.
     for i, bb in enumerate(imgs):
         if i > 0:
             content.append({"type": "text", "text": f"IMAGE {i} ABOVE ☝️ | IMAGE {i+1} BELOW 👇"})
-        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(bb)}", "detail": "low"}})
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(bb)}", "detail": "high"}})
 
     msg = [{"role": "user", "content": content}]
     result = await _openai_chat(msg, max_tokens=1600, temperature=0.1)
@@ -6063,15 +6296,12 @@ async def get_collection_value_history(user_id: int, days: int = 30):
     })
 
 
-@app.post("/api/collection/update-values")
+@app.post("/api/collection/update-values-mock")
 @safe_endpoint
-async def update_collection_market_values(user_id: int = Form(...)):
+async def update_collection_market_values_mock(user_id: int = Form(...)):
     """
-    Update all market values for a user's collection (mock structure for now).
-    Intended future flow:
-    1) fetch all cards in WP collection table
-    2) query PriceCharting
-    3) update current_market_value + record price_history snapshots
+    DEPRECATED mock — use /api/collection/update-values instead.
+    Kept for backward compatibility with any old frontend code.
     """
     return JSONResponse(content={
         "success": True,
@@ -6155,20 +6385,22 @@ async def predict_grade_confidence(
 
     prediction_prompt = """You are a quick card grading predictor.
 Based on these images, provide:
-1. Probability distribution across grades 1-10
-2. Most likely grade
+1. Probability distribution across grades (use whole and half-grades as appropriate, e.g. 10, 9.5, 9, 8.5, 8, 7, 6, 5, 4 etc.)
+2. Most likely grade (can be a half-grade like 9.5)
 3. Specific improvements needed for higher grade
 
 Return JSON:
 {
   "grade_probabilities": {
     "10": 0.05,
+    "9.5": 0.10,
     "9": 0.15,
-    "8": 0.40,
-    "7": 0.30,
+    "8.5": 0.20,
+    "8": 0.25,
+    "7": 0.15,
     "6": 0.10
   },
-  "most_likely_grade": "8",
+  "most_likely_grade": "8.5",
   "confidence": 0.75,
   "improvements_for_higher_grade": [
     "Better lighting on top-left corner to confirm whitening extent",
@@ -6176,7 +6408,7 @@ Return JSON:
     "Back photo shows glare - retake at different angle"
   ],
   "grade_limiters": ["Corner whitening", "Edge wear visible"],
-  "quick_summary": "This card will likely grade 8 or 7 based on visible corner wear."
+  "quick_summary": "This card will likely grade 8-8.5 based on visible corner wear."
 }
 """
 
@@ -6773,14 +7005,20 @@ async def verify_card_authenticity(
 Analyze these images of {card_name} ({card_set}, {card_year}) for authenticity markers.
 
 Check for common counterfeit indicators:
-1. Print quality - legitimate cards have precise, clean printing
-2. Font kerning - spacing between letters should match authentic examples
-3. Color saturation - counterfeits often have oversaturated or muted colors
-4. Holofoil pattern - if applicable, check for consistent holographic pattern
-5. Edge cut - authentic cards have precise, uniform edges
-6. Card stock texture and thickness indicators
-7. Set symbol and copyright text clarity
-8. Any obvious signs of reproduction or printing artifacts
+1. Print quality - legitimate cards have precise, clean printing with consistent dot patterns (rosette pattern)
+2. Font kerning - spacing between letters should match authentic examples; counterfeits often have subtle spacing errors
+3. Color saturation - counterfeits often have oversaturated or muted colors vs authentic reference
+4. Holofoil pattern - if applicable, check for consistent holographic pattern matching known authentic patterns
+5. Edge cut - authentic cards have precise, uniform edges; fakes may have rough or uneven cuts
+6. Card stock texture and thickness indicators - real Pokemon cards ~0.32mm thick, real MTG ~0.30mm
+7. Set symbol and copyright text clarity - should be crisp and correctly placed
+8. Rosette pattern - legitimate cards show a specific dot pattern under magnification; reprints show different patterns
+9. Black core / blue core visibility - authentic cards have a black or blue layer visible at torn edges
+10. Surface texture - authentic cards have a specific micro-texture; reprints feel smoother or rougher
+11. Back pattern consistency - does the back match known authentic patterns for this era/set?
+12. Weight indicators - card should appear consistent with authentic weight (~1.8g for Pokemon, ~1.7g for MTG)
+13. Known counterfeit tells for this specific set/era (if applicable)
+14. Holo pattern type - does the holo match the correct pattern for this set (cosmos, galaxy, linear, etc.)?
 
 Return detailed JSON:
 {{
@@ -6794,9 +7032,13 @@ Return detailed JSON:
     "font_accuracy": {{"score": 75, "notes": "..."}},
     "color_accuracy": {{"score": 95, "notes": "..."}},
     "holofoil_pattern": {{"score": 80, "notes": "..."}},
-    "manufacturing_marks": {{"score": 90, "notes": "..."}}
+    "manufacturing_marks": {{"score": 90, "notes": "..."}},
+    "rosette_pattern": {{"score": 85, "notes": "visible/not_visible at this resolution, appears consistent/inconsistent with authentic"}},
+    "card_stock": {{"score": 80, "notes": "texture and thickness assessment from visual cues"}},
+    "back_pattern": {{"score": 90, "notes": "back design matches/does not match expected pattern for era"}}
   }},
   "comparison_notes": "...",
+  "verification_steps": ["Specific steps the owner can take to verify further, e.g. 'Perform a light test - shine a flashlight through the card; authentic cards block most light'", "Check weight with a precision scale - should be approximately 1.8g"],
   "recommendation": "..."
 }}
 
