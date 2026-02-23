@@ -1382,11 +1382,68 @@ async def _translate_to_english(text_in: str) -> str:
         if resp.get("error"):
             return ""
         out = _norm_ws(resp.get("content",""))
-        # Guard against JSON wrappers or junk
-        out = re.sub(r'^"\|"$', "", out).strip()
+        # Guard against wrappers like: "Hot Breath"
+        out = out.strip().strip('"').strip("'").strip()
         if len(out) > 0 and len(out) <= 120:
             _TRANSLATE_CACHE[t] = out
             return out
+    except Exception:
+        pass
+    return ""
+
+
+def _ocr_rarity_code_from_front(front_bytes: bytes) -> str:
+    """Best-effort OCR for rarity codes (SR/R/SAR/SEC/L/UC/C/SP/P, etc.).
+    Rarity marks on JP/EN cards are usually Latin letters, so English OCR works.
+    """
+    try:
+        import pytesseract
+        from PIL import Image
+        import io
+
+        im = Image.open(io.BytesIO(front_bytes)).convert("RGB")
+        w, h = im.size
+        # Bottom-right crop tends to contain rarity + card number on most modern TCG layouts
+        x0 = int(w * 0.60)
+        y0 = int(h * 0.70)
+        crop = im.crop((x0, y0, w, h))
+        # Upscale for OCR
+        crop = crop.resize((crop.size[0] * 3, crop.size[1] * 3))
+
+        # High-contrast grayscale
+        crop = crop.convert("L")
+        # Simple threshold
+        crop = crop.point(lambda p: 255 if p > 160 else 0)
+
+        txt = pytesseract.image_to_string(
+            crop,
+            lang="eng",
+            config="--psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/",
+        )
+        t = re.sub(r"[^A-Z0-9/]", " ", (txt or "").upper())
+        # Common rarity tokens across TCGs
+        candidates = [
+            "SAR",
+            "SEC",
+            "SR",
+            "UR",
+            "HR",
+            "IR",
+            "AR",
+            "SP",
+            "PR",
+            "PROMO",
+            "RR",
+            "R",
+            "UC",
+            "C",
+            "L",
+            "ALT",
+            "AA",
+        ]
+        for c in candidates:
+            if re.search(rf"\b{re.escape(c)}\b", t):
+                return c
     except Exception:
         pass
     return ""
@@ -2829,6 +2886,21 @@ async def identify(front: UploadFile = File(...), back: UploadFile | None = File
         "reasoning": _norm_ws(str(data.get("reasoning", ""))),
     }
 
+    # If the model returns a generic card_type but game is clearly known, force it into your frontend enum.
+    try:
+        g = (result.get("game") or "").lower()
+        if result.get("card_type") in ("", "Other"):
+            if "one piece" in g:
+                result["card_type"] = "OnePiece"
+            elif "pokemon" in g:
+                result["card_type"] = "Pokemon"
+            elif "dragon" in g and "ball" in g:
+                result["card_type"] = "DragonBall"
+            elif "digimon" in g:
+                result["card_type"] = "Digimon"
+    except Exception:
+        pass
+
     # Canonicalize set info where helpers exist
     try:
         set_info = _canonicalize_set(result["set_code"], result["set_name"])
@@ -2854,6 +2926,15 @@ async def identify(front: UploadFile = File(...), back: UploadFile | None = File
     except Exception:
         pass
 
+    # Rarity OCR fallback (only when empty)
+    try:
+        if not (result.get("rarity") or "").strip():
+            rc = _ocr_rarity_code_from_front(front_bytes)
+            if rc:
+                result["rarity"] = rc
+    except Exception:
+        pass
+
     # Add English translation alongside original name for non-English cards
     try:
         lang = (result.get("language","") or "").lower()
@@ -2864,8 +2945,8 @@ async def identify(front: UploadFile = File(...), back: UploadFile | None = File
                 result["card_name_en"] = en
                 result["card_name_display"] = f"{nm} / {en}"
             else:
-                # Never return blank translation fields — if translation fails, keep original name
-                result["card_name_en"] = nm
+                # If translation fails, don't duplicate JP into the EN field.
+                result["card_name_en"] = ""
                 result["card_name_display"] = nm
         else:
             result["card_name_en"] = nm
