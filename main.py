@@ -2839,39 +2839,39 @@ async def identify(front: UploadFile = File(...), back: UploadFile | None = File
         pass
 
 
-# One Piece set/year enrichment (only when missing)
-try:
-    if "one piece" in (result.get("game","").lower()):
-        op = _onepiece_set_info(result.get("set_code",""))
-        if op.get("set_code"):
-            result["set_code"] = op.get("set_code")
-        if not result.get("set_name") and op.get("set_name"):
-            result["set_name"] = op.get("set_name")
-            result["set_source"] = "onepiece_" + op.get("source","")
-        if (not result.get("year")) and op.get("year"):
-            result["year"] = op.get("year")
-            result["year_source"] = "set_code_" + op.get("source","")
-except Exception:
-    pass
+    # One Piece set/year enrichment (only when missing)
+    try:
+        if "one piece" in (result.get("game","").lower()):
+            op = _onepiece_set_info(result.get("set_code",""))
+            if op.get("set_code"):
+                result["set_code"] = op.get("set_code")
+            if not result.get("set_name") and op.get("set_name"):
+                result["set_name"] = op.get("set_name")
+                result["set_source"] = "onepiece_" + op.get("source","")
+            if (not result.get("year")) and op.get("year"):
+                result["year"] = op.get("year")
+                result["year_source"] = "set_code_" + op.get("source","")
+    except Exception:
+        pass
 
-# Add English translation alongside original name for non-English cards
-try:
-    lang = (result.get("language","") or "").lower()
-    nm = result.get("card_name","") or ""
-    if nm and lang and lang not in ("english", "en"):
-        en = await _translate_to_english(nm)
-        if en and en.lower() != nm.lower():
-            result["card_name_en"] = en
-            result["card_name_display"] = f"{nm} / {en}"
+    # Add English translation alongside original name for non-English cards
+    try:
+        lang = (result.get("language","") or "").lower()
+        nm = result.get("card_name","") or ""
+        if nm and lang and lang not in ("english", "en"):
+            en = await _translate_to_english(nm)
+            if en and en.lower() != nm.lower():
+                result["card_name_en"] = en
+                result["card_name_display"] = f"{nm} / {en}"
+            else:
+                result["card_name_en"] = ""
+                result["card_name_display"] = nm
         else:
             result["card_name_en"] = ""
             result["card_name_display"] = nm
-    else:
+    except Exception:
         result["card_name_en"] = ""
-        result["card_name_display"] = nm
-except Exception:
-    result["card_name_en"] = ""
-    result["card_name_display"] = result.get("card_name","") or ""
+        result["card_name_display"] = result.get("card_name","") or ""
 
     # Backward-compatible response: expose fields at top-level AND under card
     flat = dict(result)
