@@ -1383,7 +1383,7 @@ async def _translate_to_english(text_in: str) -> str:
             return ""
         out = _norm_ws(resp.get("content",""))
         # Guard against JSON wrappers or junk
-        out = re.sub(r"^"|"$", "", out).strip()
+        out = re.sub(r'^"\|"$', "", out).strip()
         if len(out) > 0 and len(out) <= 120:
             _TRANSLATE_CACHE[t] = out
             return out
@@ -2864,10 +2864,11 @@ async def identify(front: UploadFile = File(...), back: UploadFile | None = File
                 result["card_name_en"] = en
                 result["card_name_display"] = f"{nm} / {en}"
             else:
-                result["card_name_en"] = ""
+                # Never return blank translation fields — if translation fails, keep original name
+                result["card_name_en"] = nm
                 result["card_name_display"] = nm
         else:
-            result["card_name_en"] = ""
+            result["card_name_en"] = nm
             result["card_name_display"] = nm
     except Exception:
         result["card_name_en"] = ""
@@ -3238,12 +3239,17 @@ Respond ONLY with JSON, no extra text.
                 data["centering"]["front"]["grade"] = cen_front.get("lr") or data["centering"]["front"].get("grade")
                 # keep notes from AI but prepend computed result
                 prev = str(data["centering"]["front"].get("notes") or "").strip()
+                # If auto-centering says perfect L/R, drop any left/right claims from AI text to avoid contradictions.
+                if str(cen_front.get("lr") or "") in ("50/50","50 / 50") and prev:
+                    prev = re.sub(r"(?i)\b(off-?center\s+towards\s+the\s+(left|right)|towards\s+the\s+(left|right))\b[^.]*\.?\s*", "", prev).strip()
                 prefix = f"Auto-centering (computed): L/R {cen_front.get('lr')} | T/B {cen_front.get('tb')}."
                 data["centering"]["front"]["notes"] = (prefix + (" " + prev if prev else "")).strip()
             if cen_back:
                 data["centering"].setdefault("back", {})
                 data["centering"]["back"]["grade"] = cen_back.get("lr") or data["centering"]["back"].get("grade")
                 prev = str(data["centering"]["back"].get("notes") or "").strip()
+                if str(cen_back.get("lr") or "") in ("50/50","50 / 50") and prev:
+                    prev = re.sub(r"(?i)\b(off-?center\s+towards\s+the\s+(left|right)|towards\s+the\s+(left|right))\b[^.]*\.?\s*", "", prev).strip()
                 prefix = f"Auto-centering (computed): L/R {cen_back.get('lr')} | T/B {cen_back.get('tb')}."
                 data["centering"]["back"]["notes"] = (prefix + (" " + prev if prev else "")).strip()
     except Exception:
