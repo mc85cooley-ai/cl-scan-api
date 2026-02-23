@@ -1375,10 +1375,12 @@ async def _translate_to_english(text_in: str) -> str:
         _TRANSLATE_CACHE[t] = t
         return t
 
-    system = "You translate trading card names to English. Return ONLY the English translation, no quotes, no extra text."
+        # IMPORTANT: use _openai_text (NOT _openai_chat) because _openai_chat enforces JSON response_format.
+    # Translation should be plain text.
+    system = "Translate trading card names to English. Return ONLY the English translation (plain text)."
     user = f"Translate this card name to English: {t}"
     try:
-        resp = await _openai_chat(messages=[{"role":"system","content":system},{"role":"user","content":user}], max_tokens=60, temperature=0.0)
+        resp = await _openai_text(messages=[{"role":"system","content":system},{"role":"user","content":user}], max_tokens=60, temperature=0.0)
         if resp.get("error"):
             return ""
         out = _norm_ws(resp.get("content",""))
