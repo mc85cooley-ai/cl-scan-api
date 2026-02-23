@@ -409,8 +409,7 @@ async def _openai_label_rois(rois: List[Dict[str, Any]], front_bytes: Optional[b
         "type": "text",
         "text": (
             "You are reviewing close-up crops from a trading card photo. "
-        "For each crop, decide whether it shows a REAL defect (not glare/noise). "
-        "IMPORTANT: Foil/holo patterns, sparkle, textured foil, embossing, and normal printing texture are NOT defects. "
+            "For each crop, decide whether it shows a REAL defect (not glare/noise). IMPORTANT: Foil/holo patterns, sparkle, textured foil, embossing, and normal printing texture are NOT defects. "
             "If real, label the defect type and write a short note. Return ONLY JSON as an array."
         )
     }]
@@ -434,8 +433,7 @@ async def _openai_label_rois(rois: List[Dict[str, Any]], front_bytes: Optional[b
     label_prompt = (
         "Return ONLY JSON array, one object per crop you can judge. "
         "Schema: {crop_index:int, is_defect:bool, type:string, note:string, confidence:0-1}. "
-        "type should be one of: whitening, edge_chipping, corner_whitening, scratch, print_line, dent, crease, stain, other. "
-        "DO NOT flag foil sparkle/texture, holo patterns, embossing, or light reflections as scratches/print lines. "
+        "type should be one of: whitening, edge_chipping, corner_whitening, scratch, print_line, dent, crease, stain, other. DO NOT flag foil sparkle/texture, holo patterns, embossing, or light reflections as scratches/print lines. "
         "If not a defect, set is_defect=false and type='none'. Keep note short."
     )
     content_parts += [{"type":"text","text": label_prompt}]
@@ -1302,6 +1300,96 @@ def _canonicalize_set(set_code: Optional[str], set_name: Optional[str]) -> Dict[
     if sc:
         return {"set_code": sc, "set_name": "", "set_source": "code_only"}
     return {"set_code": "", "set_name": "", "set_source": "unknown"}
+
+
+# ==============================
+# One Piece / non-Pokemon set helpers (heuristic)
+# ==============================
+_ONE_PIECE_SET_NAME_MAP: Dict[str, str] = {
+    # Starter Decks
+    "ST01": "Starter Deck 01 — Straw Hat Crew",
+    "ST02": "Starter Deck 02 — Worst Generation",
+    "ST03": "Starter Deck 03 — The Seven Warlords of the Sea",
+    "ST04": "Starter Deck 04 — Animal Kingdom Pirates",
+    "ST05": "Starter Deck 05 — ONE PIECE FILM edition",
+    "ST06": "Starter Deck 06 — Absolute Justice",
+    "ST07": "Starter Deck 07 — Big Mom Pirates",
+    "ST08": "Starter Deck 08 — Monkey D. Luffy",
+    "ST09": "Starter Deck 09 — Yamato",
+    "ST10": "Starter Deck 10 — The Three Captains",
+    "ST11": "Starter Deck 11 — Uta",
+    "ST12": "Starter Deck 12 — Zoro & Sanji",
+    "ST13": "Starter Deck 13 — The Three Brothers",
+    "ST14": "Starter Deck 14 — 3D2Y",
+    "ST15": "Starter Deck 15 — RED (assorted)",
+    # Boosters (common codes)
+    "OP01": "Romance Dawn",
+    "OP02": "Paramount War",
+    "OP03": "Pillars of Strength",
+    "OP04": "Kingdoms of Intrigue",
+    "OP05": "Awakening of the New Era",
+    "OP06": "Wings of the Captain",
+    "OP07": "500 Years in the Future",
+    "OP08": "Two Legends",
+    "OP09": "Four Emperors",
+    "OP10": "Royal Blood",
+    "OP11": "A Fist of Divine Speed",
+    "OP12": "Legacy of the Master",
+}
+
+# Heuristic release-year mapping (best-effort; used only when AI doesn't provide a year)
+_ONE_PIECE_SET_YEAR_MAP: Dict[str, str] = {
+    "OP01": "2022", "OP02": "2022",
+    "OP03": "2023", "OP04": "2023", "OP05": "2023",
+    "OP06": "2024", "OP07": "2024", "OP08": "2024",
+    "OP09": "2025", "OP10": "2025", "OP11": "2025", "OP12": "2025",
+    "ST01": "2022", "ST02": "2022", "ST03": "2022", "ST04": "2022",
+    "ST05": "2022", "ST06": "2022",
+    "ST07": "2023", "ST08": "2023", "ST09": "2023", "ST10": "2023",
+    "ST11": "2024", "ST12": "2024", "ST13": "2024",
+    "ST14": "2025", "ST15": "2025",
+}
+
+def _onepiece_set_info(set_code: str) -> Dict[str, str]:
+    sc = (set_code or "").strip().upper()
+    if not sc:
+        return {"set_name": "", "year": "", "source": "none"}
+    # Normalize like "OP-05" -> "OP05"
+    sc_norm = re.sub(r"[^A-Z0-9]", "", sc)
+    name = _ONE_PIECE_SET_NAME_MAP.get(sc_norm, "")
+    year = _ONE_PIECE_SET_YEAR_MAP.get(sc_norm, "")
+    return {"set_code": sc_norm, "set_name": name, "year": year, "source": "heuristic_map" if (name or year) else "unknown"}
+
+# Simple in-memory translation cache (per process)
+_TRANSLATE_CACHE: Dict[str, str] = {}
+
+async def _translate_to_english(text_in: str) -> str:
+    """Translate a short string to English (best-effort)."""
+    t = _norm_ws(text_in or "")
+    if not t:
+        return ""
+    if t in _TRANSLATE_CACHE:
+        return _TRANSLATE_CACHE[t]
+    # If it already looks English-ish, don't waste calls
+    if re.search(r"[A-Za-z]", t) and not re.search(r"[\u3040-\u30ff\u4e00-\u9fff]", t):
+        _TRANSLATE_CACHE[t] = t
+        return t
+
+    system = "You translate trading card names to English. Return ONLY the English translation, no quotes, no extra text."
+    user = f"Translate this card name to English: {t}"
+    try:
+        resp = await _openai_chat(messages=[{"role":"system","content":system},{"role":"user","content":user}], max_tokens=60, temperature=0.0)
+        if resp.get("error"):
+            return ""
+        out = _norm_ws(resp.get("content",""))
+        # Guard against JSON wrappers or junk
+        out = re.sub(r"^"|"$", "", out).strip()
+        if len(out) > 0 and len(out) <= 120:
+            _TRANSLATE_CACHE[t] = out
+            return out
+    except Exception:
+        pass
+    return ""
 
 
 
@@ -2750,9 +2838,44 @@ async def identify(front: UploadFile = File(...), back: UploadFile | None = File
     except Exception:
         pass
 
+
+# One Piece set/year enrichment (only when missing)
+try:
+    if "one piece" in (result.get("game","").lower()):
+        op = _onepiece_set_info(result.get("set_code",""))
+        if op.get("set_code"):
+            result["set_code"] = op.get("set_code")
+        if not result.get("set_name") and op.get("set_name"):
+            result["set_name"] = op.get("set_name")
+            result["set_source"] = "onepiece_" + op.get("source","")
+        if (not result.get("year")) and op.get("year"):
+            result["year"] = op.get("year")
+            result["year_source"] = "set_code_" + op.get("source","")
+except Exception:
+    pass
+
+# Add English translation alongside original name for non-English cards
+try:
+    lang = (result.get("language","") or "").lower()
+    nm = result.get("card_name","") or ""
+    if nm and lang and lang not in ("english", "en"):
+        en = await _translate_to_english(nm)
+        if en and en.lower() != nm.lower():
+            result["card_name_en"] = en
+            result["card_name_display"] = f"{nm} / {en}"
+        else:
+            result["card_name_en"] = ""
+            result["card_name_display"] = nm
+    else:
+        result["card_name_en"] = ""
+        result["card_name_display"] = nm
+except Exception:
+    result["card_name_en"] = ""
+    result["card_name_display"] = result.get("card_name","") or ""
+
     # Backward-compatible response: expose fields at top-level AND under card
     flat = dict(result)
-    flat.update({"ok": True, "card": result})
+    flat.update({"ok": True, "card": result, "api_version": "2026-02-23-main-v4"})
     return flat
 
 
