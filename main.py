@@ -1303,6 +1303,45 @@ def _canonicalize_set(set_code: Optional[str], set_name: Optional[str]) -> Dict[
 
 
 
+# ==============================
+# Language Helpers (Name bilingual formatting)
+# ==============================
+_JP_CHAR_RX = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]")  # hiragana/katakana/kanji (incl CJK ext A)
+
+def _has_japanese(text: str) -> bool:
+    try:
+        return bool(_JP_CHAR_RX.search(text or ""))
+    except Exception:
+        return False
+
+async def _translate_to_english(text: str, label: str = "text") -> str:
+    """Translate non-English (esp Japanese) text to concise English.
+    Uses the existing OpenAI chat helper; returns empty string on failure.
+    """
+    t = _norm_ws(text or "")
+    if not t:
+        return ""
+    try:
+        system = "You are a precise translator for trading card names and set titles. Return ONLY the English translation. No quotes."
+        user = f"Translate this {label} to English (use official/localized naming if obvious):\n{t}"
+        resp = await _openai_chat(messages=[{"role":"system","content":system},{"role":"user","content":user}], max_tokens=80, temperature=0.0)
+        if resp.get("error"):
+            return ""
+        out = _norm_ws(resp.get("content") or "")
+        # If model accidentally returns JSON, try to extract.
+        if out.startswith("{") and out.endswith("}"):
+            try:
+                obj = _parse_json_or_none(out) or {}
+                if isinstance(obj, dict):
+                    out = _norm_ws(str(obj.get("english") or obj.get("translation") or ""))
+            except Exception:
+                pass
+        return out
+    except Exception:
+        return ""
+
+
+
 # eBay API scaffolding (disabled by default)
 _USE_EBAY_ENV = os.getenv("USE_EBAY_API", "").strip().lower()
 # Finding/Legacy (SOLD) uses EBAY_APP_ID for FindingService
@@ -2626,6 +2665,49 @@ async def identify(front: UploadFile = File(...), back: UploadFile | None = File
         result["set_code"] = set_info.get("set_code", result["set_code"])
         result["set_name"] = set_info.get("set_name", result["set_name"])
         result["set_source"] = set_info.get("set_source", "")
+    except Exception:
+        pass
+
+
+    # Enrich set release year/date from set_code where possible (PokemonTCG.io)
+    try:
+        if (result.get("game","").lower() == "pokemon") and POKEMONTCG_API_KEY and result.get("set_code"):
+            ptcg_set = await _pokemontcg_resolve_set_by_ptcgo(result.get("set_code",""))
+            release_date = _norm_ws(str(ptcg_set.get("releaseDate", "")))
+            if release_date:
+                result["set_release_date"] = release_date
+                try:
+                    result["set_release_year"] = str(int(release_date.split("-")[0]))
+                except Exception:
+                    result["set_release_year"] = ""
+                # If year is missing/unknown, backfill from set release year
+                if not result.get("year") or str(result.get("year")).lower() in ("", "unknown", "n/a"):
+                    if result.get("set_release_year"):
+                        result["year"] = result["set_release_year"]
+            # If set_name is missing and API returned it, backfill for consistency
+            if (not result.get("set_name")) and ptcg_set.get("name"):
+                result["set_name"] = _norm_ws(str(ptcg_set.get("name","")))
+    except Exception:
+        pass
+
+    # Bilingual formatting for non-English names (Japanese + English translation)
+    try:
+        # Card name
+        cn = result.get("card_name","")
+        if _has_japanese(cn):
+            en = await _translate_to_english(cn, label="card name")
+            if en and en.lower() not in cn.lower():
+                result["card_name_local"] = cn
+                result["card_name_en"] = en
+                result["card_name"] = f"{cn} ({en})"
+        # Set name
+        sn = result.get("set_name","")
+        if _has_japanese(sn):
+            en2 = await _translate_to_english(sn, label="set name")
+            if en2 and en2.lower() not in sn.lower():
+                result["set_name_local"] = sn
+                result["set_name_en"] = en2
+                result["set_name"] = f"{sn} ({en2})"
     except Exception:
         pass
 
