@@ -1303,45 +1303,6 @@ def _canonicalize_set(set_code: Optional[str], set_name: Optional[str]) -> Dict[
 
 
 
-# ==============================
-# Language Helpers (Name bilingual formatting)
-# ==============================
-_JP_CHAR_RX = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]")  # hiragana/katakana/kanji (incl CJK ext A)
-
-def _has_japanese(text: str) -> bool:
-    try:
-        return bool(_JP_CHAR_RX.search(text or ""))
-    except Exception:
-        return False
-
-async def _translate_to_english(text: str, label: str = "text") -> str:
-    """Translate non-English (esp Japanese) text to concise English.
-    Uses the existing OpenAI chat helper; returns empty string on failure.
-    """
-    t = _norm_ws(text or "")
-    if not t:
-        return ""
-    try:
-        system = "You are a precise translator for trading card names and set titles. Return ONLY the English translation. No quotes."
-        user = f"Translate this {label} to English (use official/localized naming if obvious):\n{t}"
-        resp = await _openai_chat(messages=[{"role":"system","content":system},{"role":"user","content":user}], max_tokens=80, temperature=0.0)
-        if resp.get("error"):
-            return ""
-        out = _norm_ws(resp.get("content") or "")
-        # If model accidentally returns JSON, try to extract.
-        if out.startswith("{") and out.endswith("}"):
-            try:
-                obj = _parse_json_or_none(out) or {}
-                if isinstance(obj, dict):
-                    out = _norm_ws(str(obj.get("english") or obj.get("translation") or ""))
-            except Exception:
-                pass
-        return out
-    except Exception:
-        return ""
-
-
-
 # eBay API scaffolding (disabled by default)
 _USE_EBAY_ENV = os.getenv("USE_EBAY_API", "").strip().lower()
 # Finding/Legacy (SOLD) uses EBAY_APP_ID for FindingService
@@ -2132,6 +2093,60 @@ async def _pokemontcg_resolve_set_by_ptcgo(ptcgo: str) -> Dict[str, Any]:
     sets = data.get("data") or []
     return sets[0] if sets else {}
 
+async def _onepiece_limitless_names(card_code: str) -> Dict[str, str]:
+    """Fetch English + Japanese names for a One Piece card code (e.g., ST04-016) via Limitless.
+    Returns {'en': 'Blast Breath', 'jp': '熱息'} when available.
+    """
+    code = (card_code or "").strip().upper()
+    if not code or not re.match(r"^[A-Z]{2}\d{2}-\d{3}[A-Z]?$", code):
+        return {}
+    try:
+        timeout = httpx.Timeout(8.0, connect=5.0)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            en_url = f"https://onepiece.limitlesstcg.com/cards/{code}"
+            jp_url = f"https://onepiece.limitlesstcg.com/cards/jp/{code}"
+            en_html, jp_html = await asyncio.gather(
+                client.get(en_url),
+                client.get(jp_url),
+            )
+        en_text = en_html.text if en_html and en_html.status_code == 200 else ""
+        jp_text = jp_html.text if jp_html and jp_html.status_code == 200 else ""
+
+        def _extract_title(html: str) -> str:
+            if not html:
+                return ""
+            # Prefer <h1> title, fallback to <title>
+            m = re.search(r"<h1[^>]*>(.*?)</h1>", html, flags=re.I | re.S)
+            if m:
+                t = re.sub(r"<[^>]+>", "", m.group(1))
+                return _norm_ws(t)
+            m = re.search(r"<title>(.*?)</title>", html, flags=re.I | re.S)
+            if m:
+                t = re.sub(r"\s*•\s*Animal Kingdom Pirates.*$", "", m.group(1))
+                t = re.sub(r"\s*\(.*?\)\s*.*$", "", t)  # strip (ST04-016) etc.
+                return _norm_ws(re.sub(r"<[^>]+>", "", t))
+            return ""
+
+        en_name = _extract_title(en_text)
+        jp_name = _extract_title(jp_text)
+        out = {}
+        if en_name:
+            out["en"] = en_name
+        if jp_name:
+            out["jp"] = jp_name
+        return out
+    except Exception:
+        return {}
+
+
+def _combine_multilang_name(local_name: str, en_name: str) -> str:
+    local_name = _norm_ws(local_name)
+    en_name = _norm_ws(en_name)
+    if local_name and en_name and local_name.lower() != en_name.lower():
+        return f"{local_name} ({en_name})"
+    return local_name or en_name or ""
+
+
 async def _pokemontcg_resolve_card_id(card_name: str, set_code: str, card_number_display: str, set_name: str = "", set_id: str = "") -> str:
     if not POKEMONTCG_API_KEY:
         return ""
@@ -2657,6 +2672,39 @@ async def identify(front: UploadFile = File(...), back: UploadFile | None = File
         "error_description": _norm_ws(str(data.get("error_description", ""))),
         "confidence": _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0),
         "reasoning": _norm_ws(str(data.get("reasoning", ""))),
+# Enrich: set release year + multilingual names (where we have authoritative lookups)
+try:
+    # Pokemon: derive year from set releaseDate if missing/invalid
+    if POKEMONTCG_API_KEY and result.get("set_code") and (not result.get("year") or not re.search(r"\d{4}", str(result.get("year","")))):
+        ptcg_set = await _pokemontcg_resolve_set_by_ptcgo(result["set_code"])
+        rd = str((ptcg_set or {}).get("releaseDate", "") or "")
+        m = re.search(r"(\d{4})", rd)
+        if m:
+            result["year"] = m.group(1)
+            result["set_release_date"] = rd
+except Exception:
+    pass
+
+try:
+    # One Piece: if name is non-English, append authoritative English name (and keep both fields)
+    game_norm = (result.get("game") or "").lower()
+    if "one piece" in game_norm or "onepiece" in game_norm:
+        code = (result.get("card_number") or "").upper()
+        names = await _onepiece_limitless_names(code) if code else {}
+        if names:
+            jp = names.get("jp","")
+            en = names.get("en","")
+            # prefer detected local name if it is non-latin
+            detected = result.get("card_name","") or ""
+            local = detected
+            if jp and (re.search(r"[\u3040-\u30ff\u3400-\u9fff]", jp) or re.search(r"[\u3040-\u30ff\u3400-\u9fff]", detected)):
+                local = jp or detected
+            result["card_name_local"] = _norm_ws(local)
+            result["card_name_en"] = _norm_ws(en)
+            result["card_name"] = _combine_multilang_name(result.get("card_name_local",""), result.get("card_name_en",""))
+except Exception:
+    pass
+
     }
 
     # Canonicalize set info where helpers exist
@@ -2665,49 +2713,6 @@ async def identify(front: UploadFile = File(...), back: UploadFile | None = File
         result["set_code"] = set_info.get("set_code", result["set_code"])
         result["set_name"] = set_info.get("set_name", result["set_name"])
         result["set_source"] = set_info.get("set_source", "")
-    except Exception:
-        pass
-
-
-    # Enrich set release year/date from set_code where possible (PokemonTCG.io)
-    try:
-        if (result.get("game","").lower() == "pokemon") and POKEMONTCG_API_KEY and result.get("set_code"):
-            ptcg_set = await _pokemontcg_resolve_set_by_ptcgo(result.get("set_code",""))
-            release_date = _norm_ws(str(ptcg_set.get("releaseDate", "")))
-            if release_date:
-                result["set_release_date"] = release_date
-                try:
-                    result["set_release_year"] = str(int(release_date.split("-")[0]))
-                except Exception:
-                    result["set_release_year"] = ""
-                # If year is missing/unknown, backfill from set release year
-                if not result.get("year") or str(result.get("year")).lower() in ("", "unknown", "n/a"):
-                    if result.get("set_release_year"):
-                        result["year"] = result["set_release_year"]
-            # If set_name is missing and API returned it, backfill for consistency
-            if (not result.get("set_name")) and ptcg_set.get("name"):
-                result["set_name"] = _norm_ws(str(ptcg_set.get("name","")))
-    except Exception:
-        pass
-
-    # Bilingual formatting for non-English names (Japanese + English translation)
-    try:
-        # Card name
-        cn = result.get("card_name","")
-        if _has_japanese(cn):
-            en = await _translate_to_english(cn, label="card name")
-            if en and en.lower() not in cn.lower():
-                result["card_name_local"] = cn
-                result["card_name_en"] = en
-                result["card_name"] = f"{cn} ({en})"
-        # Set name
-        sn = result.get("set_name","")
-        if _has_japanese(sn):
-            en2 = await _translate_to_english(sn, label="set name")
-            if en2 and en2.lower() not in sn.lower():
-                result["set_name_local"] = sn
-                result["set_name_en"] = en2
-                result["set_name"] = f"{sn} ({en2})"
     except Exception:
         pass
 
