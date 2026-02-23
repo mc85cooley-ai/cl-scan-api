@@ -1542,6 +1542,125 @@ def _safe_json_extract(text: str) -> dict | None:
     return None
 
 
+def _centering_grade_from_ratio(larger: float, smaller: float) -> str:
+    """Return a human-friendly centering string like '55/45'."""
+    try:
+        larger = float(larger)
+        smaller = float(smaller)
+        total = max(larger + smaller, 1e-6)
+        p_large = int(round((larger / total) * 100))
+        p_small = 100 - p_large
+        p_large = max(50, min(99, p_large))
+        p_small = max(1, min(50, p_small))
+        return f"{p_large}/{p_small}"
+    except Exception:
+        return "N/A"
+
+
+def _estimate_centering_from_image(img_bytes: bytes) -> dict | None:
+    """Best-effort centering estimate from a single image (PIL + numpy).
+
+    Returns dict with lr/tb ratios (e.g. 55/45).
+    """
+    if not PIL_AVAILABLE or Image is None or np is None:
+        return None
+    try:
+        im = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+        im = ImageOps.exif_transpose(im)
+        im = im.resize((900, int(900 * im.height / max(im.width, 1))), Image.LANCZOS)
+        g = ImageOps.grayscale(im)
+        a = np.asarray(g, dtype=np.float32)
+
+        # Edge magnitude via Sobel (small, pure numpy)
+        kx = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float32)
+        ky = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=np.float32)
+
+        def conv2(img, k):
+            kh, kw = k.shape
+            pad_h, pad_w = kh // 2, kw // 2
+            padded = np.pad(img, ((pad_h, pad_h), (pad_w, pad_w)), mode='edge')
+            out = np.zeros_like(img)
+            for y in range(img.shape[0]):
+                for x in range(img.shape[1]):
+                    region = padded[y:y+kh, x:x+kw]
+                    out[y, x] = float(np.sum(region * k))
+            return out
+
+        gx = conv2(a, kx)
+        gy = conv2(a, ky)
+        mag = np.sqrt(gx * gx + gy * gy)
+
+        thr = float(np.percentile(mag, 95))
+        edges = (mag >= thr).astype(np.uint8)
+        ys, xs = np.where(edges > 0)
+        if len(xs) < 500:
+            return None
+
+        x1, x2 = int(np.percentile(xs, 1)), int(np.percentile(xs, 99))
+        y1, y2 = int(np.percentile(ys, 1)), int(np.percentile(ys, 99))
+        x1 = max(0, x1); y1 = max(0, y1)
+        x2 = min(edges.shape[1]-1, x2); y2 = min(edges.shape[0]-1, y2)
+        if x2 - x1 < 200 or y2 - y1 < 200:
+            return None
+
+        roi = edges[y1:y2, x1:x2]
+        col = roi.sum(axis=0).astype(np.float32)
+        row = roi.sum(axis=1).astype(np.float32)
+
+        def smooth(v, w=11):
+            if v.size < w:
+                return v
+            kernel = np.ones(w, dtype=np.float32) / float(w)
+            return np.convolve(v, kernel, mode='same')
+
+        col_s = smooth(col)
+        row_s = smooth(row)
+        w = col_s.size
+        h = row_s.size
+
+        left_zone = col_s[: int(w * 0.35)]
+        right_zone = col_s[int(w * 0.65):]
+        top_zone = row_s[: int(h * 0.35)]
+        bot_zone = row_s[int(h * 0.65):]
+
+        def peak_index(zone, from_left=True):
+            if zone.size < 10:
+                return None
+            m = float(zone.max())
+            if m <= 0:
+                return None
+            candidates = np.where(zone >= (m * 0.75))[0]
+            if candidates.size == 0:
+                return None
+            return int(candidates[0] if from_left else candidates[-1])
+
+        li = peak_index(left_zone, True)
+        ri_rel = peak_index(right_zone, False)
+        ti = peak_index(top_zone, True)
+        bi_rel = peak_index(bot_zone, False)
+        if li is None or ri_rel is None or ti is None or bi_rel is None:
+            return None
+
+        ri = int(w * 0.65) + ri_rel
+        bi = int(h * 0.65) + bi_rel
+
+        margin_left = max(1, li)
+        margin_right = max(1, (w - 1) - ri)
+        margin_top = max(1, ti)
+        margin_bottom = max(1, (h - 1) - bi)
+
+        lr = _centering_grade_from_ratio(max(margin_left, margin_right), min(margin_left, margin_right))
+        tb = _centering_grade_from_ratio(max(margin_top, margin_bottom), min(margin_top, margin_bottom))
+
+        return {
+            "lr": lr,
+            "tb": tb,
+            "margins": {"left": int(margin_left), "right": int(margin_right), "top": int(margin_top), "bottom": int(margin_bottom)},
+        }
+    except Exception:
+        return None
+
+
 def _normalize_card_type(card_type: str) -> str:
     """Force card_type into the allowed enum. Covers all major TCGs + sports."""
     s = _norm_ws(card_type or "").lower()
@@ -2093,60 +2212,6 @@ async def _pokemontcg_resolve_set_by_ptcgo(ptcgo: str) -> Dict[str, Any]:
     sets = data.get("data") or []
     return sets[0] if sets else {}
 
-async def _onepiece_limitless_names(card_code: str) -> Dict[str, str]:
-    """Fetch English + Japanese names for a One Piece card code (e.g., ST04-016) via Limitless.
-    Returns {'en': 'Blast Breath', 'jp': '熱息'} when available.
-    """
-    code = (card_code or "").strip().upper()
-    if not code or not re.match(r"^[A-Z]{2}\d{2}-\d{3}[A-Z]?$", code):
-        return {}
-    try:
-        timeout = httpx.Timeout(8.0, connect=5.0)
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            en_url = f"https://onepiece.limitlesstcg.com/cards/{code}"
-            jp_url = f"https://onepiece.limitlesstcg.com/cards/jp/{code}"
-            en_html, jp_html = await asyncio.gather(
-                client.get(en_url),
-                client.get(jp_url),
-            )
-        en_text = en_html.text if en_html and en_html.status_code == 200 else ""
-        jp_text = jp_html.text if jp_html and jp_html.status_code == 200 else ""
-
-        def _extract_title(html: str) -> str:
-            if not html:
-                return ""
-            # Prefer <h1> title, fallback to <title>
-            m = re.search(r"<h1[^>]*>(.*?)</h1>", html, flags=re.I | re.S)
-            if m:
-                t = re.sub(r"<[^>]+>", "", m.group(1))
-                return _norm_ws(t)
-            m = re.search(r"<title>(.*?)</title>", html, flags=re.I | re.S)
-            if m:
-                t = re.sub(r"\s*•\s*Animal Kingdom Pirates.*$", "", m.group(1))
-                t = re.sub(r"\s*\(.*?\)\s*.*$", "", t)  # strip (ST04-016) etc.
-                return _norm_ws(re.sub(r"<[^>]+>", "", t))
-            return ""
-
-        en_name = _extract_title(en_text)
-        jp_name = _extract_title(jp_text)
-        out = {}
-        if en_name:
-            out["en"] = en_name
-        if jp_name:
-            out["jp"] = jp_name
-        return out
-    except Exception:
-        return {}
-
-
-def _combine_multilang_name(local_name: str, en_name: str) -> str:
-    local_name = _norm_ws(local_name)
-    en_name = _norm_ws(en_name)
-    if local_name and en_name and local_name.lower() != en_name.lower():
-        return f"{local_name} ({en_name})"
-    return local_name or en_name or ""
-
-
 async def _pokemontcg_resolve_card_id(card_name: str, set_code: str, card_number_display: str, set_name: str = "", set_id: str = "") -> str:
     if not POKEMONTCG_API_KEY:
         return ""
@@ -2672,39 +2737,6 @@ async def identify(front: UploadFile = File(...), back: UploadFile | None = File
         "error_description": _norm_ws(str(data.get("error_description", ""))),
         "confidence": _clamp(_safe_float(data.get("confidence", 0.0)), 0.0, 1.0),
         "reasoning": _norm_ws(str(data.get("reasoning", ""))),
-# Enrich: set release year + multilingual names (where we have authoritative lookups)
-try:
-    # Pokemon: derive year from set releaseDate if missing/invalid
-    if POKEMONTCG_API_KEY and result.get("set_code") and (not result.get("year") or not re.search(r"\d{4}", str(result.get("year","")))):
-        ptcg_set = await _pokemontcg_resolve_set_by_ptcgo(result["set_code"])
-        rd = str((ptcg_set or {}).get("releaseDate", "") or "")
-        m = re.search(r"(\d{4})", rd)
-        if m:
-            result["year"] = m.group(1)
-            result["set_release_date"] = rd
-except Exception:
-    pass
-
-try:
-    # One Piece: if name is non-English, append authoritative English name (and keep both fields)
-    game_norm = (result.get("game") or "").lower()
-    if "one piece" in game_norm or "onepiece" in game_norm:
-        code = (result.get("card_number") or "").upper()
-        names = await _onepiece_limitless_names(code) if code else {}
-        if names:
-            jp = names.get("jp","")
-            en = names.get("en","")
-            # prefer detected local name if it is non-latin
-            detected = result.get("card_name","") or ""
-            local = detected
-            if jp and (re.search(r"[\u3040-\u30ff\u3400-\u9fff]", jp) or re.search(r"[\u3040-\u30ff\u3400-\u9fff]", detected)):
-                local = jp or detected
-            result["card_name_local"] = _norm_ws(local)
-            result["card_name_en"] = _norm_ws(en)
-            result["card_name"] = _combine_multilang_name(result.get("card_name_local",""), result.get("card_name_en",""))
-except Exception:
-    pass
-
     }
 
     # Canonicalize set info where helpers exist
@@ -3064,6 +3096,33 @@ Respond ONLY with JSON, no extra text.
         return JSONResponse(content={"error": True, "message": "AI grading failed", "details": result.get("message", "")}, status_code=502)
 
     data = _parse_json_or_none(result.get("content", "")) or {}
+
+    # ------------------------------
+    # True centering estimate (computed from pixels)
+    # ------------------------------
+    # The model sometimes repeats generic centering language. We compute a best-effort
+    # left/right and top/bottom ratio from the uploaded images and inject it into the
+    # centering section so the UI reflects *real* variation.
+    try:
+        cen_front = _estimate_centering_from_image(front_bytes)
+        cen_back = _estimate_centering_from_image(back_bytes)
+        if isinstance(data, dict):
+            data.setdefault("centering", {})
+            if cen_front:
+                data["centering"].setdefault("front", {})
+                data["centering"]["front"]["grade"] = cen_front.get("lr") or data["centering"]["front"].get("grade")
+                # keep notes from AI but prepend computed result
+                prev = str(data["centering"]["front"].get("notes") or "").strip()
+                prefix = f"Auto-centering (computed): L/R {cen_front.get('lr')} | T/B {cen_front.get('tb')}."
+                data["centering"]["front"]["notes"] = (prefix + (" " + prev if prev else "")).strip()
+            if cen_back:
+                data["centering"].setdefault("back", {})
+                data["centering"]["back"]["grade"] = cen_back.get("lr") or data["centering"]["back"].get("grade")
+                prev = str(data["centering"]["back"].get("notes") or "").strip()
+                prefix = f"Auto-centering (computed): L/R {cen_back.get('lr')} | T/B {cen_back.get('tb')}."
+                data["centering"]["back"]["notes"] = (prefix + (" " + prev if prev else "")).strip()
+    except Exception:
+        pass
 
     # ------------------------------
     # Second-pass (defect enhanced) analysis
