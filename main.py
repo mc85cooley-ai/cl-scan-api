@@ -409,7 +409,8 @@ async def _openai_label_rois(rois: List[Dict[str, Any]], front_bytes: Optional[b
         "type": "text",
         "text": (
             "You are reviewing close-up crops from a trading card photo. "
-            "For each crop, decide whether it shows a REAL defect (not glare/noise). "
+        "For each crop, decide whether it shows a REAL defect (not glare/noise). "
+        "IMPORTANT: Foil/holo patterns, sparkle, textured foil, embossing, and normal printing texture are NOT defects. "
             "If real, label the defect type and write a short note. Return ONLY JSON as an array."
         )
     }]
@@ -434,6 +435,7 @@ async def _openai_label_rois(rois: List[Dict[str, Any]], front_bytes: Optional[b
         "Return ONLY JSON array, one object per crop you can judge. "
         "Schema: {crop_index:int, is_defect:bool, type:string, note:string, confidence:0-1}. "
         "type should be one of: whitening, edge_chipping, corner_whitening, scratch, print_line, dent, crease, stain, other. "
+        "DO NOT flag foil sparkle/texture, holo patterns, embossing, or light reflections as scratches/print lines. "
         "If not a defect, set is_defect=false and type='none'. Keep note short."
     )
     content_parts += [{"type":"text","text": label_prompt}]
@@ -3160,6 +3162,7 @@ You may also receive an ANGLED image used to rule out glare/light refraction.
 
 CRITICAL:
 - Do NOT treat holo sheen / glare as whitening. If the angled shot suggests the mark moves/disappears, flag it as glare_suspect.
+- Foil/holo sparkle, textured foil, embossing, and normal card printing texture are NOT defects.
 - Card texture is NOT damage unless there is a true crease/indent/paper break.
 - Print lines are typically straight and consistent; glare moves with angle.
 
