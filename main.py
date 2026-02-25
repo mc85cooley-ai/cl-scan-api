@@ -1,19 +1,12 @@
 """
 The Collectors League Australia - Scan API
-Futureproof v6.9.0 (2026-02-26)
+Futureproof v6.9.1 (2026-02-26)
 
-What changed vs v6.8.0 (2026-02-21)
-- ✅ FIX: BytesIO import added (NameError in _make_defect_filter_variants on cold start)
-- ✅ FIX: Duplicate _is_likely_defect inner-function removed from /api/verify
-- ✅ FIX: _estimate_centering_from_image vectorised with numpy strides (~100× faster, no timeout risk)
-- ✅ FIX: Second-pass analysis now feeds ALL filter variants (was only 2 of 9) → better defect detection
-- ✅ FIX: predict-grade upgraded from detail:low → detail:high + filter variants (contrast_sharp, edge_wear, sobel_surface)
-- ✅ FIX: predict-grade max_tokens 800→1200, adds centering_estimate + worst_area fields
-- ✅ NEW: 4 new server-side inspection filter variants: uv_sim, local_variance, chromatic, corner_isolate
-- ✅ NEW: /api/overlay-variants mode_map updated for all 13 variants
-- ✅ NEW: _cv_candidate_bboxes adds surface_center ROI for interior scratch detection
-- ✅ NEW: perform_automated_auth_checks: real histogram CV analysis (was stub "analyzed:True")
-- ✅ NEW: _openai_label_rois updated to handle surface_center ROI type
+What changed vs v6.9.0 (2026-02-26)
+- ✅ CRITICAL FIX: Removed second-pass AI call from /api/verify — was exceeding Render 512MB memory limit (502 Bad Gateway)
+- ✅ CRITICAL FIX: Disabled _openai_label_rois in /api/verify and memorabilia endpoints — memory budget
+- ✅ NOTE: Single-pass mode — primary OpenAI vision call handles defect detection; second pass was redundant overhead
+- ✅ NOTE: defect_filters kept in response schema (returns empty dict) for frontend compatibility
 - ✅ FIX: _grade_bucket() now supports Grade 12 (CL Ultra Flawless) — was silently dropping to N/A
 - ✅ FIX: Removed duplicate /api/collection/update-values endpoint (mock was overwriting real)
 - ✅ FIX: Memorabilia assessment now uses detail:high images (was low — couldn't see seal damage)
@@ -3539,102 +3532,18 @@ Respond ONLY with JSON, no extra text.
     # are ALWAYS generated when PIL is available and are fed back into
     # grading logic to surface print lines, whitening, scratches, and dents.
 
-    second_pass = {"enabled": True, "ran": False, "skipped_reason": None, "glare_suspects": [], "defect_candidates": []}
-    # Optional preview images (filtered variants). Keep defined to avoid runtime errors.
-    defect_filters: Dict[str, str] = {}
-    try:
-        # Only run for cards; memorabilia uses a different endpoint.
-        front_vars = _make_defect_filter_variants(front_bytes)
-        back_vars = _make_defect_filter_variants(back_bytes)
-
-        # Expose filtered variants as base64 strings (if present). Frontend may ignore these.
-        if isinstance(front_vars, dict):
-            for k, v in front_vars.items():
-                if isinstance(v, (bytes, bytearray)) and len(v) > 200:
-                    defect_filters[f"front_{k}"] = _b64(bytes(v))
-        if isinstance(back_vars, dict):
-            for k, v in back_vars.items():
-                if isinstance(v, (bytes, bytearray)) and len(v) > 200:
-                    defect_filters[f"back_{k}"] = _b64(bytes(v))
-
-        if not front_vars and not back_vars:
-            second_pass["enabled"] = False
-            second_pass["skipped_reason"] = "image_filters_unavailable"
-        else:
-            sp_prompt = f"""You are a meticulous trading card defect inspector.
-You are analyzing ENHANCED/FILTERED variants created to make defects stand out (print lines, scratches, whitening, dents).
-Each image is labeled with the filter applied. Use ALL of them together to build a complete defect picture.
-You may also receive an ANGLED image used to rule out glare/light refraction.
-
-FILTER GUIDE:
-- gray_autocontrast: general purpose high-contrast for print lines, subtle whitening
-- contrast_sharp: sharpened contrast — best for scratches and light print lines
-- edge_wear: highlights bright low-chroma pixels at borders (red=whitening/silvering hit)
-- sobel_surface: Sobel edge interior only — reveals surface scratches, print marks
-- sobel_edges: full Sobel — confirms card border straightness and edge chipping
-- channel_r/g/b: red/green/blue isolation — color shifts reveal inks, stains, yellowing
-
-CRITICAL:
-- Do NOT treat holo sheen / glare as whitening. If the angled shot suggests the mark moves/disappears, flag it as glare_suspect.
-- Foil/holo sparkle, textured foil, embossing, and normal card printing texture are NOT defects.
-- Card texture is NOT damage unless there is a true crease/indent/paper break.
-- Print lines are typically straight and consistent; glare moves with angle.
-- The edge_wear filter turns whitening RED — any red areas near borders = real whitening evidence.
-
-Return ONLY valid JSON:
-{{
-  "defect_candidates": [
-    {{"type":"print_line|scratch|whitening|dent|crease|tear|stain|other","severity":"minor|moderate|severe","note":"short plain description","confidence":0-1,"supporting_filter":"which filter revealed this"}}
-  ],
-  "glare_suspects": [
-    {{"type":"whitening|scratch|print_line|other","note":"why it looks like glare","confidence":0-1}}
-  ]
-}}
-"""
-
-            content_parts = [{"type": "text", "text": sp_prompt}]
-
-            # Send ALL filter variants for thorough analysis
-            filter_order = [
-                ("gray_autocontrast",  "gray_autocontrast"),
-                ("contrast_sharp",     "contrast_sharp"),
-                ("edge_wear",          "edge_wear — RED = whitening/silvering at borders"),
-                ("sobel_surface",      "sobel_surface — interior surface anomalies"),
-                ("sobel_edges",        "sobel_edges — edge sharpness + chipping"),
-                ("channel_r",          "channel_r — red isolation"),
-                ("channel_b",          "channel_b — blue isolation"),
-            ]
-
-            for var_key, label in filter_order:
-                for side_prefix, side_label in [("front", "FRONT"), ("back", "BACK")]:
-                    vd = front_vars if side_prefix == "front" else back_vars
-                    if vd.get(var_key):
-                        content_parts += [
-                            {"type": "text", "text": f"{side_label} ({label})"},
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(vd[var_key])}", "detail": "high"}}
-                        ]
-
-            # Include angled if available (glare check)
-            if angled_bytes and len(angled_bytes) > 200:
-                content_parts += [
-                    {"type":"text","text":"OPTIONAL ANGLED IMAGE (glare check)"},
-                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{_b64(angled_bytes)}", "detail":"high"}}
-                ]
-
-            sp_msg = [{"role":"user","content": content_parts}]
-            sp_result = await _openai_chat(sp_msg, max_tokens=1400, temperature=0.1)
-            if not sp_result.get("error"):
-                sp_data = _parse_json_or_none(sp_result.get("content","")) or {}
-                if isinstance(sp_data, dict):
-                    second_pass["ran"] = True
-                    if isinstance(sp_data.get("glare_suspects"), list):
-                        second_pass["glare_suspects"] = sp_data.get("glare_suspects")[:10]
-                    if isinstance(sp_data.get("defect_candidates"), list):
-                        second_pass["defect_candidates"] = sp_data.get("defect_candidates")[:20]
-            else:
-                second_pass["skipped_reason"] = "second_pass_ai_failed"
-    except Exception:
-        second_pass["skipped_reason"] = "second_pass_exception"
+    # Second-pass AI disabled — single-pass mode to stay within Render memory limits.
+    # The first-pass OpenAI vision call already handles defect detection comprehensively.
+    # ── Single-pass mode ────────────────────────────────────────────────────
+    # Second AI pass + image filter variants DISABLED to stay within Render's
+    # 512 MB free-tier memory limit.  The primary vision call already covers
+    # defects comprehensively; the second pass added ~200-300 MB peak overhead.
+    second_pass = {
+        "enabled": False, "ran": False,
+        "skipped_reason": "single_pass_mode",
+        "glare_suspects": [], "defect_candidates": []
+    }
+    defect_filters: Dict[str, str] = {}   # kept for response schema compat
 
 
     # ------------------------------
@@ -3647,10 +3556,7 @@ Return ONLY valid JSON:
         rois = []
 
     roi_labels: List[Dict[str, Any]] = []
-    try:
-        roi_labels = await _openai_label_rois(rois, front_bytes, back_bytes) if rois else []
-    except Exception:
-        roi_labels = []
+    # ROI AI labeling also disabled (memory); CV crops still captured for UI thumbnails
 
     if isinstance(second_pass, dict):
         second_pass["roi_labels"] = roi_labels
@@ -4472,15 +4378,8 @@ Keep grading logic identical; only tailor advice tone and context.
             rois_m = []
     
         roi_labels_m: List[Dict[str, Any]] = []
-        try:
-            roi_labels_m = []
-            if rois_m:
-                roi_labels_m = await _openai_label_rois(rois_m, b1, b2)
-    
-        except Exception:
-            roi_labels_m = []
-    
-        label_by_idx_m = {int(x.get("crop_index", -1)): x for x in (roi_labels_m or []) if isinstance(x, dict)}
+        # _openai_label_rois disabled — single-pass mode for memory budget
+        label_by_idx_m: Dict[int, Dict[str, Any]] = {}
     
         # If the LLM clearly reported defects, force a few best ROI crops even if the labeler is conservative.
         force_idxs = set()
