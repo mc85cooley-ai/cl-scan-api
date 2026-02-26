@@ -687,6 +687,72 @@ def _build_ebay_search_query(card_name: str, card_set: str = "", card_number: st
     return q.strip()
 
 
+def _detect_tcg_game(card_name: str, set_name: str = "", card_number: str = "") -> str:
+    """
+    Detect which TCG game a card belongs to based on set name patterns and card number prefixes.
+    Returns the eBay-friendly game keyword to inject into search queries.
+
+    Returns:
+        "Pokemon"   — Pokemon TCG (default when uncertain)
+        "One Piece" — One Piece Card Game (OP prefix)
+        "Dragon Ball" — Dragon Ball Super Card Game (BT/FB/B prefix)
+        "Digimon"   — Digimon Card Game (BT/EX prefix with Digimon sets)
+        "Magic"     — Magic: The Gathering
+        "Yu-Gi-Oh"  — Yu-Gi-Oh!
+    """
+    set_lower  = (set_name or "").lower().strip()
+    name_lower = (card_name or "").lower().strip()
+    num_upper  = (card_number or "").upper().strip()
+
+    # One Piece Card Game — set codes: OP01-OP15, ST (starter decks), P (promo)
+    one_piece_sets = ["romance dawn", "paramount war", "pillars of strength", "kingdoms of intrigue",
+                      "awakening of the new era", "wings of the captain", "500 years in the future",
+                      "two legends", "emperors in the new world", "royal blood", "supreme darkness",
+                      "side characters", "memorial collection", "op-", "op0", "op1", "op2", "op3",
+                      "op4", "op5", "op6", "op7", "op8", "op9", "op10", "op11", "op12", "op13",
+                      "op14", "op15", "one piece"]
+    for marker in one_piece_sets:
+        if marker in set_lower:
+            return "One Piece"
+    # One Piece card numbers: OP01-123, ST01-001, etc.
+    if re.match(r'^(OP\d{2}|ST\d{2})', num_upper):
+        return "One Piece"
+
+    # Dragon Ball Super Card Game — sets: BT, FB, B series; Fusion World
+    dbs_sets = ["dragon ball", "fusion world", "zenkai series", "galactic battle", "union force",
+                "cross worlds", "colossal warfare", "realm of the gods", "miraculous revival",
+                "ultimate squad", "bt0", "bt1", "bt2", "bt3", "bt4", "bt5", "bt6", "bt7", "bt8",
+                "bt9", "bt10", "bt11", "bt12", "bt13", "bt14", "bt15", "bt16", "bt17", "bt18",
+                "fb0", "fb01", "fb02", "fb03", "fb04"]
+    for marker in dbs_sets:
+        if marker in set_lower:
+            return "Dragon Ball"
+    if re.match(r'^(BT\d{2}|FB\d{2})', num_upper):
+        return "Dragon Ball"
+
+    # Digimon — sets: BT/EX/RB/P/ST with Digimon context
+    if "digimon" in set_lower or "digimon" in name_lower:
+        return "Digimon"
+    if re.match(r'^(BT\d|EX\d|RB\d)', num_upper) and "digimon" in name_lower:
+        return "Digimon"
+
+    # Magic: The Gathering
+    mtg_markers = ["magic", "mtg", "the gathering", "commander", "dominaria", "innistrad",
+                   "zendikar", "strixhaven", "eldraine", "theros", "ravnica", "throne of eldraine"]
+    for marker in mtg_markers:
+        if marker in set_lower or marker in name_lower:
+            return "Magic"
+
+    # Yu-Gi-Oh
+    ygo_markers = ["yu-gi-oh", "yugioh", "master duel", "speed duel", "konami", "duel links"]
+    for marker in ygo_markers:
+        if marker in set_lower or marker in name_lower:
+            return "Yu-Gi-Oh"
+
+    # Default: Pokemon (most common in this platform)
+    return "Pokemon"
+
+
 def _build_ebay_query_ladder(
     card_name: str,
     set_name: str = "",
@@ -776,7 +842,30 @@ def _build_ebay_query_ladder(
 
     # Final ultra-broad fallback (sometimes "card" hurts recall)
     if card_name:
+    # ── Game-type injection ──────────────────────────────────────────────────
+    # Detect which TCG this card belongs to based on set name patterns and
+    # card number prefixes. This prevents cross-game contamination in eBay
+    # results (e.g. One Piece OP12 cards returning Pokemon sealed boxes).
+    game_keyword = _detect_tcg_game(card_name, set_name, card_number)
+
+    if game_keyword and game_keyword != "Pokemon":
+        # For non-Pokemon games, add targeted game variants and remove Pokemon fallbacks
+        ladder_with_game = []
+        for q in ladder:
+            # Replace any "Pokemon" word in existing queries with correct game
+            if "Pokemon" in q:
+                ladder_with_game.append(_norm_ws(q.replace("Pokemon", game_keyword)))
+            else:
+                ladder_with_game.append(q)
+        # Add game-specific fallback
+        if card_name:
+            ladder_with_game.append(_norm_ws(f"{card_name} {game_keyword}"))
+        ladder = ladder_with_game
+    elif game_keyword == "Pokemon":
         ladder.append(_norm_ws(f"{card_name} Pokemon"))
+    else:
+        # Unknown game — don't append Pokemon fallback blindly
+        ladder.append(_norm_ws(f"{card_name} trading card"))
 
     # Deduplicate while preserving order
     seen = set()
@@ -5627,11 +5716,13 @@ async def get_market_trends(
         if not ident:
             raise HTTPException(status_code=400, detail="card_identifier required")
 
-        # Parse identifier: "CardName|SetName|Grade"
+        # Parse identifier: "CardName|SetName|Grade" or "CardName|SetName|CardNumber|Grade"
         parts = [p.strip() for p in ident.split("|")] if "|" in ident else [ident]
-        card_name = parts[0] if len(parts) > 0 else ""
-        set_name = parts[1] if len(parts) > 1 else ""
-        grade = parts[2] if len(parts) > 2 else ""
+        card_name   = parts[0] if len(parts) > 0 else ""
+        set_name    = parts[1] if len(parts) > 1 else ""
+        # Support optional card_number in slot 2 (4-segment ident: Name|Set|Number|Grade)
+        card_number = parts[2] if len(parts) > 3 else ""
+        grade       = parts[3] if len(parts) > 3 else (parts[2] if len(parts) > 2 else "")
 
         logging.info(f"🔍 Market trends request: {ident}")
 
@@ -5699,9 +5790,9 @@ async def get_market_trends(
 
         # Build eBay query ladder (specific -> broad)
         if "|" in ident:
-            queries = _build_ebay_query_ladder(card_name=card_name, card_set=set_name, grade=grade)
+            queries = _build_ebay_query_ladder(card_name=card_name, card_set=set_name, card_number=card_number, grade=grade)
         else:
-            queries = _build_ebay_query_ladder(card_name=ident, card_set="", grade=grade)
+            queries = _build_ebay_query_ladder(card_name=ident, card_set="", card_number="", grade=grade)
 
         if not queries:
             raise HTTPException(status_code=400, detail="Could not build search query")
@@ -6009,8 +6100,10 @@ def generate_mock_price_history(days: int):
 
 def predict_future_prices(historical_data, forecast_days: int = 90):
     """Generate price predictions using linear regression with safe fallbacks."""
-    if not historical_data or len(historical_data) < 30:
-        return {"available": False, "reason": "Insufficient historical data"}
+    # Require at least 5 data points for a meaningful trend
+    # (30 meant waiting a month before ANY prediction — too conservative for a live product)
+    if not historical_data or len(historical_data) < 5:
+        return {"available": False, "reason": "Insufficient historical data (need 5+ recorded price points)"}
 
     prices = [float(d.get("price_median", 0) or 0) for d in historical_data]
     n = len(prices)
@@ -6064,17 +6157,21 @@ def predict_future_prices(historical_data, forecast_days: int = 90):
     predictions = []
     for i in range(forecast_days):
         days = i + 1
-        # Dampen magnitude over time (floor 70%), but NEVER flip sign
-        damp = max(0.70, 1.0 - days * 0.0033)
+        # Progressive dampening: slope effect weakens over time to prevent runaway forecasts.
+        # Starts at 100% and smoothly reduces to 65% at 90 days — keeps sign, reduces magnitude.
+        damp = max(0.65, 1.0 - days * 0.0039)
         change_magnitude = abs(daily_change) * days * damp
         if daily_change >= 0:
             predicted_price = base_price + change_magnitude
         else:
             predicted_price = base_price - change_magnitude
-        # Floor: never predict below 90% of last known price
-        predicted_price = max(predicted_price, base_price * 0.90)
-        lower_bound = predicted_price - (1.96 * std_dev)
-        upper_bound = predicted_price + (1.96 * std_dev)
+        # Adaptive floor: loosens slightly over longer horizons but never catastrophic
+        # 30d floor = 93%, 60d floor = 90%, 90d floor = 87%
+        floor_pct = max(0.87, 1.0 - (days * 0.0014))
+        predicted_price = max(predicted_price, base_price * floor_pct)
+        # Tighter uncertainty bands: 1.3× std_dev (was 1.96×, which was too wide)
+        lower_bound = predicted_price - (1.3 * std_dev)
+        upper_bound = predicted_price + (1.3 * std_dev)
         future_date = datetime.now() + timedelta(days=i)
 
         predictions.append({
