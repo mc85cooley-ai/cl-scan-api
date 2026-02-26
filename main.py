@@ -715,6 +715,7 @@ def _build_ebay_query_ladder(
     # Handles: "9", "9.5", "PSA 9", "10 - Flawless", "12 - Ultra Flawless", "Grade: 8.5"
     g = (grade or "").strip()
     psa_token = ""
+    grade_is_12_plus = False  # True when CL grade 12+ (Ultra Flawless) was mapped to PSA 10 for search
     if g:
         if "psa" in g.lower():
             # Already has PSA prefix — extract numeric part and rebuild cleanly
@@ -733,6 +734,7 @@ def _build_ebay_query_ladder(
                     gval = float(numeric_g)
                     if gval >= 11:
                         numeric_g = "10"
+                        grade_is_12_plus = True  # Flag: mapped down from CL 12+ to PSA 10 for search
                 except Exception:
                     pass
                 if re.fullmatch(r"(10|[1-9](?:\.5)?)", numeric_g):
@@ -6249,6 +6251,7 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                     "card_name": card_name,
                     "sales_count": completed.get("count", 0),
                     "price_includes_grade": grade_in_query,
+                    "grade_12_uplift": grade_is_12_plus,
                     "last_updated": datetime.now().isoformat()
                 }
 
@@ -6267,6 +6270,7 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                     "card_name": card_name,
                     "listings_count": active.get("count", 0),
                     "price_includes_grade": grade_in_query,
+                    "grade_12_uplift": grade_is_12_plus,
                     "last_updated": datetime.now().isoformat()
                 }
 
