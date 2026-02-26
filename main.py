@@ -715,7 +715,6 @@ def _build_ebay_query_ladder(
     # Handles: "9", "9.5", "PSA 9", "10 - Flawless", "12 - Ultra Flawless", "Grade: 8.5"
     g = (grade or "").strip()
     psa_token = ""
-    grade_is_12_plus = False  # True when CL grade 12+ (Ultra Flawless) was mapped to PSA 10 for search
     if g:
         if "psa" in g.lower():
             # Already has PSA prefix — extract numeric part and rebuild cleanly
@@ -734,7 +733,6 @@ def _build_ebay_query_ladder(
                     gval = float(numeric_g)
                     if gval >= 11:
                         numeric_g = "10"
-                        grade_is_12_plus = True  # Flag: mapped down from CL 12+ to PSA 10 for search
                 except Exception:
                     pass
                 if re.fullmatch(r"(10|[1-9](?:\.5)?)", numeric_g):
@@ -3339,8 +3337,14 @@ CRITICAL RULES:
    - If a mark disappears or changes drastically in the ANGLED shot, treat it as glare/reflection, NOT whitening/damage.
    - Print lines are typically straight and consistent across lighting; glare moves with angle.
    - Card texture (especially modern) is not damage unless there is a true crease, indentation, or paper break.
-   - MANUFACTURED FINISH AWARENESS: Identify the card's finish type from the image (Standard, Holofoil, Reverse Holofoil, Textured/Stamped, Etched, Glossy Foil, Full Art Foil, Rainbow Foil, etc.) and FACTOR THIS INTO YOUR SURFACE ASSESSMENT. A textured foil card WILL have a different surface appearance than a standard card — sparkle, grain, relief patterns and embossed texture are EXPECTED features, not defects. A Holofoil card WILL have rainbow shimmer. A Full Art Foil WILL have uniform metallic coverage. Assess surface quality relative to what is EXPECTED for that specific finish type.
-   - When assessing surface: note the finish type detected first, then evaluate surface condition AGAINST that finish baseline. Example: "This is a textured foil card — the grain pattern is normal and expected. I can see one faint scratch crossing the texture on the upper left quadrant that is NOT part of the texture pattern."
+   - MANUFACTURED FINISH AWARENESS (MANDATORY — do this FIRST for every card):
+     STEP 1 — Identify finish: Start your surface notes by stating the detected finish type in brackets. Example: [Finish: Reverse Holofoil]. Choose from: Standard/Matte, Glossy/Foil, Holofoil, Reverse Holofoil, Textured/Embossed Foil, Etched Foil, Full Art Foil, Rainbow Foil, Cosmos Holo, Mirror Foil, or Prism Foil.
+     STEP 2 — Set the baseline: State what is NORMAL for that finish (e.g., sparkle is normal for Holofoil; grain/emboss texture is normal for Textured Foil; uniform metallic sheen is normal for Full Art Foil; high gloss is normal for Glossy Foil).
+     STEP 3 — Evaluate against that baseline ONLY: Only flag marks that are clearly NOT part of the intended finish pattern. A holo shimmer is NOT a defect. A sparkle pattern is NOT a scratch. A raised texture is NOT an indent.
+     STEP 4 — If you see an actual defect (a scratch that crosses through the texture pattern, a dull patch on an otherwise glossy surface, a mark that appears at consistent angles), describe it precisely: location, direction, depth, and whether it breaks the finish pattern.
+   - CONSISTENCY RULE: Your surface notes and your grade must AGREE. If you say surface is "Near Mint" and list only minor gloss issues typical of the finish type, your grade must not penalise surface heavily. If you give a surface defect, it must appear in your defects array too.
+   - DO NOT write contradictory statements: do not say "minor scratches visible" AND "surface is clean" in the same assessment.
+   - When assessing surface: note the finish type detected first, then evaluate surface condition AGAINST that finish baseline. Example: "[Finish: Holofoil] — Holo shimmer and sparkle are normal for this finish type. The surface presents cleanly with no scratches or dull patches crossing the holo pattern. One faint hairline on the front top-left crosses the holo layer at an angle inconsistent with the pattern — this is a real mark."
    - If the card appears to be inside a SLEEVE, TOPLOADER, or SEMI-RIGID, account for sleeve-induced glare, refraction artifacts, and edge distortion. Note this in your assessment.
 
 5) Write the assessment summary in first person, conversational style (5-8 sentences):
@@ -3388,7 +3392,7 @@ Return ONLY valid JSON with this EXACT structure:
   "centering": {{
     "front": {{
       "grade": "55/45",
-      "notes": "CENTERING STYLE — Express using the ratio split percentage, NEVER mm. Examples: '50/50 — perfectly centered'; '55/45 — barely perceptible tilt, non-issue for any grade'; '60/40 — noticeable, acceptable up to grade 9'; '65/35 — clearly heavy [side], limiting grade 9+'; '70/30 or worse — significant, cap at 7-8'; '80/20+ — severe, major defect'. State: the ratio (e.g. 71/29), the offset from 50/50 as a percentage (e.g. 21% off true center), the heavier direction, and the grade impact."
+      "notes": "CENTERING STYLE — Use a SINGLE ratio throughout; pick the one you observe and stick to it. Express ONLY as a ratio split percentage, NEVER mm. Examples: '50/50 — perfectly centered, non-issue for any grade'; '55/45 — barely perceptible, non-issue for grade 9+'; '60/40 — noticeable, acceptable up to grade 9'; '65/35 — clearly heavy [direction], limiting grade 9+'; '70/30 or worse — significant, cap at 7-8'; '80/20+ — severe, major grade limiter'. MANDATORY: State: (1) the observed ratio e.g. '56/44', (2) offset from 50/50 as a percentage e.g. '6% off center', (3) the heavier direction, (4) grade impact. DO NOT state different ratios in the same notes field — pick ONE and be consistent with it."
     }},
     "back": {{
       "grade": "60/40",
@@ -3531,16 +3535,36 @@ Respond ONLY with JSON, no extra text.
                 # If auto-centering says perfect L/R, drop any left/right claims from AI text to avoid contradictions.
                 if str(cen_front.get("lr") or "") in ("50/50","50 / 50") and prev:
                     prev = re.sub(r"(?i)\b(off-?center\s+towards\s+the\s+(left|right)|towards\s+the\s+(left|right))\b[^.]*\.?\s*", "", prev).strip()
-                prefix = f"Auto-centering (computed): L/R {cen_front.get('lr')} | T/B {cen_front.get('tb')}."
-                data["centering"]["front"]["notes"] = (prefix + (" " + prev if prev else "")).strip()
+                computed_lr = cen_front.get('lr') or ''
+                prefix = f"Auto-centering (computed): L/R {computed_lr} | T/B {cen_front.get('tb')}."
+                # Strip any ratio in the AI notes that conflicts with the computed value.
+                # e.g. if computed says 56/44 but AI wrote "55/45" or "slightly off at 55/45"
+                def _strip_ratio_mentions(text: str, keep_ratio: str) -> str:
+                    if not text or not keep_ratio:
+                        return text
+                    # Remove patterns like "XX/YY" that are NOT the computed ratio
+                    cleaned = re.sub(
+                        r'\b(\d{2,3}/\d{2,3})\b',
+                        lambda m: m.group(0) if m.group(0) == keep_ratio else '',
+                        text
+                    )
+                    # Remove leftover phrases like "slightly off at , " from the above
+                    cleaned = re.sub(r'(?i)(slightly off at|centering is|offset of),?\s*,', '', cleaned)
+                    cleaned = re.sub(r'\s{2,}', ' ', cleaned)
+                    cleaned = re.sub(r',\s*\.', '.', cleaned)
+                    return cleaned.strip()
+                cleaned_prev = _strip_ratio_mentions(prev, computed_lr)
+                data["centering"]["front"]["notes"] = (prefix + (" " + cleaned_prev if cleaned_prev else "")).strip()
             if cen_back:
                 data["centering"].setdefault("back", {})
                 data["centering"]["back"]["grade"] = cen_back.get("lr") or data["centering"]["back"].get("grade")
                 prev = str(data["centering"]["back"].get("notes") or "").strip()
                 if str(cen_back.get("lr") or "") in ("50/50","50 / 50") and prev:
                     prev = re.sub(r"(?i)\b(off-?center\s+towards\s+the\s+(left|right)|towards\s+the\s+(left|right))\b[^.]*\.?\s*", "", prev).strip()
-                prefix = f"Auto-centering (computed): L/R {cen_back.get('lr')} | T/B {cen_back.get('tb')}."
-                data["centering"]["back"]["notes"] = (prefix + (" " + prev if prev else "")).strip()
+                computed_lr_back = cen_back.get('lr') or ''
+                prefix = f"Auto-centering (computed): L/R {computed_lr_back} | T/B {cen_back.get('tb')}."
+                cleaned_prev_back = _strip_ratio_mentions(prev, computed_lr_back) if 'computed_lr' in dir() else prev
+                data["centering"]["back"]["notes"] = (prefix + (" " + cleaned_prev_back if cleaned_prev_back else "")).strip()
     except Exception:
         pass
 
@@ -5385,7 +5409,27 @@ async def market_context(
                 f" If you want a faster sale, price closer to {_money(take_at)} AUD; if you can wait, start near {_money(list_at)} AUD and adjust."
             ])
 
-    market_summary = _norm_ws(f"{opener}{grade_line}{price_line}{trend_line}{position_line}{graded_line}{grade_advice}{advice_line}")
+    # ── Blend PriceCharting reference into summary when available ──
+    pc_line = ""
+    try:
+        if isinstance(pc_supplement, dict) and pc_supplement.get("available"):
+            pc_obs = (pc_supplement.get("observed") or {}).get("active") or {}
+            pc_low  = pc_obs.get("p20")
+            pc_mid  = pc_obs.get("p50")
+            pc_high = pc_obs.get("p80")
+            if pc_low is not None and pc_mid is not None and pc_high is not None:
+                pc_line = (
+                    f" PriceCharting also shows this card ranging from {_money(pc_low)}–{_money(pc_high)} AUD",
+                    f" (mid {_money(pc_mid)} AUD) across condition buckets — use both as a sanity-check.",
+                )
+                pc_line = "".join(pc_line)
+            elif pc_mid is not None:
+                pc_line = f" PriceCharting mid-market is {_money(pc_mid)} AUD — treat as a cross-reference.",
+                pc_line = pc_line[0] if isinstance(pc_line, tuple) else pc_line
+    except Exception:
+        pc_line = ""
+
+    market_summary = _norm_ws(f"{opener}{grade_line}{price_line}{trend_line}{pc_line}{position_line}{graded_line}{grade_advice}{advice_line}")
 
     # Strip any residual grading fee mentions (keep market info clean)
     try:
@@ -6251,7 +6295,6 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                     "card_name": card_name,
                     "sales_count": completed.get("count", 0),
                     "price_includes_grade": grade_in_query,
-                    "grade_12_uplift": grade_is_12_plus,
                     "last_updated": datetime.now().isoformat()
                 }
 
@@ -6270,7 +6313,6 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                     "card_name": card_name,
                     "listings_count": active.get("count", 0),
                     "price_includes_grade": grade_in_query,
-                    "grade_12_uplift": grade_is_12_plus,
                     "last_updated": datetime.now().isoformat()
                 }
 
