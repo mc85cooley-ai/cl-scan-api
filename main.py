@@ -841,7 +841,6 @@ def _build_ebay_query_ladder(
             ladder.append(q2)
 
     # Final ultra-broad fallback (sometimes "card" hurts recall)
-    if card_name:
     # ── Game-type injection ──────────────────────────────────────────────────
     # Detect which TCG this card belongs to based on set name patterns and
     # card number prefixes. This prevents cross-game contamination in eBay
@@ -862,10 +861,12 @@ def _build_ebay_query_ladder(
             ladder_with_game.append(_norm_ws(f"{card_name} {game_keyword}"))
         ladder = ladder_with_game
     elif game_keyword == "Pokemon":
-        ladder.append(_norm_ws(f"{card_name} Pokemon"))
+        if card_name:
+            ladder.append(_norm_ws(f"{card_name} Pokemon"))
     else:
         # Unknown game — don't append Pokemon fallback blindly
-        ladder.append(_norm_ws(f"{card_name} trading card"))
+        if card_name:
+            ladder.append(_norm_ws(f"{card_name} trading card"))
 
     # Deduplicate while preserving order
     seen = set()
