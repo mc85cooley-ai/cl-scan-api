@@ -712,15 +712,31 @@ def _build_ebay_query_ladder(
     name_only = _build_ebay_search_query(card_name=card_name, card_set="", card_number="", grade="")
 
     # Normalize grade into a PSA token when possible
+    # Handles: "9", "9.5", "PSA 9", "10 - Flawless", "12 - Ultra Flawless", "Grade: 8.5"
     g = (grade or "").strip()
     psa_token = ""
     if g:
         if "psa" in g.lower():
-            psa_token = g.strip()
+            # Already has PSA prefix — extract numeric part and rebuild cleanly
+            m_psa = re.search(r"(\d+(?:\.\d+)?)", g)
+            if m_psa:
+                psa_token = f"PSA {m_psa.group(1)}"
+            else:
+                psa_token = g.strip()
         else:
-            # numeric grade like "9" or "9.5"
-            if re.fullmatch(r"(10|[1-9](?:\.5)?)", g):
-                psa_token = f"PSA {g}"
+            # Extract numeric from strings like "10 - Flawless", "9.5", "Grade 9"
+            m_num = re.search(r"(\d+(?:\.\d+)?)", g)
+            if m_num:
+                numeric_g = m_num.group(1)
+                # CL grades 11+ → treat as PSA 10 equivalent for search
+                try:
+                    gval = float(numeric_g)
+                    if gval >= 11:
+                        numeric_g = "10"
+                except Exception:
+                    pass
+                if re.fullmatch(r"(10|[1-9](?:\.5)?)", numeric_g):
+                    psa_token = f"PSA {numeric_g}"
 
     ladder = []
     for q in [base, name_only]:
@@ -3254,7 +3270,7 @@ If {intent_context} is BUYING (user is considering purchasing this card):
 - In corner/edge/surface notes: Frame defects as NEGOTIATION LEVERAGE
   * Example: "Minor whitening on back top-right corner (about 1mm) — use this to negotiate 10-15% off the seller's asking price"
   * Example: "Light surface scratching visible under direct light on front — point this out to justify a lower offer"
-- In centering notes: Mention if it's a deal-breaker or acceptable
+- In centering notes: Express offset as a PERCENTAGE derived from the ratio (e.g. 71/29 = 21% off true center), NEVER as a physical mm measurement. State direction and grade impact.
   * "Centering is slightly off (60/40) but for this grade range, it's not a deal-breaker"
   * "Poor centering (70/30 left) significantly impacts value — factor this into your offer"
 - In overall assessment: 
@@ -3321,6 +3337,8 @@ CRITICAL RULES:
    - If a mark disappears or changes drastically in the ANGLED shot, treat it as glare/reflection, NOT whitening/damage.
    - Print lines are typically straight and consistent across lighting; glare moves with angle.
    - Card texture (especially modern) is not damage unless there is a true crease, indentation, or paper break.
+   - MANUFACTURED FINISH AWARENESS: Identify the card's finish type from the image (Standard, Holofoil, Reverse Holofoil, Textured/Stamped, Etched, Glossy Foil, Full Art Foil, Rainbow Foil, etc.) and FACTOR THIS INTO YOUR SURFACE ASSESSMENT. A textured foil card WILL have a different surface appearance than a standard card — sparkle, grain, relief patterns and embossed texture are EXPECTED features, not defects. A Holofoil card WILL have rainbow shimmer. A Full Art Foil WILL have uniform metallic coverage. Assess surface quality relative to what is EXPECTED for that specific finish type.
+   - When assessing surface: note the finish type detected first, then evaluate surface condition AGAINST that finish baseline. Example: "This is a textured foil card — the grain pattern is normal and expected. I can see one faint scratch crossing the texture on the upper left quadrant that is NOT part of the texture pattern."
    - If the card appears to be inside a SLEEVE, TOPLOADER, or SEMI-RIGID, account for sleeve-induced glare, refraction artifacts, and edge distortion. Note this in your assessment.
 
 5) Write the assessment summary in first person, conversational style (5-8 sentences):
@@ -3368,11 +3386,11 @@ Return ONLY valid JSON with this EXACT structure:
   "centering": {{
     "front": {{
       "grade": "55/45",
-      "notes": "Detailed observation: slightly off-center towards [direction], approximately [measurement]. [Impact on grade]."
+      "notes": "CENTERING STYLE — Express using the ratio split percentage, NEVER mm. Examples: '50/50 — perfectly centered'; '55/45 — barely perceptible tilt, non-issue for any grade'; '60/40 — noticeable, acceptable up to grade 9'; '65/35 — clearly heavy [side], limiting grade 9+'; '70/30 or worse — significant, cap at 7-8'; '80/20+ — severe, major defect'. State: the ratio (e.g. 71/29), the offset from 50/50 as a percentage (e.g. 21% off true center), the heavier direction, and the grade impact."
     }},
     "back": {{
       "grade": "60/40",
-      "notes": "Detailed observation: [specific description of centering quality]."
+      "notes": "Same centering style — use ratio + offset %, never mm measurements."
     }}
   }},
   "corners": {{
@@ -3525,8 +3543,44 @@ Respond ONLY with JSON, no extra text.
         pass
 
     # ------------------------------
-    # Second-pass (defect enhanced) analysis
+    # Post-process centering notes: strip mm measurements, ensure % language
     # ------------------------------
+    # The AI sometimes writes "approximately 5mm off-center" despite prompt instructions.
+    # We strip all physical distance references from centering notes since they're meaningless
+    # without knowing exact card dimensions, and replace with the ratio already in the prefix.
+    try:
+        def _clean_centering_notes(notes: str) -> str:
+            if not notes:
+                return notes
+            # Remove "approximately Xmm", "about Xmm", "X mm off", etc.
+            cleaned = re.sub(
+                r'(?i),?\s*approximately\s+\d+(?:\.\d+)?\s*mm\b[^.]*',
+                '',
+                notes
+            )
+            cleaned = re.sub(
+                r'(?i),?\s*about\s+\d+(?:\.\d+)?\s*mm\b[^.]*',
+                '',
+                cleaned
+            )
+            cleaned = re.sub(
+                r'(?i)\s*\(\s*\d+(?:\.\d+)?\s*mm\s*\)',
+                '',
+                cleaned
+            )
+            # Collapse double spaces / orphaned punctuation
+            cleaned = re.sub(r'\s{2,}', ' ', cleaned)
+            cleaned = re.sub(r'\.\s*\.', '.', cleaned)
+            return cleaned.strip()
+
+        for side in ("front", "back"):
+            if isinstance(data.get("centering"), dict) and isinstance(data["centering"].get(side), dict):
+                n_val = data["centering"][side].get("notes") or ""
+                data["centering"][side]["notes"] = _clean_centering_notes(n_val)
+    except Exception:
+        pass
+
+
     # SECOND PASS GUARANTEE:
     # Enhanced filtered images (grayscale/autocontrast + contrast/sharpness)
     # are ALWAYS generated when PIL is available and are fed back into
@@ -4850,14 +4904,26 @@ async def market_context(
                 aud = await _price_to_aud(pv, pc)
                 if aud is None or aud <= 0:
                     continue
+                # Extract thumbnail image from Browse API response
+                thumb_url = ""
+                try:
+                    thumbs = it.get("thumbnailImages") or it.get("image") or {}
+                    if isinstance(thumbs, list) and thumbs:
+                        thumb_url = str(thumbs[0].get("imageUrl") or "")
+                    elif isinstance(thumbs, dict):
+                        thumb_url = str(thumbs.get("imageUrl") or "")
+                except Exception:
+                    thumb_url = ""
                 out.append({
                     "itemId": item_id,
                     "title": title,
                     "url": web_url,
+                    "image_url": thumb_url,
                     "condition": cond,
                     "price_aud": aud,
                     "currency": "AUD",
                     "raw_currency": pc,
+                    "source": "ebay",
                 })
             except Exception:
                 continue
@@ -5041,13 +5107,21 @@ async def market_context(
     active_stats = best_stats or {"count": 0, "low": None, "median": None, "high": None, "currency": "AUD"}
     active_debug = best_debug or {}
 
-    # If eBay comes back empty/thin (common for niche sealed/memorabilia wording),
-    # fall back to PriceCharting *only if configured*.
-    if int(active_stats.get("count") or 0) == 0 and PRICECHARTING_TOKEN:
+    # If eBay comes back empty/thin, fall back to PriceCharting as the primary source.
+    # But if eBay has results, we keep eBay as primary and add PC as supplemental.
+    pc_supplement: Dict[str, Any] = {}
+    if PRICECHARTING_TOKEN:
         q_pc = _norm_ws(item_name or n or description or used_query or "").strip()
-        pc_payload = await _market_context_pricecharting(q_pc, category_hint="", pid=product_id or "")
-        if pc_payload.get("available"):
-            return pc_payload
+        try:
+            pc_payload = await _market_context_pricecharting(q_pc, category_hint="", pid=product_id or "")
+            if pc_payload.get("available"):
+                if int(active_stats.get("count") or 0) == 0:
+                    # eBay completely empty — return PC as primary
+                    return pc_payload
+                # eBay has results — keep PC as supplemental price reference
+                pc_supplement = pc_payload
+        except Exception:
+            pass
 
     # --------------------------
     # Graded buckets (ACTIVE only; brand-agnostic)
@@ -5383,6 +5457,8 @@ async def market_context(
             "Informational market context only. ACTIVE listings are current asks and can differ from final sale prices. "
             "Figures are third-party estimates and may vary. Not financial advice."
         ),
+        # PC supplemental: grade-condition buckets from PriceCharting (if available alongside eBay data)
+        "pc_supplement": pc_supplement if isinstance(pc_supplement, dict) and pc_supplement.get("available") else None,
     }
     return resp
 
@@ -5907,10 +5983,24 @@ def predict_future_prices(historical_data, forecast_days: int = 90):
         var = sum((p - mean_price) ** 2 for p in prices) / max(1, len(prices))
         std_dev = var ** 0.5
 
+    # Anchor forecast from last known price (not regression intercept).
+    # Apply directional dampening that preserves sign — a rising trend
+    # should never flip to declining just because the dampener kicks in.
+    base_price = float(prices[-1])  # last known real price
+    daily_change = float(slope)     # regression slope = best estimate of daily movement
+
     predictions = []
     for i in range(forecast_days):
-        future_x = n + i
-        predicted_price = (slope * future_x) + intercept
+        days = i + 1
+        # Dampen magnitude over time (floor 70%), but NEVER flip sign
+        damp = max(0.70, 1.0 - days * 0.0033)
+        change_magnitude = abs(daily_change) * days * damp
+        if daily_change >= 0:
+            predicted_price = base_price + change_magnitude
+        else:
+            predicted_price = base_price - change_magnitude
+        # Floor: never predict below 90% of last known price
+        predicted_price = max(predicted_price, base_price * 0.90)
         lower_bound = predicted_price - (1.96 * std_dev)
         upper_bound = predicted_price + (1.96 * std_dev)
         future_date = datetime.now() + timedelta(days=i)
@@ -6141,6 +6231,8 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
 
         for search_query in queries:
             logging.info(f"🔍 eBay query: '{search_query}'")
+            # Detect if this query included a grade token (PSA/CGC/BGS/LeagueAI grade)
+            grade_in_query = bool(re.search(r'\bPSA\s*\d|\bCGC\s*\d|\bBGS\s*\d|\bgraded\b', search_query, re.I))
 
             # Try completed (sold) listings first
             completed = await _ebay_completed_stats(search_query, limit=10, days_lookback=30)
@@ -6156,6 +6248,7 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                     "queries_tried": queries,
                     "card_name": card_name,
                     "sales_count": completed.get("count", 0),
+                    "price_includes_grade": grade_in_query,
                     "last_updated": datetime.now().isoformat()
                 }
 
@@ -6173,6 +6266,7 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                     "queries_tried": queries,
                     "card_name": card_name,
                     "listings_count": active.get("count", 0),
+                    "price_includes_grade": grade_in_query,
                     "last_updated": datetime.now().isoformat()
                 }
 
@@ -6204,6 +6298,7 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
             "search_query": best_q,
             "queries_tried": queries,
             "card_name": card_name,
+            "price_includes_grade": False,
             "candidates_sold": candidates_sold,
             "candidates_active": candidates_active,
             "hint": "If the name/set is wrong, pick the closest match from candidates and save that price in WordPress.",
