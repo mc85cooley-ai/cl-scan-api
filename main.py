@@ -3441,7 +3441,7 @@ Return ONLY valid JSON with this EXACT structure:
   "centering": {{
     "front": {{
       "grade": "55/45",
-      "notes": "CENTERING STYLE — Use a SINGLE ratio throughout; pick the one you observe and stick to it. Express ONLY as a ratio split percentage, NEVER mm. Examples: '50/50 — perfectly centered, non-issue for any grade'; '55/45 — barely perceptible, non-issue for grade 9+'; '60/40 — noticeable, acceptable up to grade 9'; '65/35 — clearly heavy [direction], limiting grade 9+'; '70/30 or worse — significant, cap at 7-8'; '80/20+ — severe, major grade limiter'. MANDATORY: State: (1) the observed ratio e.g. '56/44', (2) offset from 50/50 as a percentage e.g. '6% off center', (3) the heavier direction, (4) grade impact. DO NOT state different ratios in the same notes field — pick ONE and be consistent with it."
+      "notes": "CENTERING: Measure the PRINTED BORDER widths — the coloured/white border between the card EDGE and the inner artwork frame. Measure left border vs right border for L/R ratio; top border vs bottom border for T/B ratio. DO NOT measure card position in the photo. Use a SINGLE ratio; never state two different ratios. Format: '55/45 L/R — 5% off centre to the left, acceptable for any grade.' Reference: 50/50=perfect; 55/45=imperceptible; 60/40=noticeable; 65/35=limiting ≥9; 70/30=significant cap 7-8; 75/25=severe."
     }},
     "back": {{
       "grade": "60/40",
@@ -3452,36 +3452,36 @@ Return ONLY valid JSON with this EXACT structure:
     "front": {{
       "top_left": {{
         "condition": "sharp/minor_whitening/whitening/silvering/bend/ding/crease",
-        "notes": "Specific description: [exactly what you see, be detailed]"
+        "notes": "Examine closely: is the tip sharp and intact, or is there any fibre separation, micro-rounding, compression, whitening or silvering at the very tip? State EXACTLY what you see — even minor issues must be noted."
       }},
       "top_right": {{
         "condition": "sharp/minor_whitening/whitening/silvering/bend/ding/crease",
-        "notes": "Specific description: [exactly what you see]"
+        "notes": "Examine the tip and within 3mm of the corner for whitening/silvering, fibre lifting, bend, or creasing. State exactly what you see."
       }},
       "bottom_left": {{
         "condition": "sharp/minor_whitening/whitening/silvering/bend/ding/crease",
-        "notes": "Specific description: [exactly what you see]"
+        "notes": "Examine the tip and within 3mm of the corner. Note any compression, rounding, or colour loss at the corner tip."
       }},
       "bottom_right": {{
         "condition": "sharp/minor_whitening/whitening/silvering/bend/ding/crease",
-        "notes": "Specific description: [exactly what you see]"
+        "notes": "Examine the tip and within 3mm of the corner. Note any whitening, silvering, fibre exposure or structural deformation."
       }}
     }},
     "back": {{
-      "top_left": {{"condition": "...", "notes": "..."}},
-      "top_right": {{"condition": "...", "notes": "..."}},
-      "bottom_left": {{"condition": "...", "notes": "..."}},
-      "bottom_right": {{"condition": "...", "notes": "..."}}
+      "top_left": {{"condition": "...", "notes": "Examine back corner tip and within 3mm. Note whitening, silvering, fibre lifting, or any compression."}},
+      "top_right": {{"condition": "...", "notes": "Examine back corner tip and within 3mm. State exactly what you see."}},
+      "bottom_left": {{"condition": "...", "notes": "Examine back corner tip and within 3mm. Note any deformation or colour loss."}},
+      "bottom_right": {{"condition": "...", "notes": "Examine back corner tip and within 3mm. Note any whitening, silvering or structural issues."}}
     }}
   }},
   "edges": {{
     "front": {{
       "grade": "Mint/Near Mint/Excellent/Good/Poor",
-      "notes": "Walk around all 4 edges: top edge [description], right edge [description], bottom [description], left [description]. Note whitening vs silvering."
+      "notes": "Inspect ALL 4 edges individually. Top edge: [describe roughness, chipping, nicks, whitening, silvering]. Right edge: [describe]. Bottom edge: [describe]. Left edge: [describe]. State clearly if each edge is clean/pristine or has wear. Note any fraying, micro-chipping, colour loss at edges."
     }},
     "back": {{
       "grade": "Mint/Near Mint/Excellent/Good/Poor",
-      "notes": "Detailed edge-by-edge assessment with locations."
+      "notes": "Inspect ALL 4 back edges individually. Top: [describe]. Right: [describe]. Bottom: [describe]. Left: [describe]. Note roughness, silvering, whitening, micro-chipping or fraying on each edge."
     }}
   }},
   "surface": {{
@@ -3572,56 +3572,29 @@ Respond ONLY with JSON, no extra text.
     # True centering estimate (computed from pixels)
     # ------------------------------
     # The model sometimes repeats generic centering language. We compute a best-effort
-    # left/right and top/bottom ratio from the uploaded images and inject it into the
-    # centering section so the UI reflects *real* variation.
+    # ── Centering: AI vision is the primary assessment. ────────────────────────
+    # The edge-detection estimate (_estimate_centering_from_image) measures where
+    # the *card* sits in the *photo*, not the internal border-to-border ratio.
+    # Overriding the AI with it produces wrong results (e.g. a perfectly centred
+    # Eevee card coming out as 80/20 because the photo background skews the edge
+    # detection).  We keep the computed value as metadata for future calibration
+    # only — the AI's visual assessment is authoritative.
     try:
         cen_front = _estimate_centering_from_image(front_bytes)
-        cen_back = _estimate_centering_from_image(back_bytes)
-        if isinstance(data, dict):
+        cen_back  = _estimate_centering_from_image(back_bytes)
+        if isinstance(data, dict) and (cen_front or cen_back):
             data.setdefault("centering", {})
+            # Store raw computed values as _computed metadata (not displayed, for analytics)
             if cen_front:
                 data["centering"].setdefault("front", {})
-                data["centering"]["front"]["grade"] = cen_front.get("lr") or data["centering"]["front"].get("grade")
-                # keep notes from AI but prepend computed result
-                prev = str(data["centering"]["front"].get("notes") or "").strip()
-                # If auto-centering says perfect L/R, drop any left/right claims from AI text to avoid contradictions.
-                if str(cen_front.get("lr") or "") in ("50/50","50 / 50") and prev:
-                    prev = re.sub(r"(?i)\b(off-?center\s+towards\s+the\s+(left|right)|towards\s+the\s+(left|right))\b[^.]*\.?\s*", "", prev).strip()
-                computed_lr = cen_front.get('lr') or ''
-                prefix = f"Auto-centering (computed): L/R {computed_lr} | T/B {cen_front.get('tb')}."
-                # Strip any ratio in the AI notes that conflicts with the computed value.
-                # e.g. if computed says 56/44 but AI wrote "55/45" or "slightly off at 55/45"
-                def _strip_ratio_mentions(text: str, keep_lr: str, keep_tb: str = "") -> str:
-                    """Remove AI-written ratio claims that contradict the computed values."""
-                    if not text:
-                        return text
-                    keep_set = {r for r in [keep_lr, keep_tb] if r}
-                    # Remove any XX/YY ratio NOT in our computed set
-                    cleaned = re.sub(
-                        r'\b(\d{2,3}/\d{2,3})\b',
-                        lambda m: m.group(0) if m.group(0) in keep_set else '',
-                        text
-                    )
-                    # Remove orphaned phrases left after ratio removal
-                    cleaned = re.sub(r'(?i)\b(slightly off at|centering is|offset of|off by),?\s*[,.]?\s*', '', cleaned)
-                    cleaned = re.sub(r'\s{2,}', ' ', cleaned)
-                    cleaned = re.sub(r',\s*\.', '.', cleaned)
-                    cleaned = re.sub(r'\s+\.', '.', cleaned)
-                    return cleaned.strip()
-                cen_front_tb = cen_front.get('tb') or ''
-                cleaned_prev = _strip_ratio_mentions(prev, computed_lr, cen_front_tb)
-                data["centering"]["front"]["notes"] = (prefix + (" " + cleaned_prev if cleaned_prev else "")).strip()
+                data["centering"]["front"]["_computed_lr"] = cen_front.get("lr")
+                data["centering"]["front"]["_computed_tb"] = cen_front.get("tb")
+                data["centering"]["front"]["_computed_margins"] = cen_front.get("margins")
             if cen_back:
                 data["centering"].setdefault("back", {})
-                data["centering"]["back"]["grade"] = cen_back.get("lr") or data["centering"]["back"].get("grade")
-                prev = str(data["centering"]["back"].get("notes") or "").strip()
-                if str(cen_back.get("lr") or "") in ("50/50","50 / 50") and prev:
-                    prev = re.sub(r"(?i)\b(off-?center\s+towards\s+the\s+(left|right)|towards\s+the\s+(left|right))\b[^.]*\.?\s*", "", prev).strip()
-                computed_lr_back = cen_back.get('lr') or ''
-                prefix = f"Auto-centering (computed): L/R {computed_lr_back} | T/B {cen_back.get('tb')}."
-                cen_back_tb = cen_back.get('tb') or ''
-                cleaned_prev_back = _strip_ratio_mentions(prev, computed_lr_back, cen_back_tb) if computed_lr_back else prev
-                data["centering"]["back"]["notes"] = (prefix + (" " + cleaned_prev_back if cleaned_prev_back else "")).strip()
+                data["centering"]["back"]["_computed_lr"] = cen_back.get("lr")
+                data["centering"]["back"]["_computed_tb"] = cen_back.get("tb")
+                data["centering"]["back"]["_computed_margins"] = cen_back.get("margins")
     except Exception:
         pass
 
