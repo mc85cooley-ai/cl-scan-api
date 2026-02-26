@@ -1012,18 +1012,29 @@ async def _ebay_completed_stats(keyword_query: str, limit: int = 120, days_lookb
         idx = max(0, min(count - 1, idx))
         return float(prices[idx])
 
+    raw_median = pct(0.50)
+    raw_low    = pct(0.20)
+    raw_high   = pct(0.80)
+
+    # When sample is very small (< 3), percentiles collapse to the same value.
+    # Apply a synthetic spread so low/median/high are meaningfully different.
+    # 5% spread each side — wide enough to signal uncertainty, narrow enough to be honest.
+    if count < 3:
+        raw_low  = min(raw_low,  raw_median * 0.95)
+        raw_high = max(raw_high, raw_median * 1.05)
+
     out = {
         "source": "ebay",
         "query": q,
         "count": count,
         "currency": "AUD",
         "prices": prices[:target],
-        "low": pct(0.20),
-        "median": pct(0.50),
-        "high": pct(0.80),
+        "low": raw_low,
+        "median": raw_median,
+        "high": raw_high,
         "avg": float(sum(prices) / count),
-        "p20": pct(0.20),
-        "p80": pct(0.80),
+        "p20": raw_low,
+        "p80": raw_high,
         "min": float(prices[0]),
         "max": float(prices[-1]),
     }
@@ -2485,18 +2496,27 @@ async def _ebay_active_stats(keyword_query: str, limit: int = 120) -> dict:
         idx = max(0, min(count - 1, int(round(p * (count - 1)))))
         return float(prices[idx])
 
+    raw_median = pct(0.50)
+    raw_low    = pct(0.20)
+    raw_high   = pct(0.80)
+
+    # Synthetic spread for tiny samples so low/median/high differ meaningfully
+    if count < 3:
+        raw_low  = min(raw_low,  raw_median * 0.95)
+        raw_high = max(raw_high, raw_median * 1.05)
+
     out = {
         "source": "ebay",
         "query": q,
         "count": count,
         "currency": "AUD",
         "prices": prices[:target],
-        "low": pct(0.20),
-        "median": pct(0.50),
-        "high": pct(0.80),
+        "low": raw_low,
+        "median": raw_median,
+        "high": raw_high,
         "avg": float(sum(prices) / count),
-        "p20": pct(0.20),
-        "p80": pct(0.80),
+        "p20": raw_low,
+        "p80": raw_high,
         "min": float(prices[0]),
         "max": float(prices[-1]),
     }
@@ -5823,18 +5843,56 @@ async def get_market_trends(
         price_high = 0.0
         volume = 0
 
-        if completed and completed.get("median"):
-            current_price = float(completed.get("median") or 0.0)
-            price_low = float(completed.get("low") or (current_price * 0.9))
-            price_high = float(completed.get("high") or (current_price * 1.1))
-            volume = int(completed.get("count") or 0)
-            logging.info(f"📊 eBay sold: ${current_price:.2f} ({volume} sales)")
-        elif active and active.get("median"):
-            current_price = float(active.get("median") or 0.0)
-            price_low = current_price * 0.9
-            price_high = current_price * 1.1
-            volume = int(active.get("count") or 0)
-            logging.info(f"📊 eBay active: ${current_price:.2f} ({volume} listings)")
+        # ── Smart price blending ──────────────────────────────────────────
+        # Minimum required sold records before trusting completed stats alone.
+        # With < 3 sold records, a single outlier sale dominates the median.
+        # In those cases, blend with active listing prices for a fairer picture.
+        MIN_COMPLETED_TRUST = 3
+
+        comp_count   = int(completed.get("count") or 0) if completed else 0
+        comp_median  = float(completed.get("median") or 0.0) if completed else 0.0
+        active_count = int(active.get("count") or 0)   if active   else 0
+        active_median = float(active.get("median") or 0.0) if active else 0.0
+
+        if comp_median > 0 and comp_count >= MIN_COMPLETED_TRUST:
+            # Enough sold data — use completed median as ground truth
+            current_price = comp_median
+            price_low  = float(completed.get("low")  or current_price * 0.90)
+            price_high = float(completed.get("high") or current_price * 1.10)
+            volume = comp_count
+            logging.info(f"📊 eBay sold ({comp_count} sales): ${current_price:.2f}")
+
+        elif comp_median > 0 and active_median > 0 and active_count >= MIN_COMPLETED_TRUST:
+            # Sparse sold data (< 3 records) but active listings available.
+            # Blend: sold carries 40% weight, active 60% (active is denser).
+            current_price = round(comp_median * 0.40 + active_median * 0.60, 2)
+            # Build band from both sources
+            price_low  = min(
+                float(completed.get("low")  or comp_median  * 0.90),
+                float(active.get("low")     or active_median * 0.90),
+            )
+            price_high = max(
+                float(completed.get("high") or comp_median  * 1.10),
+                float(active.get("high")    or active_median * 1.10),
+            )
+            volume = comp_count + active_count
+            logging.info(f"📊 eBay blend (sold={comp_count}, active={active_count}): ${current_price:.2f}")
+
+        elif comp_median > 0:
+            # Only sold data, very sparse — use it but widen the band
+            current_price = comp_median
+            price_low  = current_price * 0.88
+            price_high = current_price * 1.12
+            volume = comp_count
+            logging.info(f"📊 eBay sold (sparse, {comp_count}): ${current_price:.2f}")
+
+        elif active_median > 0:
+            # Only active listings — use those
+            current_price = active_median
+            price_low  = float(active.get("low")  or current_price * 0.90)
+            price_high = float(active.get("high") or current_price * 1.10)
+            volume = active_count
+            logging.info(f"📊 eBay active ({active_count} listings): ${current_price:.2f}")
 
         if current_price <= 0:
             logging.warning(f"❌ No eBay data found for: {search_query}")
@@ -5927,13 +5985,16 @@ async def get_market_trends(
                 "median": current_price,
                 "high": price_high
             },
-            "db_log": db_log if "db_log" in locals() else {"saved": False},
             "spoken_brief": spoken_brief if "spoken_brief" in locals() else "",
             "historical_data": historical_data,
             "actual_data_points": len(historical_data),
             "ebay_listings_analyzed": int(listings_analyzed) if 'listings_analyzed' in locals() else int(volume),
             "note": f"Building history ({len(db_history)} days logged). Check again tomorrow for trend analysis!",
-            "db_log": {"saved": bool(entry) if 'entry' in locals() else False, "id": (entry.get('id') if 'entry' in locals() and isinstance(entry, dict) else None), "recorded_date": (str(entry.get('recorded_date')) if 'entry' in locals() and isinstance(entry, dict) else None)},
+            "db_log": {
+                "saved": bool(entry) if 'entry' in locals() else False,
+                "id": (entry.get('id') if 'entry' in locals() and isinstance(entry, dict) else None),
+                "recorded_date": (str(entry.get('recorded_date')) if 'entry' in locals() and isinstance(entry, dict) else None),
+            },
             "timestamp": datetime.utcnow().isoformat() + "Z",
         })
 
@@ -6155,6 +6216,10 @@ def predict_future_prices(historical_data, forecast_days: int = 90):
     base_price = float(prices[-1])  # last known real price
     daily_change = float(slope)     # regression slope = best estimate of daily movement
 
+    # Minimum band half-width: 2% of current price per 30-day horizon.
+    # Ensures uncertainty cone is visible even when price history is tight.
+    min_band_halfwidth = max(std_dev, base_price * 0.02)
+
     predictions = []
     for i in range(forecast_days):
         days = i + 1
@@ -6167,12 +6232,13 @@ def predict_future_prices(historical_data, forecast_days: int = 90):
         else:
             predicted_price = base_price - change_magnitude
         # Adaptive floor: loosens slightly over longer horizons but never catastrophic
-        # 30d floor = 93%, 60d floor = 90%, 90d floor = 87%
-        floor_pct = max(0.87, 1.0 - (days * 0.0014))
+        # 30d floor = 95%, 60d floor = 90%, 90d floor = 85% (match JS logic)
+        floor_pct = max(0.85, 1.0 - (days * 0.0017))
         predicted_price = max(predicted_price, base_price * floor_pct)
-        # Tighter uncertainty bands: 1.3× std_dev (was 1.96×, which was too wide)
-        lower_bound = predicted_price - (1.3 * std_dev)
-        upper_bound = predicted_price + (1.3 * std_dev)
+        # Uncertainty bands: 1.3× band_halfwidth, grows with sqrt(days/7)
+        band = min_band_halfwidth * 1.3 * (days / 7) ** 0.5
+        lower_bound = predicted_price - band
+        upper_bound = predicted_price + band
         future_date = datetime.now() + timedelta(days=i)
 
         predictions.append({
@@ -6406,44 +6472,57 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
         last_completed = None
         last_active = None
 
+        MIN_COMPLETED_TRUST = 3  # min sold records before using completed stats alone
+
         for search_query in queries:
             logging.info(f"🔍 eBay query: '{search_query}'")
             grade_in_query = bool(re.search(r"\bPSA\s*\d|\bCGC\s*\d|\bBGS\s*\d|\bgraded\b", search_query, re.I))
 
-            completed = await _ebay_completed_stats(search_query, limit=10, days_lookback=30)
+            # Fetch both in parallel context; limit=25 for a more stable median
+            completed = await _ebay_completed_stats(search_query, limit=25, days_lookback=30)
+            active    = await _ebay_active_stats(search_query, limit=25)
             last_completed = completed or last_completed
-            if completed and completed.get("median") and completed.get("median") > 0:
-                price = float(completed["median"])
-                logging.info(f"✅ eBay sold: ${price:.2f} ({completed.get('count',0)} sales)")
-                return {
-                    "current_price": price,
-                    "source": "ebay_completed",
-                    "search_query": search_query,
-                    "queries_tried": queries,
-                    "card_name": card_name,
-                    "sales_count": completed.get("count", 0),
-                    "price_includes_grade": grade_in_query,
-                    "grade_12_uplift": bool(grade_is_12_plus and grade_in_query),
-                    "last_updated": datetime.now().isoformat(),
-                }
+            last_active    = active    or last_active
 
-            active = await _ebay_active_stats(search_query, limit=10)
-            last_active = active or last_active
-            if active and active.get("median") and active.get("median") > 0:
-                price = float(active["median"])
-                logging.info(f"✅ eBay active: ${price:.2f} ({active.get('count',0)} listings)")
-                return {
-                    "current_price": price,
-                    "source": "ebay_active",
-                    "search_query": search_query,
-                    "queries_tried": queries,
-                    "card_name": card_name,
-                    "listings_count": active.get("count", 0),
-                    "price_includes_grade": grade_in_query,
-                    "grade_12_uplift": bool(grade_is_12_plus and grade_in_query),
-                    "last_updated": datetime.now().isoformat(),
-                }
+            comp_median   = float((completed or {}).get("median") or 0.0)
+            comp_count    = int((completed or {}).get("count")  or 0)
+            active_median = float((active or {}).get("median") or 0.0)
+            active_count  = int((active or {}).get("count")   or 0)
 
+            if comp_median <= 0 and active_median <= 0:
+                continue  # nothing on this query tier — try broader query
+
+            # Blend logic: require >= 3 sold records to use completed alone
+            if comp_median > 0 and comp_count >= MIN_COMPLETED_TRUST:
+                price  = comp_median
+                source = "ebay_completed"
+                sales  = comp_count
+            elif comp_median > 0 and active_median > 0 and active_count >= MIN_COMPLETED_TRUST:
+                # Sparse sold data + healthy active sample → blend (60/40 active/sold)
+                price  = round(comp_median * 0.40 + active_median * 0.60, 2)
+                source = "ebay_blended"
+                sales  = comp_count + active_count
+            elif comp_median > 0:
+                price  = comp_median   # sparse sold data, best available
+                source = "ebay_completed_sparse"
+                sales  = comp_count
+            else:
+                price  = active_median
+                source = "ebay_active"
+                sales  = active_count
+
+            logging.info(f"✅ {source}: ${price:.2f} ({sales} records)")
+            return {
+                "current_price": price,
+                "source": source,
+                "search_query": search_query,
+                "queries_tried": queries,
+                "card_name": card_name,
+                "sales_count": sales,
+                "price_includes_grade": grade_in_query,
+                "grade_12_uplift": bool(grade_is_12_plus and grade_in_query),
+                "last_updated": datetime.now().isoformat(),
+            }
         # ── eBay found nothing — try PriceCharting as fallback ──
         if PRICECHARTING_TOKEN:
             try:
