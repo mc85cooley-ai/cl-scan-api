@@ -1892,16 +1892,26 @@ def _safe_json_extract(text: str) -> dict | None:
     return None
 
 
-def _centering_grade_from_ratio(larger: float, smaller: float) -> str:
-    """Return a human-friendly centering string like '55/45'."""
+def _centering_grade_from_ratio(larger: float, smaller: float, axis: str = "lr") -> str:
+    """Return a human-friendly centering string like '55/45'.
+
+    Physical card centering limits (standard TCG borders):
+      L/R: never more extreme than 80/20 (true miscut territory)
+      T/B: never more extreme than 75/25 (T/B borders are narrower so miscuts show earlier)
+    We clamp to these to avoid artefacts like '99/1' from holofoil edge detection noise.
+    """
     try:
         larger = float(larger)
         smaller = float(smaller)
         total = max(larger + smaller, 1e-6)
         p_large = int(round((larger / total) * 100))
         p_small = 100 - p_large
-        p_large = max(50, min(99, p_large))
-        p_small = max(1, min(50, p_small))
+        # Physical clamp — no real card can have a border ratio outside these
+        if axis == "tb":
+            p_large = max(50, min(75, p_large))
+        else:  # lr
+            p_large = max(50, min(80, p_large))
+        p_small = 100 - p_large
         return f"{p_large}/{p_small}"
     except Exception:
         return "N/A"
@@ -2000,8 +2010,8 @@ def _estimate_centering_from_image(img_bytes: bytes) -> dict | None:
         margin_top = max(1, ti)
         margin_bottom = max(1, (h - 1) - bi)
 
-        lr = _centering_grade_from_ratio(max(margin_left, margin_right), min(margin_left, margin_right))
-        tb = _centering_grade_from_ratio(max(margin_top, margin_bottom), min(margin_top, margin_bottom))
+        lr = _centering_grade_from_ratio(max(margin_left, margin_right), min(margin_left, margin_right), axis="lr")
+        tb = _centering_grade_from_ratio(max(margin_top, margin_bottom), min(margin_top, margin_bottom), axis="tb")
 
         return {
             "lr": lr,
@@ -3539,21 +3549,25 @@ Respond ONLY with JSON, no extra text.
                 prefix = f"Auto-centering (computed): L/R {computed_lr} | T/B {cen_front.get('tb')}."
                 # Strip any ratio in the AI notes that conflicts with the computed value.
                 # e.g. if computed says 56/44 but AI wrote "55/45" or "slightly off at 55/45"
-                def _strip_ratio_mentions(text: str, keep_ratio: str) -> str:
-                    if not text or not keep_ratio:
+                def _strip_ratio_mentions(text: str, keep_lr: str, keep_tb: str = "") -> str:
+                    """Remove AI-written ratio claims that contradict the computed values."""
+                    if not text:
                         return text
-                    # Remove patterns like "XX/YY" that are NOT the computed ratio
+                    keep_set = {r for r in [keep_lr, keep_tb] if r}
+                    # Remove any XX/YY ratio NOT in our computed set
                     cleaned = re.sub(
                         r'\b(\d{2,3}/\d{2,3})\b',
-                        lambda m: m.group(0) if m.group(0) == keep_ratio else '',
+                        lambda m: m.group(0) if m.group(0) in keep_set else '',
                         text
                     )
-                    # Remove leftover phrases like "slightly off at , " from the above
-                    cleaned = re.sub(r'(?i)(slightly off at|centering is|offset of),?\s*,', '', cleaned)
+                    # Remove orphaned phrases left after ratio removal
+                    cleaned = re.sub(r'(?i)\b(slightly off at|centering is|offset of|off by),?\s*[,.]?\s*', '', cleaned)
                     cleaned = re.sub(r'\s{2,}', ' ', cleaned)
                     cleaned = re.sub(r',\s*\.', '.', cleaned)
+                    cleaned = re.sub(r'\s+\.', '.', cleaned)
                     return cleaned.strip()
-                cleaned_prev = _strip_ratio_mentions(prev, computed_lr)
+                cen_front_tb = cen_front.get('tb') or ''
+                cleaned_prev = _strip_ratio_mentions(prev, computed_lr, cen_front_tb)
                 data["centering"]["front"]["notes"] = (prefix + (" " + cleaned_prev if cleaned_prev else "")).strip()
             if cen_back:
                 data["centering"].setdefault("back", {})
@@ -3563,7 +3577,8 @@ Respond ONLY with JSON, no extra text.
                     prev = re.sub(r"(?i)\b(off-?center\s+towards\s+the\s+(left|right)|towards\s+the\s+(left|right))\b[^.]*\.?\s*", "", prev).strip()
                 computed_lr_back = cen_back.get('lr') or ''
                 prefix = f"Auto-centering (computed): L/R {computed_lr_back} | T/B {cen_back.get('tb')}."
-                cleaned_prev_back = _strip_ratio_mentions(prev, computed_lr_back) if 'computed_lr' in dir() else prev
+                cen_back_tb = cen_back.get('tb') or ''
+                cleaned_prev_back = _strip_ratio_mentions(prev, computed_lr_back, cen_back_tb) if computed_lr_back else prev
                 data["centering"]["back"]["notes"] = (prefix + (" " + cleaned_prev_back if cleaned_prev_back else "")).strip()
     except Exception:
         pass
@@ -3739,7 +3754,7 @@ Respond ONLY with JSON, no extra text.
             pass
         return ""
 
-    for i, r in enumerate((rois or [])[:10]):
+    for i, r in enumerate(rois or []):  # Process ALL ROIs, not just first 10
         src = front_bytes if r.get("side") == "front" else back_bytes
         if not src:
             continue
@@ -3779,7 +3794,7 @@ Respond ONLY with JSON, no extra text.
         })
 
     defect_snaps.sort(key=lambda x: (0 if x.get("type") != "hotspot" else 1, -float(x.get("confidence") or 0.0)))
-    defect_snaps = defect_snaps[:8]
+    defect_snaps = defect_snaps[:max(1, len(defect_snaps))]  # Show all confirmed defects, no artificial cap
 
 
     # Fallback: if defects were clearly flagged but ROI labeling filtered everything out,
@@ -3809,7 +3824,7 @@ Respond ONLY with JSON, no extra text.
                     "thumbnail_b64": thumb,
                 })
             defect_snaps.sort(key=lambda x: (0 if x.get("type") != "hotspot" else 1, -float(x.get("confidence") or 0.0)))
-            defect_snaps[:] = defect_snaps[:8]
+            defect_snaps[:] = defect_snaps[:]  # Keep all defect crops
         except Exception:
             pass
 
@@ -4535,7 +4550,7 @@ Keep grading logic identical; only tailor advice tone and context.
             })
     
         defect_snaps.sort(key=lambda x: -float(x.get("confidence") or 0.0))
-        defect_snaps = defect_snaps[:8]
+        defect_snaps = defect_snaps[:]  # No cap — show all identified defects
     except Exception:
         defect_snaps = []
     
@@ -5141,10 +5156,8 @@ async def market_context(
         try:
             pc_payload = await _market_context_pricecharting(q_pc, category_hint="", pid=product_id or "")
             if pc_payload.get("available"):
-                if int(active_stats.get("count") or 0) == 0:
-                    # eBay completely empty — return PC as primary
-                    return pc_payload
-                # eBay has results — keep PC as supplemental price reference
+                # Always keep PC as supplement — blended into market_summary text below.
+                # Do NOT return PC-only even if eBay is empty; show both data sources.
                 pc_supplement = pc_payload
         except Exception:
             pass
@@ -5413,19 +5426,17 @@ async def market_context(
     pc_line = ""
     try:
         if isinstance(pc_supplement, dict) and pc_supplement.get("available"):
-            pc_obs = (pc_supplement.get("observed") or {}).get("active") or {}
+            pc_obs  = (pc_supplement.get("observed") or {}).get("active") or {}
             pc_low  = pc_obs.get("p20")
             pc_mid  = pc_obs.get("p50")
             pc_high = pc_obs.get("p80")
             if pc_low is not None and pc_mid is not None and pc_high is not None:
                 pc_line = (
-                    f" PriceCharting also shows this card ranging from {_money(pc_low)}–{_money(pc_high)} AUD",
-                    f" (mid {_money(pc_mid)} AUD) across condition buckets — use both as a sanity-check.",
+                    f" PriceCharting also shows this card ranging from {_money(pc_low)}–{_money(pc_high)} AUD"
+                    f" (mid {_money(pc_mid)} AUD) across condition buckets — use both as a sanity-check."
                 )
-                pc_line = "".join(pc_line)
             elif pc_mid is not None:
-                pc_line = f" PriceCharting mid-market is {_money(pc_mid)} AUD — treat as a cross-reference.",
-                pc_line = pc_line[0] if isinstance(pc_line, tuple) else pc_line
+                pc_line = f" PriceCharting mid-market is {_money(pc_mid)} AUD — treat as a cross-reference."
     except Exception:
         pc_line = ""
 
@@ -6252,23 +6263,30 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
     """
     try:
         card_name = (request.card_name or "").strip()
-        card_set = (request.card_set or "").strip()
+        card_set  = (request.card_set  or "").strip()
         card_number = (request.card_number or "").strip()
         grade = (request.grade or "").strip()
 
         if not card_name:
             return {"current_price": 0, "source": "error", "error": "card_name required"}
 
-        logging.info(f"💰 Price lookup request: {card_name}")
+        logging.info(f"💰 Price lookup: {card_name} | grade={grade}")
 
-        # Build smart query ladder (try specific -> broad)
+        # ── Detect CL Grade 12+ (Ultra Flawless) — maps to PSA 10 on eBay, needs scarcity uplift ──
+        grade_is_12_plus = False
+        try:
+            _gm = re.search(r"(\d+(?:\.\d+)?)", grade)
+            if _gm and float(_gm.group(1)) >= 12:
+                grade_is_12_plus = True
+        except Exception:
+            pass
+
         queries = _build_ebay_query_ladder(
             card_name=card_name,
             card_set=card_set,
             card_number=card_number,
             grade=grade,
         )
-
         if not queries:
             return {"current_price": 0, "source": "error", "error": "Could not build search query"}
 
@@ -6277,81 +6295,94 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
 
         for search_query in queries:
             logging.info(f"🔍 eBay query: '{search_query}'")
-            # Detect if this query included a grade token (PSA/CGC/BGS/LeagueAI grade)
-            grade_in_query = bool(re.search(r'\bPSA\s*\d|\bCGC\s*\d|\bBGS\s*\d|\bgraded\b', search_query, re.I))
+            grade_in_query = bool(re.search(r"\bPSA\s*\d|\bCGC\s*\d|\bBGS\s*\d|\bgraded\b", search_query, re.I))
 
-            # Try completed (sold) listings first
             completed = await _ebay_completed_stats(search_query, limit=10, days_lookback=30)
             last_completed = completed or last_completed
-
             if completed and completed.get("median") and completed.get("median") > 0:
-                current_price = float(completed.get("median"))
-                logging.info(f"✅ Found price: ${current_price:.2f} (from {completed.get('count', 0)} sales)")
+                price = float(completed["median"])
+                logging.info(f"✅ eBay sold: ${price:.2f} ({completed.get('count',0)} sales)")
                 return {
-                    "current_price": current_price,
+                    "current_price": price,
                     "source": "ebay_completed",
                     "search_query": search_query,
                     "queries_tried": queries,
                     "card_name": card_name,
                     "sales_count": completed.get("count", 0),
                     "price_includes_grade": grade_in_query,
-                    "last_updated": datetime.now().isoformat()
+                    "grade_12_uplift": bool(grade_is_12_plus and grade_in_query),
+                    "last_updated": datetime.now().isoformat(),
                 }
 
-            # If no completed, try active listings
             active = await _ebay_active_stats(search_query, limit=10)
             last_active = active or last_active
-
             if active and active.get("median") and active.get("median") > 0:
-                current_price = float(active.get("median"))
-                logging.info(f"✅ Found price: ${current_price:.2f} (from {active.get('count', 0)} active listings)")
+                price = float(active["median"])
+                logging.info(f"✅ eBay active: ${price:.2f} ({active.get('count',0)} listings)")
                 return {
-                    "current_price": current_price,
+                    "current_price": price,
                     "source": "ebay_active",
                     "search_query": search_query,
                     "queries_tried": queries,
                     "card_name": card_name,
                     "listings_count": active.get("count", 0),
                     "price_includes_grade": grade_in_query,
-                    "last_updated": datetime.now().isoformat()
+                    "grade_12_uplift": bool(grade_is_12_plus and grade_in_query),
+                    "last_updated": datetime.now().isoformat(),
                 }
 
-        # No results from either source
-        logging.warning(f"❌ No eBay results for any query tried: {queries}")
+        # ── eBay found nothing — try PriceCharting as fallback ──
+        if PRICECHARTING_TOKEN:
+            try:
+                pc_q = _norm_ws(f"{card_name} {card_set}".strip())
+                pc_products = await _pc_search(pc_q, limit=5)
+                if pc_products:
+                    pc_best = pc_products[0]
+                    pc_pid  = str(pc_best.get("id") or pc_best.get("product-id") or "").strip()
+                    pc_detail = await _pc_product(pc_pid) if pc_pid else {}
+                    pc_merged = dict(pc_best)
+                    if isinstance(pc_detail, dict):
+                        pc_merged.update(pc_detail)
+                    pc_prices = _pc_extract_price_fields(pc_merged)
+                    for pk in ["loose-price", "used_price", "complete-price", "new-price"]:
+                        if pk in pc_prices and isinstance(pc_prices[pk], (int, float)) and pc_prices[pk] > 0:
+                            pc_aud = _usd_to_aud_simple(pc_prices[pk])
+                            if pc_aud and float(pc_aud) > 0:
+                                logging.info(f"✅ PriceCharting fallback: ${float(pc_aud):.2f} AUD")
+                                return {
+                                    "current_price": round(float(pc_aud), 2),
+                                    "source": "pricecharting",
+                                    "search_query": pc_q,
+                                    "queries_tried": queries,
+                                    "card_name": card_name,
+                                    "price_includes_grade": False,
+                                    "grade_12_uplift": False,
+                                    "last_updated": datetime.now().isoformat(),
+                                }
+            except Exception as _pce:
+                logging.warning(f"PriceCharting fallback error: {_pce}")
+
+        # ── No results from any source ──
+        logging.warning(f"❌ No price found for: {card_name}")
         best_q = queries[-1] if queries else card_name
-        simple_q = _norm_ws(f"{card_name} Pokemon") if card_name else best_q
-
-        candidates_sold = await _ebay_find_items(best_q, limit=5, sold=True, days_lookback=30)
+        candidates_sold   = await _ebay_find_items(best_q, limit=5, sold=True, days_lookback=30)
         candidates_active = await _ebay_find_items(best_q, limit=5, sold=False)
-
-        # If nothing came back, also try the simplified query as a last-gasp recall boost
-        if simple_q and simple_q != best_q:
-            more_sold = await _ebay_find_items(simple_q, limit=5, sold=True, days_lookback=30)
-            more_active = await _ebay_find_items(simple_q, limit=5, sold=False)
-
-            seen = set([x.get("item_id") for x in (candidates_sold + candidates_active) if x.get("item_id")])
-            for it in more_sold:
-                if it.get("item_id") and it["item_id"] not in seen and len(candidates_sold) < 5:
-                    candidates_sold.append(it); seen.add(it["item_id"])
-            for it in more_active:
-                if it.get("item_id") and it["item_id"] not in seen and len(candidates_active) < 5:
-                    candidates_active.append(it); seen.add(it["item_id"])
-
         return {
             "current_price": 0,
-            "source": "ebay_no_results",
-            "error": "No eBay listings found",
+            "source": "no_results",
+            "error": "No listings found on eBay or PriceCharting",
             "search_query": best_q,
             "queries_tried": queries,
             "card_name": card_name,
             "price_includes_grade": False,
+            "grade_12_uplift": False,
             "candidates_sold": candidates_sold,
             "candidates_active": candidates_active,
-            "hint": "If the name/set is wrong, pick the closest match from candidates and save that price in WordPress.",
+            "hint": "Pick the closest match from candidates and save that price.",
         }
 
     except Exception as e:
-        logging.error(f"❌ Price lookup error: {e}")
+        logging.error(f"❌ Price lookup error: {e}", exc_info=True)
         return {"current_price": 0, "source": "error", "error": str(e)}
 
 
@@ -7854,6 +7885,79 @@ Respond ONLY with JSON.
         "timestamp": datetime.utcnow().isoformat() + "Z"
     })
 
+
+@app.post("/api/auth-check")
+@safe_endpoint
+async def auth_check_simple(
+    front: UploadFile = File(...),
+    back: UploadFile = File(None),
+    card_name: Optional[str] = Form(None),
+    card_set:  Optional[str] = Form(None),
+    card_year: Optional[str] = Form(None),
+):
+    """
+    Simplified auth-check endpoint — called by the WordPress WP AJAX proxy.
+    Returns the flat {verdict, confidence, summary, flags, positives} shape expected by the frontend.
+    """
+    front_bytes = await front.read()
+    back_bytes  = await back.read() if back else None
+
+    cn = (card_name or "unknown card").strip()
+    cs = (card_set  or "").strip()
+    cy = (card_year or "").strip()
+
+    auth_prompt = (
+        f"You are an expert trading card authenticator. Analyze the provided image(s) of '{cn}'"
+        + (f" ({cs})" if cs else "")
+        + (f" from {cy}" if cy else "")
+        + """. Check for signs of counterfeiting, reprints, or alterations.
+
+Respond ONLY with valid JSON matching this exact schema:
+{
+  "verdict": "Likely Authentic|Suspicious|Likely Counterfeit",
+  "confidence": 0.0,
+  "summary": "One or two sentences summarising your findings.",
+  "flags": ["issue 1", "issue 2"],
+  "positives": ["positive 1", "positive 2"]
+}
+
+Evaluate: print quality, font/kerning, colour accuracy, holofoil pattern (if applicable),
+edge precision, back pattern consistency, set symbol clarity, rosette dot pattern,
+and any known counterfeit tells for this game/set/era.
+Only flag genuine concerns — normal print variation and manufacturing tolerance are NOT defects.
+"""
+    )
+
+    content_parts: list = [{"type": "text", "text": auth_prompt}]
+    if front_bytes:
+        content_parts.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{_b64(front_bytes)}", "detail": "high"},
+        })
+    if back_bytes:
+        content_parts.append({"type": "text", "text": "BACK IMAGE:"})
+        content_parts.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{_b64(back_bytes)}", "detail": "high"},
+        })
+
+    result   = await _openai_chat([{"role": "user", "content": content_parts}], max_tokens=800, temperature=0.1)
+    parsed   = _parse_json_or_none(result.get("content", "")) or {}
+
+    # Normalise to expected flat shape
+    verdict    = str(parsed.get("verdict")    or "Unable to determine").strip()
+    confidence = float(parsed.get("confidence") or 0.0)
+    summary    = str(parsed.get("summary")    or "Analysis complete.").strip()
+    flags      = list(parsed.get("flags")     or parsed.get("red_flags")  or [])
+    positives  = list(parsed.get("positives") or parsed.get("green_flags") or [])
+
+    return JSONResponse(content={
+        "verdict":    verdict,
+        "confidence": confidence,
+        "summary":    summary,
+        "flags":      flags,
+        "positives":  positives,
+    })
 
 
 def perform_automated_auth_checks(image_bytes: bytes) -> Dict[str, Any]:
