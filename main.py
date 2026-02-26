@@ -532,7 +532,7 @@ def safe_endpoint(func):
 # ==============================
 # Config
 # ==============================
-APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-02-21-v6.8.0")
+APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-02-26-v7.0.0")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
@@ -2158,16 +2158,28 @@ async def _openai_chat(messages: List[Dict[str, Any]], max_tokens: int = 1200, t
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     payload = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature, "response_format": {"type": "json_object"}}
 
-    try:
-        async with httpx.AsyncClient(timeout=90.0) as client:
-            r = await client.post(url, headers=headers, json=payload)
-            if r.status_code != 200:
-                return {"error": True, "status": r.status_code, "message": r.text[:700]}
-            data = r.json()
-            content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
-            return {"error": False, "content": content}
-    except Exception as e:
-        return {"error": True, "status": 0, "message": str(e)}
+    last_error = {}
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                r = await client.post(url, headers=headers, json=payload)
+                if r.status_code == 200:
+                    data = r.json()
+                    content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+                    return {"error": False, "content": content}
+                elif r.status_code in (429, 503) and attempt < 2:
+                    # Rate-limited or service busy — back off and retry
+                    await asyncio.sleep(3 * (attempt + 1))
+                    last_error = {"error": True, "status": r.status_code, "message": r.text[:700]}
+                    continue
+                else:
+                    return {"error": True, "status": r.status_code, "message": r.text[:700]}
+        except Exception as e:
+            last_error = {"error": True, "status": 0, "message": str(e)}
+            if attempt < 2:
+                await asyncio.sleep(2)
+            continue
+    return last_error
 
 
 # ==============================
@@ -3196,6 +3208,33 @@ async def verify(
     if not front_bytes or not back_bytes or len(front_bytes) < 200 or len(back_bytes) < 200:
         raise HTTPException(status_code=400, detail="Images are too small or empty")
 
+    # ── Compress images to keep Render memory within limits ────────────────
+    # High-res source images can spike memory to 400MB+ when base64-encoded.
+    # We resize to max 1200px on the long edge at JPEG quality 88 before sending
+    # to OpenAI. This preserves enough detail for fine defect detection while
+    # keeping the base64 payload and server memory under control.
+    def _compress_for_ai(raw_bytes: bytes, max_long: int = 1200, quality: int = 88) -> bytes:
+        if not PIL_AVAILABLE:
+            return raw_bytes
+        try:
+            im = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+            w, h = im.size
+            long_edge = max(w, h)
+            if long_edge > max_long:
+                scale = max_long / long_edge
+                im = im.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=quality, optimize=True)
+            return buf.getvalue()
+        except Exception:
+            return raw_bytes  # fallback: pass original
+
+    front_bytes  = _compress_for_ai(front_bytes)
+    back_bytes   = _compress_for_ai(back_bytes)
+    if angled_bytes and len(angled_bytes) > 200:
+        angled_bytes = _compress_for_ai(angled_bytes)
+    # ─────────────────────────────────────────────────────────────────────
+
     provided_name = _norm_ws(card_name or "")
     provided_set = _norm_ws(card_set or "")
     if _is_blankish(provided_set):
@@ -3522,7 +3561,10 @@ Respond ONLY with JSON, no extra text.
 
     result = await _openai_chat(msg, max_tokens=3000, temperature=0.1)
     if result.get("error"):
-        return JSONResponse(content={"error": True, "message": "AI grading failed", "details": result.get("message", "")}, status_code=502)
+        err_msg = result.get("message", "")
+        err_status = result.get("status", 0)
+        logging.error(f"❌ /api/verify OpenAI call failed: status={err_status} msg={err_msg[:200]}")
+        return JSONResponse(content={"error": True, "message": "AI grading failed", "details": err_msg, "openai_status": err_status}, status_code=502)
 
     data = _parse_json_or_none(result.get("content", "")) or {}
 
