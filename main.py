@@ -6431,21 +6431,102 @@ class MarketPriceLookupRequest(BaseModel):
     card_year: Optional[str] = None
     card_number: Optional[str] = None
     grade: Optional[str] = None
-    # Variant/rarity attributes — dramatically affect eBay price
-    # NOTE: Some older callers used `variant` while newer code expects `variant_type`.
-    # We keep BOTH to stay backward compatible.
-    variant_type: Optional[str] = None     # Regular/Holo/Reverse Holo/Full Art/Alt Art/Parallel/Textured/etc.
-    variant: Optional[str] = None          # Legacy alias for variant_type
-    rarity: Optional[str] = None           # Secret Rare, Ultra Rare, Full Art Rare, Double Rare, Illustration Rare
-    edition: Optional[str] = None          # 1st Edition, Shadowless, Collector's Edition
-    finish: Optional[str] = None           # Foil/Etched/Textured/Gloss/etc. (optional)
-    language: Optional[str] = None         # Japanese, Korean, Chinese — omit/English for default
-    is_signed: Optional[bool] = None       # Artist/player signature
-    signed_by: Optional[str] = None        # Who signed it (optional)
-    is_error_card: Optional[bool] = None   # Error/misprint
-    is_promo: Optional[bool] = None        # Promo flag
-    extra_attributes: Optional[str] = None # Catch-all: Prerelease stamp, Staff stamp, Galaxy foil etc.
 
+    # Variant/rarity attributes — dramatically affect eBay price
+    # Keep legacy 'variant' for backward compatibility, but prefer 'variant_type'
+    variant_type: Optional[str] = None     # Parallel, Full Art, Alt Art, Textured, Etched, etc.
+    variant: Optional[str] = None          # legacy alias
+    rarity: Optional[str] = None           # Secret Rare, Ultra Rare, Full Art Rare, etc.
+    language: Optional[str] = None         # Japanese, Korean, Chinese — omit/English for default
+
+    # Additional structured signals (optional)
+    edition: Optional[str] = None          # 1st Edition, Unlimited, etc.
+    finish: Optional[str] = None           # Foil, Textured, Etched, Gloss, etc.
+
+    # Signatures / promos / error cards
+    is_signed: Optional[bool] = False
+    signed_by: Optional[str] = None
+    is_error_card: Optional[bool] = False
+    is_promo: Optional[bool] = False
+
+    # Pricing behavior controls (optional)
+    apply_graded_premium: Optional[bool] = True  # if graded comps not found, estimate graded price from raw
+    graded_premium_add_aud: Optional[float] = 70.0
+
+
+def _parse_numeric_grade(grade: str) -> Optional[float]:
+    try:
+        m = re.search(r"(\d+(?:\.\d+)?)", grade or "")
+        return float(m.group(1)) if m else None
+    except Exception:
+        return None
+
+def _grade_multiplier_heuristic(grade: str) -> float:
+    """Conservative multiplier (on top of 'raw + premium') when no graded comps exist."""
+    g = _parse_numeric_grade(grade or "")
+    if g is None:
+        return 1.0
+    # CLA 12+ is rarer than PSA10, but we keep conservative to avoid runaway valuations
+    if g >= 12:
+        return 1.60
+    if g >= 11:
+        return 1.40
+    if g >= 10:
+        return 1.25
+    if g >= 9:
+        return 1.10
+    if g >= 8:
+        return 1.05
+    return 1.00
+
+def _variant_multiplier_heuristic(variant_type: str, rarity: str, finish: str, edition: str, language: str) -> float:
+    v = (variant_type or "").strip().lower()
+    r = (rarity or "").strip().lower()
+    f = (finish or "").strip().lower()
+    e = (edition or "").strip().lower()
+    lang = (language or "").strip().lower()
+
+    mult = 1.0
+
+    # One Piece / TCG common value drivers
+    if "manga" in v or "manga" in r:
+        mult *= 6.0
+    if "alt" in v or "alt art" in v or "alternate" in v or "alt art" in r:
+        mult *= 2.5
+    if "full art" in v or "full art" in r:
+        mult *= 1.8
+    if "parallel" in v or "parallel" in r:
+        mult *= 2.2
+    if "1 star" in v or "★" in v or "one star" in v:
+        mult *= 2.5
+    if "2 star" in v or "two star" in v or "★★" in v:
+        mult *= 5.0
+    if "secret" in r:
+        mult *= 2.0
+
+    # Finish bumps
+    if "textured" in v or "textured" in f:
+        mult *= 1.20
+    if "etched" in v or "etched" in f:
+        mult *= 1.15
+    if "foil" in f:
+        mult *= 1.10
+
+    # Edition bumps (mostly vintage Pokémon, but harmless)
+    if "1st" in e or "first" in e:
+        mult *= 1.35
+
+    # Language: Japanese can be higher or lower depending on TCG; small, conservative nudge
+    if lang in {"jp", "japanese"}:
+        mult *= 1.05
+
+    # Clamp to prevent explosions from messy labels
+    return max(1.0, min(mult, 12.0))
+
+def _estimate_graded_price_from_raw(raw_price: float, grade: str, variant_type: str, rarity: str, finish: str, edition: str, language: str, premium_add: float = 70.0) -> float:
+    base = max(0.0, float(raw_price)) + max(0.0, float(premium_add or 0.0))
+    mult = _grade_multiplier_heuristic(grade) * _variant_multiplier_heuristic(variant_type, rarity, finish, edition, language)
+    return round(base * mult, 2)
 
 @app.post("/api/market/price-lookup")
 @safe_endpoint
@@ -6460,7 +6541,6 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
         card_number  = (request.card_number  or "").strip()
         grade        = (request.grade        or "").strip()
         rarity       = (request.rarity       or "").strip()
-        # Backward compatible: accept either `variant_type` or legacy `variant`
         variant_type = ((request.variant_type or request.variant) or "").strip()
         edition      = (request.edition      or "").strip()
         finish       = (request.finish       or "").strip()
@@ -6529,6 +6609,13 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
             "master ball":      "Master Ball",
             "art rare":         "Art Rare",
             "promo":            "Promo",
+            "parallel":         "Parallel",
+            "full art":         "Full Art",
+            "alt art":          "Alt Art",
+            "alternate art":    "Alt Art",
+            "manga":            "Manga",
+            "1 star":           "1 Star",
+            "2 star":           "2 Star",
         }
         if variant_type.lower() not in _skip_variant:
             vtoken = _variant_canonical.get(variant_type.lower(), variant_type)
@@ -6634,8 +6721,34 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
             # Detect whether the winning query included variant terms
             variant_in_query = bool(variant_str and variant_str.lower() in search_query.lower())
             logging.info(f"✅ {source}: ${price:.2f} ({sales} records) | variant_in_query={variant_in_query}")
+
+            raw_price = float(price or 0.0)
+
+            # If we DID NOT find graded comps (no PSA/CGC/BGS token in the winning query),
+            # but the caller provided a grade, estimate a graded price from raw using:
+            #   (raw + premium_add) * grade_mult * variant_mult
+            adjusted_price = None
+            if (request.apply_graded_premium is not False) and grade and not grade_in_query and raw_price > 0:
+                premium_add = float(request.graded_premium_add_aud or 70.0)
+                adjusted_price = _estimate_graded_price_from_raw(
+                    raw_price=raw_price,
+                    grade=grade,
+                    variant_type=variant_type,
+                    rarity=rarity,
+                    finish=finish,
+                    edition=edition,
+                    language=request.language or "",
+                    premium_add=premium_add,
+                )
+
+                # For collection valuation, prefer the adjusted graded estimate when no graded comps exist.
+                price = adjusted_price
+                source = f"{source}_estimated_graded"
+
             return {
                 "current_price": price,
+                "raw_price": raw_price,
+                "estimated_graded_price": adjusted_price,
                 "source": source,
                 "search_query": search_query,
                 "queries_tried": queries,
@@ -6665,8 +6778,28 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                             pc_aud = _usd_to_aud_simple(pc_prices[pk])
                             if pc_aud and float(pc_aud) > 0:
                                 logging.info(f"✅ PriceCharting fallback: ${float(pc_aud):.2f} AUD")
+
+                                raw_price = float(pc_aud or 0.0)
+                                adjusted_price = None
+                                if (request.apply_graded_premium is not False) and grade and raw_price > 0:
+                                    premium_add = float(request.graded_premium_add_aud or 70.0)
+                                    adjusted_price = _estimate_graded_price_from_raw(
+                                        raw_price=raw_price,
+                                        grade=grade,
+                                        variant_type=variant_type,
+                                        rarity=rarity,
+                                        finish=finish,
+                                        edition=edition,
+                                        language=request.language or "",
+                                        premium_add=premium_add,
+                                    )
+                                    # If PC is ungraded, prefer graded estimate for collection valuation
+                                    raw_price = float(pc_aud or 0.0)
+
                                 return {
                                     "current_price": round(float(pc_aud), 2),
+                                    "raw_price": raw_price,
+                                    "estimated_graded_price": adjusted_price,
                                     "source": "pricecharting",
                                     "search_query": pc_q,
                                     "queries_tried": queries,
