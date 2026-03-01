@@ -8344,10 +8344,21 @@ async def auth_check_simple(
     card_set:  Optional[str] = Form(None),
     card_year: Optional[str] = Form(None),
 ):
+    """Authentication check endpoint used by /authentication-check/.
+
+    Backward compatible response fields (existing UI):
+      - verdict, confidence, summary, flags, positives
+
+    Extended fields (for a premium UI / reporting):
+      - request_id, needs_more_images, image_requests
+      - image_quality (front/back), checklist, recommendations, signals
+
+    Design principles:
+      - Provide evidence-based, structured output
+      - Be conservative when images are low quality
+      - Never return nonsense confidence (always 0–100)
     """
-    Simplified auth-check endpoint — called by the WordPress WP AJAX proxy.
-    Returns the flat {verdict, confidence, summary, flags, positives} shape expected by the frontend.
-    """
+
     front_bytes = await front.read()
     back_bytes  = await back.read() if back else None
 
@@ -8355,26 +8366,117 @@ async def auth_check_simple(
     cs = (card_set  or "").strip()
     cy = (card_year or "").strip()
 
+    request_id = "AUTH-" + secrets.token_hex(5).upper()
+
+    # ---- Deterministic image-quality checks (best-effort, no SciPy) ----
+    def _img_quality(image_bytes: Optional[bytes]) -> Dict[str, Any]:
+        out: Dict[str, Any] = {"available": False}
+        if not (PIL_AVAILABLE and image_bytes):
+            return out
+        try:
+            from PIL import Image, ImageStat, ImageFilter
+            img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            w, h = img.size
+
+            # Resolution
+            res_pass = bool(w >= 1100 and h >= 1100)
+
+            # Sharpness via edge response variance
+            edges = img.filter(ImageFilter.FIND_EDGES)
+            stat_e = ImageStat.Stat(edges)
+            edge_var = float(sum(stat_e.var) / max(1, len(stat_e.var)))
+            sharp_pass = bool(edge_var >= 120.0)
+
+            # Glare/overexposure via bright pixel ratio
+            gray = img.convert("L")
+            hist = gray.histogram()
+            bright = sum(hist[246:])
+            total = max(1, w * h)
+            bright_pct = float(bright) / float(total) * 100.0
+            glare_pass = bool(bright_pct <= 3.0)
+
+            mean_l = float(ImageStat.Stat(gray).mean[0])
+            low_light = bool(mean_l < 55.0)
+
+            warnings: List[str] = []
+            if not res_pass:
+                warnings.append("Image resolution is low — use a closer shot or higher quality photo.")
+            if not sharp_pass:
+                warnings.append("Image looks blurry — tap to focus and keep the camera steady.")
+            if not glare_pass:
+                warnings.append("Glare/overexposure detected — tilt the card and reduce reflections.")
+            if low_light:
+                warnings.append("Image is quite dark — add lighting to reveal print texture and edges.")
+
+            return {
+                "available": True,
+                "width": w,
+                "height": h,
+                "edge_variance": round(edge_var, 2),
+                "mean_luminance": round(mean_l, 2),
+                "bright_pixel_percent": round(bright_pct, 2),
+                "passes": {
+                    "resolution": res_pass,
+                    "sharpness": sharp_pass,
+                    "glare": glare_pass,
+                },
+                "warnings": warnings,
+            }
+        except Exception:
+            return {"available": False}
+
+    front_quality = _img_quality(front_bytes)
+    back_quality  = _img_quality(back_bytes)
+
+    front_auto = perform_automated_auth_checks(front_bytes) if front_bytes else {"available": False}
+    back_auto  = perform_automated_auth_checks(back_bytes) if back_bytes else {"available": False}
+
+    needs_more_images = False
+    image_requests: List[str] = []
+    if front_quality.get("available"):
+        p = front_quality.get("passes") or {}
+        if not (p.get("resolution") and p.get("sharpness") and p.get("glare")):
+            needs_more_images = True
+            image_requests.append("Front photo: closer, in-focus, no glare, fill frame with the card.")
+    else:
+        needs_more_images = True
+        image_requests.append("Front photo: please upload a clear photo (or use the Camera button).")
+
+    if back_bytes:
+        if back_quality.get("available"):
+            p = back_quality.get("passes") or {}
+            if not (p.get("resolution") and p.get("sharpness") and p.get("glare")):
+                needs_more_images = True
+                image_requests.append("Back photo: closer, in-focus, no glare, fill frame with the card.")
+
+    # ---- Rubric-driven LLM analysis (structured, defensible) ----
     auth_prompt = (
-        f"You are an expert trading card authenticator. Analyze the provided image(s) of '{cn}'"
-        + (f" ({cs})" if cs else "")
-        + (f" from {cy}" if cy else "")
-        + """. Check for signs of counterfeiting, reprints, or alterations.
-
-Respond ONLY with valid JSON matching this exact schema:
-{
-  "verdict": "Likely Authentic|Suspicious|Likely Counterfeit",
-  "confidence": 0.0,
-  "summary": "One or two sentences summarising your findings.",
-  "flags": ["issue 1", "issue 2"],
-  "positives": ["positive 1", "positive 2"]
-}
-
-Evaluate: print quality, font/kerning, colour accuracy, holofoil pattern (if applicable),
-edge precision, back pattern consistency, set symbol clarity, rosette dot pattern,
-and any known counterfeit tells for this game/set/era.
-Only flag genuine concerns — normal print variation and manufacturing tolerance are NOT defects.
-"""
+        f"You are an expert trading card authenticator and forensic examiner. "
+        f"Analyze the provided image(s) of: '{cn}'" + (f" ({cs})" if cs else "") + (f" from {cy}" if cy else "") + ".\n\n"
+        "Be conservative: if image quality is insufficient, lower confidence and ask for better photos.\n\n"
+        "Return ONLY valid JSON using this schema (no markdown, no extra keys):\n"
+        "{\n"
+        "  \\\"verdict\\\": \\\"Likely Authentic\\\" | \\\"Suspicious\\\" | \\\"Likely Counterfeit\\\" | \\\"Unable to Determine\\\",\n"
+        "  \\\"confidence\\\": 0-100,\n"
+        "  \\\"summary\\\": string,\n"
+        "  \\\"positives\\\": [string, ...],\n"
+        "  \\\"flags\\\": [string, ...],\n"
+        "  \\\"needs_more_images\\\": true|false,\n"
+        "  \\\"image_requests\\\": [string, ...],\n"
+        "  \\\"checklist\\\": {\n"
+        "    \\\"print_quality\\\": {\\\"score\\\": 0-10, \\\"notes\\\": string},\n"
+        "    \\\"fonts_ink_edges\\\": {\\\"score\\\": 0-10, \\\"notes\\\": string},\n"
+        "    \\\"holo_foil_texture\\\": {\\\"score\\\": 0-10, \\\"notes\\\": string},\n"
+        "    \\\"set_symbols_numbers\\\": {\\\"score\\\": 0-10, \\\"notes\\\": string},\n"
+        "    \\\"back_pattern\\\": {\\\"score\\\": 0-10, \\\"notes\\\": string},\n"
+        "    \\\"cut_edges_corners\\\": {\\\"score\\\": 0-10, \\\"notes\\\": string},\n"
+        "    \\\"tamper_alteration\\\": {\\\"score\\\": 0-10, \\\"notes\\\": string}\n"
+        "  }\n"
+        "}\n\n"
+        "Evaluation guidance:\n"
+        "- Only flag genuine counterfeit indicators (wrong back pattern, incorrect fonts/kerning, muddy printing, inconsistent set symbols).\n"
+        "- Normal factory variation is NOT a counterfeit indicator.\n"
+        "- If holo/texture cannot be validated from a still photo, state that limitation and reduce confidence.\n"
     )
 
     content_parts: list = [{"type": "text", "text": auth_prompt}]
@@ -8390,22 +8492,73 @@ Only flag genuine concerns — normal print variation and manufacturing toleranc
             "image_url": {"url": f"data:image/jpeg;base64,{_b64(back_bytes)}", "detail": "high"},
         })
 
-    result   = await _openai_chat([{"role": "user", "content": content_parts}], max_tokens=800, temperature=0.1)
-    parsed   = _parse_json_or_none(result.get("content", "")) or {}
+    # Small in-process cache to avoid reprocessing identical uploads
+    try:
+        cache_key = hashlib.sha256((front_bytes or b"") + (back_bytes or b"") + (cn+cs+cy).encode("utf-8", "ignore")).hexdigest()
+    except Exception:
+        cache_key = None
 
-    # Normalise to expected flat shape
-    verdict    = str(parsed.get("verdict")    or "Unable to determine").strip()
-    confidence = float(parsed.get("confidence") or 0.0)
-    summary    = str(parsed.get("summary")    or "Analysis complete.").strip()
-    flags      = list(parsed.get("flags")     or parsed.get("red_flags")  or [])
-    positives  = list(parsed.get("positives") or parsed.get("green_flags") or [])
+    if not hasattr(auth_check_simple, "_cache"):
+        auth_check_simple._cache = {}  # type: ignore[attr-defined]
+    cache: Dict[str, Any] = getattr(auth_check_simple, "_cache")  # type: ignore[attr-defined]
+
+    if cache_key and cache_key in cache:
+        parsed = cache[cache_key]
+    else:
+        result = await _openai_chat([{"role": "user", "content": content_parts}], max_tokens=1100, temperature=0.1)
+        parsed = _parse_json_or_none(result.get("content", "")) or {}
+        if cache_key:
+            if len(cache) > 256:
+                for _k in list(cache.keys())[:64]:
+                    cache.pop(_k, None)
+            cache[cache_key] = parsed
+
+    # ---- Normalize outputs (strict) ----
+    verdict = str(parsed.get("verdict") or "Unable to Determine").strip()
+    try:
+        confidence = float(parsed.get("confidence") or 0.0)
+    except Exception:
+        confidence = 0.0
+    if 0.0 <= confidence <= 1.0:
+        confidence *= 100.0
+    confidence = float(max(0.0, min(100.0, confidence)))
+
+    summary = str(parsed.get("summary") or "Analysis complete.").strip()
+    flags = list(parsed.get("flags") or parsed.get("red_flags") or [])
+    positives = list(parsed.get("positives") or parsed.get("green_flags") or [])
+    checklist = parsed.get("checklist") or {}
+
+    ai_needs = bool(parsed.get("needs_more_images") or False)
+    ai_reqs = list(parsed.get("image_requests") or [])
+    if needs_more_images and not ai_needs:
+        ai_needs = True
+    for r in image_requests:
+        if r not in ai_reqs:
+            ai_reqs.append(r)
+
+    recommendations: List[str] = []
+    if ai_needs:
+        recommendations.append("Retake photos to improve confidence (focus, lighting, reduce glare, fill frame).")
+    if not back_bytes:
+        recommendations.append("Add a back photo for stronger verification (back pattern is a key counterfeit tell).")
+    recommendations.append("For high-value items, consider in-person authentication for final confirmation.")
 
     return JSONResponse(content={
-        "verdict":    verdict,
-        "confidence": confidence,
-        "summary":    summary,
-        "flags":      flags,
-        "positives":  positives,
+        # Backward compatible
+        "verdict": verdict,
+        "confidence": round(confidence, 2),
+        "summary": summary,
+        "flags": flags,
+        "positives": positives,
+
+        # Extended
+        "request_id": request_id,
+        "needs_more_images": ai_needs,
+        "image_requests": ai_reqs,
+        "image_quality": {"front": front_quality, "back": back_quality},
+        "checklist": checklist,
+        "recommendations": recommendations,
+        "signals": {"automated": {"front": front_auto, "back": back_auto}},
     })
 
 
