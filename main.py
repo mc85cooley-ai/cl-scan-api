@@ -5730,7 +5730,6 @@ async def get_market_trends_query(
     """
     return await get_market_trends(card_identifier=q, days=days, api_key=api_key)
 
-=====
 
 @app.get("/api/market-trends/{card_identifier:path}")
 @safe_endpoint
