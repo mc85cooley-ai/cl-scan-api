@@ -6432,10 +6432,18 @@ class MarketPriceLookupRequest(BaseModel):
     card_number: Optional[str] = None
     grade: Optional[str] = None
     # Variant/rarity attributes — dramatically affect eBay price
-    variant: Optional[str] = None          # Holo, Reverse Holo, 1st Edition, Full Art, Alt Art, Parallel, Shadowless
+    # NOTE: Some older callers used `variant` while newer code expects `variant_type`.
+    # We keep BOTH to stay backward compatible.
+    variant_type: Optional[str] = None     # Regular/Holo/Reverse Holo/Full Art/Alt Art/Parallel/Textured/etc.
+    variant: Optional[str] = None          # Legacy alias for variant_type
     rarity: Optional[str] = None           # Secret Rare, Ultra Rare, Full Art Rare, Double Rare, Illustration Rare
+    edition: Optional[str] = None          # 1st Edition, Shadowless, Collector's Edition
+    finish: Optional[str] = None           # Foil/Etched/Textured/Gloss/etc. (optional)
     language: Optional[str] = None         # Japanese, Korean, Chinese — omit/English for default
     is_signed: Optional[bool] = None       # Artist/player signature
+    signed_by: Optional[str] = None        # Who signed it (optional)
+    is_error_card: Optional[bool] = None   # Error/misprint
+    is_promo: Optional[bool] = None        # Promo flag
     extra_attributes: Optional[str] = None # Catch-all: Prerelease stamp, Staff stamp, Galaxy foil etc.
 
 
@@ -6452,7 +6460,8 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
         card_number  = (request.card_number  or "").strip()
         grade        = (request.grade        or "").strip()
         rarity       = (request.rarity       or "").strip()
-        variant_type = (request.variant_type or "").strip()
+        # Backward compatible: accept either `variant_type` or legacy `variant`
+        variant_type = ((request.variant_type or request.variant) or "").strip()
         edition      = (request.edition      or "").strip()
         finish       = (request.finish       or "").strip()
         is_signed    = bool(request.is_signed)
