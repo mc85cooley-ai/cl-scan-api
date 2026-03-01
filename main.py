@@ -38,7 +38,7 @@ Env vars
 - USE_EBAY_API=0/1 (default 0) + EBAY_APP_ID/EBAY_CERT_ID/EBAY_DEV_ID/EBAY_OAUTH_TOKEN (optional; scaffold only)
 """
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Depends, Security, status, Request, Body
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Depends, Security, status, Request, Body, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -5714,9 +5714,25 @@ async def _ebay_sold_prices_stub(query: str) -> Dict[str, Any]:
 # ==============================
 # ========================================
 # MARKET TREND PREDICTIONS
-# ========================================
+# ===================================
+@app.get("/api/market-trends")
+@safe_endpoint
+async def get_market_trends_query(
+    q: str = Query(..., description="Card identifier or free-text query (supports pipes)"),
+    days: int = 90,
+    api_key: Optional[str] = Depends(verify_api_key_optional),  # optional (read endpoint)
+):
+    """
+    Query-param wrapper for market trends.
 
-@app.get("/api/market-trends/{card_identifier}")
+    This avoids path-routing edge cases when identifiers contain slashes (e.g., "13/94"),
+    which can otherwise lead to 404s depending on URL decoding behavior.
+    """
+    return await get_market_trends(card_identifier=q, days=days, api_key=api_key)
+
+=====
+
+@app.get("/api/market-trends/{card_identifier:path}")
 @safe_endpoint
 async def get_market_trends(
     card_identifier: str,
@@ -6341,7 +6357,7 @@ def generate_trend_recommendation(slope: float, confidence: float, change_90d: f
 
 
 
-@app.get("/api/market-trends/history/{card_identifier}")
+@app.get("/api/market-trends/history/{card_identifier:path}")
 @safe_endpoint
 async def get_market_trends_history(
     card_identifier: str,
@@ -6431,102 +6447,13 @@ class MarketPriceLookupRequest(BaseModel):
     card_year: Optional[str] = None
     card_number: Optional[str] = None
     grade: Optional[str] = None
-
     # Variant/rarity attributes — dramatically affect eBay price
-    # Keep legacy 'variant' for backward compatibility, but prefer 'variant_type'
-    variant_type: Optional[str] = None     # Parallel, Full Art, Alt Art, Textured, Etched, etc.
-    variant: Optional[str] = None          # legacy alias
-    rarity: Optional[str] = None           # Secret Rare, Ultra Rare, Full Art Rare, etc.
+    variant: Optional[str] = None          # Holo, Reverse Holo, 1st Edition, Full Art, Alt Art, Parallel, Shadowless
+    rarity: Optional[str] = None           # Secret Rare, Ultra Rare, Full Art Rare, Double Rare, Illustration Rare
     language: Optional[str] = None         # Japanese, Korean, Chinese — omit/English for default
+    is_signed: Optional[bool] = None       # Artist/player signature
+    extra_attributes: Optional[str] = None # Catch-all: Prerelease stamp, Staff stamp, Galaxy foil etc.
 
-    # Additional structured signals (optional)
-    edition: Optional[str] = None          # 1st Edition, Unlimited, etc.
-    finish: Optional[str] = None           # Foil, Textured, Etched, Gloss, etc.
-
-    # Signatures / promos / error cards
-    is_signed: Optional[bool] = False
-    signed_by: Optional[str] = None
-    is_error_card: Optional[bool] = False
-    is_promo: Optional[bool] = False
-
-    # Pricing behavior controls (optional)
-    apply_graded_premium: Optional[bool] = True  # if graded comps not found, estimate graded price from raw
-    graded_premium_add_aud: Optional[float] = 70.0
-
-
-def _parse_numeric_grade(grade: str) -> Optional[float]:
-    try:
-        m = re.search(r"(\d+(?:\.\d+)?)", grade or "")
-        return float(m.group(1)) if m else None
-    except Exception:
-        return None
-
-def _grade_multiplier_heuristic(grade: str) -> float:
-    """Conservative multiplier (on top of 'raw + premium') when no graded comps exist."""
-    g = _parse_numeric_grade(grade or "")
-    if g is None:
-        return 1.0
-    # CLA 12+ is rarer than PSA10, but we keep conservative to avoid runaway valuations
-    if g >= 12:
-        return 1.60
-    if g >= 11:
-        return 1.40
-    if g >= 10:
-        return 1.25
-    if g >= 9:
-        return 1.10
-    if g >= 8:
-        return 1.05
-    return 1.00
-
-def _variant_multiplier_heuristic(variant_type: str, rarity: str, finish: str, edition: str, language: str) -> float:
-    v = (variant_type or "").strip().lower()
-    r = (rarity or "").strip().lower()
-    f = (finish or "").strip().lower()
-    e = (edition or "").strip().lower()
-    lang = (language or "").strip().lower()
-
-    mult = 1.0
-
-    # One Piece / TCG common value drivers
-    if "manga" in v or "manga" in r:
-        mult *= 6.0
-    if "alt" in v or "alt art" in v or "alternate" in v or "alt art" in r:
-        mult *= 2.5
-    if "full art" in v or "full art" in r:
-        mult *= 1.8
-    if "parallel" in v or "parallel" in r:
-        mult *= 2.2
-    if "1 star" in v or "★" in v or "one star" in v:
-        mult *= 2.5
-    if "2 star" in v or "two star" in v or "★★" in v:
-        mult *= 5.0
-    if "secret" in r:
-        mult *= 2.0
-
-    # Finish bumps
-    if "textured" in v or "textured" in f:
-        mult *= 1.20
-    if "etched" in v or "etched" in f:
-        mult *= 1.15
-    if "foil" in f:
-        mult *= 1.10
-
-    # Edition bumps (mostly vintage Pokémon, but harmless)
-    if "1st" in e or "first" in e:
-        mult *= 1.35
-
-    # Language: Japanese can be higher or lower depending on TCG; small, conservative nudge
-    if lang in {"jp", "japanese"}:
-        mult *= 1.05
-
-    # Clamp to prevent explosions from messy labels
-    return max(1.0, min(mult, 12.0))
-
-def _estimate_graded_price_from_raw(raw_price: float, grade: str, variant_type: str, rarity: str, finish: str, edition: str, language: str, premium_add: float = 70.0) -> float:
-    base = max(0.0, float(raw_price)) + max(0.0, float(premium_add or 0.0))
-    mult = _grade_multiplier_heuristic(grade) * _variant_multiplier_heuristic(variant_type, rarity, finish, edition, language)
-    return round(base * mult, 2)
 
 @app.post("/api/market/price-lookup")
 @safe_endpoint
@@ -6541,7 +6468,7 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
         card_number  = (request.card_number  or "").strip()
         grade        = (request.grade        or "").strip()
         rarity       = (request.rarity       or "").strip()
-        variant_type = ((request.variant_type or request.variant) or "").strip()
+        variant_type = (request.variant_type or "").strip()
         edition      = (request.edition      or "").strip()
         finish       = (request.finish       or "").strip()
         is_signed    = bool(request.is_signed)
@@ -6609,13 +6536,6 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
             "master ball":      "Master Ball",
             "art rare":         "Art Rare",
             "promo":            "Promo",
-            "parallel":         "Parallel",
-            "full art":         "Full Art",
-            "alt art":          "Alt Art",
-            "alternate art":    "Alt Art",
-            "manga":            "Manga",
-            "1 star":           "1 Star",
-            "2 star":           "2 Star",
         }
         if variant_type.lower() not in _skip_variant:
             vtoken = _variant_canonical.get(variant_type.lower(), variant_type)
@@ -6721,34 +6641,8 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
             # Detect whether the winning query included variant terms
             variant_in_query = bool(variant_str and variant_str.lower() in search_query.lower())
             logging.info(f"✅ {source}: ${price:.2f} ({sales} records) | variant_in_query={variant_in_query}")
-
-            raw_price = float(price or 0.0)
-
-            # If we DID NOT find graded comps (no PSA/CGC/BGS token in the winning query),
-            # but the caller provided a grade, estimate a graded price from raw using:
-            #   (raw + premium_add) * grade_mult * variant_mult
-            adjusted_price = None
-            if (request.apply_graded_premium is not False) and grade and not grade_in_query and raw_price > 0:
-                premium_add = float(request.graded_premium_add_aud or 70.0)
-                adjusted_price = _estimate_graded_price_from_raw(
-                    raw_price=raw_price,
-                    grade=grade,
-                    variant_type=variant_type,
-                    rarity=rarity,
-                    finish=finish,
-                    edition=edition,
-                    language=request.language or "",
-                    premium_add=premium_add,
-                )
-
-                # For collection valuation, prefer the adjusted graded estimate when no graded comps exist.
-                price = adjusted_price
-                source = f"{source}_estimated_graded"
-
             return {
                 "current_price": price,
-                "raw_price": raw_price,
-                "estimated_graded_price": adjusted_price,
                 "source": source,
                 "search_query": search_query,
                 "queries_tried": queries,
@@ -6778,28 +6672,8 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                             pc_aud = _usd_to_aud_simple(pc_prices[pk])
                             if pc_aud and float(pc_aud) > 0:
                                 logging.info(f"✅ PriceCharting fallback: ${float(pc_aud):.2f} AUD")
-
-                                raw_price = float(pc_aud or 0.0)
-                                adjusted_price = None
-                                if (request.apply_graded_premium is not False) and grade and raw_price > 0:
-                                    premium_add = float(request.graded_premium_add_aud or 70.0)
-                                    adjusted_price = _estimate_graded_price_from_raw(
-                                        raw_price=raw_price,
-                                        grade=grade,
-                                        variant_type=variant_type,
-                                        rarity=rarity,
-                                        finish=finish,
-                                        edition=edition,
-                                        language=request.language or "",
-                                        premium_add=premium_add,
-                                    )
-                                    # If PC is ungraded, prefer graded estimate for collection valuation
-                                    raw_price = float(pc_aud or 0.0)
-
                                 return {
                                     "current_price": round(float(pc_aud), 2),
-                                    "raw_price": raw_price,
-                                    "estimated_graded_price": adjusted_price,
                                     "source": "pricecharting",
                                     "search_query": pc_q,
                                     "queries_tried": queries,
@@ -8344,21 +8218,10 @@ async def auth_check_simple(
     card_set:  Optional[str] = Form(None),
     card_year: Optional[str] = Form(None),
 ):
-    """Authentication check endpoint used by /authentication-check/.
-
-    Backward compatible response fields (existing UI):
-      - verdict, confidence, summary, flags, positives
-
-    Extended fields (for a premium UI / reporting):
-      - request_id, needs_more_images, image_requests
-      - image_quality (front/back), checklist, recommendations, signals
-
-    Design principles:
-      - Provide evidence-based, structured output
-      - Be conservative when images are low quality
-      - Never return nonsense confidence (always 0–100)
     """
-
+    Simplified auth-check endpoint — called by the WordPress WP AJAX proxy.
+    Returns the flat {verdict, confidence, summary, flags, positives} shape expected by the frontend.
+    """
     front_bytes = await front.read()
     back_bytes  = await back.read() if back else None
 
@@ -8366,117 +8229,26 @@ async def auth_check_simple(
     cs = (card_set  or "").strip()
     cy = (card_year or "").strip()
 
-    request_id = "AUTH-" + secrets.token_hex(5).upper()
-
-    # ---- Deterministic image-quality checks (best-effort, no SciPy) ----
-    def _img_quality(image_bytes: Optional[bytes]) -> Dict[str, Any]:
-        out: Dict[str, Any] = {"available": False}
-        if not (PIL_AVAILABLE and image_bytes):
-            return out
-        try:
-            from PIL import Image, ImageStat, ImageFilter
-            img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-            w, h = img.size
-
-            # Resolution
-            res_pass = bool(w >= 1100 and h >= 1100)
-
-            # Sharpness via edge response variance
-            edges = img.filter(ImageFilter.FIND_EDGES)
-            stat_e = ImageStat.Stat(edges)
-            edge_var = float(sum(stat_e.var) / max(1, len(stat_e.var)))
-            sharp_pass = bool(edge_var >= 120.0)
-
-            # Glare/overexposure via bright pixel ratio
-            gray = img.convert("L")
-            hist = gray.histogram()
-            bright = sum(hist[246:])
-            total = max(1, w * h)
-            bright_pct = float(bright) / float(total) * 100.0
-            glare_pass = bool(bright_pct <= 3.0)
-
-            mean_l = float(ImageStat.Stat(gray).mean[0])
-            low_light = bool(mean_l < 55.0)
-
-            warnings: List[str] = []
-            if not res_pass:
-                warnings.append("Image resolution is low — use a closer shot or higher quality photo.")
-            if not sharp_pass:
-                warnings.append("Image looks blurry — tap to focus and keep the camera steady.")
-            if not glare_pass:
-                warnings.append("Glare/overexposure detected — tilt the card and reduce reflections.")
-            if low_light:
-                warnings.append("Image is quite dark — add lighting to reveal print texture and edges.")
-
-            return {
-                "available": True,
-                "width": w,
-                "height": h,
-                "edge_variance": round(edge_var, 2),
-                "mean_luminance": round(mean_l, 2),
-                "bright_pixel_percent": round(bright_pct, 2),
-                "passes": {
-                    "resolution": res_pass,
-                    "sharpness": sharp_pass,
-                    "glare": glare_pass,
-                },
-                "warnings": warnings,
-            }
-        except Exception:
-            return {"available": False}
-
-    front_quality = _img_quality(front_bytes)
-    back_quality  = _img_quality(back_bytes)
-
-    front_auto = perform_automated_auth_checks(front_bytes) if front_bytes else {"available": False}
-    back_auto  = perform_automated_auth_checks(back_bytes) if back_bytes else {"available": False}
-
-    needs_more_images = False
-    image_requests: List[str] = []
-    if front_quality.get("available"):
-        p = front_quality.get("passes") or {}
-        if not (p.get("resolution") and p.get("sharpness") and p.get("glare")):
-            needs_more_images = True
-            image_requests.append("Front photo: closer, in-focus, no glare, fill frame with the card.")
-    else:
-        needs_more_images = True
-        image_requests.append("Front photo: please upload a clear photo (or use the Camera button).")
-
-    if back_bytes:
-        if back_quality.get("available"):
-            p = back_quality.get("passes") or {}
-            if not (p.get("resolution") and p.get("sharpness") and p.get("glare")):
-                needs_more_images = True
-                image_requests.append("Back photo: closer, in-focus, no glare, fill frame with the card.")
-
-    # ---- Rubric-driven LLM analysis (structured, defensible) ----
     auth_prompt = (
-        f"You are an expert trading card authenticator and forensic examiner. "
-        f"Analyze the provided image(s) of: '{cn}'" + (f" ({cs})" if cs else "") + (f" from {cy}" if cy else "") + ".\n\n"
-        "Be conservative: if image quality is insufficient, lower confidence and ask for better photos.\n\n"
-        "Return ONLY valid JSON using this schema (no markdown, no extra keys):\n"
-        "{\n"
-        "  \\\"verdict\\\": \\\"Likely Authentic\\\" | \\\"Suspicious\\\" | \\\"Likely Counterfeit\\\" | \\\"Unable to Determine\\\",\n"
-        "  \\\"confidence\\\": 0-100,\n"
-        "  \\\"summary\\\": string,\n"
-        "  \\\"positives\\\": [string, ...],\n"
-        "  \\\"flags\\\": [string, ...],\n"
-        "  \\\"needs_more_images\\\": true|false,\n"
-        "  \\\"image_requests\\\": [string, ...],\n"
-        "  \\\"checklist\\\": {\n"
-        "    \\\"print_quality\\\": {\\\"score\\\": 0-10, \\\"notes\\\": string},\n"
-        "    \\\"fonts_ink_edges\\\": {\\\"score\\\": 0-10, \\\"notes\\\": string},\n"
-        "    \\\"holo_foil_texture\\\": {\\\"score\\\": 0-10, \\\"notes\\\": string},\n"
-        "    \\\"set_symbols_numbers\\\": {\\\"score\\\": 0-10, \\\"notes\\\": string},\n"
-        "    \\\"back_pattern\\\": {\\\"score\\\": 0-10, \\\"notes\\\": string},\n"
-        "    \\\"cut_edges_corners\\\": {\\\"score\\\": 0-10, \\\"notes\\\": string},\n"
-        "    \\\"tamper_alteration\\\": {\\\"score\\\": 0-10, \\\"notes\\\": string}\n"
-        "  }\n"
-        "}\n\n"
-        "Evaluation guidance:\n"
-        "- Only flag genuine counterfeit indicators (wrong back pattern, incorrect fonts/kerning, muddy printing, inconsistent set symbols).\n"
-        "- Normal factory variation is NOT a counterfeit indicator.\n"
-        "- If holo/texture cannot be validated from a still photo, state that limitation and reduce confidence.\n"
+        f"You are an expert trading card authenticator. Analyze the provided image(s) of '{cn}'"
+        + (f" ({cs})" if cs else "")
+        + (f" from {cy}" if cy else "")
+        + """. Check for signs of counterfeiting, reprints, or alterations.
+
+Respond ONLY with valid JSON matching this exact schema:
+{
+  "verdict": "Likely Authentic|Suspicious|Likely Counterfeit",
+  "confidence": 0.0,
+  "summary": "One or two sentences summarising your findings.",
+  "flags": ["issue 1", "issue 2"],
+  "positives": ["positive 1", "positive 2"]
+}
+
+Evaluate: print quality, font/kerning, colour accuracy, holofoil pattern (if applicable),
+edge precision, back pattern consistency, set symbol clarity, rosette dot pattern,
+and any known counterfeit tells for this game/set/era.
+Only flag genuine concerns — normal print variation and manufacturing tolerance are NOT defects.
+"""
     )
 
     content_parts: list = [{"type": "text", "text": auth_prompt}]
@@ -8492,73 +8264,22 @@ async def auth_check_simple(
             "image_url": {"url": f"data:image/jpeg;base64,{_b64(back_bytes)}", "detail": "high"},
         })
 
-    # Small in-process cache to avoid reprocessing identical uploads
-    try:
-        cache_key = hashlib.sha256((front_bytes or b"") + (back_bytes or b"") + (cn+cs+cy).encode("utf-8", "ignore")).hexdigest()
-    except Exception:
-        cache_key = None
+    result   = await _openai_chat([{"role": "user", "content": content_parts}], max_tokens=800, temperature=0.1)
+    parsed   = _parse_json_or_none(result.get("content", "")) or {}
 
-    if not hasattr(auth_check_simple, "_cache"):
-        auth_check_simple._cache = {}  # type: ignore[attr-defined]
-    cache: Dict[str, Any] = getattr(auth_check_simple, "_cache")  # type: ignore[attr-defined]
-
-    if cache_key and cache_key in cache:
-        parsed = cache[cache_key]
-    else:
-        result = await _openai_chat([{"role": "user", "content": content_parts}], max_tokens=1100, temperature=0.1)
-        parsed = _parse_json_or_none(result.get("content", "")) or {}
-        if cache_key:
-            if len(cache) > 256:
-                for _k in list(cache.keys())[:64]:
-                    cache.pop(_k, None)
-            cache[cache_key] = parsed
-
-    # ---- Normalize outputs (strict) ----
-    verdict = str(parsed.get("verdict") or "Unable to Determine").strip()
-    try:
-        confidence = float(parsed.get("confidence") or 0.0)
-    except Exception:
-        confidence = 0.0
-    if 0.0 <= confidence <= 1.0:
-        confidence *= 100.0
-    confidence = float(max(0.0, min(100.0, confidence)))
-
-    summary = str(parsed.get("summary") or "Analysis complete.").strip()
-    flags = list(parsed.get("flags") or parsed.get("red_flags") or [])
-    positives = list(parsed.get("positives") or parsed.get("green_flags") or [])
-    checklist = parsed.get("checklist") or {}
-
-    ai_needs = bool(parsed.get("needs_more_images") or False)
-    ai_reqs = list(parsed.get("image_requests") or [])
-    if needs_more_images and not ai_needs:
-        ai_needs = True
-    for r in image_requests:
-        if r not in ai_reqs:
-            ai_reqs.append(r)
-
-    recommendations: List[str] = []
-    if ai_needs:
-        recommendations.append("Retake photos to improve confidence (focus, lighting, reduce glare, fill frame).")
-    if not back_bytes:
-        recommendations.append("Add a back photo for stronger verification (back pattern is a key counterfeit tell).")
-    recommendations.append("For high-value items, consider in-person authentication for final confirmation.")
+    # Normalise to expected flat shape
+    verdict    = str(parsed.get("verdict")    or "Unable to determine").strip()
+    confidence = float(parsed.get("confidence") or 0.0)
+    summary    = str(parsed.get("summary")    or "Analysis complete.").strip()
+    flags      = list(parsed.get("flags")     or parsed.get("red_flags")  or [])
+    positives  = list(parsed.get("positives") or parsed.get("green_flags") or [])
 
     return JSONResponse(content={
-        # Backward compatible
-        "verdict": verdict,
-        "confidence": round(confidence, 2),
-        "summary": summary,
-        "flags": flags,
-        "positives": positives,
-
-        # Extended
-        "request_id": request_id,
-        "needs_more_images": ai_needs,
-        "image_requests": ai_reqs,
-        "image_quality": {"front": front_quality, "back": back_quality},
-        "checklist": checklist,
-        "recommendations": recommendations,
-        "signals": {"automated": {"front": front_auto, "back": back_auto}},
+        "verdict":    verdict,
+        "confidence": confidence,
+        "summary":    summary,
+        "flags":      flags,
+        "positives":  positives,
     })
 
 
