@@ -6431,6 +6431,12 @@ class MarketPriceLookupRequest(BaseModel):
     card_year: Optional[str] = None
     card_number: Optional[str] = None
     grade: Optional[str] = None
+    # Variant/rarity attributes — dramatically affect eBay price
+    variant: Optional[str] = None          # Holo, Reverse Holo, 1st Edition, Full Art, Alt Art, Parallel, Shadowless
+    rarity: Optional[str] = None           # Secret Rare, Ultra Rare, Full Art Rare, Double Rare, Illustration Rare
+    language: Optional[str] = None         # Japanese, Korean, Chinese — omit/English for default
+    is_signed: Optional[bool] = None       # Artist/player signature
+    extra_attributes: Optional[str] = None # Catch-all: Prerelease stamp, Staff stamp, Galaxy foil etc.
 
 
 @app.post("/api/market/price-lookup")
@@ -6441,15 +6447,23 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
     NOW USES EBAY (same smart query logic as market-trends).
     """
     try:
-        card_name = (request.card_name or "").strip()
-        card_set  = (request.card_set  or "").strip()
-        card_number = (request.card_number or "").strip()
-        grade = (request.grade or "").strip()
+        card_name    = (request.card_name    or "").strip()
+        card_set     = (request.card_set     or "").strip()
+        card_number  = (request.card_number  or "").strip()
+        grade        = (request.grade        or "").strip()
+        rarity       = (request.rarity       or "").strip()
+        variant_type = (request.variant_type or "").strip()
+        edition      = (request.edition      or "").strip()
+        finish       = (request.finish       or "").strip()
+        is_signed    = bool(request.is_signed)
+        signed_by    = (request.signed_by    or "").strip()
+        is_error     = bool(request.is_error_card)
+        is_promo     = bool(request.is_promo)
 
         if not card_name:
             return {"current_price": 0, "source": "error", "error": "card_name required"}
 
-        logging.info(f"💰 Price lookup: {card_name} | grade={grade}")
+        logging.info(f"💰 Price lookup: {card_name} | grade={grade} | rarity={rarity} | variant={variant_type} | signed={is_signed}")
 
         # ── Detect CL Grade 12+ (Ultra Flawless) — maps to PSA 10 on eBay, needs scarcity uplift ──
         grade_is_12_plus = False
@@ -6460,12 +6474,109 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
         except Exception:
             pass
 
-        queries = _build_ebay_query_ladder(
+        # ── Build variant keyword tokens for eBay query enrichment ──────────────
+        # These are injected as the FIRST (most specific) tier of the query ladder.
+        # If no variant-specific results come back, the ladder falls through to the
+        # base card queries so we always get some price signal.
+        variant_tokens = []
+
+        # Rarity — skip low-value rarities that won't help filter eBay results
+        _skip_rarity = {"common", "uncommon", "rare", ""}
+        _rarity_canonical = {
+            "secret rare":                    "Secret Rare",
+            "sr":                             "Secret Rare",
+            "full art":                       "Full Art",
+            "alt art":                        "Alt Art",
+            "special illustration rare":      "Special Illustration Rare SAR",
+            "special art rare":               "SAR",
+            "sar":                            "Special Illustration Rare SAR",
+            "illustration rare":              "Illustration Rare",
+            "ir":                             "Illustration Rare",
+            "hyper rare":                     "Hyper Rare",
+            "rainbow rare":                   "Rainbow Rare",
+            "crown rare":                     "Crown Rare",
+            "ultra rare":                     "Ultra Rare",
+            "gold rare":                      "Gold",
+            "shiny rare":                     "Shiny",
+            "shiny ultra rare":               "Shiny Ultra Rare",
+            "trainer gallery":                "Trainer Gallery",
+            "radiant rare":                   "Radiant",
+        }
+        if rarity.lower() not in _skip_rarity:
+            token = _rarity_canonical.get(rarity.lower(), rarity)
+            if token:
+                variant_tokens.append(token)
+
+        # Variant type — add specific type keywords (complement rarity)
+        _skip_variant = {"regular", "standard", ""}
+        _variant_canonical = {
+            "reverse holo":     "Reverse Holo",
+            "holo":             "Holo",
+            "cosmos holo":      "Cosmos Holo",
+            "rainbow":          "Rainbow Rare",
+            "gold":             "Gold",
+            "textured":         "Textured",
+            "etched":           "Etched",
+            "master ball":      "Master Ball",
+            "art rare":         "Art Rare",
+            "promo":            "Promo",
+        }
+        if variant_type.lower() not in _skip_variant:
+            vtoken = _variant_canonical.get(variant_type.lower(), variant_type)
+            # Only add if not already covered by rarity token (avoid duplicates)
+            if vtoken and vtoken not in " ".join(variant_tokens):
+                variant_tokens.append(vtoken)
+
+        # Edition — high-signal for vintage cards (adds major price premium)
+        _edition_canonical = {
+            "1st edition":         "1st Edition",
+            "first edition":       "1st Edition",
+            "shadowless":          "Shadowless",
+            "collector's edition": "Collector's Edition",
+        }
+        if edition:
+            etoken = _edition_canonical.get(edition.lower(), "")
+            if etoken:
+                variant_tokens.append(etoken)
+
+        # Signed / autographed
+        if is_signed:
+            if signed_by:
+                variant_tokens.append(f"Signed {signed_by}")
+            else:
+                variant_tokens.append("Signed")
+
+        # Error / misprint cards
+        if is_error:
+            variant_tokens.append("Error Misprint")
+
+        # Promo (event/tournament)
+        if is_promo and not any("Promo" in t for t in variant_tokens):
+            variant_tokens.append("Promo")
+
+        variant_str = " ".join(variant_tokens).strip()
+
+        # ── Build query ladder ────────────────────────────────────────────────
+        # Tier 1 (most specific): include variant terms → returns exact-variant price
+        # Tier 2+: base ladder without variant → fallback if variant too niche for eBay
+        base_queries = _build_ebay_query_ladder(
             card_name=card_name,
             card_set=card_set,
             card_number=card_number,
             grade=grade,
         )
+
+        if variant_str:
+            # Prepend variant-enriched versions of the top 2 base queries
+            variant_queries = []
+            for bq in base_queries[:2]:
+                vq = _norm_ws(f"{bq} {variant_str}")
+                if vq not in variant_queries:
+                    variant_queries.append(vq)
+            queries = variant_queries + [q for q in base_queries if q not in variant_queries]
+        else:
+            queries = base_queries
+
         if not queries:
             return {"current_price": 0, "source": "error", "error": "Could not build search query"}
 
@@ -6511,7 +6622,9 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                 source = "ebay_active"
                 sales  = active_count
 
-            logging.info(f"✅ {source}: ${price:.2f} ({sales} records)")
+            # Detect whether the winning query included variant terms
+            variant_in_query = bool(variant_str and variant_str.lower() in search_query.lower())
+            logging.info(f"✅ {source}: ${price:.2f} ({sales} records) | variant_in_query={variant_in_query}")
             return {
                 "current_price": price,
                 "source": source,
@@ -6521,6 +6634,8 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                 "sales_count": sales,
                 "price_includes_grade": grade_in_query,
                 "grade_12_uplift": bool(grade_is_12_plus and grade_in_query),
+                "variant_matched": variant_in_query,
+                "variant_terms_used": variant_str or None,
                 "last_updated": datetime.now().isoformat(),
             }
         # ── eBay found nothing — try PriceCharting as fallback ──
