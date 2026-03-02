@@ -38,7 +38,7 @@ Env vars
 - USE_EBAY_API=0/1 (default 0) + EBAY_APP_ID/EBAY_CERT_ID/EBAY_DEV_ID/EBAY_OAUTH_TOKEN (optional; scaffold only)
 """
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Depends, Security, status, Request, Body, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Depends, Security, status, Request, Body
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -940,10 +940,6 @@ async def _ebay_completed_stats(keyword_query: str, limit: int = 120, days_lookb
     pages = min(5, (target + 99) // 100)  # safety cap
 
     prices: list[float] = []
-    graded_prices: list[float] = []
-    raw_prices: list[float] = []
-    samples: list[dict] = []
-
 
     # Fetch live FX rate once for the whole batch (falls back to static if unavailable)
     aud_rate = await _fx_usd_to_aud()
@@ -985,13 +981,6 @@ async def _ebay_completed_stats(keyword_query: str, limit: int = 120, days_lookb
 
             for it in items or []:
                 try:
-                    title_val = it.get('title')
-                    if isinstance(title_val, list):
-                        title = str(title_val[0] if title_val else '')
-                    else:
-                        title = str(title_val or '')
-                    sig = _detect_graded_signals(title)
-
                     selling = it.get("sellingStatus", [{}])[0]
                     cp = (selling.get("convertedCurrentPrice", [{}]) or [{}])[0] or (selling.get("currentPrice", [{}]) or [{}])[0]
                     val = float(cp.get("__value__", 0.0))
@@ -1004,12 +993,6 @@ async def _ebay_completed_stats(keyword_query: str, limit: int = 120, days_lookb
                     if val <= 0 or val > 1_000_000:
                         continue
                     prices.append(val)
-                    if sig.get('graded'):
-                        graded_prices.append(val)
-                    else:
-                        raw_prices.append(val)
-                    if len(samples) < 5:
-                        samples.append({'price': val, 'currency': cur, 'graded': bool(sig.get('graded')), 'grader': sig.get('grader'), 'grade': sig.get('grade_str'), 'score': sig.get('score'), 'title': sig.get('title')})
                 except Exception:
                     continue
 
@@ -1054,14 +1037,6 @@ async def _ebay_completed_stats(keyword_query: str, limit: int = 120, days_lookb
         "p80": raw_high,
         "min": float(prices[0]),
         "max": float(prices[-1]),
-        "graded_count": len(graded_prices),
-        "raw_count": len(raw_prices),
-        "graded_prices": sorted(graded_prices)[:target],
-        "raw_prices": sorted(raw_prices)[:target],
-        "graded_median": (sorted(graded_prices)[len(graded_prices)//2] if graded_prices else None),
-        "raw_median": (sorted(raw_prices)[len(raw_prices)//2] if raw_prices else None),
-        "samples": samples,
-
     }
     _EBAY_CACHE[cache_key] = {"ts": now, "data": out}
     return out
@@ -1993,221 +1968,6 @@ def _is_blankish(s: str) -> bool:
         "not sure", "unsure",
     )
 
-
-# ==============================
-# GRADED SIGNALS + GRADE PARSING (eBay titles)
-# ==============================
-
-_GRADER_REGEXES = [
-    ("PSA",   r"\bpsa\b|\bprofessional sports authenticator\b"),
-    ("BGS",   r"\bbgs\b|\bbeckett\b|\bbvg\b"),
-    ("CGC",   r"\bcgc\b"),
-    ("SGC",   r"\bsgc\b"),
-    ("CSG",   r"\bcsg\b"),
-    ("HGA",   r"\bhga\b"),
-    ("TAG",   r"\btag\b"),
-    ("ACE",   r"\bace\b"),
-    ("GMA",   r"\bgma\b"),
-    ("ARS",   r"\bars\b"),
-    ("BAS",   r"\bbas\b|\bbeckett authentication\b"),
-    ("CLA",   r"\bcla\b"),
-]
-
-# Strong negative phrases that often appear in raw listings or "PSA 10 quality" claims
-_GRADED_NEGATIVE = [
-    "raw", "ungraded", "not graded", "no grade", "no psa", "not psa",
-    "psa ready", "psa-ready", "ready to grade", "grade ready", "will grade",
-    "could grade", "should grade", "potential psa", "looks like psa",
-    "10/10 condition", "10 10 condition", "mint 10 quality", "gem mint quality",
-]
-
-# Words that indicate grading/slabbing even if grader acronym is missing
-_GRADED_GENERIC = [
-    "graded", "slab", "slabbed", "encapsulated", "case", "holder",
-    "gem mint", "gem mt", "mint 10", "pristine", "black label",
-]
-
-_GRADE_NUM_RE = re.compile(r"\b(10(?:\.0)?|9\.5|9|8\.5|8|7\.5|7|6\.5|6|5\.5|5|4\.5|4|3\.5|3|2\.5|2|1\.5|1)\b")
-
-def _parse_grade_num_from_text(text: str) -> Tuple[Optional[float], Optional[str]]:
-    """Extract a plausible grading number from text. Returns (grade_float, grade_str)."""
-    if not text:
-        return None, None
-    t = _norm_ws(str(text)).lower()
-    # Avoid obvious false positives like "10/10"
-    if re.search(r"\b\d{1,2}\s*/\s*\d{1,2}\b", t):
-        # still may contain real grade elsewhere; don't early return
-        pass
-
-    m = _GRADE_NUM_RE.search(t)
-    if not m:
-        return None, None
-    gstr = m.group(1)
-    # Reject if immediately adjacent to '/' or 'x' like "10x" or "10/10"
-    span = m.span(1)
-    before = t[span[0]-1:span[0]] if span[0] > 0 else ""
-    after  = t[span[1]:span[1]+1] if span[1] < len(t) else ""
-    if before in ("/", "x") or after in ("/", "x"):
-        return None, None
-    try:
-        return float(gstr), gstr
-    except Exception:
-        return None, None
-
-def _detect_graded_signals(listing_title: str) -> Dict[str, Any]:
-    """Detect if a listing is graded and parse grader/grade when possible."""
-    title = _norm_ws(listing_title or "")
-    t = title.lower()
-
-    score = 0
-    reasons: list[str] = []
-    grader = None
-    grade_val: Optional[float] = None
-    grade_str: Optional[str] = None
-
-    # Strong negatives
-    for neg in _GRADED_NEGATIVE:
-        if neg in t:
-            score -= 6
-            reasons.append(f"neg:{neg}")
-
-    # Grader tokens
-    for name, rx in _GRADER_REGEXES:
-        if re.search(rx, t, re.I):
-            grader = grader or name
-            score += 4
-            reasons.append(f"grader:{name}")
-
-    # Generic graded indicators
-    for kw in _GRADED_GENERIC:
-        if kw in t:
-            score += 2
-            reasons.append(f"kw:{kw}")
-
-    # Black label / pristine keywords
-    if "black label" in t:
-        score += 6
-        reasons.append("label:black")
-    if "pristine" in t:
-        score += 3
-        reasons.append("label:pristine")
-
-    # Parse grade near grader token (tight window)
-    if grader:
-        # Search for patterns like "PSA 10", "BGS 9.5", "CGC 10"
-        rx = re.compile(rf"(?:{grader.lower()}|psa|bgs|cgc|sgc|csg|hga|tag|ace|gma|ars|bvg|beckett)\s*#?\s*(?:grade\s*)?(10(?:\.0)?|9\.5|9|8\.5|8|7\.5|7|6\.5|6|5\.5|5|4\.5|4|3\.5|3|2\.5|2|1\.5|1)\b", re.I)
-        m = rx.search(title)
-        if m:
-            try:
-                grade_val = float(m.group(1))
-                grade_str = m.group(1)
-                score += 6
-                reasons.append("pattern:grader+grade")
-            except Exception:
-                pass
-
-    # Fallback: parse a grade number if strong graded keywords exist
-    if grade_val is None and score >= 4:
-        gv, gs = _parse_grade_num_from_text(title)
-        if gv is not None:
-            grade_val, grade_str = gv, gs
-            score += 2
-            reasons.append("pattern:grade_only")
-
-    graded = score >= 6
-    return {
-        "graded": graded,
-        "score": score,
-        "grader": grader,
-        "grade_value": grade_val,
-        "grade_str": grade_str,
-        "reasons": reasons[:12],
-        "title": title[:240],
-    }
-
-def _grade_multiplier_from_grade(grade: str) -> float:
-    """Map CLA/PSA-style grades to a conservative multiplier."""
-    g = (grade or "").strip()
-    m = re.search(r"(\d+(?:\.\d+)?)", g)
-    if not m:
-        return 1.0
-    try:
-        val = float(m.group(1))
-    except Exception:
-        return 1.0
-
-    # CLA 11/12 treated as PSA 10-equivalent but with uplift
-    if val >= 12:
-        return 2.4
-    if val >= 11:
-        return 2.1
-    if val >= 10:
-        return 1.8
-    if val >= 9.5:
-        return 1.6
-    if val >= 9:
-        return 1.4
-    if val >= 8.5:
-        return 1.25
-    if val >= 8:
-        return 1.15
-    if val >= 7.5:
-        return 1.05
-    if val >= 7:
-        return 1.0
-    # Lower grades — no premium in this model (you can tune later)
-    return 0.9
-
-def _variant_multiplier(variant_type: str = "", edition: str = "", finish: str = "", rarity: str = "", is_signed: bool = False, is_error: bool = False, is_promo: bool = False) -> float:
-    """Conservative multiplicative uplift for variants/finishes."""
-    v = (variant_type or "").lower()
-    e = (edition or "").lower()
-    f = (finish or "").lower()
-    r = (rarity or "").lower()
-
-    mult = 1.0
-
-    # High-signal variants
-    if any(x in v for x in ["manga"]):
-        mult *= 2.5
-    if any(x in v for x in ["alt art", "alternate art", "aa"]):
-        mult *= 1.9
-    if any(x in v for x in ["full art", "fa"]):
-        mult *= 1.6
-    if "parallel" in v:
-        mult *= 1.5
-    if "secret" in r:
-        mult *= 1.3
-
-    # Star rarity (One Piece)
-    if "1 star" in v or "one star" in v or "★" in variant_type:
-        mult *= 1.8
-    if "2 star" in v or "two star" in v or "★★" in variant_type:
-        mult *= 2.4
-
-    # Finishes
-    if any(x in f for x in ["textured", "etched"]):
-        mult *= 1.2
-    if any(x in f for x in ["holo", "foil", "reverse"]):
-        mult *= 1.1
-
-    # Editions
-    if "1st" in e or "first" in e:
-        mult *= 1.4
-    if "shadowless" in e:
-        mult *= 1.6
-
-    if is_signed:
-        mult *= 1.3
-    if is_error:
-        mult *= 1.2
-    if is_promo:
-        mult *= 1.1
-
-    # Clamp to prevent runaway
-    return float(max(0.5, min(mult, 6.0)))
-
-
 def _safe_json_extract(text: str) -> dict | None:
     """Best-effort extraction of a JSON object from a model response."""
     if not text:
@@ -2621,10 +2381,6 @@ async def _ebay_active_stats(keyword_query: str, limit: int = 120) -> dict:
 
     target = max(1, int(limit or 120))
     prices: List[float] = []
-    graded_prices: List[float] = []
-    raw_prices: List[float] = []
-    samples: List[dict] = []
-
 
     # Warm the FX cache so _usd_to_aud_simple picks up the live rate
     await _fx_usd_to_aud()
@@ -2664,13 +2420,6 @@ async def _ebay_active_stats(keyword_query: str, limit: int = 120) -> dict:
                     items = j.get("itemSummaries") or []
                     for it in items:
                         try:
-                            title_val = it.get('title')
-                            if isinstance(title_val, list):
-                                title = str(title_val[0] if title_val else '')
-                            else:
-                                title = str(title_val or '')
-                            sig = _detect_graded_signals(title)
-
                             pr = (it.get("price") or {})
                             val = float(pr.get("value") or 0.0)
                             cur = str(pr.get("currency") or DEFAULT_CURRENCY).upper()
@@ -2681,12 +2430,6 @@ async def _ebay_active_stats(keyword_query: str, limit: int = 120) -> dict:
                             if val <= 0 or val > 1_000_000:
                                 continue
                             prices.append(val)
-                            if sig.get('graded'):
-                                graded_prices.append(val)
-                            else:
-                                raw_prices.append(val)
-                            if len(samples) < 5:
-                                samples.append({'price': val, 'currency': cur, 'graded': bool(sig.get('graded')), 'grader': sig.get('grader'), 'grade': sig.get('grade_str'), 'score': sig.get('score'), 'title': sig.get('title')})
                         except Exception:
                             continue
                     if len(prices) >= target:
@@ -2776,14 +2519,6 @@ async def _ebay_active_stats(keyword_query: str, limit: int = 120) -> dict:
         "p80": raw_high,
         "min": float(prices[0]),
         "max": float(prices[-1]),
-        "graded_count": len(graded_prices),
-        "raw_count": len(raw_prices),
-        "graded_prices": sorted(graded_prices)[:target],
-        "raw_prices": sorted(raw_prices)[:target],
-        "graded_median": (sorted(graded_prices)[len(graded_prices)//2] if graded_prices else None),
-        "raw_median": (sorted(raw_prices)[len(raw_prices)//2] if raw_prices else None),
-        "samples": samples,
-
     }
     _EBAY_CACHE[cache_key] = {"ts": now, "data": out}
     return out
@@ -5979,24 +5714,9 @@ async def _ebay_sold_prices_stub(query: str) -> Dict[str, Any]:
 # ==============================
 # ========================================
 # MARKET TREND PREDICTIONS
-# ===================================
-@app.get("/api/market-trends")
-@safe_endpoint
-async def get_market_trends_query(
-    q: str = Query(..., description="Card identifier or free-text query (supports pipes)"),
-    days: int = 90,
-    api_key: Optional[str] = Depends(verify_api_key_optional),  # optional (read endpoint)
-):
-    """
-    Query-param wrapper for market trends.
+# ========================================
 
-    This avoids path-routing edge cases when identifiers contain slashes (e.g., "13/94"),
-    which can otherwise lead to 404s depending on URL decoding behavior.
-    """
-    return await get_market_trends(card_identifier=q, days=days, api_key=api_key)
-
-
-@app.get("/api/market-trends/{card_identifier:path}")
+@app.get("/api/market-trends/{card_identifier}")
 @safe_endpoint
 async def get_market_trends(
     card_identifier: str,
@@ -6621,7 +6341,7 @@ def generate_trend_recommendation(slope: float, confidence: float, change_90d: f
 
 
 
-@app.get("/api/market-trends/history/{card_identifier:path}")
+@app.get("/api/market-trends/history/{card_identifier}")
 @safe_endpoint
 async def get_market_trends_history(
     card_identifier: str,
@@ -6711,20 +6431,134 @@ class MarketPriceLookupRequest(BaseModel):
     card_year: Optional[str] = None
     card_number: Optional[str] = None
     grade: Optional[str] = None
-    # Variant/rarity attributes — dramatically affect eBay price
-    variant: Optional[str] = None          # Holo, Reverse Holo, 1st Edition, Full Art, Alt Art, Parallel, Shadowless
-    # Backwards/forwards compatibility: some callers send variant_type/edition/finish, others send variant
-    variant_type: Optional[str] = None     # Parallel, Full Art, Alt Art, Manga, etc.
-    edition: Optional[str] = None          # 1st Edition, Unlimited, etc.
-    finish: Optional[str] = None           # Textured, Etched, Foil, Holo, Reverse, etc.
-    signed_by: Optional[str] = None        # Name/role if signed (string); use is_signed boolean too
-    is_error_card: Optional[bool] = None   # Error/misprint flag
-    is_promo: Optional[bool] = None        # Promo flag
-    rarity: Optional[str] = None           # Secret Rare, Ultra Rare, Full Art Rare, Double Rare, Illustration Rare
-    language: Optional[str] = None         # Japanese, Korean, Chinese — omit/English for default
-    is_signed: Optional[bool] = None       # Artist/player signature
+
+    rank_within_card: Optional[int] = None  # population rank within identical card
+    rank_total: Optional[int] = None        # total population for identical card
+    apply_cla_valuation: Optional[bool] = True  # if true, backend returns final_value using CLA model
+
+    # ── Variant / rarity attributes — dramatically affect eBay price ──────────
+    # All fields below are synced from card_submissions via cg-collection.php.
+    # The endpoint reads these directly; keep names in sync with the PHP $query_data keys.
+    variant: Optional[str] = None          # legacy / catch-all variant label (back-compat)
+    rarity: Optional[str] = None           # Secret Rare, Ultra Rare, Full Art Rare, Illustration Rare …
+    variant_type: Optional[str] = None     # Reverse Holo, Rainbow, Textured, Alt Art, Cosmos Holo …
+    edition: Optional[str] = None          # 1st Edition, Shadowless, Collector's Edition
+    finish: Optional[str] = None           # Textured, Holofoil, Etched, Cosmos Holo
+    is_signed: Optional[bool] = None       # Artist / athlete autograph present
+    signed_by: Optional[str] = None        # Signer name (e.g. "Ken Sugimori")
+    is_error_card: Optional[bool] = None   # Factory misprint / miscut / wrong-back
+    is_promo: Optional[bool] = None        # Tournament / event / prerelease promo
+    language: Optional[str] = None         # Japanese, Korean, Chinese — omit/None for English default
     extra_attributes: Optional[str] = None # Catch-all: Prerelease stamp, Staff stamp, Galaxy foil etc.
 
+
+
+# ========================================
+# CLA VALUATION MODEL (single source of truth)
+# ========================================
+def _cla_parse_grade(grade_str: str) -> float | None:
+    if not grade_str:
+        return None
+    m = re.search(r"(\d+(?:\.\d+)?)", str(grade_str))
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except Exception:
+        return None
+
+def cla_grade_multiplier(grade_str: str, rank_within_card: int | None = None, rank_total: int | None = None) -> float:
+    """Return CLA multiplier vs RAW baseline (1.0). Conservative defaults."""
+    g = _cla_parse_grade(grade_str) or 0.0
+
+    # Core grade multipliers — kept in sync with cg_grade_value_multiplier() in cg-collection.php.
+    # PHP is the canonical source; update both places together if you tune these.
+    if g >= 12:
+        mult = 3.50   # CL Ultra Flawless: PSA10 × scarcity (~30% on top)
+    elif g >= 10:
+        mult = 2.70   # PSA 10 / Gem Mint: 170% premium over raw
+    elif g >= 9.5:
+        mult = 2.10   # Near-gem: strong but not PSA10
+    elif g >= 9:
+        mult = 1.65   # PSA 9: solid graded premium
+    elif g >= 8.5:
+        mult = 1.30   # PSA 8.5: modest premium
+    elif g >= 8:
+        mult = 1.05   # PSA 8: near-market
+    elif g >= 7:
+        mult = 0.82   # PSA 7: slight graded discount (condition concern)
+    elif g > 0:
+        mult = 0.60   # PSA 6 and below: graded but damaged discount
+    else:
+        mult = 1.00
+
+    # Optional pop-rank premium (small, capped)
+    if rank_within_card is not None and rank_within_card > 0:
+        if rank_within_card == 1:
+            mult *= 1.15
+        elif rank_within_card <= 3:
+            mult *= 1.08
+        elif rank_within_card <= 10:
+            mult *= 1.03
+
+    return float(round(mult, 6))
+
+def _parse_grade_from_query(q: str) -> float | None:
+    if not q:
+        return None
+    m = re.search(r"\b(?:PSA|BGS|CGC|SGC|CSG|TAG|HGA|ACE|GMA|ARS)\s*(\d+(?:\.\d+)?)\b", q, re.I)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except Exception:
+        return None
+
+def apply_cla_valuation(signal_price: float, signal_includes_grade: bool, search_query: str, target_grade: str | None,
+                        rank_within_card: int | None = None, rank_total: int | None = None,
+                        slab_premium_add_aud: float = 70.0) -> dict:
+    """Compute final_value from a market signal + CLA rules."""
+    signal_price = float(signal_price or 0.0)
+    if signal_price <= 0:
+        return {
+            "final_value": 0.0,
+            "base_price": 0.0,
+            "multiplier_applied": 1.0,
+            "slab_premium_added": 0.0,
+            "target_multiplier": 1.0,
+            "base_multiplier": 1.0,
+        }
+
+    tg_mult = cla_grade_multiplier(target_grade or "", rank_within_card, rank_total) if target_grade else 1.0
+
+    if signal_includes_grade and target_grade:
+        # Assume the signal is for a known graded baseline (e.g. PSA 10). Parse grade from query when possible.
+        base_grade = _parse_grade_from_query(search_query) or 10.0
+        base_mult = cla_grade_multiplier(str(base_grade))
+        base_price = signal_price
+        slab_added = 0.0
+        mult_applied = (tg_mult / base_mult) if base_mult > 0 else 1.0
+    elif (not signal_includes_grade) and target_grade:
+        # Raw signal → add slab premium then apply full target multiplier
+        slab_added = float(slab_premium_add_aud or 70.0)
+        base_price = signal_price + slab_added
+        base_mult = 1.0
+        mult_applied = tg_mult
+    else:
+        slab_added = 0.0
+        base_price = signal_price
+        base_mult = 1.0
+        mult_applied = 1.0
+
+    final_value = round(base_price * mult_applied, 2)
+    return {
+        "final_value": final_value,
+        "base_price": round(base_price, 2),
+        "multiplier_applied": round(mult_applied, 6),
+        "slab_premium_added": round(slab_added, 2),
+        "target_multiplier": round(tg_mult, 6),
+        "base_multiplier": round(base_mult, 6),
+    }
 
 @app.post("/api/market/price-lookup")
 @safe_endpoint
@@ -6739,13 +6573,13 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
         card_number  = (request.card_number  or "").strip()
         grade        = (request.grade        or "").strip()
         rarity       = (request.rarity       or "").strip()
-        variant_type = ((getattr(request, "variant_type", None) or getattr(request, "variant", None)) or "").strip()
-        edition      = (getattr(request, "edition", None) or "").strip()
-        finish       = (getattr(request, "finish", None) or "").strip()
+        variant_type = (request.variant_type or "").strip()
+        edition      = (request.edition      or "").strip()
+        finish       = (request.finish       or "").strip()
         is_signed    = bool(request.is_signed)
-        signed_by    = (getattr(request, "signed_by", None) or "").strip()
-        is_error     = bool(getattr(request, "is_error_card", False))
-        is_promo     = bool(getattr(request, "is_promo", False))
+        signed_by    = (request.signed_by    or "").strip()
+        is_error     = bool(request.is_error_card)
+        is_promo     = bool(request.is_promo)
 
         if not card_name:
             return {"current_price": 0, "source": "error", "error": "card_name required"}
@@ -6807,14 +6641,6 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
             "master ball":      "Master Ball",
             "art rare":         "Art Rare",
             "promo":            "Promo",
-            "parallel":         "Parallel",
-            "full art":         "Full Art",
-            "alt art":          "Alt Art",
-            "alternate art":    "Alt Art",
-            "manga":            "Manga",
-            "1 star":           "1 Star",
-            "2 star":           "2 Star",
-
         }
         if variant_type.lower() not in _skip_variant:
             vtoken = _variant_canonical.get(variant_type.lower(), variant_type)
@@ -6917,79 +6743,59 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                 source = "ebay_active"
                 sales  = active_count
 
-            # Detect whether the winning query included variant terms
-            variant_in_query = bool(variant_str and variant_str.lower() in search_query.lower())
+            # Detect whether the winning query included any variant terms.
+            # Check each token individually — the query builder doesn't always insert
+            # variant_str as one contiguous block, so a substring search on the full
+            # variant_str would produce false-negatives for multi-token strings.
+            if variant_tokens and search_query:
+                sq_lower = search_query.lower()
+                variant_in_query = any(tok.lower() in sq_lower for tok in variant_tokens if tok)
+            else:
+                variant_in_query = False
             logging.info(f"✅ {source}: ${price:.2f} ({sales} records) | variant_in_query={variant_in_query}")
-            # Determine if our market signal is genuinely graded based on title parsing (when available)
-            target_is_graded = bool(re.search(r"(\d+(?:\.\d+)?)", grade))  # any numeric grade implies graded intent
 
-            comp_graded_med = float((completed or {}).get("graded_median") or 0.0)
-            comp_raw_med    = float((completed or {}).get("raw_median") or 0.0)
-            act_graded_med  = float((active or {}).get("graded_median") or 0.0)
-            act_raw_med     = float((active or {}).get("raw_median") or 0.0)
-
-            # Prefer graded comps when the user/item is graded; otherwise take overall price signal.
-            signal_price = float(price or 0.0)
-            signal_is_graded = False
-            if target_is_graded:
-                if comp_graded_med > 0:
-                    signal_price = comp_graded_med
-                    signal_is_graded = True
-                elif act_graded_med > 0:
-                    signal_price = act_graded_med
-                    signal_is_graded = True
-                elif comp_raw_med > 0:
-                    signal_price = comp_raw_med
-                    signal_is_graded = False
-                elif act_raw_med > 0:
-                    signal_price = act_raw_med
-                    signal_is_graded = False
-
-            # CLA valuation layer (deterministic)
-            slab_premium = 70.0 if (target_is_graded and not signal_is_graded) else 0.0
-            g_mult = _grade_multiplier_from_grade(grade) if target_is_graded else 1.0
-            v_mult = _variant_multiplier(variant_type=variant_type, edition=edition, finish=finish, rarity=rarity, is_signed=is_signed, is_error=is_error, is_promo=is_promo)
-
-            final_price = round((signal_price + slab_premium) * g_mult * v_mult, 2)
-
-            logging.info(
-                f"📌 valuation: signal=${signal_price:.2f} graded={signal_is_graded} +premium=${slab_premium:.2f} "
-                f"*g={g_mult:.2f} *v={v_mult:.2f} => ${final_price:.2f}"
-            )
+            # Backend valuation (single source of truth)
+            try:
+                if request.apply_cla_valuation is not False:
+                    valuation = apply_cla_valuation(
+                        signal_price=float(price or 0.0),
+                        signal_includes_grade=bool(grade_in_query),
+                        search_query=search_query,
+                        target_grade=grade or None,
+                        rank_within_card=getattr(request, "rank_within_card", None),
+                        rank_total=getattr(request, "rank_total", None),
+                        slab_premium_add_aud=70.0,
+                    )
+                    final_price = float(valuation.get("final_value") or 0.0)
+                else:
+                    valuation = None
+                    final_price = float(price or 0.0)
+            except Exception as _e:
+                logging.exception("Valuation error; falling back to signal price")
+                valuation = None
+                final_price = float(price or 0.0)
 
             return {
+                # Back-compat: current_price is what callers typically display
                 "current_price": final_price,
+                # The raw market signal before CLA adjustments
+                "signal_price": float(price or 0.0),
+                "base_price": (valuation.get("base_price") if valuation else float(price or 0.0)),
+                "final_value": (valuation.get("final_value") if valuation else final_price),
+                "multiplier_applied": (valuation.get("multiplier_applied") if valuation else 1.0),
+                "slab_premium_added": (valuation.get("slab_premium_added") if valuation else 0.0),
+                "target_multiplier": (valuation.get("target_multiplier") if valuation else 1.0),
+                "base_multiplier": (valuation.get("base_multiplier") if valuation else 1.0),
+
                 "source": source,
                 "search_query": search_query,
                 "queries_tried": queries,
                 "card_name": card_name,
                 "sales_count": sales,
-                "market_signal_price": round(signal_price, 2),
-                "market_signal_is_graded": signal_is_graded,
-                "slab_premium_added": slab_premium,
-                "grade_multiplier": g_mult,
-                "variant_multiplier": v_mult,
-                "price_includes_grade": bool(signal_is_graded),
+                "price_includes_grade": grade_in_query,
+                "grade_12_uplift": bool(grade_is_12_plus and grade_in_query),
                 "variant_matched": variant_in_query,
                 "variant_terms_used": variant_str or None,
-                "market_debug": {
-                    "completed": {
-                        "count": int((completed or {}).get("count") or 0),
-                        "graded_count": int((completed or {}).get("graded_count") or 0),
-                        "raw_count": int((completed or {}).get("raw_count") or 0),
-                        "graded_median": comp_graded_med or None,
-                        "raw_median": comp_raw_med or None,
-                        "samples": (completed or {}).get("samples") or [],
-                    },
-                    "active": {
-                        "count": int((active or {}).get("count") or 0),
-                        "graded_count": int((active or {}).get("graded_count") or 0),
-                        "raw_count": int((active or {}).get("raw_count") or 0),
-                        "graded_median": act_graded_med or None,
-                        "raw_median": act_raw_med or None,
-                        "samples": (active or {}).get("samples") or [],
-                    },
-                },
                 "last_updated": datetime.now().isoformat(),
             }
         # ── eBay found nothing — try PriceCharting as fallback ──
@@ -7010,14 +6816,41 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                             pc_aud = _usd_to_aud_simple(pc_prices[pk])
                             if pc_aud and float(pc_aud) > 0:
                                 logging.info(f"✅ PriceCharting fallback: ${float(pc_aud):.2f} AUD")
+                                # PriceCharting provides a raw signal; apply CLA valuation if enabled
+                                try:
+                                    if request.apply_cla_valuation is not False:
+                                        _val = apply_cla_valuation(
+                                            signal_price=float(pc_aud or 0.0),
+                                            signal_includes_grade=False,
+                                            search_query=str(pc_q),
+                                            target_grade=grade or None,
+                                            rank_within_card=getattr(request, "rank_within_card", None),
+                                            rank_total=getattr(request, "rank_total", None),
+                                            slab_premium_add_aud=70.0,
+                                        )
+                                        _final = float(_val.get("final_value") or 0.0)
+                                    else:
+                                        _val = None
+                                        _final = round(float(pc_aud), 2)
+                                except Exception:
+                                    _val = None
+                                    _final = round(float(pc_aud), 2)
+
                                 return {
-                                    "current_price": round(float(pc_aud), 2),
+                                    "current_price": round(_final, 2),
+                                    "signal_price": round(float(pc_aud), 2),
+                                    "base_price": (_val.get("base_price") if _val else round(float(pc_aud), 2)),
+                                    "final_value": (_val.get("final_value") if _val else round(_final, 2)),
+                                    "multiplier_applied": (_val.get("multiplier_applied") if _val else 1.0),
+                                    "slab_premium_added": (_val.get("slab_premium_added") if _val else 0.0),
+                                    "target_multiplier": (_val.get("target_multiplier") if _val else 1.0),
+                                    "base_multiplier": (_val.get("base_multiplier") if _val else 1.0),
+
                                     "source": "pricecharting",
                                     "search_query": pc_q,
                                     "queries_tried": queries,
                                     "card_name": card_name,
                                     "price_includes_grade": False,
-                                    "grade_12_uplift": False,
                                     "last_updated": datetime.now().isoformat(),
                                 }
             except Exception as _pce:
