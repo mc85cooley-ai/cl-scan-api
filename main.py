@@ -6448,6 +6448,13 @@ class MarketPriceLookupRequest(BaseModel):
     grade: Optional[str] = None
     # Variant/rarity attributes — dramatically affect eBay price
     variant: Optional[str] = None          # Holo, Reverse Holo, 1st Edition, Full Art, Alt Art, Parallel, Shadowless
+    # Backwards/forwards compatibility: some callers send variant_type/edition/finish, others send variant
+    variant_type: Optional[str] = None     # Parallel, Full Art, Alt Art, Manga, etc.
+    edition: Optional[str] = None          # 1st Edition, Unlimited, etc.
+    finish: Optional[str] = None           # Textured, Etched, Foil, Holo, Reverse, etc.
+    signed_by: Optional[str] = None        # Name/role if signed (string); use is_signed boolean too
+    is_error_card: Optional[bool] = None   # Error/misprint flag
+    is_promo: Optional[bool] = None        # Promo flag
     rarity: Optional[str] = None           # Secret Rare, Ultra Rare, Full Art Rare, Double Rare, Illustration Rare
     language: Optional[str] = None         # Japanese, Korean, Chinese — omit/English for default
     is_signed: Optional[bool] = None       # Artist/player signature
@@ -6467,13 +6474,13 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
         card_number  = (request.card_number  or "").strip()
         grade        = (request.grade        or "").strip()
         rarity       = (request.rarity       or "").strip()
-        variant_type = (request.variant_type or "").strip()
-        edition      = (request.edition      or "").strip()
-        finish       = (request.finish       or "").strip()
+        variant_type = ((getattr(request, "variant_type", None) or getattr(request, "variant", None)) or "").strip()
+        edition      = (getattr(request, "edition", None) or "").strip()
+        finish       = (getattr(request, "finish", None) or "").strip()
         is_signed    = bool(request.is_signed)
-        signed_by    = (request.signed_by    or "").strip()
-        is_error     = bool(request.is_error_card)
-        is_promo     = bool(request.is_promo)
+        signed_by    = (getattr(request, "signed_by", None) or "").strip()
+        is_error     = bool(getattr(request, "is_error_card", False))
+        is_promo     = bool(getattr(request, "is_promo", False))
 
         if not card_name:
             return {"current_price": 0, "source": "error", "error": "card_name required"}
