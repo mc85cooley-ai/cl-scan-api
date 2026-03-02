@@ -2153,6 +2153,158 @@ def _estimate_centering_from_image(img_bytes: bytes) -> dict | None:
         return None
 
 
+def _autocrop_card(img_bytes: bytes, inset_pct: float = 0.01) -> tuple:
+    """
+    Detect card border via Sobel edge detection and crop to the card boundary.
+
+    Uses the same vectorised Sobel pipeline as _estimate_centering_from_image but
+    instead of computing ratios it returns a cropped image.
+
+    inset_pct: fraction to pull the crop boundary INWARD from the detected card edge
+               (default 1 % — keeps just inside the border, avoids background bleed).
+
+    Returns (cropped_bytes: bytes, crop_info: dict).
+      crop_info keys:
+        detected        bool   — True if border was found with confidence
+        original_size   [w,h]  — input image dimensions
+        crop_box        [x1,y1,x2,y2] — absolute pixel crop on the original image
+        crop_pct        [x1_pct,y1_pct,x2_pct,y2_pct] — 0-1 fractions for JS canvas
+    If detection fails, cropped_bytes == img_bytes (original) and detected==False.
+    """
+    if not PIL_AVAILABLE or Image is None or np is None or not img_bytes:
+        return img_bytes, {"detected": False}
+
+    try:
+        im = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        im = ImageOps.exif_transpose(im)
+        orig_w, orig_h = im.size
+
+        # ── 1. Resize to working resolution for fast Sobel ────────────────────
+        WORK_W = 900
+        scale = WORK_W / max(orig_w, 1)
+        work_h = max(1, int(orig_h * scale))
+        work = im.resize((WORK_W, work_h), Image.LANCZOS)
+        g = np.asarray(ImageOps.grayscale(work), dtype=np.float32)
+        ww, wh = WORK_W, work_h
+
+        # ── 2. Vectorised Sobel (identical kernel to _estimate_centering) ──────
+        kx = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float32)
+        ky = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=np.float32)
+
+        def _conv2(img: np.ndarray, k: np.ndarray) -> np.ndarray:
+            kh, kw = k.shape
+            ph, pw = kh // 2, kw // 2
+            padded = np.pad(img, ((ph, ph), (pw, pw)), mode="edge")
+            shape = img.shape + k.shape
+            strides = padded.strides + padded.strides
+            view = np.lib.stride_tricks.as_strided(padded, shape=shape, strides=strides)
+            return (view * k).sum(axis=(-2, -1))
+
+        mag = np.sqrt(_conv2(g, kx) ** 2 + _conv2(g, ky) ** 2)
+
+        # ── 3. Find edge pixels and their bounding box ────────────────────────
+        thr = float(np.percentile(mag, 94))
+        edges = mag >= thr
+        ys, xs = np.where(edges)
+        if len(xs) < 400:
+            return img_bytes, {"detected": False, "original_size": [orig_w, orig_h]}
+
+        # Coarse boundary: 2nd / 98th percentile (more robust than 1st/99th for noisy shots)
+        cx1 = int(np.percentile(xs, 2))
+        cx2 = int(np.percentile(xs, 98))
+        cy1 = int(np.percentile(ys, 2))
+        cy2 = int(np.percentile(ys, 98))
+
+        if cx2 - cx1 < ww * 0.30 or cy2 - cy1 < wh * 0.30:
+            # Card region too small — image may be macro/extreme crop; skip
+            return img_bytes, {"detected": False, "original_size": [orig_w, orig_h]}
+
+        # ── 4. Refine with row/col sum profiles inside the coarse box ─────────
+        roi_edges = edges[cy1:cy2, cx1:cx2]
+        col_sum = roi_edges.sum(axis=0).astype(np.float32)
+        row_sum = roi_edges.sum(axis=1).astype(np.float32)
+
+        def _smooth(v: np.ndarray, w: int = 9) -> np.ndarray:
+            if v.size < w:
+                return v
+            return np.convolve(v, np.ones(w, dtype=np.float32) / w, mode="same")
+
+        col_s = _smooth(col_sum)
+        row_s = _smooth(row_sum)
+
+        def _border_peak(signal: np.ndarray, from_start: bool, zone_frac: float = 0.30) -> int | None:
+            zone = int(signal.size * zone_frac)
+            seg = signal[:zone] if from_start else signal[-zone:]
+            if seg.size < 4 or seg.max() <= 0:
+                return None
+            thr_peak = seg.max() * 0.65
+            hits = np.where(seg >= thr_peak)[0]
+            if hits.size == 0:
+                return None
+            idx = int(hits[0] if from_start else hits[-1])
+            return idx if from_start else (signal.size - zone + idx)
+
+        li = _border_peak(col_s, True)
+        ri = _border_peak(col_s, False)
+        ti = _border_peak(row_s, True)
+        bi = _border_peak(row_s, False)
+
+        # Fall back to coarse bounds if refinement fails
+        fine_x1 = (cx1 + li) if li is not None else cx1
+        fine_x2 = (cx1 + ri) if ri is not None else cx2
+        fine_y1 = (cy1 + ti) if ti is not None else cy1
+        fine_y2 = (cy1 + bi) if bi is not None else cy2
+
+        if fine_x2 - fine_x1 < ww * 0.25 or fine_y2 - fine_y1 < wh * 0.25:
+            fine_x1, fine_x2, fine_y1, fine_y2 = cx1, cx2, cy1, cy2
+
+        # ── 5. Apply inset and scale to original image coordinates ────────────
+        card_w = fine_x2 - fine_x1
+        card_h = fine_y2 - fine_y1
+        inset_x = max(1, int(card_w * inset_pct))
+        inset_y = max(1, int(card_h * inset_pct))
+
+        crop_x1_w = fine_x1 + inset_x
+        crop_x2_w = fine_x2 - inset_x
+        crop_y1_w = fine_y1 + inset_y
+        crop_y2_w = fine_y2 - inset_y
+
+        if crop_x2_w <= crop_x1_w or crop_y2_w <= crop_y1_w:
+            return img_bytes, {"detected": False, "original_size": [orig_w, orig_h]}
+
+        # Scale back to original image coordinates
+        inv = 1.0 / scale
+        ox1 = max(0,      int(crop_x1_w * inv))
+        oy1 = max(0,      int(crop_y1_w * inv))
+        ox2 = min(orig_w, int(crop_x2_w * inv))
+        oy2 = min(orig_h, int(crop_y2_w * inv))
+
+        if ox2 - ox1 < 100 or oy2 - oy1 < 100:
+            return img_bytes, {"detected": False, "original_size": [orig_w, orig_h]}
+
+        # ── 6. Crop original image and encode ─────────────────────────────────
+        cropped = im.crop((ox1, oy1, ox2, oy2))
+        buf = io.BytesIO()
+        cropped.save(buf, format="JPEG", quality=92, optimize=True)
+        cropped_bytes = buf.getvalue()
+
+        crop_info = {
+            "detected":      True,
+            "original_size": [orig_w, orig_h],
+            "crop_box":      [ox1, oy1, ox2, oy2],
+            "crop_pct":      [
+                round(ox1 / orig_w, 4),
+                round(oy1 / orig_h, 4),
+                round(ox2 / orig_w, 4),
+                round(oy2 / orig_h, 4),
+            ],
+        }
+        return cropped_bytes, crop_info
+
+    except Exception:
+        return img_bytes, {"detected": False}
+
+
 def _normalize_card_type(card_type: str) -> str:
     """Force card_type into the allowed enum. Covers all major TCGs + sports."""
     s = _norm_ws(card_type or "").lower()
@@ -7086,28 +7238,64 @@ async def update_collection_market_values(request: Request):
 
         # ── Parallel market lookups — asyncio.gather instead of sequential awaits ──
         # Sequential: 10 items × ~3s each = 30s. Parallel: ~3-5s total.
+        # Also pass rarity/variant/finish/edition/language so eBay queries are
+        # specific to the actual card variant (e.g. SAR vs common, Shadowless, etc.)
         valid_items = []
         for it in items:
             if not isinstance(it, dict):
                 continue
-            item_id   = str(it.get("item_id") or it.get("id") or "")
-            card_name = str(it.get("card_name") or it.get("card") or "").strip()
-            card_set  = str(it.get("card_set")  or it.get("set")  or "").strip()
-            card_number = str(it.get("card_number") or it.get("number") or "").strip()
-            grade     = str(it.get("grade") or "").strip()
+            item_id      = str(it.get("item_id") or it.get("id") or "")
+            card_name    = str(it.get("card_name") or it.get("card") or "").strip()
+            card_set     = str(it.get("card_set")  or it.get("set")  or "").strip()
+            card_number  = str(it.get("card_number") or it.get("number") or "").strip()
+            grade        = str(it.get("grade") or "").strip()
+            # Variant / rarity enrichment fields
+            rarity       = str(it.get("rarity")       or "").strip()
+            variant_type = str(it.get("variant_type") or "").strip()
+            finish       = str(it.get("finish")       or "").strip()
+            edition      = str(it.get("edition")      or "").strip()
+            is_signed    = bool(it.get("is_signed")   or False)
+            signed_by    = str(it.get("signed_by")    or "").strip()
+            is_error     = bool(it.get("is_error_card") or False)
+            is_promo     = bool(it.get("is_promo")    or False)
+            language     = str(it.get("language")     or "").strip()
+            rank_within  = it.get("rank_within_card")
+            rank_total   = it.get("rank_total")
             if not card_name:
                 errors.append({"item_id": item_id, "card": "", "error": "Missing card_name"})
                 continue
-            valid_items.append((item_id, card_name, card_set, card_number, grade))
+            valid_items.append((
+                item_id, card_name, card_set, card_number, grade,
+                rarity, variant_type, finish, edition,
+                is_signed, signed_by, is_error, is_promo, language,
+                rank_within, rank_total,
+            ))
 
-        async def _lookup_one(item_id, card_name, card_set, card_number, grade):
+        async def _lookup_one(
+            item_id, card_name, card_set, card_number, grade,
+            rarity, variant_type, finish, edition,
+            is_signed, signed_by, is_error, is_promo, language,
+            rank_within, rank_total,
+        ):
             try:
-                return item_id, card_name, await market_price_lookup(MarketPriceLookupRequest(
+                result = await market_price_lookup(MarketPriceLookupRequest(
                     card_name=card_name,
                     card_set=card_set or None,
                     card_number=card_number or None,
                     grade=grade or None,
+                    rarity=rarity or None,
+                    variant_type=variant_type or None,
+                    finish=finish or None,
+                    edition=edition or None,
+                    is_signed=is_signed or None,
+                    signed_by=signed_by or None,
+                    is_error_card=is_error or None,
+                    is_promo=is_promo or None,
+                    language=language or None,
+                    rank_within_card=int(rank_within) if rank_within else None,
+                    rank_total=int(rank_total) if rank_total else None,
                 ))
+                return item_id, card_name, result
             except Exception as ex:
                 return item_id, card_name, {"current_price": 0, "error": str(ex)}
 
@@ -7121,7 +7309,19 @@ async def update_collection_market_values(request: Request):
             if price > 0:
                 updated_count += 1
                 total_value += price
-                results.append({"item_id": item_id, "card": card_name, "current_price": round(price, 2), "market": market})
+                results.append({
+                    "item_id": item_id,
+                    "card": card_name,
+                    "current_market_value": round(price, 2),
+                    # Expose signal vs final so the UI can explain the number
+                    "raw_price": round(float(market.get("signal_price") or price), 2),
+                    "multiplier": round(float(market.get("multiplier_applied") or 1.0), 4),
+                    "slab_premium": round(float(market.get("slab_premium_added") or 0.0), 2),
+                    "source": market.get("source", ""),
+                    "variant_matched": bool(market.get("variant_matched")),
+                    "variant_terms": market.get("variant_terms_used") or "",
+                    "search_query": market.get("search_query") or "",
+                })
             else:
                 errors.append({"item_id": item_id, "card": card_name, "error": "No price returned", "market": market})
 
@@ -7129,10 +7329,11 @@ async def update_collection_market_values(request: Request):
             "success": True,
             "user_id": user_id,
             "updated_count": updated_count,
+            "total_items": len(valid_items),
             "total_value": f"{total_value:.2f}",
             "change_24h": "0.00",
             "change_percent": "0.0",
-            "results": results,
+            "updated_items": results,   # per-item detail incl. raw_price, multiplier, variant_matched
             "errors": errors,
         }
 
@@ -7433,17 +7634,31 @@ async def defect_scan(
     if scan_mode not in ("quick", "full"):
         scan_mode = "quick"
 
+    # ── 1b. Autocrop — detect card border and crop to 1% inside it ───────────
+    # The cropped bytes are used for ALL downstream analysis (filter variants,
+    # defect zones, centering, AI pass). The original compressed bytes are kept
+    # for the crop overlay display.
+    front_cropped, front_crop_info = _autocrop_card(front_bytes, inset_pct=0.01)
+    back_cropped,  back_crop_info  = _autocrop_card(back_bytes,  inset_pct=0.01) if back_bytes  else (b"", {"detected": False})
+    extra_cropped, extra_crop_info = _autocrop_card(extra_bytes, inset_pct=0.01) if extra_bytes else (b"", {"detected": False})
+
+    # Use cropped versions for all analysis; fall back to originals if not detected
+    front_proc = front_cropped if front_crop_info.get("detected") else front_bytes
+    back_proc  = back_cropped  if back_crop_info.get("detected")  else back_bytes
+    extra_proc = extra_cropped if extra_crop_info.get("detected") else extra_bytes
+
     # ── 2. CV pass — runs for both modes ─────────────────────────────────────
 
     # 2a. Centering (pixel-accurate Sobel border detection)
-    centering_front = _estimate_centering_from_image(front_bytes)
-    centering_back  = _estimate_centering_from_image(back_bytes)  if back_bytes  else None
-    centering_extra = _estimate_centering_from_image(extra_bytes) if extra_bytes else None
+    # Run on cropped images — centering on a clean card crop is more accurate
+    centering_front = _estimate_centering_from_image(front_proc)
+    centering_back  = _estimate_centering_from_image(back_proc)  if back_proc  else None
+    centering_extra = _estimate_centering_from_image(extra_proc) if extra_proc else None
 
-    # 2b. Filter variants (all 13 modes) — front, back, extra
-    front_variants = _make_defect_filter_variants(front_bytes)
-    back_variants  = _make_defect_filter_variants(back_bytes)  if back_bytes  else {}
-    extra_variants = _make_defect_filter_variants(extra_bytes) if extra_bytes else {}
+    # 2b. Filter variants (all 13 modes) — run on cropped images
+    front_variants = _make_defect_filter_variants(front_proc)
+    back_variants  = _make_defect_filter_variants(back_proc)  if back_proc  else {}
+    extra_variants = _make_defect_filter_variants(extra_proc) if extra_proc else {}
 
     def _encode_variants(vd: Dict[str, bytes], prefix: str) -> Dict[str, str]:
         out = {}
@@ -7691,6 +7906,24 @@ async def defect_scan(
         "has_back":  bool(back_bytes),
         "has_extra": bool(extra_bytes),
         "pil_available": PIL_AVAILABLE,
+        # ── Autocrop ─────────────────────────────────────────────────────────
+        # The frontend displays these cropped images in the viewer by default.
+        # crop_info contains crop_box and crop_pct so the JS can draw a crop
+        # rectangle overlay on the original image.
+        "autocrop": {
+            "front": {
+                "info":  front_crop_info,
+                "image": _b64(front_cropped) if front_crop_info.get("detected") else None,
+            },
+            "back": {
+                "info":  back_crop_info,
+                "image": _b64(back_cropped)  if back_crop_info.get("detected")  else None,
+            },
+            "extra": {
+                "info":  extra_crop_info,
+                "image": _b64(extra_cropped) if extra_crop_info.get("detected") else None,
+            },
+        },
     }
 
     if scan_mode == "full":
