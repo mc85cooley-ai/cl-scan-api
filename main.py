@@ -7299,6 +7299,337 @@ async def generate_overlay_variants(
     })
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# /api/defect-scan  — Standalone Defect Detection Tool
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Two modes:
+#   quick (default)  → CV-only (PIL/numpy): filter variants + centering + pixel
+#                       hotspot zones. No AI calls. ~2-4 seconds.
+#   full             → Quick pass PLUS _openai_label_rois on worst ROI crops,
+#                       then a synthesis pass for a natural-language summary.
+#                       ~10-20 seconds depending on image count.
+#
+# Accepts: front (required), back (optional), extra (optional detail shot)
+# Returns: centering, filter_variants (all 13 modes), cv_defects, hotspot_crops,
+#          severity_breakdown, and (full only) ai_defects + defect_summary.
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/defect-scan")
+@safe_endpoint
+async def defect_scan(
+    front: UploadFile = File(...),
+    back:  Optional[UploadFile] = File(None),
+    extra: Optional[UploadFile] = File(None),   # close-up / detail shot
+    scan_mode:  str  = Form("quick"),            # "quick" | "full"
+    card_name:  Optional[str] = Form(None),
+    card_set:   Optional[str] = Form(None),
+):
+    """
+    Dedicated defect scanner — the only job is finding and reporting defects.
+
+    quick mode:  CV-only, no AI.  ~2-4 s.
+    full  mode:  CV + AI ROI labelling + natural-language synthesis.  ~15-20 s.
+    """
+    import time
+    t0 = time.time()
+
+    # ── 1. Read and compress images ───────────────────────────────────────────
+    def _compress(raw: bytes, max_long: int = 1200, quality: int = 88) -> bytes:
+        if not PIL_AVAILABLE or not raw or len(raw) < 200:
+            return raw
+        try:
+            im = Image.open(io.BytesIO(raw)).convert("RGB")
+            im = ImageOps.exif_transpose(im)
+            w, h = im.size
+            long_edge = max(w, h)
+            if long_edge > max_long:
+                scale = max_long / long_edge
+                im = im.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=quality, optimize=True)
+            return buf.getvalue()
+        except Exception:
+            return raw
+
+    front_bytes = _compress(await front.read())
+    back_bytes  = _compress(await back.read())  if back  and back.filename  else b""
+    extra_bytes = _compress(await extra.read()) if extra and extra.filename else b""
+
+    if not front_bytes or len(front_bytes) < 200:
+        raise HTTPException(status_code=400, detail="Front image required")
+
+    scan_mode = (scan_mode or "quick").strip().lower()
+    if scan_mode not in ("quick", "full"):
+        scan_mode = "quick"
+
+    # ── 2. CV pass — runs for both modes ─────────────────────────────────────
+
+    # 2a. Centering (pixel-accurate Sobel border detection)
+    centering_front = _estimate_centering_from_image(front_bytes)
+    centering_back  = _estimate_centering_from_image(back_bytes)  if back_bytes  else None
+    centering_extra = _estimate_centering_from_image(extra_bytes) if extra_bytes else None
+
+    # 2b. Filter variants (all 13 modes) — front, back, extra
+    front_variants = _make_defect_filter_variants(front_bytes)
+    back_variants  = _make_defect_filter_variants(back_bytes)  if back_bytes  else {}
+    extra_variants = _make_defect_filter_variants(extra_bytes) if extra_bytes else {}
+
+    def _encode_variants(vd: Dict[str, bytes], prefix: str) -> Dict[str, str]:
+        out = {}
+        for k, v in vd.items():
+            if v and len(v) > 200:
+                out[f"{prefix}_{k}"] = _b64(v)
+        return out
+
+    filter_variants: Dict[str, str] = {}
+    filter_variants.update(_encode_variants(front_variants, "front"))
+    filter_variants.update(_encode_variants(back_variants,  "back"))
+    filter_variants.update(_encode_variants(extra_variants, "extra"))
+
+    # 2c. CV pixel hotspot detection (corners + edges on each image)
+    def _cv_zones_for_image(img_bytes: bytes, side: str) -> List[Dict]:
+        """Return hotspot zone dicts from pixel analysis on one image."""
+        if not img_bytes or Image is None:
+            return []
+        zones: List[Dict] = []
+        try:
+            im = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            w, h = im.size
+            g_img = ImageOps.grayscale(im)
+            edge_img = g_img.filter(ImageFilter.FIND_EDGES)
+            band = max(8, int(min(w, h) * 0.10))
+
+            def _score(x1, y1, x2, y2) -> float:
+                c_g = g_img.crop((x1, y1, x2, y2))
+                c_e = edge_img.crop((x1, y1, x2, y2))
+                bg = ImageStat.Stat(c_g).mean[0] / 255.0
+                be = ImageStat.Stat(c_e).mean[0] / 255.0
+                return 0.5 * bg + 0.5 * be
+
+            c = max(16, int(min(w, h) * 0.18))
+            corners = [
+                ("top_left",     0,       0,       c,     c,     0.12, 0.12),
+                ("top_right",    w - c,   0,       w,     c,     0.88, 0.12),
+                ("bottom_left",  0,       h - c,   c,     h,     0.12, 0.88),
+                ("bottom_right", w - c,   h - c,   w,     h,     0.88, 0.88),
+            ]
+            for (name, x1, y1, x2, y2, cx, cy) in corners:
+                score = _score(max(0, x1), max(0, y1), min(w, x2), min(h, y2))
+                sev = 3 if score > 0.55 else (2 if score > 0.40 else (1 if score > 0.28 else 0))
+                if sev > 0:
+                    zones.append({
+                        "x": cx, "y": cy, "radius": 0.13, "severity": sev,
+                        "type": "corner", "label": name.replace("_", " ").title(),
+                        "side": side, "source": "cv_pixel",
+                    })
+
+            edges = [
+                ("top",    w // 4, 0,        3 * w // 4, band,       0.50, 0.06),
+                ("bottom", w // 4, h - band,  3 * w // 4, h,          0.50, 0.94),
+                ("left",   0,      h // 4,    band,        3 * h // 4, 0.06, 0.50),
+                ("right",  w-band, h // 4,    w,           3 * h // 4, 0.94, 0.50),
+            ]
+            for (name, x1, y1, x2, y2, cx, cy) in edges:
+                score = _score(max(0, x1), max(0, y1), min(w, x2), min(h, y2))
+                sev = 2 if score > 0.50 else (1 if score > 0.35 else 0)
+                if sev > 0:
+                    zones.append({
+                        "x": cx, "y": cy, "radius": 0.18, "severity": sev,
+                        "type": "edge", "label": name.title() + " Edge",
+                        "side": side, "source": "cv_pixel",
+                    })
+
+            # Surface scan: interior variance (scratch detector)
+            if np is not None:
+                try:
+                    interior_x1 = int(w * 0.15)
+                    interior_y1 = int(h * 0.15)
+                    interior_x2 = int(w * 0.85)
+                    interior_y2 = int(h * 0.85)
+                    interior = im.crop((interior_x1, interior_y1, interior_x2, interior_y2))
+                    g_int = np.asarray(ImageOps.grayscale(interior), dtype=np.float32)
+                    # 7×7 local variance
+                    from scipy.ndimage import uniform_filter
+                    mean_f = uniform_filter(g_int, size=7)
+                    sq_mean = uniform_filter(g_int ** 2, size=7)
+                    var_map = sq_mean - mean_f ** 2
+                    # Flag if top 1% variance patches are unusually high
+                    thr_var = float(np.percentile(var_map, 99))
+                    mean_var = float(np.mean(var_map))
+                    if thr_var > mean_var * 4.5:  # abnormal variance spike
+                        # Find rough location of worst patch
+                        max_pos = np.unravel_index(np.argmax(var_map), var_map.shape)
+                        rel_y = (interior_y1 + max_pos[0]) / h
+                        rel_x = (interior_x1 + max_pos[1]) / w
+                        zones.append({
+                            "x": round(rel_x, 3), "y": round(rel_y, 3),
+                            "radius": 0.12, "severity": 2,
+                            "type": "surface", "label": "Surface Anomaly",
+                            "side": side, "source": "cv_variance",
+                        })
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return zones
+
+    cv_defects = {
+        "front": _cv_zones_for_image(front_bytes, "front"),
+        "back":  _cv_zones_for_image(back_bytes,  "back")  if back_bytes  else [],
+        "extra": _cv_zones_for_image(extra_bytes, "extra") if extra_bytes else [],
+    }
+
+    # 2d. Hotspot thumbnail crops (evidence strips)
+    hotspot_crops: List[Dict] = []
+    for side_key, img_bytes in [("front", front_bytes), ("back", back_bytes), ("extra", extra_bytes)]:
+        if img_bytes:
+            hotspot_crops.extend(_make_basic_hotspot_snaps(img_bytes, side_key, max_snaps=6))
+
+    # 2e. Severity breakdown
+    all_zones = cv_defects["front"] + cv_defects["back"] + cv_defects["extra"]
+    def _severity_breakdown(zones: List[Dict]) -> Dict[str, int]:
+        b = {"minor": 0, "moderate": 0, "severe": 0}
+        for z in zones:
+            s = int(z.get("severity", 0) or 0)
+            if s == 1:   b["minor"] += 1
+            elif s == 2: b["moderate"] += 1
+            elif s >= 3: b["severe"] += 1
+        return b
+
+    severity_breakdown = _severity_breakdown(all_zones)
+
+    # ── 3. AI pass — full mode only ───────────────────────────────────────────
+    ai_defects: List[Dict] = []
+    defect_summary: str = ""
+    overall_severity: str = "clean"
+
+    if scan_mode == "full":
+        # Build ROI list from worst CV zones (top 8 by severity)
+        ranked_zones = sorted(all_zones, key=lambda z: -int(z.get("severity", 0) or 0))
+        rois_to_label = []
+        for z in ranked_zones[:8]:
+            r = z.get("radius", 0.13)
+            cx, cy = z["x"], z["y"]
+            rois_to_label.append({
+                "side": z.get("side", "front"),
+                "roi":  z.get("label", "region"),
+                "bbox": {
+                    "x": max(0.0, cx - r),
+                    "y": max(0.0, cy - r),
+                    "w": min(1.0, r * 2),
+                    "h": min(1.0, r * 2),
+                },
+            })
+
+        # Also add the extra image as a surface ROI if provided
+        if extra_bytes:
+            rois_to_label.append({
+                "side": "extra",
+                "roi":  "detail_shot",
+                "bbox": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+            })
+
+        # Map "extra" side to front_bytes for the labeler (closest match)
+        img_map = {"front": front_bytes, "back": back_bytes, "extra": extra_bytes}
+
+        # Patch: _openai_label_rois only accepts front/back — split extra into front path
+        rois_front_back = []
+        for r in rois_to_label:
+            side = r.get("side", "front")
+            if side == "extra":
+                r2 = dict(r); r2["side"] = "front"
+                rois_front_back.append(r2)
+            else:
+                rois_front_back.append(r)
+
+        ai_defects = await _openai_label_rois(rois_front_back, front_bytes, back_bytes)
+
+        # Synthesis: natural-language summary
+        defect_lines = []
+        for d in ai_defects:
+            if d.get("is_defect"):
+                defect_lines.append(
+                    f"- {d.get('roi','unknown')} ({d.get('side','?')} side): "
+                    f"{d.get('type','defect')} — {d.get('note','')}"
+                )
+        cv_summary_lines = []
+        for z in ranked_zones[:5]:
+            sev_word = {1: "minor", 2: "moderate", 3: "severe"}.get(z.get("severity", 0), "unknown")
+            cv_summary_lines.append(f"- {z.get('label','zone')} ({z.get('side','?')}): CV-detected {sev_word} anomaly")
+
+        synth_prompt = (
+            f"You are a professional card defect analyst. "
+            f"A collector has scanned a {'named ' + card_name if card_name else 'trading'} card "
+            f"{'from ' + card_set if card_set else ''}. "
+            f"Below are the defects found by CV analysis and AI ROI inspection. "
+            f"Write a clear, honest 3-5 sentence defect summary for the collector. "
+            f"Mention the most impactful issues first. Do NOT recommend a grade. "
+            f"CV findings:\n" + ("\n".join(cv_summary_lines) or "None detected") +
+            f"\nAI ROI findings:\n" + ("\n".join(defect_lines) or "No AI-confirmed defects") +
+            f"\nFormat: plain text, no markdown, no bullet points."
+        )
+        synth_res = await _openai_chat(
+            [{"role": "user", "content": synth_prompt}],
+            max_tokens=300,
+            temperature=0.2,
+        )
+        defect_summary = _norm_ws(synth_res.get("content", ""))
+
+        # Overall severity label
+        if severity_breakdown["severe"] > 0:
+            overall_severity = "severe"
+        elif severity_breakdown["moderate"] > 0:
+            overall_severity = "moderate"
+        elif severity_breakdown["minor"] > 0:
+            overall_severity = "minor"
+        else:
+            overall_severity = "clean"
+
+    elapsed_ms = int((time.time() - t0) * 1000)
+
+    # ── 4. Build response ──────────────────────────────────────────────────────
+    response: Dict[str, Any] = {
+        "success": True,
+        "scan_mode": scan_mode,
+        "processing_time_ms": elapsed_ms,
+        "centering": {
+            "front": centering_front,
+            "back":  centering_back,
+            "extra": centering_extra,
+        },
+        "cv_defects": cv_defects,
+        "severity_breakdown": severity_breakdown,
+        "overall_severity": overall_severity,
+        "filter_variants": filter_variants,
+        "filter_mode_map": {
+            "contrast_sharp":    "contrast",
+            "edge_wear":         "edgewear",
+            "sobel_surface":     "surface",
+            "sobel_edges":       "edges",
+            "invert":            "invert",
+            "channel_r":         "r",
+            "channel_g":         "g",
+            "channel_b":         "b",
+            "gray_autocontrast": "ai_pass",
+            "uv_sim":            "uv",
+            "local_variance":    "variance",
+            "chromatic":         "chromatic",
+            "corner_isolate":    "corners",
+        },
+        "hotspot_crops": hotspot_crops,
+        "has_back":  bool(back_bytes),
+        "has_extra": bool(extra_bytes),
+        "pil_available": PIL_AVAILABLE,
+    }
+
+    if scan_mode == "full":
+        response["ai_defects"]     = ai_defects
+        response["defect_summary"] = defect_summary
+
+    return JSONResponse(content=response)
+
+
 def extract_defect_zones(assessment):
     """
     Extract defect locations and severities from assessment dict.
