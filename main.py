@@ -8383,47 +8383,114 @@ Respond ONLY with JSON.
 @app.post("/api/auth-check")
 @safe_endpoint
 async def auth_check_simple(
-    front: UploadFile = File(...),
-    back: UploadFile = File(None),
-    card_name: Optional[str] = Form(None),
-    card_set:  Optional[str] = Form(None),
-    card_year: Optional[str] = Form(None),
+    front:     UploadFile        = File(...),
+    back:      UploadFile        = File(None),
+    detail1:   UploadFile        = File(None),
+    detail2:   UploadFile        = File(None),
+    detail3:   UploadFile        = File(None),
+    detail4:   UploadFile        = File(None),
+    card_game: Optional[str]     = Form(None),
+    card_name: Optional[str]     = Form(None),
+    card_set:  Optional[str]     = Form(None),
+    card_year: Optional[str]     = Form(None),
 ):
     """
-    Simplified auth-check endpoint — called by the WordPress WP AJAX proxy.
-    Returns the flat {verdict, confidence, summary, flags, positives} shape expected by the frontend.
+    Auth-check endpoint — called by the WordPress WP AJAX proxy.
+    Accepts front + optional back + up to 4 detail shots + card context fields.
+    Returns full forensic shape expected by the frontend tabs.
+    Works well even when card details are not provided.
     """
-    front_bytes = await front.read()
-    back_bytes  = await back.read() if back else None
+    front_bytes   = await front.read()
+    back_bytes    = await back.read()    if back    else None
+    detail1_bytes = await detail1.read() if detail1 else None
+    detail2_bytes = await detail2.read() if detail2 else None
+    detail3_bytes = await detail3.read() if detail3 else None
+    detail4_bytes = await detail4.read() if detail4 else None
 
-    cn = (card_name or "unknown card").strip()
+    # Build context string — gracefully handle missing fields
+    cg = (card_game or "").strip()
+    cn = (card_name or "").strip()
     cs = (card_set  or "").strip()
     cy = (card_year or "").strip()
 
-    auth_prompt = (
-        f"You are an expert trading card authenticator. Analyze the provided image(s) of '{cn}'"
-        + (f" ({cs})" if cs else "")
-        + (f" from {cy}" if cy else "")
-        + """. Check for signs of counterfeiting, reprints, or alterations.
+    has_context = bool(cg or cn or cs or cy)
 
-Respond ONLY with valid JSON matching this exact schema:
-{
-  "verdict": "Likely Authentic|Suspicious|Likely Counterfeit",
-  "confidence": 0.0,
-  "summary": "One or two sentences summarising your findings.",
-  "flags": ["issue 1", "issue 2"],
-  "positives": ["positive 1", "positive 2"]
-}
+    if has_context:
+        card_desc = cn or "this card"
+        context_line = f"You are analysing '{card_desc}'"
+        if cg:  context_line += f" — a {cg} card"
+        if cs:  context_line += f" from the {cs} set"
+        if cy:  context_line += f" ({cy})"
+        context_line += "."
+        context_note = (
+            "Use your knowledge of authentic printing standards, known counterfeit tells, "
+            f"and documented issues specific to {cg or 'this TCG'} to inform your analysis."
+        )
+    else:
+        context_line = "You are analysing an unidentified trading card."
+        context_note = (
+            "The card game/set has not been specified. Identify the game/set from the images if possible, "
+            "then apply relevant authentication knowledge. Base your analysis purely on what you can observe — "
+            "print quality, colours, foil/texture, edge cuts, font/text rendering, and back pattern. "
+            "Do not penalise the card for lack of context — only flag genuine visual concerns."
+        )
 
-Evaluate: print quality, font/kerning, colour accuracy, holofoil pattern (if applicable),
-edge precision, back pattern consistency, set symbol clarity, rosette dot pattern,
-and any known counterfeit tells for this game/set/era.
-Only flag genuine concerns — normal print variation and manufacturing tolerance are NOT defects.
+    extra_images_note = ""
+    detail_count = sum(1 for b in [detail1_bytes, detail2_bytes, detail3_bytes, detail4_bytes] if b)
+    if detail_count:
+        extra_images_note = f"\nYou have also been provided {detail_count} close-up detail shot(s). Use these to inspect micro-level features such as rosette dot patterns, corner cuts, holofoil texture, text sharpness, and barcode/symbol accuracy."
+
+    auth_prompt = f"""{context_line}
+{context_note}{extra_images_note}
+
+Perform a thorough forensic authentication analysis. Evaluate ALL of the following where visible:
+- Print quality: rosette dot pattern, ink saturation, sharpness, bleed
+- Colour accuracy: hue, contrast, brightness vs known authentic examples
+- Font & text: kerning, weight, alignment, gloss/matte finish accuracy
+- Holofoil / foil pattern: texture authenticity, light refraction, coverage area
+- Card stock & edges: cut precision, corner radius, layering/core colour if visible
+- Back pattern: colour accuracy, pattern symmetry, print consistency
+- Set symbol / collector number: size, placement, font accuracy
+- Any era/set-specific known counterfeit tells
+
+Respond ONLY with valid JSON matching this exact schema (no markdown, no extra text):
+{{
+  "verdict": "Likely Authentic | Suspicious | Likely Counterfeit",
+  "confidence": 0.85,
+  "summary": "2-3 sentence overall assessment.",
+  "flags": ["Specific concern 1", "Specific concern 2"],
+  "positives": ["Positive indicator 1", "Positive indicator 2"],
+  "checklist": {{
+    "print_quality":   {{"score": 8, "notes": "Short note on print dot pattern and ink quality."}},
+    "colour_accuracy": {{"score": 7, "notes": "Short note on colour fidelity."}},
+    "font_and_text":   {{"score": 9, "notes": "Short note on font rendering and text placement."}},
+    "holo_foil":       {{"score": 6, "notes": "Short note on foil pattern (or N/A if non-holo)."}},
+    "card_stock_edges":{{"score": 8, "notes": "Short note on edge precision and card feel."}},
+    "back_pattern":    {{"score": 7, "notes": "Short note on back design accuracy."}},
+    "set_symbol":      {{"score": 9, "notes": "Short note on symbol/number accuracy."}}
+  }},
+  "forensic_notes": "1-2 sentences on the most technically significant finding.",
+  "print_analysis": "1-2 sentences specifically about print/rosette dot quality observed.",
+  "recommendations": [
+    "Actionable recommendation 1",
+    "Actionable recommendation 2"
+  ],
+  "next_steps": [
+    "Suggested next step 1",
+    "Suggested next step 2"
+  ]
+}}
+
+Scoring guide for checklist: 10 = perfect/indistinguishable from authentic, 7-9 = good with minor concerns,
+4-6 = notable issues worth flagging, 1-3 = strong counterfeit indicators.
+If a category is not visible/applicable, score it 0 and set notes to "Not visible in provided images."
+Only flag genuine concerns — normal manufacturing tolerance is NOT a defect.
 """
-    )
 
     content_parts: list = [{"type": "text", "text": auth_prompt}]
+
     if front_bytes:
+        content_parts.append({"type": "text", "text": "FRONT IMAGE:"})
         content_parts.append({
             "type": "image_url",
             "image_url": {"url": f"data:image/jpeg;base64,{_b64(front_bytes)}", "detail": "high"},
@@ -8435,22 +8502,63 @@ Only flag genuine concerns — normal print variation and manufacturing toleranc
             "image_url": {"url": f"data:image/jpeg;base64,{_b64(back_bytes)}", "detail": "high"},
         })
 
-    result   = await _openai_chat([{"role": "user", "content": content_parts}], max_tokens=800, temperature=0.1)
-    parsed   = _parse_json_or_none(result.get("content", "")) or {}
+    detail_labels = ["CORNER CLOSE-UP:", "HOLOFOIL / TEXTURE CLOSE-UP:", "BACK TEXT / PRINT CLOSE-UP:", "BARCODE / SYMBOL CLOSE-UP:"]
+    for label, dbytes in zip(detail_labels, [detail1_bytes, detail2_bytes, detail3_bytes, detail4_bytes]):
+        if dbytes:
+            content_parts.append({"type": "text", "text": label})
+            content_parts.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{_b64(dbytes)}", "detail": "high"},
+            })
 
-    # Normalise to expected flat shape
+    result = await _openai_chat([{"role": "user", "content": content_parts}], max_tokens=1400, temperature=0.1)
+    parsed = _parse_json_or_none(result.get("content", "")) or {}
+
+    # Normalise — gracefully handle partial responses
     verdict    = str(parsed.get("verdict")    or "Unable to determine").strip()
     confidence = float(parsed.get("confidence") or 0.0)
     summary    = str(parsed.get("summary")    or "Analysis complete.").strip()
-    flags      = list(parsed.get("flags")     or parsed.get("red_flags")  or [])
+    flags      = list(parsed.get("flags")     or parsed.get("red_flags")   or [])
     positives  = list(parsed.get("positives") or parsed.get("green_flags") or [])
+    checklist  = parsed.get("checklist")      or {}
+    forensic_notes = str(parsed.get("forensic_notes") or "").strip()
+    print_analysis = str(parsed.get("print_analysis") or "").strip()
+    recommendations = list(parsed.get("recommendations") or [])
+    next_steps      = list(parsed.get("next_steps")      or [])
+
+    # If recommendations empty, generate sensible defaults based on verdict
+    if not recommendations:
+        v_lower = verdict.lower()
+        if "counterfeit" in v_lower or "suspicious" in v_lower:
+            recommendations = [
+                "Do not purchase until physically inspected by a certified grader.",
+                "Compare side-by-side with a verified authentic copy under bright light.",
+                "Submit to a professional grading service (PSA/CGC/BGS) for definitive authentication.",
+            ]
+        else:
+            recommendations = [
+                "Consider professional grading to lock in the card's authenticated status and value.",
+                "Store in a hard case to preserve condition and prevent future authenticity disputes.",
+            ]
+
+    if not next_steps:
+        next_steps = [
+            "Photograph under UV light to check for fluorescent ink (common on reprints).",
+            "Check card thickness with a calliper — authentic cards have tightly controlled tolerances.",
+            "Compare the back pattern colour under neutral white light with a known authentic copy.",
+        ]
 
     return JSONResponse(content={
-        "verdict":    verdict,
-        "confidence": confidence,
-        "summary":    summary,
-        "flags":      flags,
-        "positives":  positives,
+        "verdict":         verdict,
+        "confidence":      confidence,
+        "summary":         summary,
+        "flags":           flags,
+        "positives":       positives,
+        "checklist":       checklist,
+        "forensic_notes":  forensic_notes,
+        "print_analysis":  print_analysis,
+        "recommendations": recommendations,
+        "next_steps":      next_steps,
     })
 
 
