@@ -2155,20 +2155,27 @@ def _estimate_centering_from_image(img_bytes: bytes) -> dict | None:
 
 def _autocrop_card(img_bytes: bytes, inset_pct: float = 0.01) -> tuple:
     """
-    Detect card border via Sobel edge detection and crop to the card boundary.
+    Detect the physical card border by sampling the image background colour and
+    finding the card-vs-background boundary.
 
-    Uses the same vectorised Sobel pipeline as _estimate_centering_from_image but
-    instead of computing ratios it returns a cropped image.
+    Why NOT Sobel: Sobel detects every high-contrast edge in the artwork, making
+    internal card features (character outlines, holofoil patterns, text borders)
+    compete with the actual card edge — causing the crop to cut into the card.
 
-    inset_pct: fraction to pull the crop boundary INWARD from the detected card edge
-               (default 1 % — keeps just inside the border, avoids background bleed).
+    This approach:
+    1. Samples the outer 4% border strip of the image to estimate background colour
+    2. Builds a per-pixel distance-from-background mask
+    3. Finds the bounding box of foreground (card) pixels
+    4. Refines each edge by scanning inward until ≥30% of pixels in a row/column
+       belong to the card — making it robust to corner shadows and dark borders
+    5. Applies 1% inset so the crop lands just inside the physical card edge
 
     Returns (cropped_bytes: bytes, crop_info: dict).
-      crop_info keys:
+    crop_info keys:
         detected        bool   — True if border was found with confidence
         original_size   [w,h]  — input image dimensions
         crop_box        [x1,y1,x2,y2] — absolute pixel crop on the original image
-        crop_pct        [x1_pct,y1_pct,x2_pct,y2_pct] — 0-1 fractions for JS canvas
+        crop_pct        [x1_pct,y1_pct,x2_pct,y2_pct] — 0-1 fractions for JS overlay
     If detection fails, cropped_bytes == img_bytes (original) and detected==False.
     """
     if not PIL_AVAILABLE or Image is None or np is None or not img_bytes:
@@ -2179,127 +2186,102 @@ def _autocrop_card(img_bytes: bytes, inset_pct: float = 0.01) -> tuple:
         im = ImageOps.exif_transpose(im)
         orig_w, orig_h = im.size
 
-        # ── 1. Resize to working resolution for fast Sobel ────────────────────
-        WORK_W = 900
-        scale = WORK_W / max(orig_w, 1)
+        # ── 1. Downscale for speed ─────────────────────────────────────────────
+        WORK_LONG = 900
+        long_edge = max(orig_w, orig_h)
+        scale = WORK_LONG / max(long_edge, 1)
+        work_w = max(1, int(orig_w * scale))
         work_h = max(1, int(orig_h * scale))
-        work = im.resize((WORK_W, work_h), Image.LANCZOS)
-        g = np.asarray(ImageOps.grayscale(work), dtype=np.float32)
-        ww, wh = WORK_W, work_h
+        work = im.resize((work_w, work_h), Image.LANCZOS)
+        arr = np.asarray(work, dtype=np.float32)   # (H, W, 3)
 
-        # ── 2. Vectorised Sobel (identical kernel to _estimate_centering) ──────
-        kx = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float32)
-        ky = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=np.float32)
+        # ── 2. Estimate background colour from outer border strip ─────────────
+        bpx = max(4, int(min(work_w, work_h) * 0.04))
+        border_pixels = np.vstack([
+            arr[:bpx, :, :].reshape(-1, 3),         # top strip
+            arr[-bpx:, :, :].reshape(-1, 3),         # bottom strip
+            arr[:, :bpx, :].reshape(-1, 3),          # left strip
+            arr[:, -bpx:, :].reshape(-1, 3),         # right strip
+        ])
+        bg_colour = np.median(border_pixels, axis=0)  # robust to noise / tape / hands
 
-        def _conv2(img: np.ndarray, k: np.ndarray) -> np.ndarray:
-            kh, kw = k.shape
-            ph, pw = kh // 2, kw // 2
-            padded = np.pad(img, ((ph, ph), (pw, pw)), mode="edge")
-            shape = img.shape + k.shape
-            strides = padded.strides + padded.strides
-            view = np.lib.stride_tricks.as_strided(padded, shape=shape, strides=strides)
-            return (view * k).sum(axis=(-2, -1))
+        # ── 3. Card mask: pixels that differ from background ──────────────────
+        diff = np.sqrt(np.sum((arr - bg_colour) ** 2, axis=2))
+        # Adaptive threshold: 3× the background strip's own std-dev, min 22
+        bg_std = float(np.std(diff[:bpx, :]) + np.std(diff[-bpx:, :]) +
+                       np.std(diff[:, :bpx]) + np.std(diff[:, -bpx:])) / 4.0
+        thr_val = max(22.0, bg_std * 3.0)
+        card_mask = diff > thr_val  # True = card pixel
 
-        mag = np.sqrt(_conv2(g, kx) ** 2 + _conv2(g, ky) ** 2)
-
-        # ── 3. Find edge pixels and their bounding box ────────────────────────
-        thr = float(np.percentile(mag, 94))
-        edges = mag >= thr
-        ys, xs = np.where(edges)
-        if len(xs) < 400:
+        ys, xs = np.where(card_mask)
+        if len(xs) < 300:
+            # Background and card are very similar in colour — can't auto-detect
             return img_bytes, {"detected": False, "original_size": [orig_w, orig_h]}
 
-        # Coarse boundary: 2nd / 98th percentile (more robust than 1st/99th for noisy shots)
-        cx1 = int(np.percentile(xs, 2))
-        cx2 = int(np.percentile(xs, 98))
-        cy1 = int(np.percentile(ys, 2))
-        cy2 = int(np.percentile(ys, 98))
+        # ── 4. Coarse bounding box (1st/99th percentile to ignore noise) ──────
+        x1c = int(np.percentile(xs, 1));  x2c = int(np.percentile(xs, 99))
+        y1c = int(np.percentile(ys, 1));  y2c = int(np.percentile(ys, 99))
 
-        if cx2 - cx1 < ww * 0.30 or cy2 - cy1 < wh * 0.30:
-            # Card region too small — image may be macro/extreme crop; skip
+        if x2c - x1c < work_w * 0.25 or y2c - y1c < work_h * 0.25:
             return img_bytes, {"detected": False, "original_size": [orig_w, orig_h]}
 
-        # ── 4. Refine with row/col sum profiles inside the coarse box ─────────
-        roi_edges = edges[cy1:cy2, cx1:cx2]
-        col_sum = roi_edges.sum(axis=0).astype(np.float32)
-        row_sum = roi_edges.sum(axis=1).astype(np.float32)
+        # ── 5. Fine-refine each edge: scan inward until ≥30% of the cross-section
+        #       belongs to the card mask.  This handles dark card borders and edge
+        #       shadows that can fool a simple percentile cut. ─────────────────
+        def _find_edge(mask: np.ndarray, axis: int, from_start: bool,
+                       min_frac: float = 0.30) -> int:
+            """Return the first row (axis=0) or col (axis=1) index where
+               ≥min_frac of pixels are True, scanning from the given end."""
+            n = mask.shape[1] if axis == 1 else mask.shape[0]
+            total = mask.shape[0] if axis == 1 else mask.shape[1]
+            idx_range = range(n) if from_start else range(n - 1, -1, -1)
+            for i in idx_range:
+                stripe = mask[:, i] if axis == 1 else mask[i, :]
+                if stripe.sum() / max(total, 1) >= min_frac:
+                    return i
+            return 0 if from_start else n - 1
 
-        def _smooth(v: np.ndarray, w: int = 9) -> np.ndarray:
-            if v.size < w:
-                return v
-            return np.convolve(v, np.ones(w, dtype=np.float32) / w, mode="same")
+        roi = card_mask[max(0, y1c - 2):min(work_h, y2c + 2),
+                        max(0, x1c - 2):min(work_w, x2c + 2)]
 
-        col_s = _smooth(col_sum)
-        row_s = _smooth(row_sum)
+        fine_x1 = max(0,       x1c - 2 + _find_edge(roi, axis=1, from_start=True))
+        fine_x2 = min(work_w-1, x1c - 2 + _find_edge(roi, axis=1, from_start=False))
+        fine_y1 = max(0,       y1c - 2 + _find_edge(roi, axis=0, from_start=True))
+        fine_y2 = min(work_h-1, y1c - 2 + _find_edge(roi, axis=0, from_start=False))
 
-        def _border_peak(signal: np.ndarray, from_start: bool, zone_frac: float = 0.30) -> int | None:
-            zone = int(signal.size * zone_frac)
-            seg = signal[:zone] if from_start else signal[-zone:]
-            if seg.size < 4 or seg.max() <= 0:
-                return None
-            thr_peak = seg.max() * 0.65
-            hits = np.where(seg >= thr_peak)[0]
-            if hits.size == 0:
-                return None
-            idx = int(hits[0] if from_start else hits[-1])
-            return idx if from_start else (signal.size - zone + idx)
-
-        li = _border_peak(col_s, True)
-        ri = _border_peak(col_s, False)
-        ti = _border_peak(row_s, True)
-        bi = _border_peak(row_s, False)
-
-        # Fall back to coarse bounds if refinement fails
-        fine_x1 = (cx1 + li) if li is not None else cx1
-        fine_x2 = (cx1 + ri) if ri is not None else cx2
-        fine_y1 = (cy1 + ti) if ti is not None else cy1
-        fine_y2 = (cy1 + bi) if bi is not None else cy2
-
-        if fine_x2 - fine_x1 < ww * 0.25 or fine_y2 - fine_y1 < wh * 0.25:
-            fine_x1, fine_x2, fine_y1, fine_y2 = cx1, cx2, cy1, cy2
-
-        # ── 5. Apply inset and scale to original image coordinates ────────────
-        card_w = fine_x2 - fine_x1
-        card_h = fine_y2 - fine_y1
-        inset_x = max(1, int(card_w * inset_pct))
-        inset_y = max(1, int(card_h * inset_pct))
-
-        crop_x1_w = fine_x1 + inset_x
-        crop_x2_w = fine_x2 - inset_x
-        crop_y1_w = fine_y1 + inset_y
-        crop_y2_w = fine_y2 - inset_y
-
-        if crop_x2_w <= crop_x1_w or crop_y2_w <= crop_y1_w:
+        cw = fine_x2 - fine_x1
+        ch = fine_y2 - fine_y1
+        if cw < 50 or ch < 50:
             return img_bytes, {"detected": False, "original_size": [orig_w, orig_h]}
 
-        # Scale back to original image coordinates
+        # ── 6. Apply inset (1%) and scale back to original coordinates ────────
+        inset_x = max(1, int(cw * inset_pct))
+        inset_y = max(1, int(ch * inset_pct))
+
         inv = 1.0 / scale
-        ox1 = max(0,      int(crop_x1_w * inv))
-        oy1 = max(0,      int(crop_y1_w * inv))
-        ox2 = min(orig_w, int(crop_x2_w * inv))
-        oy2 = min(orig_h, int(crop_y2_w * inv))
+        ox1 = max(0,       int((fine_x1 + inset_x) * inv))
+        oy1 = max(0,       int((fine_y1 + inset_y) * inv))
+        ox2 = min(orig_w,  int((fine_x2 - inset_x) * inv))
+        oy2 = min(orig_h,  int((fine_y2 - inset_y) * inv))
 
         if ox2 - ox1 < 100 or oy2 - oy1 < 100:
             return img_bytes, {"detected": False, "original_size": [orig_w, orig_h]}
 
-        # ── 6. Crop original image and encode ─────────────────────────────────
+        # ── 7. Crop and encode ────────────────────────────────────────────────
         cropped = im.crop((ox1, oy1, ox2, oy2))
         buf = io.BytesIO()
         cropped.save(buf, format="JPEG", quality=92, optimize=True)
-        cropped_bytes = buf.getvalue()
 
         crop_info = {
             "detected":      True,
             "original_size": [orig_w, orig_h],
             "crop_box":      [ox1, oy1, ox2, oy2],
             "crop_pct":      [
-                round(ox1 / orig_w, 4),
-                round(oy1 / orig_h, 4),
-                round(ox2 / orig_w, 4),
-                round(oy2 / orig_h, 4),
+                round(ox1 / orig_w, 4), round(oy1 / orig_h, 4),
+                round(ox2 / orig_w, 4), round(oy2 / orig_h, 4),
             ],
         }
-        return cropped_bytes, crop_info
+        return buf.getvalue(), crop_info
 
     except Exception:
         return img_bytes, {"detected": False}
@@ -7650,10 +7632,12 @@ async def defect_scan(
     # ── 2. CV pass — runs for both modes ─────────────────────────────────────
 
     # 2a. Centering (pixel-accurate Sobel border detection)
-    # Run on cropped images — centering on a clean card crop is more accurate
-    centering_front = _estimate_centering_from_image(front_proc)
-    centering_back  = _estimate_centering_from_image(back_proc)  if back_proc  else None
-    centering_extra = _estimate_centering_from_image(extra_proc) if extra_proc else None
+    # Run on ORIGINAL compressed bytes (before autocrop) — centering measures the
+    # physical white border of the card, which the autocrop deliberately removes.
+    # Using the cropped image would give zero/garbage margins since the borders are gone.
+    centering_front = _estimate_centering_from_image(front_bytes)
+    centering_back  = _estimate_centering_from_image(back_bytes)  if back_bytes  else None
+    centering_extra = _estimate_centering_from_image(extra_bytes) if extra_bytes else None
 
     # 2b. Filter variants (all 13 modes) — run on cropped images
     front_variants = _make_defect_filter_variants(front_proc)
