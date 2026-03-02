@@ -2337,10 +2337,10 @@ async def _openai_text(messages: List[Dict[str, Any]], max_tokens: int = 220, te
         client = _get_http_client()
         r = await client.post(url, headers=headers, json=payload)
         if r.status_code != 200:
-                return {"error": True, "status": r.status_code, "message": r.text[:700]}
-            data = r.json()
-            content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
-            return {"error": False, "content": (content or "").strip()}
+            return {"error": True, "status": r.status_code, "message": r.text[:700]}
+        data = r.json()
+        content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+        return {"error": False, "content": (content or "").strip()}
     except Exception as e:
         return {"error": True, "status": 0, "message": str(e)}
 
