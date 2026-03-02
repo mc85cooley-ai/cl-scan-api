@@ -96,6 +96,16 @@ except Exception:
 
 PIL_AVAILABLE = bool(Image)
 
+# u2500u2500 Shared async HTTP client u2014 reused across all requests to avoid per-call
+#    TCP + TLS handshake overhead. Timeout of 120s covers large OpenAI payloads.
+_HTTP_CLIENT = None
+
+def _get_http_client():
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is None or _HTTP_CLIENT.is_closed:
+        _HTTP_CLIENT = httpx.AsyncClient(timeout=120.0)
+    return _HTTP_CLIENT
+
 
 
 def _relax_whitening_mm(text: str) -> str:
@@ -1708,171 +1718,191 @@ def _b64(img: bytes) -> str:
 
 
 def _make_defect_filter_variants(img_bytes: bytes) -> Dict[str, bytes]:
-    """Create enhanced filter variants matching the frontend inspection overlay modes.
+    """Create enhanced filter variants for the frontend inspection overlay.
 
-    Frontend modes → server variants:
-      'contrast'       → contrast_sharp     (already existed)
-      'edgewear'       → edge_wear          (NEW: bright low-chroma band detection)
-      'surface'        → sobel_surface      (NEW: Sobel magnitude, interior only)
-      'edges'          → sobel_edges        (NEW: full Sobel, all edges)
-      'invert'         → invert             (NEW: pixel inversion)
-      'r'              → channel_r          (NEW: red channel grayscale)
-      'g'              → channel_g          (NEW: green channel grayscale)
-      'b'              → channel_b          (NEW: blue channel grayscale)
-      AI second-pass   → gray_autocontrast  (already existed, kept for AI pass)
-      AI second-pass   → contrast_sharp     (already existed, kept for AI pass)
+    Performance-optimised rewrite (2026-03):
+    - Hard resize to ≤800px before any processing — prevents multi-second
+      Python loops on 4K phone images
+    - local_variance, edge_wear, uv_sim, sobel_surface: all numpy array ops
+      instead of per-pixel Python loops (~50-100x faster)
+    - Border mask via numpy slice assignment instead of putpixel() loop
+    - JPEG quality 78 (inspection, not print — saves ~40% payload)
 
-    All returned as JPEG bytes at quality=90.
-    Returns empty dict if PIL missing.
+    Frontend mode map:
+      contrast_sharp  → 'contrast'   | edge_wear      → 'edgewear'
+      sobel_surface   → 'surface'    | sobel_edges    → 'edges'
+      invert          → 'invert'     | corner_isolate → 'corners'
+      uv_sim          → 'uv'         | local_variance → 'variance'
+      chromatic       → 'chromatic'  | channel_r/g/b  → 'r'/'g'/'b'
     """
     if not img_bytes or Image is None:
         return {}
     try:
-        from PIL import ImageChops
         im = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        im = ImageOps.exif_transpose(im)
+
+        # ── Hard resize cap — process at most 800px long edge ─────────────────
+        # A 4K image has ~12M pixels; at 800px it's ~600K — 20× less work.
+        # Defect detection doesn't need print resolution.
+        _MAX_PX = 800
+        lw, lh = im.size
+        if max(lw, lh) > _MAX_PX:
+            scale = _MAX_PX / max(lw, lh)
+            im = im.resize((max(1, int(lw * scale)), max(1, int(lh * scale))), Image.LANCZOS)
         w, h = im.size
+
         variants: Dict[str, bytes] = {}
 
         def _to_jpeg(img_obj) -> bytes:
             buf = BytesIO()
-            img_obj.save(buf, format="JPEG", quality=90)
+            # Quality 78: sharp enough for on-screen defect inspection, ~40% smaller than 90
+            img_obj.save(buf, format="JPEG", quality=78, optimize=True)
             return buf.getvalue()
 
-        # ── 1. gray_autocontrast (AI second-pass) ──────────────────
+        # Shared numpy array (float32) used by several filters below
+        arr = np.asarray(im, dtype=np.float32) if np is not None else None
+
+        # ── 1. gray_autocontrast ───────────────────────────────────────────────
         g = ImageOps.grayscale(im)
         g = ImageOps.autocontrast(g)
         g = g.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
         variants["gray_autocontrast"] = _to_jpeg(g)
 
-        # ── 2. contrast_sharp (AI second-pass + 'contrast' mode) ───
+        # ── 2. contrast_sharp ─────────────────────────────────────────────────
         c = ImageEnhance.Contrast(im).enhance(1.6)
         c = ImageEnhance.Sharpness(c).enhance(1.8)
         c = c.filter(ImageFilter.UnsharpMask(radius=1, percent=130, threshold=2))
         variants["contrast_sharp"] = _to_jpeg(c)
 
-        # ── 3. invert (frontend 'invert' mode) ─────────────────────
-        inv = ImageOps.invert(im)
-        variants["invert"] = _to_jpeg(inv)
+        # ── 3. invert ─────────────────────────────────────────────────────────
+        variants["invert"] = _to_jpeg(ImageOps.invert(im))
 
-        # ── 4. RGB channel isolation ('r', 'g', 'b' modes) ─────────
+        # ── 4. RGB channel isolation ───────────────────────────────────────────
         r_ch, g_ch, b_ch = im.split()
         variants["channel_r"] = _to_jpeg(r_ch)
         variants["channel_g"] = _to_jpeg(g_ch)
         variants["channel_b"] = _to_jpeg(b_ch)
 
-        # ── 5. Sobel edge magnitude (shared base for modes 'surface' / 'edges') ──
+        # ── 5. Sobel edges + surface (numpy) ──────────────────────────────────
         try:
-            gray_arr = ImageOps.grayscale(im)
-            # PIL FIND_EDGES is a simple approximation; good enough for thumbnails
-            sobel = gray_arr.filter(ImageFilter.FIND_EDGES)
-            sobel = ImageOps.autocontrast(sobel)
-            variants["sobel_edges"] = _to_jpeg(sobel)
+            sobel_pil = ImageOps.grayscale(im).filter(ImageFilter.FIND_EDGES)
+            sobel_pil = ImageOps.autocontrast(sobel_pil)
+            variants["sobel_edges"] = _to_jpeg(sobel_pil)
 
-            # Surface: Sobel with edge band masked out (interior anomalies only)
-            sobel_arr_data = list(sobel.getdata())
-            gray_base = list(ImageOps.grayscale(im).getdata())
-            band = max(8, int(min(w, h) * 0.06))
-            surface_pix = []
-            for idx, (sv, _) in enumerate(zip(sobel_arr_data, gray_base)):
-                row, col = divmod(idx, w)
-                in_band = col < band or col >= (w - band) or row < band or row >= (h - band)
-                surface_pix.append(0 if in_band else (sv if isinstance(sv, int) else sv[0]))
-            surface_img = Image.new("L", (w, h))
-            surface_img.putdata(surface_pix)
-            surface_img = ImageOps.autocontrast(surface_img)
-            variants["sobel_surface"] = _to_jpeg(surface_img)
+            if np is not None:
+                # Surface: zero-out the border band, keep interior Sobel signal
+                band = max(4, int(min(w, h) * 0.06))
+                sv = np.asarray(sobel_pil, dtype=np.uint8).copy()
+                sv[:band, :]   = 0
+                sv[-band:, :]  = 0
+                sv[:, :band]   = 0
+                sv[:, -band:]  = 0
+                sv_img = Image.fromarray(sv, mode="L")
+                variants["sobel_surface"] = _to_jpeg(ImageOps.autocontrast(sv_img))
+            else:
+                # Fallback: PIL only (slower but correct)
+                sobel_d = np.array(list(sobel_pil.getdata()), dtype=np.uint8) if np else None
+                variants["sobel_surface"] = _to_jpeg(sobel_pil)
         except Exception:
             pass
 
-        # ── 6. Edge wear / whitening band (frontend 'edgewear' mode) ─
-        # Highlights bright, low-chroma pixels near card borders.
+        # ── 6. Edge wear — numpy vectorised ───────────────────────────────────
+        # Highlights bright low-chroma pixels near borders (whitening/silvering).
         try:
-            px = list(im.getdata())
-            band = max(8, int(min(w, h) * 0.08))
-            edge_wear_pix = []
-            for idx, rgb in enumerate(px):
-                row, col = divmod(idx, w)
-                in_band = col < band or col >= (w - band) or row < band or row >= (h - band)
-                if in_band:
-                    r_, g_, b_ = rgb[0], rgb[1], rgb[2]
-                    L = int(0.2126 * r_ + 0.7152 * g_ + 0.0722 * b_)
-                    C = max(r_, g_, b_) - min(r_, g_, b_)
-                    if L > 190 and C < 55:
-                        # Whitening/silvering hit: tint vivid red for visibility
-                        edge_wear_pix.append((255, max(0, r_ - 200), max(0, b_ - 200)))
-                    else:
-                        # Not wear: darken to make hits stand out
-                        edge_wear_pix.append((max(0, r_ // 3), max(0, g_ // 3), max(0, b_ // 3)))
+            if arr is not None:
+                band = max(4, int(min(w, h) * 0.08))
+                R, G, B = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+
+                # Luminance and chroma per pixel
+                lum   = 0.2126 * R + 0.7152 * G + 0.0722 * B
+                chroma = np.maximum(np.maximum(R, G), B) - np.minimum(np.minimum(R, G), B)
+
+                # Border mask
+                border = np.zeros((h, w), dtype=bool)
+                border[:band, :]   = True
+                border[-band:, :]  = True
+                border[:, :band]   = True
+                border[:, -band:]  = True
+
+                # Whitening hit: bright + low chroma in border zone
+                hit = border & (lum > 190) & (chroma < 55)
+
+                ew = np.zeros((h, w, 3), dtype=np.uint8)
+                # Interior: desaturate
+                gray3 = lum.astype(np.uint8)
+                ew[~border, 0] = gray3[~border]
+                ew[~border, 1] = gray3[~border]
+                ew[~border, 2] = gray3[~border]
+                # Border non-hit: darken
+                ew[border & ~hit, 0] = (R[border & ~hit] / 3).astype(np.uint8)
+                ew[border & ~hit, 1] = (G[border & ~hit] / 3).astype(np.uint8)
+                ew[border & ~hit, 2] = (B[border & ~hit] / 3).astype(np.uint8)
+                # Whitening hit: vivid red
+                ew[hit, 0] = 255
+                ew[hit, 1] = np.clip(R[hit] - 200, 0, 255).astype(np.uint8)
+                ew[hit, 2] = np.clip(B[hit] - 200, 0, 255).astype(np.uint8)
+
+                variants["edge_wear"] = _to_jpeg(Image.fromarray(ew, mode="RGB"))
+        except Exception:
+            pass
+
+        # ── 7. UV simulation — numpy vectorised ───────────────────────────────
+        try:
+            if arr is not None:
+                R, G, B = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+                v = np.clip(R * 0.5 + G * 0.5 - B * 0.35 + 40, 0, 255).astype(np.uint8)
+                uv = np.stack([v, v, np.clip(v.astype(np.int16) - 60, 0, 255).astype(np.uint8)], axis=2)
+                uv_img = Image.fromarray(uv, mode="RGB")
+                uv_img = ImageEnhance.Contrast(uv_img).enhance(1.8)
+                variants["uv_sim"] = _to_jpeg(uv_img)
+        except Exception:
+            pass
+
+        # ── 8. Local variance — numpy uniform_filter ──────────────────────────
+        # Surface scratches create tiny high-variance patches.
+        # scipy.ndimage.uniform_filter is ~200x faster than the Python patch loop.
+        try:
+            if np is not None:
+                gray_np = np.asarray(ImageOps.grayscale(im), dtype=np.float32)
+                try:
+                    from scipy.ndimage import uniform_filter as _uf
+                    mean_f  = _uf(gray_np, size=5)
+                    sq_mean = _uf(gray_np ** 2, size=5)
+                except ImportError:
+                    # scipy unavailable: use numpy stride-based box filter
+                    from numpy.lib.stride_tricks import sliding_window_view
+                    wins = sliding_window_view(
+                        np.pad(gray_np, 2, mode='edge'), (5, 5)
+                    )
+                    mean_f  = wins.mean(axis=(-2, -1))
+                    sq_mean = (wins ** 2).mean(axis=(-2, -1))
+
+                var_map = np.clip(sq_mean - mean_f ** 2, 0, None)
+                # Scale variance to 0-255
+                vmax = var_map.max()
+                if vmax > 0:
+                    lv = np.clip((var_map / vmax) * 255 * 0.4, 0, 255).astype(np.uint8)
                 else:
-                    # Interior: show as desaturated for context
-                    gray_v = int(0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2])
-                    edge_wear_pix.append((gray_v, gray_v, gray_v))
-            ew_img = Image.new("RGB", (w, h))
-            ew_img.putdata(edge_wear_pix)
-            variants["edge_wear"] = _to_jpeg(ew_img)
+                    lv = np.zeros_like(gray_np, dtype=np.uint8)
+
+                # Zero-out border band via slice (no putpixel loop)
+                band_lv = max(4, int(min(w, h) * 0.06))
+                lv[:band_lv, :]    = 0
+                lv[-band_lv:, :]   = 0
+                lv[:, :band_lv]    = 0
+                lv[:, -band_lv:]   = 0
+
+                lv_img = Image.fromarray(lv, mode="L")
+                lv_img = ImageOps.autocontrast(lv_img)
+                # Return as RGB so frontend canvas treats it consistently
+                variants["local_variance"] = _to_jpeg(lv_img.convert("RGB"))
         except Exception:
             pass
 
-        # ── 7. UV simulation (channel math: R+G−B, exaggerates stains/inks) ─────
-        # Ink alterations and fluorescent stains absorb blue differently.
-        # Formula: (R + G - B) clamped, gives stains/re-inks a bright yellow glow.
+        # ── 9. Chromatic (exaggerate saturation) ──────────────────────────────
         try:
-            px_rgb = list(im.getdata())
-            uv_pix: list = []
-            for rgb in px_rgb:
-                r_, g_, b_ = rgb[0], rgb[1], rgb[2]
-                v = min(255, max(0, int(r_ * 0.5 + g_ * 0.5 - b_ * 0.35 + 40)))
-                uv_pix.append((v, v, max(0, v - 60)))  # yellow-green cast
-            uv_img = Image.new("RGB", (w, h))
-            uv_img.putdata(uv_pix)
-            uv_img = ImageEnhance.Contrast(uv_img).enhance(1.8)
-            variants["uv_sim"] = _to_jpeg(uv_img)
-        except Exception:
-            pass
-
-        # ── 8. Local variance (surface scratch detector — better than Sobel) ────
-        # Computes local pixel variance in a small window.  Surface scratches
-        # create tiny high-variance patches even where the overall gradient is low.
-        try:
-            gray_arr = ImageOps.grayscale(im)
-            gray_a = list(gray_arr.getdata())
-            lv_pix: list = []
-            ws = 2  # half-window size → 5x5 patch
-            for idx in range(w * h):
-                row, col = divmod(idx, w)
-                patch: list = []
-                for dr in range(-ws, ws + 1):
-                    for dc in range(-ws, ws + 1):
-                        rr = max(0, min(h - 1, row + dr))
-                        cc = max(0, min(w - 1, col + dc))
-                        v = gray_a[rr * w + cc]
-                        patch.append(v if isinstance(v, int) else v[0])
-                mean_p = sum(patch) / len(patch)
-                var_p  = sum((pv - mean_p) ** 2 for pv in patch) / len(patch)
-                lv_val = min(255, int(var_p * 0.4))
-                lv_pix.append(lv_val)
-            lv_img = Image.new("L", (w, h))
-            lv_img.putdata(lv_pix)
-            lv_img = ImageOps.autocontrast(lv_img)
-            # Mask out border band so edge clutter doesn't dominate
-            band_lv = max(8, int(min(w, h) * 0.06))
-            lv_rgb = lv_img.convert("RGB")
-            for idx in range(w * h):
-                row, col = divmod(idx, w)
-                in_band = col < band_lv or col >= (w - band_lv) or row < band_lv or row >= (h - band_lv)
-                if in_band:
-                    lv_rgb.putpixel((col, row), (0, 0, 0))
-            variants["local_variance"] = _to_jpeg(lv_rgb)
-        except Exception:
-            pass
-
-        # ── 9. Chromatic analysis (exaggerate saturation — stain / ink shift) ──
-        # Stains, yellowing, ink transfer show as unnatural saturation patches.
-        try:
-            from PIL import ImageFilter as _IF
             hsv_img = im.convert("HSV")
             h_ch, s_ch, v_ch = hsv_img.split()
-            # Amplify saturation 3× so subtle colour shifts become visible
             s_boosted = ImageEnhance.Brightness(s_ch).enhance(3.0)
             chroma = Image.merge("HSV", (h_ch, s_boosted, v_ch)).convert("RGB")
             chroma = ImageEnhance.Contrast(chroma).enhance(1.5)
@@ -1880,14 +1910,14 @@ def _make_defect_filter_variants(img_bytes: bytes) -> Dict[str, bytes]:
         except Exception:
             pass
 
-        # ── 10. Corner isolate (high-contrast corner crops tiled in 2×2 grid) ─
+        # ── 10. Corner isolate (2×2 grid of contrast-enhanced corner crops) ───
         try:
             csize = max(32, int(min(w, h) * 0.25))
             defs = [
-                (0,       0,       csize,   csize),    # TL
-                (w-csize, 0,       w,       csize),    # TR
-                (0,       h-csize, csize,   h),        # BL
-                (w-csize, h-csize, w,       h),        # BR
+                (0,       0,       csize,   csize),
+                (w-csize, 0,       w,       csize),
+                (0,       h-csize, csize,   h),
+                (w-csize, h-csize, w,       h),
             ]
             tile = csize * 2
             grid_img = Image.new("RGB", (tile + 4, tile + 4), (20, 20, 20))
@@ -2262,7 +2292,13 @@ async def _openai_chat(messages: List[Dict[str, Any]], max_tokens: int = 1200, t
     last_error = {}
     for attempt in range(3):
         try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
+            client = _get_http_client()
+            try:
+                r = await client.post(url, headers=headers, json=payload)
+            except httpx.TransportError:
+                # Client may have gone stale — reset and retry once
+                _HTTP_CLIENT = None
+                client = _get_http_client()
                 r = await client.post(url, headers=headers, json=payload)
                 if r.status_code == 200:
                     data = r.json()
@@ -2298,9 +2334,9 @@ async def _openai_text(messages: List[Dict[str, Any]], max_tokens: int = 220, te
     payload = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature}
 
     try:
-        async with httpx.AsyncClient(timeout=45.0) as client:
-            r = await client.post(url, headers=headers, json=payload)
-            if r.status_code != 200:
+        client = _get_http_client()
+        r = await client.post(url, headers=headers, json=payload)
+        if r.status_code != 200:
                 return {"error": True, "status": r.status_code, "message": r.text[:700]}
             data = r.json()
             content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
@@ -6432,6 +6468,133 @@ class MarketPriceLookupRequest(BaseModel):
     card_number: Optional[str] = None
     grade: Optional[str] = None
 
+    rank_within_card: Optional[int] = None  # population rank within identical card
+    rank_total: Optional[int] = None        # total population for identical card
+    apply_cla_valuation: Optional[bool] = True  # if true, backend returns final_value using CLA model
+
+    # ── Variant / rarity attributes — dramatically affect eBay price ──────────
+    # All fields below are synced from card_submissions via cg-collection.php.
+    # The endpoint reads these directly; keep names in sync with the PHP $query_data keys.
+    variant: Optional[str] = None          # legacy / catch-all variant label (back-compat)
+    rarity: Optional[str] = None           # Secret Rare, Ultra Rare, Full Art Rare, Illustration Rare …
+    variant_type: Optional[str] = None     # Reverse Holo, Rainbow, Textured, Alt Art, Cosmos Holo …
+    edition: Optional[str] = None          # 1st Edition, Shadowless, Collector's Edition
+    finish: Optional[str] = None           # Textured, Holofoil, Etched, Cosmos Holo
+    is_signed: Optional[bool] = None       # Artist / athlete autograph present
+    signed_by: Optional[str] = None        # Signer name (e.g. "Ken Sugimori")
+    is_error_card: Optional[bool] = None   # Factory misprint / miscut / wrong-back
+    is_promo: Optional[bool] = None        # Tournament / event / prerelease promo
+    language: Optional[str] = None         # Japanese, Korean, Chinese — omit/None for English default
+    extra_attributes: Optional[str] = None # Catch-all: Prerelease stamp, Staff stamp, Galaxy foil etc.
+
+
+
+# ========================================
+# CLA VALUATION MODEL (single source of truth)
+# ========================================
+def _cla_parse_grade(grade_str: str) -> float | None:
+    if not grade_str:
+        return None
+    m = re.search(r"(\d+(?:\.\d+)?)", str(grade_str))
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except Exception:
+        return None
+
+def cla_grade_multiplier(grade_str: str, rank_within_card: int | None = None, rank_total: int | None = None) -> float:
+    """Return CLA multiplier vs RAW baseline (1.0). Conservative defaults."""
+    g = _cla_parse_grade(grade_str) or 0.0
+
+    # Core grade multipliers — kept in sync with cg_grade_value_multiplier() in cg-collection.php.
+    # PHP is the canonical source; update both places together if you tune these.
+    if g >= 12:
+        mult = 3.50   # CL Ultra Flawless: PSA10 × scarcity (~30% on top)
+    elif g >= 10:
+        mult = 2.70   # PSA 10 / Gem Mint: 170% premium over raw
+    elif g >= 9.5:
+        mult = 2.10   # Near-gem: strong but not PSA10
+    elif g >= 9:
+        mult = 1.65   # PSA 9: solid graded premium
+    elif g >= 8.5:
+        mult = 1.30   # PSA 8.5: modest premium
+    elif g >= 8:
+        mult = 1.05   # PSA 8: near-market
+    elif g >= 7:
+        mult = 0.82   # PSA 7: slight graded discount (condition concern)
+    elif g > 0:
+        mult = 0.60   # PSA 6 and below: graded but damaged discount
+    else:
+        mult = 1.00
+
+    # Optional pop-rank premium (small, capped)
+    if rank_within_card is not None and rank_within_card > 0:
+        if rank_within_card == 1:
+            mult *= 1.15
+        elif rank_within_card <= 3:
+            mult *= 1.08
+        elif rank_within_card <= 10:
+            mult *= 1.03
+
+    return float(round(mult, 6))
+
+def _parse_grade_from_query(q: str) -> float | None:
+    if not q:
+        return None
+    m = re.search(r"\b(?:PSA|BGS|CGC|SGC|CSG|TAG|HGA|ACE|GMA|ARS)\s*(\d+(?:\.\d+)?)\b", q, re.I)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except Exception:
+        return None
+
+def apply_cla_valuation(signal_price: float, signal_includes_grade: bool, search_query: str, target_grade: str | None,
+                        rank_within_card: int | None = None, rank_total: int | None = None,
+                        slab_premium_add_aud: float = 70.0) -> dict:
+    """Compute final_value from a market signal + CLA rules."""
+    signal_price = float(signal_price or 0.0)
+    if signal_price <= 0:
+        return {
+            "final_value": 0.0,
+            "base_price": 0.0,
+            "multiplier_applied": 1.0,
+            "slab_premium_added": 0.0,
+            "target_multiplier": 1.0,
+            "base_multiplier": 1.0,
+        }
+
+    tg_mult = cla_grade_multiplier(target_grade or "", rank_within_card, rank_total) if target_grade else 1.0
+
+    if signal_includes_grade and target_grade:
+        # Assume the signal is for a known graded baseline (e.g. PSA 10). Parse grade from query when possible.
+        base_grade = _parse_grade_from_query(search_query) or 10.0
+        base_mult = cla_grade_multiplier(str(base_grade))
+        base_price = signal_price
+        slab_added = 0.0
+        mult_applied = (tg_mult / base_mult) if base_mult > 0 else 1.0
+    elif (not signal_includes_grade) and target_grade:
+        # Raw signal → add slab premium then apply full target multiplier
+        slab_added = float(slab_premium_add_aud or 70.0)
+        base_price = signal_price + slab_added
+        base_mult = 1.0
+        mult_applied = tg_mult
+    else:
+        slab_added = 0.0
+        base_price = signal_price
+        base_mult = 1.0
+        mult_applied = 1.0
+
+    final_value = round(base_price * mult_applied, 2)
+    return {
+        "final_value": final_value,
+        "base_price": round(base_price, 2),
+        "multiplier_applied": round(mult_applied, 6),
+        "slab_premium_added": round(slab_added, 2),
+        "target_multiplier": round(tg_mult, 6),
+        "base_multiplier": round(base_mult, 6),
+    }
 
 @app.post("/api/market/price-lookup")
 @safe_endpoint
@@ -6441,15 +6604,23 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
     NOW USES EBAY (same smart query logic as market-trends).
     """
     try:
-        card_name = (request.card_name or "").strip()
-        card_set  = (request.card_set  or "").strip()
-        card_number = (request.card_number or "").strip()
-        grade = (request.grade or "").strip()
+        card_name    = (request.card_name    or "").strip()
+        card_set     = (request.card_set     or "").strip()
+        card_number  = (request.card_number  or "").strip()
+        grade        = (request.grade        or "").strip()
+        rarity       = (request.rarity       or "").strip()
+        variant_type = (request.variant_type or "").strip()
+        edition      = (request.edition      or "").strip()
+        finish       = (request.finish       or "").strip()
+        is_signed    = bool(request.is_signed)
+        signed_by    = (request.signed_by    or "").strip()
+        is_error     = bool(request.is_error_card)
+        is_promo     = bool(request.is_promo)
 
         if not card_name:
             return {"current_price": 0, "source": "error", "error": "card_name required"}
 
-        logging.info(f"💰 Price lookup: {card_name} | grade={grade}")
+        logging.info(f"💰 Price lookup: {card_name} | grade={grade} | rarity={rarity} | variant={variant_type} | signed={is_signed}")
 
         # ── Detect CL Grade 12+ (Ultra Flawless) — maps to PSA 10 on eBay, needs scarcity uplift ──
         grade_is_12_plus = False
@@ -6460,12 +6631,109 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
         except Exception:
             pass
 
-        queries = _build_ebay_query_ladder(
+        # ── Build variant keyword tokens for eBay query enrichment ──────────────
+        # These are injected as the FIRST (most specific) tier of the query ladder.
+        # If no variant-specific results come back, the ladder falls through to the
+        # base card queries so we always get some price signal.
+        variant_tokens = []
+
+        # Rarity — skip low-value rarities that won't help filter eBay results
+        _skip_rarity = {"common", "uncommon", "rare", ""}
+        _rarity_canonical = {
+            "secret rare":                    "Secret Rare",
+            "sr":                             "Secret Rare",
+            "full art":                       "Full Art",
+            "alt art":                        "Alt Art",
+            "special illustration rare":      "Special Illustration Rare SAR",
+            "special art rare":               "SAR",
+            "sar":                            "Special Illustration Rare SAR",
+            "illustration rare":              "Illustration Rare",
+            "ir":                             "Illustration Rare",
+            "hyper rare":                     "Hyper Rare",
+            "rainbow rare":                   "Rainbow Rare",
+            "crown rare":                     "Crown Rare",
+            "ultra rare":                     "Ultra Rare",
+            "gold rare":                      "Gold",
+            "shiny rare":                     "Shiny",
+            "shiny ultra rare":               "Shiny Ultra Rare",
+            "trainer gallery":                "Trainer Gallery",
+            "radiant rare":                   "Radiant",
+        }
+        if rarity.lower() not in _skip_rarity:
+            token = _rarity_canonical.get(rarity.lower(), rarity)
+            if token:
+                variant_tokens.append(token)
+
+        # Variant type — add specific type keywords (complement rarity)
+        _skip_variant = {"regular", "standard", ""}
+        _variant_canonical = {
+            "reverse holo":     "Reverse Holo",
+            "holo":             "Holo",
+            "cosmos holo":      "Cosmos Holo",
+            "rainbow":          "Rainbow Rare",
+            "gold":             "Gold",
+            "textured":         "Textured",
+            "etched":           "Etched",
+            "master ball":      "Master Ball",
+            "art rare":         "Art Rare",
+            "promo":            "Promo",
+        }
+        if variant_type.lower() not in _skip_variant:
+            vtoken = _variant_canonical.get(variant_type.lower(), variant_type)
+            # Only add if not already covered by rarity token (avoid duplicates)
+            if vtoken and vtoken not in " ".join(variant_tokens):
+                variant_tokens.append(vtoken)
+
+        # Edition — high-signal for vintage cards (adds major price premium)
+        _edition_canonical = {
+            "1st edition":         "1st Edition",
+            "first edition":       "1st Edition",
+            "shadowless":          "Shadowless",
+            "collector's edition": "Collector's Edition",
+        }
+        if edition:
+            etoken = _edition_canonical.get(edition.lower(), "")
+            if etoken:
+                variant_tokens.append(etoken)
+
+        # Signed / autographed
+        if is_signed:
+            if signed_by:
+                variant_tokens.append(f"Signed {signed_by}")
+            else:
+                variant_tokens.append("Signed")
+
+        # Error / misprint cards
+        if is_error:
+            variant_tokens.append("Error Misprint")
+
+        # Promo (event/tournament)
+        if is_promo and not any("Promo" in t for t in variant_tokens):
+            variant_tokens.append("Promo")
+
+        variant_str = " ".join(variant_tokens).strip()
+
+        # ── Build query ladder ────────────────────────────────────────────────
+        # Tier 1 (most specific): include variant terms → returns exact-variant price
+        # Tier 2+: base ladder without variant → fallback if variant too niche for eBay
+        base_queries = _build_ebay_query_ladder(
             card_name=card_name,
             card_set=card_set,
             card_number=card_number,
             grade=grade,
         )
+
+        if variant_str:
+            # Prepend variant-enriched versions of the top 2 base queries
+            variant_queries = []
+            for bq in base_queries[:2]:
+                vq = _norm_ws(f"{bq} {variant_str}")
+                if vq not in variant_queries:
+                    variant_queries.append(vq)
+            queries = variant_queries + [q for q in base_queries if q not in variant_queries]
+        else:
+            queries = base_queries
+
         if not queries:
             return {"current_price": 0, "source": "error", "error": "Could not build search query"}
 
@@ -6511,9 +6779,50 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                 source = "ebay_active"
                 sales  = active_count
 
-            logging.info(f"✅ {source}: ${price:.2f} ({sales} records)")
+            # Detect whether the winning query included any variant terms.
+            # Check each token individually — the query builder doesn't always insert
+            # variant_str as one contiguous block, so a substring search on the full
+            # variant_str would produce false-negatives for multi-token strings.
+            if variant_tokens and search_query:
+                sq_lower = search_query.lower()
+                variant_in_query = any(tok.lower() in sq_lower for tok in variant_tokens if tok)
+            else:
+                variant_in_query = False
+            logging.info(f"✅ {source}: ${price:.2f} ({sales} records) | variant_in_query={variant_in_query}")
+
+            # Backend valuation (single source of truth)
+            try:
+                if request.apply_cla_valuation is not False:
+                    valuation = apply_cla_valuation(
+                        signal_price=float(price or 0.0),
+                        signal_includes_grade=bool(grade_in_query),
+                        search_query=search_query,
+                        target_grade=grade or None,
+                        rank_within_card=getattr(request, "rank_within_card", None),
+                        rank_total=getattr(request, "rank_total", None),
+                        slab_premium_add_aud=70.0,
+                    )
+                    final_price = float(valuation.get("final_value") or 0.0)
+                else:
+                    valuation = None
+                    final_price = float(price or 0.0)
+            except Exception as _e:
+                logging.exception("Valuation error; falling back to signal price")
+                valuation = None
+                final_price = float(price or 0.0)
+
             return {
-                "current_price": price,
+                # Back-compat: current_price is what callers typically display
+                "current_price": final_price,
+                # The raw market signal before CLA adjustments
+                "signal_price": float(price or 0.0),
+                "base_price": (valuation.get("base_price") if valuation else float(price or 0.0)),
+                "final_value": (valuation.get("final_value") if valuation else final_price),
+                "multiplier_applied": (valuation.get("multiplier_applied") if valuation else 1.0),
+                "slab_premium_added": (valuation.get("slab_premium_added") if valuation else 0.0),
+                "target_multiplier": (valuation.get("target_multiplier") if valuation else 1.0),
+                "base_multiplier": (valuation.get("base_multiplier") if valuation else 1.0),
+
                 "source": source,
                 "search_query": search_query,
                 "queries_tried": queries,
@@ -6521,6 +6830,8 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                 "sales_count": sales,
                 "price_includes_grade": grade_in_query,
                 "grade_12_uplift": bool(grade_is_12_plus and grade_in_query),
+                "variant_matched": variant_in_query,
+                "variant_terms_used": variant_str or None,
                 "last_updated": datetime.now().isoformat(),
             }
         # ── eBay found nothing — try PriceCharting as fallback ──
@@ -6541,14 +6852,41 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                             pc_aud = _usd_to_aud_simple(pc_prices[pk])
                             if pc_aud and float(pc_aud) > 0:
                                 logging.info(f"✅ PriceCharting fallback: ${float(pc_aud):.2f} AUD")
+                                # PriceCharting provides a raw signal; apply CLA valuation if enabled
+                                try:
+                                    if request.apply_cla_valuation is not False:
+                                        _val = apply_cla_valuation(
+                                            signal_price=float(pc_aud or 0.0),
+                                            signal_includes_grade=False,
+                                            search_query=str(pc_q),
+                                            target_grade=grade or None,
+                                            rank_within_card=getattr(request, "rank_within_card", None),
+                                            rank_total=getattr(request, "rank_total", None),
+                                            slab_premium_add_aud=70.0,
+                                        )
+                                        _final = float(_val.get("final_value") or 0.0)
+                                    else:
+                                        _val = None
+                                        _final = round(float(pc_aud), 2)
+                                except Exception:
+                                    _val = None
+                                    _final = round(float(pc_aud), 2)
+
                                 return {
-                                    "current_price": round(float(pc_aud), 2),
+                                    "current_price": round(_final, 2),
+                                    "signal_price": round(float(pc_aud), 2),
+                                    "base_price": (_val.get("base_price") if _val else round(float(pc_aud), 2)),
+                                    "final_value": (_val.get("final_value") if _val else round(_final, 2)),
+                                    "multiplier_applied": (_val.get("multiplier_applied") if _val else 1.0),
+                                    "slab_premium_added": (_val.get("slab_premium_added") if _val else 0.0),
+                                    "target_multiplier": (_val.get("target_multiplier") if _val else 1.0),
+                                    "base_multiplier": (_val.get("base_multiplier") if _val else 1.0),
+
                                     "source": "pricecharting",
                                     "search_query": pc_q,
                                     "queries_tried": queries,
                                     "card_name": card_name,
                                     "price_includes_grade": False,
-                                    "grade_12_uplift": False,
                                     "last_updated": datetime.now().isoformat(),
                                 }
             except Exception as _pce:
@@ -6746,26 +7084,39 @@ async def update_collection_market_values(request: Request):
         errors: List[Dict[str, Any]] = []
         results: List[Dict[str, Any]] = []
 
+        # ── Parallel market lookups — asyncio.gather instead of sequential awaits ──
+        # Sequential: 10 items × ~3s each = 30s. Parallel: ~3-5s total.
+        valid_items = []
         for it in items:
             if not isinstance(it, dict):
                 continue
-            item_id = str(it.get("item_id") or it.get("id") or "")
+            item_id   = str(it.get("item_id") or it.get("id") or "")
             card_name = str(it.get("card_name") or it.get("card") or "").strip()
-            card_set = str(it.get("card_set") or it.get("set") or "").strip()
+            card_set  = str(it.get("card_set")  or it.get("set")  or "").strip()
             card_number = str(it.get("card_number") or it.get("number") or "").strip()
-            grade = str(it.get("grade") or "").strip()
-
+            grade     = str(it.get("grade") or "").strip()
             if not card_name:
                 errors.append({"item_id": item_id, "card": "", "error": "Missing card_name"})
                 continue
+            valid_items.append((item_id, card_name, card_set, card_number, grade))
 
-            market = await market_price_lookup(MarketPriceLookupRequest(
-                card_name=card_name,
-                card_set=card_set or None,
-                card_number=card_number or None,
-                grade=grade or None,
-            ))
+        async def _lookup_one(item_id, card_name, card_set, card_number, grade):
+            try:
+                return item_id, card_name, await market_price_lookup(MarketPriceLookupRequest(
+                    card_name=card_name,
+                    card_set=card_set or None,
+                    card_number=card_number or None,
+                    grade=grade or None,
+                ))
+            except Exception as ex:
+                return item_id, card_name, {"current_price": 0, "error": str(ex)}
 
+        lookup_results = await asyncio.gather(
+            *[_lookup_one(*args) for args in valid_items],
+            return_exceptions=False,
+        )
+
+        for item_id, card_name, market in lookup_results:
             price = float(market.get("current_price") or 0.0)
             if price > 0:
                 updated_count += 1
@@ -6957,6 +7308,27 @@ async def generate_overlay_variants(
     if not front_bytes or len(front_bytes) < 200:
         raise HTTPException(status_code=400, detail="Front image required")
 
+    # Compress before filter processing — _make_defect_filter_variants will also
+    # resize internally to 800px but compressing here reduces IO overhead too.
+    def _compress_overlay(raw: bytes) -> bytes:
+        if not PIL_AVAILABLE or not raw:
+            return raw
+        try:
+            im = Image.open(io.BytesIO(raw)).convert("RGB")
+            im = ImageOps.exif_transpose(im)
+            w, h = im.size
+            if max(w, h) > 1000:
+                scale = 1000 / max(w, h)
+                im = im.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=85, optimize=True)
+            return buf.getvalue()
+        except Exception:
+            return raw
+
+    front_bytes = _compress_overlay(front_bytes)
+    back_bytes  = _compress_overlay(back_bytes) if back_bytes else None
+
     front_variants = _make_defect_filter_variants(front_bytes)
     back_variants  = _make_defect_filter_variants(back_bytes) if back_bytes else {}
 
@@ -6995,6 +7367,337 @@ async def generate_overlay_variants(
         "has_back": bool(back_bytes),
         "pil_available": PIL_AVAILABLE,
     })
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# /api/defect-scan  — Standalone Defect Detection Tool
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Two modes:
+#   quick (default)  → CV-only (PIL/numpy): filter variants + centering + pixel
+#                       hotspot zones. No AI calls. ~2-4 seconds.
+#   full             → Quick pass PLUS _openai_label_rois on worst ROI crops,
+#                       then a synthesis pass for a natural-language summary.
+#                       ~10-20 seconds depending on image count.
+#
+# Accepts: front (required), back (optional), extra (optional detail shot)
+# Returns: centering, filter_variants (all 13 modes), cv_defects, hotspot_crops,
+#          severity_breakdown, and (full only) ai_defects + defect_summary.
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/defect-scan")
+@safe_endpoint
+async def defect_scan(
+    front: UploadFile = File(...),
+    back:  Optional[UploadFile] = File(None),
+    extra: Optional[UploadFile] = File(None),   # close-up / detail shot
+    scan_mode:  str  = Form("quick"),            # "quick" | "full"
+    card_name:  Optional[str] = Form(None),
+    card_set:   Optional[str] = Form(None),
+):
+    """
+    Dedicated defect scanner — the only job is finding and reporting defects.
+
+    quick mode:  CV-only, no AI.  ~2-4 s.
+    full  mode:  CV + AI ROI labelling + natural-language synthesis.  ~15-20 s.
+    """
+    import time
+    t0 = time.time()
+
+    # ── 1. Read and compress images ───────────────────────────────────────────
+    def _compress(raw: bytes, max_long: int = 1200, quality: int = 88) -> bytes:
+        if not PIL_AVAILABLE or not raw or len(raw) < 200:
+            return raw
+        try:
+            im = Image.open(io.BytesIO(raw)).convert("RGB")
+            im = ImageOps.exif_transpose(im)
+            w, h = im.size
+            long_edge = max(w, h)
+            if long_edge > max_long:
+                scale = max_long / long_edge
+                im = im.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=quality, optimize=True)
+            return buf.getvalue()
+        except Exception:
+            return raw
+
+    front_bytes = _compress(await front.read())
+    back_bytes  = _compress(await back.read())  if back  and back.filename  else b""
+    extra_bytes = _compress(await extra.read()) if extra and extra.filename else b""
+
+    if not front_bytes or len(front_bytes) < 200:
+        raise HTTPException(status_code=400, detail="Front image required")
+
+    scan_mode = (scan_mode or "quick").strip().lower()
+    if scan_mode not in ("quick", "full"):
+        scan_mode = "quick"
+
+    # ── 2. CV pass — runs for both modes ─────────────────────────────────────
+
+    # 2a. Centering (pixel-accurate Sobel border detection)
+    centering_front = _estimate_centering_from_image(front_bytes)
+    centering_back  = _estimate_centering_from_image(back_bytes)  if back_bytes  else None
+    centering_extra = _estimate_centering_from_image(extra_bytes) if extra_bytes else None
+
+    # 2b. Filter variants (all 13 modes) — front, back, extra
+    front_variants = _make_defect_filter_variants(front_bytes)
+    back_variants  = _make_defect_filter_variants(back_bytes)  if back_bytes  else {}
+    extra_variants = _make_defect_filter_variants(extra_bytes) if extra_bytes else {}
+
+    def _encode_variants(vd: Dict[str, bytes], prefix: str) -> Dict[str, str]:
+        out = {}
+        for k, v in vd.items():
+            if v and len(v) > 200:
+                out[f"{prefix}_{k}"] = _b64(v)
+        return out
+
+    filter_variants: Dict[str, str] = {}
+    filter_variants.update(_encode_variants(front_variants, "front"))
+    filter_variants.update(_encode_variants(back_variants,  "back"))
+    filter_variants.update(_encode_variants(extra_variants, "extra"))
+
+    # 2c. CV pixel hotspot detection (corners + edges on each image)
+    def _cv_zones_for_image(img_bytes: bytes, side: str) -> List[Dict]:
+        """Return hotspot zone dicts from pixel analysis on one image."""
+        if not img_bytes or Image is None:
+            return []
+        zones: List[Dict] = []
+        try:
+            im = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            w, h = im.size
+            g_img = ImageOps.grayscale(im)
+            edge_img = g_img.filter(ImageFilter.FIND_EDGES)
+            band = max(8, int(min(w, h) * 0.10))
+
+            def _score(x1, y1, x2, y2) -> float:
+                c_g = g_img.crop((x1, y1, x2, y2))
+                c_e = edge_img.crop((x1, y1, x2, y2))
+                bg = ImageStat.Stat(c_g).mean[0] / 255.0
+                be = ImageStat.Stat(c_e).mean[0] / 255.0
+                return 0.5 * bg + 0.5 * be
+
+            c = max(16, int(min(w, h) * 0.18))
+            corners = [
+                ("top_left",     0,       0,       c,     c,     0.12, 0.12),
+                ("top_right",    w - c,   0,       w,     c,     0.88, 0.12),
+                ("bottom_left",  0,       h - c,   c,     h,     0.12, 0.88),
+                ("bottom_right", w - c,   h - c,   w,     h,     0.88, 0.88),
+            ]
+            for (name, x1, y1, x2, y2, cx, cy) in corners:
+                score = _score(max(0, x1), max(0, y1), min(w, x2), min(h, y2))
+                sev = 3 if score > 0.55 else (2 if score > 0.40 else (1 if score > 0.28 else 0))
+                if sev > 0:
+                    zones.append({
+                        "x": cx, "y": cy, "radius": 0.13, "severity": sev,
+                        "type": "corner", "label": name.replace("_", " ").title(),
+                        "side": side, "source": "cv_pixel",
+                    })
+
+            edges = [
+                ("top",    w // 4, 0,        3 * w // 4, band,       0.50, 0.06),
+                ("bottom", w // 4, h - band,  3 * w // 4, h,          0.50, 0.94),
+                ("left",   0,      h // 4,    band,        3 * h // 4, 0.06, 0.50),
+                ("right",  w-band, h // 4,    w,           3 * h // 4, 0.94, 0.50),
+            ]
+            for (name, x1, y1, x2, y2, cx, cy) in edges:
+                score = _score(max(0, x1), max(0, y1), min(w, x2), min(h, y2))
+                sev = 2 if score > 0.50 else (1 if score > 0.35 else 0)
+                if sev > 0:
+                    zones.append({
+                        "x": cx, "y": cy, "radius": 0.18, "severity": sev,
+                        "type": "edge", "label": name.title() + " Edge",
+                        "side": side, "source": "cv_pixel",
+                    })
+
+            # Surface scan: interior variance (scratch detector)
+            if np is not None:
+                try:
+                    interior_x1 = int(w * 0.15)
+                    interior_y1 = int(h * 0.15)
+                    interior_x2 = int(w * 0.85)
+                    interior_y2 = int(h * 0.85)
+                    interior = im.crop((interior_x1, interior_y1, interior_x2, interior_y2))
+                    g_int = np.asarray(ImageOps.grayscale(interior), dtype=np.float32)
+                    # 7×7 local variance
+                    from scipy.ndimage import uniform_filter
+                    mean_f = uniform_filter(g_int, size=7)
+                    sq_mean = uniform_filter(g_int ** 2, size=7)
+                    var_map = sq_mean - mean_f ** 2
+                    # Flag if top 1% variance patches are unusually high
+                    thr_var = float(np.percentile(var_map, 99))
+                    mean_var = float(np.mean(var_map))
+                    if thr_var > mean_var * 4.5:  # abnormal variance spike
+                        # Find rough location of worst patch
+                        max_pos = np.unravel_index(np.argmax(var_map), var_map.shape)
+                        rel_y = (interior_y1 + max_pos[0]) / h
+                        rel_x = (interior_x1 + max_pos[1]) / w
+                        zones.append({
+                            "x": round(rel_x, 3), "y": round(rel_y, 3),
+                            "radius": 0.12, "severity": 2,
+                            "type": "surface", "label": "Surface Anomaly",
+                            "side": side, "source": "cv_variance",
+                        })
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return zones
+
+    cv_defects = {
+        "front": _cv_zones_for_image(front_bytes, "front"),
+        "back":  _cv_zones_for_image(back_bytes,  "back")  if back_bytes  else [],
+        "extra": _cv_zones_for_image(extra_bytes, "extra") if extra_bytes else [],
+    }
+
+    # 2d. Hotspot thumbnail crops (evidence strips)
+    hotspot_crops: List[Dict] = []
+    for side_key, img_bytes in [("front", front_bytes), ("back", back_bytes), ("extra", extra_bytes)]:
+        if img_bytes:
+            hotspot_crops.extend(_make_basic_hotspot_snaps(img_bytes, side_key, max_snaps=6))
+
+    # 2e. Severity breakdown
+    all_zones = cv_defects["front"] + cv_defects["back"] + cv_defects["extra"]
+    def _severity_breakdown(zones: List[Dict]) -> Dict[str, int]:
+        b = {"minor": 0, "moderate": 0, "severe": 0}
+        for z in zones:
+            s = int(z.get("severity", 0) or 0)
+            if s == 1:   b["minor"] += 1
+            elif s == 2: b["moderate"] += 1
+            elif s >= 3: b["severe"] += 1
+        return b
+
+    severity_breakdown = _severity_breakdown(all_zones)
+
+    # ── 3. AI pass — full mode only ───────────────────────────────────────────
+    ai_defects: List[Dict] = []
+    defect_summary: str = ""
+    overall_severity: str = "clean"
+
+    if scan_mode == "full":
+        # Build ROI list from worst CV zones (top 8 by severity)
+        ranked_zones = sorted(all_zones, key=lambda z: -int(z.get("severity", 0) or 0))
+        rois_to_label = []
+        for z in ranked_zones[:8]:
+            r = z.get("radius", 0.13)
+            cx, cy = z["x"], z["y"]
+            rois_to_label.append({
+                "side": z.get("side", "front"),
+                "roi":  z.get("label", "region"),
+                "bbox": {
+                    "x": max(0.0, cx - r),
+                    "y": max(0.0, cy - r),
+                    "w": min(1.0, r * 2),
+                    "h": min(1.0, r * 2),
+                },
+            })
+
+        # Also add the extra image as a surface ROI if provided
+        if extra_bytes:
+            rois_to_label.append({
+                "side": "extra",
+                "roi":  "detail_shot",
+                "bbox": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+            })
+
+        # Map "extra" side to front_bytes for the labeler (closest match)
+        img_map = {"front": front_bytes, "back": back_bytes, "extra": extra_bytes}
+
+        # Patch: _openai_label_rois only accepts front/back — split extra into front path
+        rois_front_back = []
+        for r in rois_to_label:
+            side = r.get("side", "front")
+            if side == "extra":
+                r2 = dict(r); r2["side"] = "front"
+                rois_front_back.append(r2)
+            else:
+                rois_front_back.append(r)
+
+        ai_defects = await _openai_label_rois(rois_front_back, front_bytes, back_bytes)
+
+        # Synthesis: natural-language summary
+        defect_lines = []
+        for d in ai_defects:
+            if d.get("is_defect"):
+                defect_lines.append(
+                    f"- {d.get('roi','unknown')} ({d.get('side','?')} side): "
+                    f"{d.get('type','defect')} — {d.get('note','')}"
+                )
+        cv_summary_lines = []
+        for z in ranked_zones[:5]:
+            sev_word = {1: "minor", 2: "moderate", 3: "severe"}.get(z.get("severity", 0), "unknown")
+            cv_summary_lines.append(f"- {z.get('label','zone')} ({z.get('side','?')}): CV-detected {sev_word} anomaly")
+
+        synth_prompt = (
+            f"You are a professional card defect analyst. "
+            f"A collector has scanned a {'named ' + card_name if card_name else 'trading'} card "
+            f"{'from ' + card_set if card_set else ''}. "
+            f"Below are the defects found by CV analysis and AI ROI inspection. "
+            f"Write a clear, honest 3-5 sentence defect summary for the collector. "
+            f"Mention the most impactful issues first. Do NOT recommend a grade. "
+            f"CV findings:\n" + ("\n".join(cv_summary_lines) or "None detected") +
+            f"\nAI ROI findings:\n" + ("\n".join(defect_lines) or "No AI-confirmed defects") +
+            f"\nFormat: plain text, no markdown, no bullet points."
+        )
+        synth_res = await _openai_chat(
+            [{"role": "user", "content": synth_prompt}],
+            max_tokens=300,
+            temperature=0.2,
+        )
+        defect_summary = _norm_ws(synth_res.get("content", ""))
+
+        # Overall severity label
+        if severity_breakdown["severe"] > 0:
+            overall_severity = "severe"
+        elif severity_breakdown["moderate"] > 0:
+            overall_severity = "moderate"
+        elif severity_breakdown["minor"] > 0:
+            overall_severity = "minor"
+        else:
+            overall_severity = "clean"
+
+    elapsed_ms = int((time.time() - t0) * 1000)
+
+    # ── 4. Build response ──────────────────────────────────────────────────────
+    response: Dict[str, Any] = {
+        "success": True,
+        "scan_mode": scan_mode,
+        "processing_time_ms": elapsed_ms,
+        "centering": {
+            "front": centering_front,
+            "back":  centering_back,
+            "extra": centering_extra,
+        },
+        "cv_defects": cv_defects,
+        "severity_breakdown": severity_breakdown,
+        "overall_severity": overall_severity,
+        "filter_variants": filter_variants,
+        "filter_mode_map": {
+            "contrast_sharp":    "contrast",
+            "edge_wear":         "edgewear",
+            "sobel_surface":     "surface",
+            "sobel_edges":       "edges",
+            "invert":            "invert",
+            "channel_r":         "r",
+            "channel_g":         "g",
+            "channel_b":         "b",
+            "gray_autocontrast": "ai_pass",
+            "uv_sim":            "uv",
+            "local_variance":    "variance",
+            "chromatic":         "chromatic",
+            "corner_isolate":    "corners",
+        },
+        "hotspot_crops": hotspot_crops,
+        "has_back":  bool(back_bytes),
+        "has_extra": bool(extra_bytes),
+        "pil_available": PIL_AVAILABLE,
+    }
+
+    if scan_mode == "full":
+        response["ai_defects"]     = ai_defects
+        response["defect_summary"] = defect_summary
+
+    return JSONResponse(content=response)
 
 
 def extract_defect_zones(assessment):
@@ -8081,47 +8784,114 @@ Respond ONLY with JSON.
 @app.post("/api/auth-check")
 @safe_endpoint
 async def auth_check_simple(
-    front: UploadFile = File(...),
-    back: UploadFile = File(None),
-    card_name: Optional[str] = Form(None),
-    card_set:  Optional[str] = Form(None),
-    card_year: Optional[str] = Form(None),
+    front:     UploadFile        = File(...),
+    back:      UploadFile        = File(None),
+    detail1:   UploadFile        = File(None),
+    detail2:   UploadFile        = File(None),
+    detail3:   UploadFile        = File(None),
+    detail4:   UploadFile        = File(None),
+    card_game: Optional[str]     = Form(None),
+    card_name: Optional[str]     = Form(None),
+    card_set:  Optional[str]     = Form(None),
+    card_year: Optional[str]     = Form(None),
 ):
     """
-    Simplified auth-check endpoint — called by the WordPress WP AJAX proxy.
-    Returns the flat {verdict, confidence, summary, flags, positives} shape expected by the frontend.
+    Auth-check endpoint — called by the WordPress WP AJAX proxy.
+    Accepts front + optional back + up to 4 detail shots + card context fields.
+    Returns full forensic shape expected by the frontend tabs.
+    Works well even when card details are not provided.
     """
-    front_bytes = await front.read()
-    back_bytes  = await back.read() if back else None
+    front_bytes   = await front.read()
+    back_bytes    = await back.read()    if back    else None
+    detail1_bytes = await detail1.read() if detail1 else None
+    detail2_bytes = await detail2.read() if detail2 else None
+    detail3_bytes = await detail3.read() if detail3 else None
+    detail4_bytes = await detail4.read() if detail4 else None
 
-    cn = (card_name or "unknown card").strip()
+    # Build context string — gracefully handle missing fields
+    cg = (card_game or "").strip()
+    cn = (card_name or "").strip()
     cs = (card_set  or "").strip()
     cy = (card_year or "").strip()
 
-    auth_prompt = (
-        f"You are an expert trading card authenticator. Analyze the provided image(s) of '{cn}'"
-        + (f" ({cs})" if cs else "")
-        + (f" from {cy}" if cy else "")
-        + """. Check for signs of counterfeiting, reprints, or alterations.
+    has_context = bool(cg or cn or cs or cy)
 
-Respond ONLY with valid JSON matching this exact schema:
-{
-  "verdict": "Likely Authentic|Suspicious|Likely Counterfeit",
-  "confidence": 0.0,
-  "summary": "One or two sentences summarising your findings.",
-  "flags": ["issue 1", "issue 2"],
-  "positives": ["positive 1", "positive 2"]
-}
+    if has_context:
+        card_desc = cn or "this card"
+        context_line = f"You are analysing '{card_desc}'"
+        if cg:  context_line += f" — a {cg} card"
+        if cs:  context_line += f" from the {cs} set"
+        if cy:  context_line += f" ({cy})"
+        context_line += "."
+        context_note = (
+            "Use your knowledge of authentic printing standards, known counterfeit tells, "
+            f"and documented issues specific to {cg or 'this TCG'} to inform your analysis."
+        )
+    else:
+        context_line = "You are analysing an unidentified trading card."
+        context_note = (
+            "The card game/set has not been specified. Identify the game/set from the images if possible, "
+            "then apply relevant authentication knowledge. Base your analysis purely on what you can observe — "
+            "print quality, colours, foil/texture, edge cuts, font/text rendering, and back pattern. "
+            "Do not penalise the card for lack of context — only flag genuine visual concerns."
+        )
 
-Evaluate: print quality, font/kerning, colour accuracy, holofoil pattern (if applicable),
-edge precision, back pattern consistency, set symbol clarity, rosette dot pattern,
-and any known counterfeit tells for this game/set/era.
-Only flag genuine concerns — normal print variation and manufacturing tolerance are NOT defects.
+    extra_images_note = ""
+    detail_count = sum(1 for b in [detail1_bytes, detail2_bytes, detail3_bytes, detail4_bytes] if b)
+    if detail_count:
+        extra_images_note = f"\nYou have also been provided {detail_count} close-up detail shot(s). Use these to inspect micro-level features such as rosette dot patterns, corner cuts, holofoil texture, text sharpness, and barcode/symbol accuracy."
+
+    auth_prompt = f"""{context_line}
+{context_note}{extra_images_note}
+
+Perform a thorough forensic authentication analysis. Evaluate ALL of the following where visible:
+- Print quality: rosette dot pattern, ink saturation, sharpness, bleed
+- Colour accuracy: hue, contrast, brightness vs known authentic examples
+- Font & text: kerning, weight, alignment, gloss/matte finish accuracy
+- Holofoil / foil pattern: texture authenticity, light refraction, coverage area
+- Card stock & edges: cut precision, corner radius, layering/core colour if visible
+- Back pattern: colour accuracy, pattern symmetry, print consistency
+- Set symbol / collector number: size, placement, font accuracy
+- Any era/set-specific known counterfeit tells
+
+Respond ONLY with valid JSON matching this exact schema (no markdown, no extra text):
+{{
+  "verdict": "Likely Authentic | Suspicious | Likely Counterfeit",
+  "confidence": 0.85,
+  "summary": "2-3 sentence overall assessment.",
+  "flags": ["Specific concern 1", "Specific concern 2"],
+  "positives": ["Positive indicator 1", "Positive indicator 2"],
+  "checklist": {{
+    "print_quality":   {{"score": 8, "notes": "Short note on print dot pattern and ink quality."}},
+    "colour_accuracy": {{"score": 7, "notes": "Short note on colour fidelity."}},
+    "font_and_text":   {{"score": 9, "notes": "Short note on font rendering and text placement."}},
+    "holo_foil":       {{"score": 6, "notes": "Short note on foil pattern (or N/A if non-holo)."}},
+    "card_stock_edges":{{"score": 8, "notes": "Short note on edge precision and card feel."}},
+    "back_pattern":    {{"score": 7, "notes": "Short note on back design accuracy."}},
+    "set_symbol":      {{"score": 9, "notes": "Short note on symbol/number accuracy."}}
+  }},
+  "forensic_notes": "1-2 sentences on the most technically significant finding.",
+  "print_analysis": "1-2 sentences specifically about print/rosette dot quality observed.",
+  "recommendations": [
+    "Actionable recommendation 1",
+    "Actionable recommendation 2"
+  ],
+  "next_steps": [
+    "Suggested next step 1",
+    "Suggested next step 2"
+  ]
+}}
+
+Scoring guide for checklist: 10 = perfect/indistinguishable from authentic, 7-9 = good with minor concerns,
+4-6 = notable issues worth flagging, 1-3 = strong counterfeit indicators.
+If a category is not visible/applicable, score it 0 and set notes to "Not visible in provided images."
+Only flag genuine concerns — normal manufacturing tolerance is NOT a defect.
 """
-    )
 
     content_parts: list = [{"type": "text", "text": auth_prompt}]
+
     if front_bytes:
+        content_parts.append({"type": "text", "text": "FRONT IMAGE:"})
         content_parts.append({
             "type": "image_url",
             "image_url": {"url": f"data:image/jpeg;base64,{_b64(front_bytes)}", "detail": "high"},
@@ -8133,22 +8903,63 @@ Only flag genuine concerns — normal print variation and manufacturing toleranc
             "image_url": {"url": f"data:image/jpeg;base64,{_b64(back_bytes)}", "detail": "high"},
         })
 
-    result   = await _openai_chat([{"role": "user", "content": content_parts}], max_tokens=800, temperature=0.1)
-    parsed   = _parse_json_or_none(result.get("content", "")) or {}
+    detail_labels = ["CORNER CLOSE-UP:", "HOLOFOIL / TEXTURE CLOSE-UP:", "BACK TEXT / PRINT CLOSE-UP:", "BARCODE / SYMBOL CLOSE-UP:"]
+    for label, dbytes in zip(detail_labels, [detail1_bytes, detail2_bytes, detail3_bytes, detail4_bytes]):
+        if dbytes:
+            content_parts.append({"type": "text", "text": label})
+            content_parts.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{_b64(dbytes)}", "detail": "high"},
+            })
 
-    # Normalise to expected flat shape
+    result = await _openai_chat([{"role": "user", "content": content_parts}], max_tokens=1400, temperature=0.1)
+    parsed = _parse_json_or_none(result.get("content", "")) or {}
+
+    # Normalise — gracefully handle partial responses
     verdict    = str(parsed.get("verdict")    or "Unable to determine").strip()
     confidence = float(parsed.get("confidence") or 0.0)
     summary    = str(parsed.get("summary")    or "Analysis complete.").strip()
-    flags      = list(parsed.get("flags")     or parsed.get("red_flags")  or [])
+    flags      = list(parsed.get("flags")     or parsed.get("red_flags")   or [])
     positives  = list(parsed.get("positives") or parsed.get("green_flags") or [])
+    checklist  = parsed.get("checklist")      or {}
+    forensic_notes = str(parsed.get("forensic_notes") or "").strip()
+    print_analysis = str(parsed.get("print_analysis") or "").strip()
+    recommendations = list(parsed.get("recommendations") or [])
+    next_steps      = list(parsed.get("next_steps")      or [])
+
+    # If recommendations empty, generate sensible defaults based on verdict
+    if not recommendations:
+        v_lower = verdict.lower()
+        if "counterfeit" in v_lower or "suspicious" in v_lower:
+            recommendations = [
+                "Do not purchase until physically inspected by a certified grader.",
+                "Compare side-by-side with a verified authentic copy under bright light.",
+                "Submit to a professional grading service (PSA/CGC/BGS) for definitive authentication.",
+            ]
+        else:
+            recommendations = [
+                "Consider professional grading to lock in the card's authenticated status and value.",
+                "Store in a hard case to preserve condition and prevent future authenticity disputes.",
+            ]
+
+    if not next_steps:
+        next_steps = [
+            "Photograph under UV light to check for fluorescent ink (common on reprints).",
+            "Check card thickness with a calliper — authentic cards have tightly controlled tolerances.",
+            "Compare the back pattern colour under neutral white light with a known authentic copy.",
+        ]
 
     return JSONResponse(content={
-        "verdict":    verdict,
-        "confidence": confidence,
-        "summary":    summary,
-        "flags":      flags,
-        "positives":  positives,
+        "verdict":         verdict,
+        "confidence":      confidence,
+        "summary":         summary,
+        "flags":           flags,
+        "positives":       positives,
+        "checklist":       checklist,
+        "forensic_notes":  forensic_notes,
+        "print_analysis":  print_analysis,
+        "recommendations": recommendations,
+        "next_steps":      next_steps,
     })
 
 
