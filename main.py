@@ -2300,17 +2300,17 @@ async def _openai_chat(messages: List[Dict[str, Any]], max_tokens: int = 1200, t
                 _HTTP_CLIENT = None
                 client = _get_http_client()
                 r = await client.post(url, headers=headers, json=payload)
-                if r.status_code == 200:
-                    data = r.json()
-                    content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
-                    return {"error": False, "content": content}
-                elif r.status_code in (429, 503) and attempt < 2:
-                    # Rate-limited or service busy — back off and retry
-                    await asyncio.sleep(3 * (attempt + 1))
-                    last_error = {"error": True, "status": r.status_code, "message": r.text[:700]}
-                    continue
-                else:
-                    return {"error": True, "status": r.status_code, "message": r.text[:700]}
+            if r.status_code == 200:
+                data = r.json()
+                content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+                return {"error": False, "content": content}
+            elif r.status_code in (429, 503) and attempt < 2:
+                # Rate-limited or service busy — back off and retry
+                await asyncio.sleep(3 * (attempt + 1))
+                last_error = {"error": True, "status": r.status_code, "message": r.text[:700]}
+                continue
+            else:
+                return {"error": True, "status": r.status_code, "message": r.text[:700]}
         except Exception as e:
             last_error = {"error": True, "status": 0, "message": str(e)}
             if attempt < 2:
@@ -2337,10 +2337,10 @@ async def _openai_text(messages: List[Dict[str, Any]], max_tokens: int = 220, te
         client = _get_http_client()
         r = await client.post(url, headers=headers, json=payload)
         if r.status_code != 200:
-                return {"error": True, "status": r.status_code, "message": r.text[:700]}
-            data = r.json()
-            content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
-            return {"error": False, "content": (content or "").strip()}
+            return {"error": True, "status": r.status_code, "message": r.text[:700]}
+        data = r.json()
+        content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+        return {"error": False, "content": (content or "").strip()}
     except Exception as e:
         return {"error": True, "status": 0, "message": str(e)}
 
