@@ -7577,6 +7577,10 @@ async def defect_scan(
     scan_mode:  str  = Form("quick"),            # "quick" | "full"
     card_name:  Optional[str] = Form(None),
     card_set:   Optional[str] = Form(None),
+    # Optional client-provided hashes (for chain-of-custody UI / cross-check)
+    front_sha256: Optional[str] = Form(None),
+    back_sha256:  Optional[str] = Form(None),
+    extra_sha256: Optional[str] = Form(None),
 ):
     """
     Dedicated defect scanner — the only job is finding and reporting defects.
@@ -7605,9 +7609,29 @@ async def defect_scan(
         except Exception:
             return raw
 
-    front_bytes = _compress(await front.read())
-    back_bytes  = _compress(await back.read())  if back  and back.filename  else b""
-    extra_bytes = _compress(await extra.read()) if extra and extra.filename else b""
+    # Read raw upload bytes first (chain-of-custody), then compress for processing.
+    front_raw = await front.read()
+    back_raw  = await back.read()  if back  and back.filename  else b""
+    extra_raw = await extra.read() if extra and extra.filename else b""
+
+    front_bytes = _compress(front_raw)
+    back_bytes  = _compress(back_raw)  if back_raw  else b""
+    extra_bytes = _compress(extra_raw) if extra_raw else b""
+
+    def _sha256(b: bytes) -> str:
+        try:
+            return hashlib.sha256(b or b"").hexdigest()
+        except Exception:
+            return ""
+
+    # Hashes of the RAW uploads (match client-side SHA-256) + compressed processing bytes.
+    front_sha_raw = _sha256(front_raw)
+    back_sha_raw  = _sha256(back_raw)  if back_raw  else ""
+    extra_sha_raw = _sha256(extra_raw) if extra_raw else ""
+
+    front_sha_server = _sha256(front_bytes)
+    back_sha_server  = _sha256(back_bytes)  if back_bytes  else ""
+    extra_sha_server = _sha256(extra_bytes) if extra_bytes else ""
 
     if not front_bytes or len(front_bytes) < 200:
         raise HTTPException(status_code=400, detail="Front image required")
@@ -7861,7 +7885,46 @@ async def defect_scan(
     response: Dict[str, Any] = {
         "success": True,
         "scan_mode": scan_mode,
+        "server_time_utc": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
         "processing_time_ms": elapsed_ms,
+        "evidence": {
+            "inputs": {
+                "front": {
+                    "filename": getattr(front, "filename", None),
+                    "content_type": getattr(front, "content_type", None),
+                    "bytes": len(front_raw or b""),
+                    "raw_sha256": front_sha_raw,
+                    "processed_bytes": len(front_bytes or b""),
+                    "processed_sha256": front_sha_server,
+                    "client_sha256": (front_sha256 or "").strip() or None,
+                    "client_sha256_match": (front_sha_raw == (front_sha256 or "").strip()) if front_sha256 else None,
+                },
+                "back": {
+                    "filename": getattr(back, "filename", None) if back else None,
+                    "content_type": getattr(back, "content_type", None) if back else None,
+                    "bytes": len(back_raw or b""),
+                    "raw_sha256": back_sha_raw or None,
+                    "processed_bytes": len(back_bytes or b""),
+                    "processed_sha256": back_sha_server or None,
+                    "client_sha256": (back_sha256 or "").strip() or None,
+                    "client_sha256_match": (back_sha_raw == (back_sha256 or "").strip()) if back_sha256 and back_raw else None,
+                },
+                "extra": {
+                    "filename": getattr(extra, "filename", None) if extra else None,
+                    "content_type": getattr(extra, "content_type", None) if extra else None,
+                    "bytes": len(extra_raw or b""),
+                    "raw_sha256": extra_sha_raw or None,
+                    "processed_bytes": len(extra_bytes or b""),
+                    "processed_sha256": extra_sha_server or None,
+                    "client_sha256": (extra_sha256 or "").strip() or None,
+                    "client_sha256_match": (extra_sha_raw == (extra_sha256 or "").strip()) if extra_sha256 and extra_raw else None,
+                },
+            },
+            "notes": {
+                "compression": {"max_long": 1200, "quality": 88},
+                "autocrop": {"inset_pct": 0.01, "analysis_runs_on_cropped": True, "centering_runs_on_original": True},
+            },
+        },
         "centering": {
             "front": centering_front,
             "back":  centering_back,
