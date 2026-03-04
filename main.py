@@ -2153,22 +2153,16 @@ def _estimate_centering_from_image(img_bytes: bytes) -> dict | None:
         return None
 
 
-def _autocrop_card(img_bytes: bytes, inset_pct: float = 0.01) -> tuple:
+def _autocrop_card(img_bytes: bytes, inset_pct: float = 0.0, pad_pct: float = 0.03) -> tuple:
     """
     Detect the physical card border by sampling the image background colour and
     finding the card-vs-background boundary.
 
-    Why NOT Sobel: Sobel detects every high-contrast edge in the artwork, making
-    internal card features (character outlines, holofoil patterns, text borders)
-    compete with the actual card edge — causing the crop to cut into the card.
-
-    This approach:
-    1. Samples the outer 4% border strip of the image to estimate background colour
-    2. Builds a per-pixel distance-from-background mask
-    3. Finds the bounding box of foreground (card) pixels
-    4. Refines each edge by scanning inward until ≥30% of pixels in a row/column
-       belong to the card — making it robust to corner shadows and dark borders
-    5. Applies 1% inset so the crop lands just inside the physical card edge
+    NOTE (2026-03): We intentionally *pad outward* a little (pad_pct default 3%)
+    because some scans/phones fill the frame with the card, and the border-strip
+    background sampling can occasionally lock onto an *inner* high-contrast frame
+    (artwork/text border) which makes the crop too tight. Padding + sanity checks
+    prevents shaving off the card edges in those cases.
 
     Returns (cropped_bytes: bytes, crop_info: dict).
     crop_info keys:
@@ -2196,12 +2190,14 @@ def _autocrop_card(img_bytes: bytes, inset_pct: float = 0.01) -> tuple:
         arr = np.asarray(work, dtype=np.float32)   # (H, W, 3)
 
         # ── 2. Estimate background colour from outer border strip ─────────────
-        bpx = max(4, int(min(work_w, work_h) * 0.04))
+        # For many user photos, the card can occupy most of the frame. Using a
+        # thick strip increases risk of sampling card pixels. Keep this modest.
+        bpx = max(4, int(min(work_w, work_h) * 0.03))
         border_pixels = np.vstack([
             arr[:bpx, :, :].reshape(-1, 3),         # top strip
-            arr[-bpx:, :, :].reshape(-1, 3),         # bottom strip
-            arr[:, :bpx, :].reshape(-1, 3),          # left strip
-            arr[:, -bpx:, :].reshape(-1, 3),         # right strip
+            arr[-bpx:, :, :].reshape(-1, 3),        # bottom strip
+            arr[:, :bpx, :].reshape(-1, 3),         # left strip
+            arr[:, -bpx:, :].reshape(-1, 3),        # right strip
         ])
         bg_colour = np.median(border_pixels, axis=0)  # robust to noise / tape / hands
 
@@ -2215,7 +2211,6 @@ def _autocrop_card(img_bytes: bytes, inset_pct: float = 0.01) -> tuple:
 
         ys, xs = np.where(card_mask)
         if len(xs) < 300:
-            # Background and card are very similar in colour — can't auto-detect
             return img_bytes, {"detected": False, "original_size": [orig_w, orig_h]}
 
         # ── 4. Coarse bounding box (1st/99th percentile to ignore noise) ──────
@@ -2226,12 +2221,9 @@ def _autocrop_card(img_bytes: bytes, inset_pct: float = 0.01) -> tuple:
             return img_bytes, {"detected": False, "original_size": [orig_w, orig_h]}
 
         # ── 5. Fine-refine each edge: scan inward until ≥30% of the cross-section
-        #       belongs to the card mask.  This handles dark card borders and edge
-        #       shadows that can fool a simple percentile cut. ─────────────────
+        #       belongs to the card mask. ──────────────────────────────────────
         def _find_edge(mask: np.ndarray, axis: int, from_start: bool,
                        min_frac: float = 0.30) -> int:
-            """Return the first row (axis=0) or col (axis=1) index where
-               ≥min_frac of pixels are True, scanning from the given end."""
             n = mask.shape[1] if axis == 1 else mask.shape[0]
             total = mask.shape[0] if axis == 1 else mask.shape[1]
             idx_range = range(n) if from_start else range(n - 1, -1, -1)
@@ -2244,9 +2236,9 @@ def _autocrop_card(img_bytes: bytes, inset_pct: float = 0.01) -> tuple:
         roi = card_mask[max(0, y1c - 2):min(work_h, y2c + 2),
                         max(0, x1c - 2):min(work_w, x2c + 2)]
 
-        fine_x1 = max(0,       x1c - 2 + _find_edge(roi, axis=1, from_start=True))
+        fine_x1 = max(0,        x1c - 2 + _find_edge(roi, axis=1, from_start=True))
         fine_x2 = min(work_w-1, x1c - 2 + _find_edge(roi, axis=1, from_start=False))
-        fine_y1 = max(0,       y1c - 2 + _find_edge(roi, axis=0, from_start=True))
+        fine_y1 = max(0,        y1c - 2 + _find_edge(roi, axis=0, from_start=True))
         fine_y2 = min(work_h-1, y1c - 2 + _find_edge(roi, axis=0, from_start=False))
 
         cw = fine_x2 - fine_x1
@@ -2254,20 +2246,31 @@ def _autocrop_card(img_bytes: bytes, inset_pct: float = 0.01) -> tuple:
         if cw < 50 or ch < 50:
             return img_bytes, {"detected": False, "original_size": [orig_w, orig_h]}
 
-        # ── 6. Apply inset (1%) and scale back to original coordinates ────────
-        inset_x = max(1, int(cw * inset_pct))
-        inset_y = max(1, int(ch * inset_pct))
+        # ── 5b. Sanity guard: if the "card" bbox is suspiciously interior,
+        #     it's likely we latched onto an inner frame. In that case, do NOT
+        #     crop; let downstream use the original.
+        #     (We still return original_size so the UI overlay can handle it.)
+        if (cw / max(work_w, 1) < 0.78) or (ch / max(work_h, 1) < 0.78):
+            return img_bytes, {"detected": False, "original_size": [orig_w, orig_h]}
 
-        inv = 1.0 / scale
-        ox1 = max(0,       int((fine_x1 + inset_x) * inv))
-        oy1 = max(0,       int((fine_y1 + inset_y) * inv))
-        ox2 = min(orig_w,  int((fine_x2 - inset_x) * inv))
-        oy2 = min(orig_h,  int((fine_y2 - inset_y) * inv))
+        # ── 6. Apply inset and outward padding, then scale back ────────────────
+        inset_pct = max(0.0, float(inset_pct or 0.0))
+        pad_pct   = max(0.0, float(pad_pct or 0.0))
+
+        inset_x = int(cw * inset_pct) if inset_pct > 0 else 0
+        inset_y = int(ch * inset_pct) if inset_pct > 0 else 0
+        pad_x   = int(cw * pad_pct)   if pad_pct   > 0 else 0
+        pad_y   = int(ch * pad_pct)   if pad_pct   > 0 else 0
+
+        inv = 1.0 / max(scale, 1e-6)
+        ox1 = max(0,       int((fine_x1 + inset_x - pad_x) * inv))
+        oy1 = max(0,       int((fine_y1 + inset_y - pad_y) * inv))
+        ox2 = min(orig_w,  int((fine_x2 - inset_x + pad_x) * inv))
+        oy2 = min(orig_h,  int((fine_y2 - inset_y + pad_y) * inv))
 
         if ox2 - ox1 < 100 or oy2 - oy1 < 100:
             return img_bytes, {"detected": False, "original_size": [orig_w, orig_h]}
 
-        # ── 7. Crop and encode ────────────────────────────────────────────────
         cropped = im.crop((ox1, oy1, ox2, oy2))
         buf = io.BytesIO()
         cropped.save(buf, format="JPEG", quality=92, optimize=True)
@@ -7644,9 +7647,9 @@ async def defect_scan(
     # The cropped bytes are used for ALL downstream analysis (filter variants,
     # defect zones, centering, AI pass). The original compressed bytes are kept
     # for the crop overlay display.
-    front_cropped, front_crop_info = _autocrop_card(front_bytes, inset_pct=0.01)
-    back_cropped,  back_crop_info  = _autocrop_card(back_bytes,  inset_pct=0.01) if back_bytes  else (b"", {"detected": False})
-    extra_cropped, extra_crop_info = _autocrop_card(extra_bytes, inset_pct=0.01) if extra_bytes else (b"", {"detected": False})
+    front_cropped, front_crop_info = _autocrop_card(front_bytes, inset_pct=0.0, pad_pct=0.03)
+    back_cropped,  back_crop_info  = _autocrop_card(back_bytes,  inset_pct=0.0, pad_pct=0.03) if back_bytes  else (b"", {"detected": False})
+    extra_cropped, extra_crop_info = _autocrop_card(extra_bytes, inset_pct=0.0, pad_pct=0.03) if extra_bytes else (b"", {"detected": False})
 
     # Use cropped versions for all analysis; fall back to originals if not detected
     front_proc = front_cropped if front_crop_info.get("detected") else front_bytes
