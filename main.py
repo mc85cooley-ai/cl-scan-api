@@ -7647,9 +7647,9 @@ async def defect_scan(
     # The cropped bytes are used for ALL downstream analysis (filter variants,
     # defect zones, centering, AI pass). The original compressed bytes are kept
     # for the crop overlay display.
-    front_cropped, front_crop_info = _autocrop_card(front_bytes, inset_pct=0.0, pad_pct=0.03)
-    back_cropped,  back_crop_info  = _autocrop_card(back_bytes,  inset_pct=0.0, pad_pct=0.03) if back_bytes  else (b"", {"detected": False})
-    extra_cropped, extra_crop_info = _autocrop_card(extra_bytes, inset_pct=0.0, pad_pct=0.03) if extra_bytes else (b"", {"detected": False})
+    front_cropped, front_crop_info = _autocrop_card(front_bytes, inset_pct=0.0, pad_pct=0.05)
+    back_cropped,  back_crop_info  = _autocrop_card(back_bytes,  inset_pct=0.0, pad_pct=0.05) if back_bytes  else (b"", {"detected": False})
+    extra_cropped, extra_crop_info = _autocrop_card(extra_bytes, inset_pct=0.0, pad_pct=0.05) if extra_bytes else (b"", {"detected": False})
 
     # Use cropped versions for all analysis; fall back to originals if not detected
     front_proc = front_cropped if front_crop_info.get("detected") else front_bytes
