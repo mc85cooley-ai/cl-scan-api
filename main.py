@@ -8013,6 +8013,105 @@ async def defect_scan(
         response["ai_defects"]     = ai_defects
         response["defect_summary"] = defect_summary
 
+    # ── 5. PHP frontend compatibility layer ────────────────────────────────────
+    # The PHP scan panel JS reads a flat, normalised shape.  We add these
+    # aliased fields without removing the original nested structure so that
+    # any future clients using the raw schema still work.
+
+    # 5a. overall_severity — compute for quick mode too (was always "clean")
+    if scan_mode == "quick":
+        if severity_breakdown["severe"] > 0:
+            overall_severity = "severe"
+        elif severity_breakdown["moderate"] > 0:
+            overall_severity = "moderate"
+        elif severity_breakdown["minor"] > 0:
+            overall_severity = "minor"
+        else:
+            overall_severity = "clean"
+        response["overall_severity"] = overall_severity
+
+    # 5b. Flat centering — PHP expects h_pct, v_pct, left_pct, right_pct, top_pct, bottom_pct
+    def _parse_ratio(ratio_str) -> float:
+        """Convert '55/45' → 55.0  (the larger side as a percentage)."""
+        try:
+            if ratio_str is None or ratio_str == "N/A":
+                return 50.0
+            parts = str(ratio_str).split("/")
+            return float(parts[0])
+        except Exception:
+            return 50.0
+
+    def _margins_to_pcts(cen_dict) -> dict:
+        """Extract normalised margin percentages from centering dict."""
+        if not cen_dict or not isinstance(cen_dict, dict):
+            return {}
+        m = cen_dict.get("margins", {})
+        ml = m.get("left",   1)
+        mr = m.get("right",  1)
+        mt = m.get("top",    1)
+        mb = m.get("bottom", 1)
+        h_total = max(ml + mr, 1)
+        v_total = max(mt + mb, 1)
+        h_pct = round(_parse_ratio(cen_dict.get("lr")), 1)
+        v_pct = round(_parse_ratio(cen_dict.get("tb")), 1)
+        return {
+            "h_pct":     h_pct,
+            "v_pct":     v_pct,
+            "left_pct":  round(ml / h_total * 100, 1),
+            "right_pct": round(mr / h_total * 100, 1),
+            "top_pct":   round(mt / v_total * 100, 1),
+            "bottom_pct":round(mb / v_total * 100, 1),
+            "lr":        cen_dict.get("lr", "N/A"),
+            "tb":        cen_dict.get("tb", "N/A"),
+        }
+
+    response["centering"] = _margins_to_pcts(centering_front)
+    # Keep nested originals under a separate key for forensics PDF
+    response["centering_detail"] = {
+        "front": centering_front,
+        "back":  centering_back,
+        "extra": centering_extra,
+    }
+
+    # 5c. Flat defects array — PHP iterates data.defects with .type/.location/.severity/.confidence
+    flat_defects = []
+    for side_key, zones in cv_defects.items():
+        for z in (zones or []):
+            flat_defects.append({
+                "type":       z.get("type", "unknown"),
+                "label":      z.get("label", ""),
+                "location":   z.get("label", side_key),
+                "side":       z.get("side", side_key),
+                "severity":   int(z.get("severity", 0) or 0),
+                "confidence": round(float(z.get("confidence", 0.6) or 0.6), 2),
+                "source":     z.get("source", "cv"),
+                "x":          z.get("x"),
+                "y":          z.get("y"),
+            })
+    if scan_mode == "full":
+        for d in ai_defects:
+            if d.get("is_defect"):
+                flat_defects.append({
+                    "type":       d.get("type", "ai_detected"),
+                    "label":      d.get("roi", ""),
+                    "location":   d.get("roi", ""),
+                    "side":       d.get("side", "front"),
+                    "severity":   int(d.get("severity", 1) or 1),
+                    "confidence": round(float(d.get("confidence", 0.8) or 0.8), 2),
+                    "source":     "ai",
+                    "note":       d.get("note", ""),
+                })
+    response["defects"] = flat_defects
+
+    # 5d. defect_snaps — PHP reads data.defect_snaps; API produces hotspot_crops
+    response["defect_snaps"] = hotspot_crops   # same list, aliased
+
+    # 5e. synthesis — PHP reads data.synthesis; API produces defect_summary
+    response["synthesis"] = defect_summary if scan_mode == "full" else ""
+
+    # 5f. api_version — PHP logs this for chain-of-custody
+    response["api_version"] = APP_VERSION
+
     return JSONResponse(content=response)
 
 
