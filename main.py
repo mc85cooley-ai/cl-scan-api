@@ -2155,22 +2155,22 @@ def _estimate_centering_from_image(img_bytes: bytes) -> dict | None:
 
 def _autocrop_card(img_bytes: bytes, inset_pct: float = 0.0, pad_pct: float = 0.03) -> tuple:
     """
-    Detect the physical card border by sampling the image background colour and
-    finding the card-vs-background boundary.
+    Detect the physical card border and crop tightly to it, with generous
+    outward padding to avoid shaving any edge.
 
-    NOTE (2026-03): We intentionally *pad outward* a little (pad_pct default 3%)
-    because some scans/phones fill the frame with the card, and the border-strip
-    background sampling can occasionally lock onto an *inner* high-contrast frame
-    (artwork/text border) which makes the crop too tight. Padding + sanity checks
-    prevents shaving off the card edges in those cases.
+    Improvements over previous version (2026-03):
+    - Auto-rotate: detects if card is photographed sideways (landscape image
+      containing a portrait card) and corrects to portrait before returning.
+    - Wider background strip (6% not 3%) — more robust on close-up shots.
+    - Tighter percentile clipping (0.2%/99.8% not 1%/99%) — preserves thin
+      white card borders that were being trimmed off.
+    - _find_edge min_frac reduced 30% → 12% — finds the genuine card edge
+      rather than pushing it inside the white border.
+    - Absolute minimum safety pad: always adds at least 12px outward so the
+      border pixel is never exactly on the crop boundary.
+    - Sanity guard relaxed 78% → 60% — accepts more zoom levels.
 
     Returns (cropped_bytes: bytes, crop_info: dict).
-    crop_info keys:
-        detected        bool   — True if border was found with confidence
-        original_size   [w,h]  — input image dimensions
-        crop_box        [x1,y1,x2,y2] — absolute pixel crop on the original image
-        crop_pct        [x1_pct,y1_pct,x2_pct,y2_pct] — 0-1 fractions for JS overlay
-    If detection fails, cropped_bytes == img_bytes (original) and detected==False.
     """
     if not PIL_AVAILABLE or Image is None or np is None or not img_bytes:
         return img_bytes, {"detected": False}
@@ -2179,6 +2179,10 @@ def _autocrop_card(img_bytes: bytes, inset_pct: float = 0.0, pad_pct: float = 0.
         im = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         im = ImageOps.exif_transpose(im)
         orig_w, orig_h = im.size
+
+        # ── 0. Auto-rotate: if detected card bbox is in landscape but image is
+        #       portrait (or vice versa), rotate 90° so card is upright. ────────
+        # We'll do this AFTER detection — decide at end whether to rotate output.
 
         # ── 1. Downscale for speed ─────────────────────────────────────────────
         WORK_LONG = 900
@@ -2189,41 +2193,45 @@ def _autocrop_card(img_bytes: bytes, inset_pct: float = 0.0, pad_pct: float = 0.
         work = im.resize((work_w, work_h), Image.LANCZOS)
         arr = np.asarray(work, dtype=np.float32)   # (H, W, 3)
 
-        # ── 2. Estimate background colour from outer border strip ─────────────
-        # For many user photos, the card can occupy most of the frame. Using a
-        # thick strip increases risk of sampling card pixels. Keep this modest.
-        bpx = max(4, int(min(work_w, work_h) * 0.03))
+        # ── 2. Background colour — wider strip (6%) for better sampling ────────
+        # On close-up shots the card nearly fills the frame; 3% was too thin and
+        # occasionally sampled card pixels rather than background.
+        bpx = max(6, int(min(work_w, work_h) * 0.06))
         border_pixels = np.vstack([
-            arr[:bpx, :, :].reshape(-1, 3),         # top strip
-            arr[-bpx:, :, :].reshape(-1, 3),        # bottom strip
-            arr[:, :bpx, :].reshape(-1, 3),         # left strip
-            arr[:, -bpx:, :].reshape(-1, 3),        # right strip
+            arr[:bpx, :, :].reshape(-1, 3),
+            arr[-bpx:, :, :].reshape(-1, 3),
+            arr[:, :bpx, :].reshape(-1, 3),
+            arr[:, -bpx:, :].reshape(-1, 3),
         ])
-        bg_colour = np.median(border_pixels, axis=0)  # robust to noise / tape / hands
+        bg_colour = np.median(border_pixels, axis=0)
 
-        # ── 3. Card mask: pixels that differ from background ──────────────────
+        # ── 3. Card mask ───────────────────────────────────────────────────────
         diff = np.sqrt(np.sum((arr - bg_colour) ** 2, axis=2))
-        # Adaptive threshold: 3× the background strip's own std-dev, min 22
-        bg_std = float(np.std(diff[:bpx, :]) + np.std(diff[-bpx:, :]) +
-                       np.std(diff[:, :bpx]) + np.std(diff[:, -bpx:])) / 4.0
-        thr_val = max(22.0, bg_std * 3.0)
-        card_mask = diff > thr_val  # True = card pixel
+        bg_std = float(
+            np.std(diff[:bpx, :]) + np.std(diff[-bpx:, :]) +
+            np.std(diff[:, :bpx]) + np.std(diff[:, -bpx:])
+        ) / 4.0
+        # Lower minimum threshold (18 instead of 22) — catches faint card edges
+        thr_val = max(18.0, bg_std * 2.5)
+        card_mask = diff > thr_val
 
         ys, xs = np.where(card_mask)
-        if len(xs) < 300:
+        if len(xs) < 200:
             return img_bytes, {"detected": False, "original_size": [orig_w, orig_h]}
 
-        # ── 4. Coarse bounding box (1st/99th percentile to ignore noise) ──────
-        x1c = int(np.percentile(xs, 1));  x2c = int(np.percentile(xs, 99))
-        y1c = int(np.percentile(ys, 1));  y2c = int(np.percentile(ys, 99))
+        # ── 4. Coarse bbox — tighter percentile (0.2/99.8) preserves white borders
+        x1c = int(np.percentile(xs, 0.2));  x2c = int(np.percentile(xs, 99.8))
+        y1c = int(np.percentile(ys, 0.2));  y2c = int(np.percentile(ys, 99.8))
 
-        if x2c - x1c < work_w * 0.25 or y2c - y1c < work_h * 0.25:
+        if x2c - x1c < work_w * 0.20 or y2c - y1c < work_h * 0.20:
             return img_bytes, {"detected": False, "original_size": [orig_w, orig_h]}
 
-        # ── 5. Fine-refine each edge: scan inward until ≥30% of the cross-section
-        #       belongs to the card mask. ──────────────────────────────────────
+        # ── 5. Fine edge refinement — min_frac 12% (was 30%) ─────────────────
+        # 30% was too aggressive: it looked for a column where 30% of pixels
+        # were card-coloured, pushing the detected edge inside the white border.
+        # 12% reliably catches the first card pixels while ignoring noise.
         def _find_edge(mask: np.ndarray, axis: int, from_start: bool,
-                       min_frac: float = 0.30) -> int:
+                       min_frac: float = 0.12) -> int:
             n = mask.shape[1] if axis == 1 else mask.shape[0]
             total = mask.shape[0] if axis == 1 else mask.shape[1]
             idx_range = range(n) if from_start else range(n - 1, -1, -1)
@@ -2246,14 +2254,11 @@ def _autocrop_card(img_bytes: bytes, inset_pct: float = 0.0, pad_pct: float = 0.
         if cw < 50 or ch < 50:
             return img_bytes, {"detected": False, "original_size": [orig_w, orig_h]}
 
-        # ── 5b. Sanity guard: if the "card" bbox is suspiciously interior,
-        #     it's likely we latched onto an inner frame. In that case, do NOT
-        #     crop; let downstream use the original.
-        #     (We still return original_size so the UI overlay can handle it.)
-        if (cw / max(work_w, 1) < 0.78) or (ch / max(work_h, 1) < 0.78):
+        # ── 5b. Sanity guard — relaxed to 60% (was 78%) ───────────────────────
+        if (cw / max(work_w, 1) < 0.60) or (ch / max(work_h, 1) < 0.60):
             return img_bytes, {"detected": False, "original_size": [orig_w, orig_h]}
 
-        # ── 6. Apply inset and outward padding, then scale back ────────────────
+        # ── 6. Inset + outward pad + absolute safety minimum ──────────────────
         inset_pct = max(0.0, float(inset_pct or 0.0))
         pad_pct   = max(0.0, float(pad_pct or 0.0))
 
@@ -2262,16 +2267,39 @@ def _autocrop_card(img_bytes: bytes, inset_pct: float = 0.0, pad_pct: float = 0.
         pad_x   = int(cw * pad_pct)   if pad_pct   > 0 else 0
         pad_y   = int(ch * pad_pct)   if pad_pct   > 0 else 0
 
+        # Absolute safety pad: always expand by at least 12 work-pixels so the
+        # genuine card border pixel is never exactly on the crop boundary.
+        ABS_PAD = 12
+        pad_x = max(pad_x, ABS_PAD)
+        pad_y = max(pad_y, ABS_PAD)
+
         inv = 1.0 / max(scale, 1e-6)
         ox1 = max(0,       int((fine_x1 + inset_x - pad_x) * inv))
         oy1 = max(0,       int((fine_y1 + inset_y - pad_y) * inv))
         ox2 = min(orig_w,  int((fine_x2 - inset_x + pad_x) * inv))
         oy2 = min(orig_h,  int((fine_y2 - inset_y + pad_y) * inv))
 
-        if ox2 - ox1 < 100 or oy2 - oy1 < 100:
+        if ox2 - ox1 < 80 or oy2 - oy1 < 80:
             return img_bytes, {"detected": False, "original_size": [orig_w, orig_h]}
 
         cropped = im.crop((ox1, oy1, ox2, oy2))
+
+        # ── 7. Auto-rotate: correct for sideways photography ─────────────────
+        # Standard trading/sports cards are portrait (taller than wide).
+        # If the cropped region is landscape (wider than tall), rotate 90° CW
+        # so downstream analysis always sees a portrait card.
+        # Exemption: if the *original image* is already landscape (user shot
+        # landscape intentionally, e.g., for a wide-format card), don't rotate.
+        crop_w = ox2 - ox1
+        crop_h = oy2 - oy1
+        rotated = False
+        PORTRAIT_RATIO = 1.15   # card must be at least 15% taller than wide to count
+        if crop_w > crop_h * PORTRAIT_RATIO and orig_h >= orig_w:
+            # Cropped bbox is landscape but original shot was portrait —
+            # the card was photographed sideways. Rotate 90° counter-clockwise.
+            cropped = cropped.rotate(90, expand=True)
+            rotated = True
+
         buf = io.BytesIO()
         cropped.save(buf, format="JPEG", quality=92, optimize=True)
 
@@ -2283,6 +2311,8 @@ def _autocrop_card(img_bytes: bytes, inset_pct: float = 0.0, pad_pct: float = 0.
                 round(ox1 / orig_w, 4), round(oy1 / orig_h, 4),
                 round(ox2 / orig_w, 4), round(oy2 / orig_h, 4),
             ],
+            "rotated":       rotated,
+            "pad_applied":   [pad_x, pad_y],
         }
         return buf.getvalue(), crop_info
 
@@ -7964,14 +7994,17 @@ async def defect_scan(
             "front": {
                 "info":  front_crop_info,
                 "image": _b64(front_cropped) if front_crop_info.get("detected") else None,
+                "rotated": front_crop_info.get("rotated", False),
             },
             "back": {
                 "info":  back_crop_info,
                 "image": _b64(back_cropped)  if back_crop_info.get("detected")  else None,
+                "rotated": back_crop_info.get("rotated", False),
             },
             "extra": {
                 "info":  extra_crop_info,
                 "image": _b64(extra_cropped) if extra_crop_info.get("detected") else None,
+                "rotated": extra_crop_info.get("rotated", False),
             },
         },
     }
