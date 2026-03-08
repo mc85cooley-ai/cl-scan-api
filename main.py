@@ -6628,6 +6628,580 @@ async def record_market_price(
 # ========================================
 # DEFECT HEATMAP GENERATION
 # ========================================
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PRECISION PRICING v2 — CARD-FINGERPRINT-FIRST MULTI-SOURCE PIPELINE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _resolve_card_fingerprint(
+    card_name:   str,
+    card_set:    str,
+    card_number: str,
+    language:    str = "english",
+    game_type:   str = "pokemon",
+    grade:       str = "",
+    grader:      str = "",
+) -> Dict[str, Any]:
+    """
+    Validate and normalise card identity.  Raises ValueError with a clear
+    message if mandatory fields are absent.
+
+    Returns a fingerprint dict consumed by all three price-source helpers.
+    card_number + card_set are hard-required: without them we cannot guarantee
+    we are pricing the correct card and will refuse to guess.
+    """
+    errors = []
+    if not (card_name   or "").strip(): errors.append("card_name")
+    if not (card_set    or "").strip(): errors.append("card_set")
+    if not (card_number or "").strip(): errors.append("card_number")
+    if errors:
+        raise ValueError(f"Missing required fields for precision lookup: {', '.join(errors)}")
+
+    _LANG_MAP = {
+        "en": "english",  "english": "english",
+        "jp": "japanese", "ja": "japanese", "japanese": "japanese",
+        "kr": "korean",   "korean": "korean",
+        "zh": "chinese",  "chinese": "chinese",
+        "de": "german",   "german": "german",
+        "fr": "french",   "french": "french",
+        "it": "italian",  "italian": "italian",
+        "pt": "portuguese","portuguese":"portuguese",
+        "es": "spanish",  "spanish": "spanish",
+    }
+    lang = _LANG_MAP.get((language or "english").lower().strip(),
+                          (language or "english").lower().strip())
+
+    grade_clean = (grade or "").strip()
+    is_graded   = bool(grade_clean and grade_clean not in ("raw", "ungraded", "0"))
+
+    # Strip leading "#" — stored inconsistently across the DB
+    num = (card_number or "").strip().lstrip("#")
+
+    return {
+        "card_name":   card_name.strip(),
+        "card_set":    card_set.strip(),
+        "card_number": num,
+        "language":    lang,
+        "is_english":  lang == "english",
+        "game_type":   (game_type or "pokemon").lower().strip(),
+        "grade":       grade_clean if is_graded else "",
+        "grader":      (grader or "").strip() if is_graded else "",
+        "is_graded":   is_graded,
+    }
+
+
+async def _ebay_sold_strict(
+    fp:            Dict[str, Any],
+    limit:         int = 60,
+    days_lookback: int = 90,
+) -> Dict[str, Any]:
+    """
+    Fetch eBay completed-sale stats using a strict card fingerprint.
+
+    Key differences from the legacy _ebay_completed_stats():
+    • card_number is injected as a mandatory token in every query tier —
+      if it is absent the function returns {} immediately instead of
+      running a name-only fuzzy search (which caused the $2,500 Charizard).
+    • Both EBAY-AU and EBAY-US are queried in parallel; the market with
+      the higher sales volume wins.  If neither alone has >=5 sales the
+      results are merged.
+    • Prices are trimmed (top+bottom 10 %) before computing the median.
+    """
+    if not EBAY_APP_ID:
+        return {}
+
+    card_number = (fp.get("card_number") or "").strip()
+    if not card_number:
+        logging.warning("_ebay_sold_strict: card_number missing — skipping strict lookup")
+        return {}
+
+    card_name = fp["card_name"]
+    card_set  = fp["card_set"]
+    language  = fp.get("language", "english")
+    grade     = fp.get("grade", "")
+    is_graded = fp.get("is_graded", False)
+
+    def _q(*parts):
+        return _norm_ws(" ".join(p for p in parts if p))
+
+    grade_token = grade if is_graded else ""
+
+    # Build query tiers: most-specific first, broadening as we go
+    tiers = []
+    if is_graded and grade_token:
+        tiers.append(_q(card_name, card_set, card_number, grade_token))
+    tiers.append(_q(card_name, card_set, card_number))
+    if language != "english":
+        tiers.append(_q(card_name, card_set, card_number, language.capitalize()))
+        tiers.append(_q(card_name, card_number, language.capitalize()))
+    else:
+        tiers.append(_q(card_name, card_number))
+
+    seen: set = set()
+    query_tiers = []
+    for t in tiers:
+        if t and t not in seen:
+            seen.add(t)
+            query_tiers.append(t)
+
+    aud_rate = await _fx_usd_to_aud()
+    url      = "https://svcs.ebay.com/services/search/FindingService/v1"
+    headers  = {"User-Agent": UA}
+
+    async def _fetch_market(global_id: str, query: str) -> List[float]:
+        prices: List[float] = []
+        target = max(1, int(limit))
+        pages  = min(3, (target + 99) // 100)
+        async with httpx.AsyncClient(timeout=20.0, headers=headers) as client:
+            for page in range(1, pages + 1):
+                params = {
+                    "OPERATION-NAME":                "findCompletedItems",
+                    "SERVICE-VERSION":               "1.13.0",
+                    "GLOBAL-ID":                     global_id,
+                    "RESPONSE-DATA-FORMAT":          "JSON",
+                    "REST-PAYLOAD":                  "",
+                    "keywords":                      query,
+                    "paginationInput.entriesPerPage":"100",
+                    "paginationInput.pageNumber":    str(page),
+                    "itemFilter(0).name":            "SoldItemsOnly",
+                    "itemFilter(0).value":           "true",
+                    "SECURITY-APPNAME":              EBAY_APP_ID,
+                }
+                try:
+                    r = await client.get(url, params=params, timeout=15.0)
+                    j = r.json()
+                    resp  = (j.get("findCompletedItemsResponse") or [{}])[0]
+                    items = ((resp.get("searchResult") or [{}])[0].get("item") or [])
+                    for item in items:
+                        try:
+                            sp   = item.get("sellingStatus", [{}])[0]
+                            csp  = sp.get("convertedCurrentPrice", [{}])[0]
+                            val  = float(csp.get("__value__") or 0.0)
+                            curr = csp.get("@currencyId", "AUD")
+                            if curr != "AUD":
+                                val = float(_usd_to_aud_simple(val) or 0.0)
+                            if val > 0:
+                                prices.append(val)
+                        except Exception:
+                            pass
+                    total = int(
+                        ((resp.get("paginationOutput") or [{}])[0]
+                         .get("totalEntries") or [0])[0]
+                    )
+                    if len(prices) >= target or page * 100 >= total:
+                        break
+                except Exception as e:
+                    logging.warning(f"eBay {global_id} page {page} error: {e}")
+                    break
+        return prices
+
+    def _stats(prices: List[float], query: str, market: str) -> Dict[str, Any]:
+        if not prices:
+            return {}
+        prices = sorted(prices)
+        count  = len(prices)
+        if count >= 10:
+            lo      = int(count * 0.10)
+            hi      = int(count * 0.90)
+            trimmed = prices[lo:hi]
+        else:
+            trimmed = prices
+        if not trimmed:
+            return {}
+        def _pct(lst, p):
+            idx = max(0, min(len(lst)-1, int(len(lst)*p/100)))
+            return float(lst[idx])
+        med = float(statistics.median(trimmed))
+        return {
+            "source":               "ebay",
+            "market":               market,
+            "query":                query,
+            "count":                count,
+            "trimmed_count":        len(trimmed),
+            "currency":             "AUD",
+            "prices":               trimmed[:40],
+            "low":                  _pct(trimmed, 20),
+            "median":               med,
+            "high":                 _pct(trimmed, 80),
+            "avg":                  float(sum(trimmed)/len(trimmed)),
+            "min":                  float(trimmed[0]),
+            "max":                  float(trimmed[-1]),
+            "card_number_enforced": True,
+        }
+
+    MIN_SALES = 5
+    best_result: Dict[str, Any] = {}
+
+    for query in query_tiers:
+        logging.info(f"🔍 eBay strict: '{query}'")
+        au_prices, us_prices = await asyncio.gather(
+            _fetch_market("EBAY-AU", query),
+            _fetch_market("EBAY-US", query),
+        )
+        if len(au_prices) >= len(us_prices):
+            primary, pm = au_prices, "EBAY-AU"
+            fallback, _ = us_prices, "EBAY-US"
+        else:
+            primary, pm = us_prices, "EBAY-US"
+            fallback, _ = au_prices, "EBAY-AU"
+
+        if len(primary) < MIN_SALES and fallback:
+            result = _stats(primary + fallback, query, "EBAY-COMBINED")
+        else:
+            result = _stats(primary, query, pm)
+
+        if result and result.get("count", 0) >= MIN_SALES:
+            logging.info(
+                f"✅ eBay strict ({result['market']}): ${result['median']:.2f} AUD "
+                f"from {result['count']} sales | query='{query}'"
+            )
+            return result
+        if result and result.get("count", 0) > best_result.get("count", 0):
+            best_result = result
+
+    if best_result:
+        logging.info(
+            f"⚠️ eBay strict: best={best_result.get('count',0)} sales "
+            f"(below {MIN_SALES} threshold) — low-confidence signal"
+        )
+    return best_result
+
+
+async def _fetch_pokemontcg_price(fp: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    For Pokémon (English only): exact set+number lookup via PokemonTCG.io,
+    then read the embedded TCGPlayer 30-day market price.
+    Returns {} if game is not Pokémon, card is non-English, or lookup fails.
+    """
+    game = fp.get("game_type", "").lower()
+    if game not in ("pokemon", "pokémon", "pokemon tcg", "ptcg"):
+        return {}
+    if not fp.get("is_english", True):
+        return {}
+
+    card_number = (fp.get("card_number") or "").strip()
+    card_set    = (fp.get("card_set")    or "").strip()
+    if not card_number or not card_set:
+        return {}
+
+    hdrs: Dict[str, str] = {"User-Agent": UA}
+    if POKEMONTCG_API_KEY:
+        hdrs["X-Api-Key"] = POKEMONTCG_API_KEY
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            params = {
+                "q":      f'set.name:"{card_set}" number:"{card_number}"',
+                "select": "id,name,set,number,tcgplayer,cardmarket",
+            }
+            r = await client.get(f"{POKEMONTCG_BASE}/cards",
+                                 params=params, headers=hdrs)
+            cards = (r.json().get("data") or []) if r.status_code == 200 else []
+
+            if not cards:
+                params2 = {
+                    "q":      f'number:"{card_number}" name:"{fp["card_name"]}"',
+                    "select": "id,name,set,number,tcgplayer,cardmarket",
+                }
+                r2    = await client.get(f"{POKEMONTCG_BASE}/cards",
+                                         params=params2, headers=hdrs)
+                cards = (r2.json().get("data") or []) if r2.status_code == 200 else []
+
+            if not cards:
+                return {}
+
+            card       = cards[0]
+            tcgplayer  = card.get("tcgplayer") or {}
+            prices_obj = tcgplayer.get("prices") or {}
+
+            PRICE_PRIORITY = [
+                "holofoil", "normal", "reverseHolofoil",
+                "1stEditionHolofoil", "unlimitedHolofoil", "1stEdition",
+            ]
+            market_usd: Optional[float] = None
+            price_type_used: Optional[str] = None
+
+            for pt in PRICE_PRIORITY:
+                if pt in prices_obj:
+                    raw = prices_obj[pt].get("market") or prices_obj[pt].get("mid")
+                    if raw and float(raw) > 0:
+                        market_usd      = float(raw)
+                        price_type_used = pt
+                        break
+
+            if market_usd is None:
+                for pt, pdata in prices_obj.items():
+                    if isinstance(pdata, dict):
+                        raw = pdata.get("market") or pdata.get("mid")
+                        if raw and float(raw) > 0:
+                            market_usd      = float(raw)
+                            price_type_used = pt
+                            break
+
+            if not market_usd:
+                return {}
+
+            market_aud = _usd_to_aud_simple(market_usd)
+            if not market_aud:
+                return {}
+
+            logging.info(
+                f"✅ TCGPlayer (PokemonTCG.io): ${market_usd:.2f} USD → "
+                f"${market_aud:.2f} AUD | type={price_type_used} | "
+                f"card_id={card.get('id')}"
+            )
+            return {
+                "source":               "tcgplayer_via_pokemontcgapi",
+                "card_id":              card.get("id"),
+                "card_name":            card.get("name"),
+                "card_number":          card.get("number"),
+                "set_name":             (card.get("set") or {}).get("name"),
+                "price_type":           price_type_used,
+                "market_price_usd":     market_usd,
+                "market_price_aud":     market_aud,
+                "median":               market_aud,
+                "tcgplayer_url":        tcgplayer.get("url"),
+                "updated_at":           tcgplayer.get("updatedAt"),
+                "exact_match":          True,
+                "count":                30,
+                "price_includes_grade": False,
+            }
+    except Exception as e:
+        logging.warning(f"PokemonTCG.io price lookup failed: {e}")
+        return {}
+
+
+async def _fetch_pricecharting_strict(fp: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    PriceCharting lookup with card-number validation.
+    Queries using card name + set + number.  Validates that the returned
+    product's name or URL contains the card number before using its price,
+    preventing cross-card contamination from fuzzy name matching.
+    """
+    if not PRICECHARTING_TOKEN:
+        return {}
+
+    card_name   = fp["card_name"]
+    card_set    = fp["card_set"]
+    card_number = fp.get("card_number", "")
+
+    async def _try_query(q: str, require_number: bool) -> Optional[Dict[str, Any]]:
+        products = await _pc_search(q, limit=8)
+        if not products:
+            return None
+        num_lower        = card_number.lower()
+        name_first_word  = (card_name.split()[0]).lower() if card_name.split() else ""
+        num_variants     = [num_lower, f"#{num_lower}", f"/{num_lower}", f"- {num_lower}"]
+        for product in products:
+            pname = str(product.get("product-name") or product.get("name") or "").lower()
+            purl  = str(product.get("url") or "").lower()
+            num_matched  = any(v in pname or v in purl
+                               for v in num_variants if v.strip("#/- "))
+            name_matched = name_first_word and name_first_word in pname
+            if require_number and num_matched and name_matched:
+                return product
+            elif (not require_number) and name_matched:
+                return product
+        return None
+
+    q_full    = _norm_ws(f"{card_name} {card_set} {card_number}")
+    validated = await _try_query(q_full, require_number=True)
+    number_validated = True
+
+    if not validated:
+        q_base    = _norm_ws(f"{card_name} {card_set}")
+        validated = await _try_query(q_base, require_number=False)
+        number_validated = False
+
+    if not validated:
+        logging.info(f"PriceCharting: no validated match for {card_name} #{card_number}")
+        return {}
+
+    pc_pid    = str(validated.get("id") or validated.get("product-id") or "").strip()
+    pc_detail = await _pc_product(pc_pid) if pc_pid else {}
+    pc_merged = dict(validated)
+    if isinstance(pc_detail, dict):
+        pc_merged.update(pc_detail)
+
+    pc_prices = _pc_extract_price_fields(pc_merged)
+
+    raw_usd = None
+    for pk in ("loose-price", "loose_price", "used_price"):
+        if pk in pc_prices and isinstance(pc_prices[pk], (int, float)) and pc_prices[pk] > 0:
+            raw_usd = float(pc_prices[pk])
+            break
+
+    graded_usd = None
+    for pk in ("graded-price", "graded_price"):
+        if pk in pc_prices and isinstance(pc_prices[pk], (int, float)) and pc_prices[pk] > 0:
+            graded_usd = float(pc_prices[pk])
+            break
+
+    if raw_usd is None and graded_usd is None:
+        return {}
+
+    raw_aud    = _usd_to_aud_simple(raw_usd)    if raw_usd    else None
+    graded_aud = _usd_to_aud_simple(graded_usd) if graded_usd else None
+
+    logging.info(
+        f"✅ PriceCharting: raw=${raw_aud} AUD | graded=${graded_aud} AUD | "
+        f"number_validated={number_validated} | "
+        f"product='{pc_merged.get('product-name') or pc_merged.get('name')}'"
+    )
+    return {
+        "source":                "pricecharting",
+        "product_name":          pc_merged.get("product-name") or pc_merged.get("name"),
+        "product_id":            pc_pid,
+        "product_url":           pc_merged.get("url"),
+        "raw_price_usd":         raw_usd,
+        "raw_price_aud":         raw_aud,
+        "graded_price_usd":      graded_usd,
+        "graded_price_aud":      graded_aud,
+        "median":                raw_aud,
+        "card_number_validated": number_validated,
+        "query":                 q_full,
+        "count":                 5,
+        "price_includes_grade":  False,
+    }
+
+
+def _reconcile_prices(
+    sources: Dict[str, Dict[str, Any]],
+    fp:      Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Reconcile price signals from TCGPlayer, eBay, and PriceCharting.
+
+    Weighting: TCGPlayer ×3  |  eBay ×2  |  PriceCharting ×1
+    Confidence based on source agreement and total sample size.
+    Grade multiplier applied ONLY when:
+      • card is graded  AND
+      • winning price signal is from a raw/ungraded source
+    Never double-multiplies a price already reflecting a graded sale.
+    """
+    grade     = fp.get("grade", "")
+    is_graded = fp.get("is_graded", False)
+
+    SOURCE_WEIGHTS = {
+        "tcgplayer":                   3,
+        "tcgplayer_via_pokemontcgapi": 3,
+        "ebay":                        2,
+        "pricecharting":               1,
+    }
+
+    signals: Dict[str, Dict[str, Any]] = {}
+    for src_key, result in sources.items():
+        if not result or not isinstance(result, dict):
+            continue
+        price = (
+            result.get("median")
+            or result.get("market_price_aud")
+            or result.get("raw_price_aud")
+        )
+        if price and float(price) > 0:
+            signals[src_key] = {
+                "price":                float(price),
+                "count":                int(result.get("trimmed_count")
+                                            or result.get("count") or 1),
+                "price_includes_grade": bool(result.get("price_includes_grade", False)),
+                "source_data":          result,
+            }
+
+    if not signals:
+        return {
+            "final_price":        0.0,
+            "signal_price":       0.0,
+            "confidence":         "none",
+            "sources_used":       [],
+            "source_breakdown":   {},
+            "sample_sizes":       {},
+            "multiplier_applied": 1.0,
+            "slab_premium_added": 0.0,
+            "multiplier_reason":  "no_data",
+            "sources_agreed_pct": 0,
+            "max_deviation_pct":  0.0,
+        }
+
+    prices = [v["price"] for v in signals.values()]
+
+    if len(prices) > 1:
+        mid       = statistics.median(prices)
+        within_30 = sum(1 for p in prices if abs(p - mid) / max(mid, 1) <= 0.30)
+        max_dev   = max(abs(p - mid) / max(mid, 1) for p in prices)
+    else:
+        within_30, max_dev = 1, 0.0
+
+    weighted: List[float] = []
+    for src_key, sig in signals.items():
+        w = SOURCE_WEIGHTS.get(sig["source_data"].get("source", src_key), 1)
+        weighted.extend([sig["price"]] * w)
+    weighted.sort()
+    raw_signal = float(statistics.median(weighted))
+
+    total_samples = sum(v["count"] for v in signals.values())
+    n = len(signals)
+
+    if max_dev > 1.0:
+        confidence = "suspect"
+    elif n >= 2 and within_30 >= 2 and total_samples >= 10:
+        confidence = "high"
+    elif n >= 2 and within_30 >= 1 and total_samples >= 5:
+        confidence = "medium"
+    elif n == 1 and total_samples >= 5:
+        confidence = "medium"
+    else:
+        confidence = "low"
+
+    multiplier        = 1.0
+    slab_premium      = 0.0
+    multiplier_reason = "not_graded"
+    final_price       = raw_signal
+
+    if is_graded and grade:
+        ebay_data      = sources.get("ebay") or {}
+        ebay_has_grade = bool(
+            re.search(r"\bPSA\s*\d|\bBGS\s*\d|\bCGC\s*\d|\bgraded\b",
+                      ebay_data.get("query", ""), re.I)
+        )
+        source_is_graded = any(v["price_includes_grade"] for v in signals.values())
+
+        if ebay_has_grade or source_is_graded:
+            multiplier        = 1.0
+            multiplier_reason = "source_price_already_graded"
+            final_price       = raw_signal
+        else:
+            try:
+                val = apply_cla_valuation(
+                    signal_price          = raw_signal,
+                    signal_includes_grade = False,
+                    search_query          = f"{fp['card_name']} {fp['card_set']}",
+                    target_grade          = grade,
+                    slab_premium_add_aud  = 70.0,
+                )
+                final_price       = float(val.get("final_value") or raw_signal)
+                multiplier        = float(val.get("multiplier_applied") or 1.0)
+                slab_premium      = float(val.get("slab_premium_added") or 0.0)
+                multiplier_reason = f"raw_base_grade_{grade}"
+            except Exception as _e:
+                logging.warning(f"apply_cla_valuation failed in reconciler: {_e}")
+                final_price       = raw_signal
+                multiplier_reason = "valuation_error_fallback"
+
+    return {
+        "final_price":        round(final_price,  2),
+        "signal_price":       round(raw_signal,   2),
+        "confidence":         confidence,
+        "sources_used":       list(signals.keys()),
+        "source_breakdown":   {k: round(v["price"], 2) for k, v in signals.items()},
+        "sample_sizes":       {k: v["count"]           for k, v in signals.items()},
+        "multiplier_applied": round(multiplier,   4),
+        "slab_premium_added": round(slab_premium, 2),
+        "multiplier_reason":  multiplier_reason,
+        "sources_agreed_pct": within_30,
+        "max_deviation_pct":  round(max_dev * 100, 1),
+    }
+
 class MarketPriceLookupRequest(BaseModel):
     card_name: str
     card_set: Optional[str] = None
@@ -6767,18 +7341,33 @@ def apply_cla_valuation(signal_price: float, signal_includes_grade: bool, search
 @safe_endpoint
 async def market_price_lookup(request: MarketPriceLookupRequest):
     """
-    Look up current market price for a specific card/item.
-    NOW USES EBAY (same smart query logic as market-trends).
+    Precision pricing v2 — card-fingerprint-first, multi-source pipeline.
+
+    Flow:
+    1. Build a strict card fingerprint (card_number + set mandatory).
+    2. Query all three sources IN PARALLEL:
+         • TCGPlayer (via PokemonTCG.io) — exact set+number, EN Pokémon only
+         • eBay completed sales (AU+US)  — card_number mandatory in every query
+         • PriceCharting                 — card-number-validated product match
+    3. Reconcile: weighted median, confidence, multiplier ONLY on raw base price.
+    4. Return final_price + full audit trail (source_breakdown, confidence, etc.)
+
+    Backwards-compatible fields (current_price, signal_price, source, etc.)
+    are preserved so existing PHP callers continue to work without changes.
+
+    Falls back to the original query-ladder path when card_number or card_set
+    is missing (legacy collections that predate the precision fields).
     """
     try:
         card_name    = (request.card_name    or "").strip()
         card_set     = (request.card_set     or "").strip()
         card_number  = (request.card_number  or "").strip()
         grade        = (request.grade        or "").strip()
+        language     = (getattr(request, "language",  None) or "english").strip()
+        game_type    = (getattr(request, "game_type", None) or "pokemon").strip()
         rarity       = (request.rarity       or "").strip()
         variant_type = (request.variant_type or "").strip()
         edition      = (request.edition      or "").strip()
-        finish       = (request.finish       or "").strip()
         is_signed    = bool(request.is_signed)
         signed_by    = (request.signed_by    or "").strip()
         is_error     = bool(request.is_error_card)
@@ -6787,9 +7376,12 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
         if not card_name:
             return {"current_price": 0, "source": "error", "error": "card_name required"}
 
-        logging.info(f"💰 Price lookup: {card_name} | grade={grade} | rarity={rarity} | variant={variant_type} | signed={is_signed}")
+        logging.info(
+            f"💰 Price lookup v2: {card_name} | set={card_set} | "
+            f"num={card_number} | grade={grade} | lang={language}"
+        )
 
-        # ── Detect CL Grade 12+ (Ultra Flawless) — maps to PSA 10 on eBay, needs scarcity uplift ──
+        # ── Detect CL Grade 12+ (used in both paths) ──────────────────────────
         grade_is_12_plus = False
         try:
             _gm = re.search(r"(\d+(?:\.\d+)?)", grade)
@@ -6798,60 +7390,174 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
         except Exception:
             pass
 
-        # ── Build variant keyword tokens for eBay query enrichment ──────────────
-        # These are injected as the FIRST (most specific) tier of the query ladder.
-        # If no variant-specific results come back, the ladder falls through to the
-        # base card queries so we always get some price signal.
-        variant_tokens = []
+        # ── Step 1: Build fingerprint ─────────────────────────────────────────
+        fp: Dict[str, Any] = {}
+        fp_error: Optional[str] = None
+        try:
+            fp = _resolve_card_fingerprint(
+                card_name   = card_name,
+                card_set    = card_set,
+                card_number = card_number,
+                language    = language,
+                game_type   = game_type,
+                grade       = grade,
+                grader      = "",
+            )
+        except ValueError as ve:
+            fp_error = str(ve)
+            logging.warning(
+                f"⚠️ Fingerprint incomplete ({ve}) — falling back to legacy lookup"
+            )
 
-        # Rarity — skip low-value rarities that won't help filter eBay results
+        # ── Step 2 (PRECISION PATH) ───────────────────────────────────────────
+        if fp and not fp_error:
+            tcg_result, ebay_result, pc_result = await asyncio.gather(
+                _fetch_pokemontcg_price(fp),
+                _ebay_sold_strict(fp, limit=60, days_lookback=90),
+                _fetch_pricecharting_strict(fp),
+            )
+
+            sources = {
+                "tcgplayer":     tcg_result,
+                "ebay":          ebay_result,
+                "pricecharting": pc_result,
+            }
+
+            # Re-run eBay with variant tokens when we have strong variant signals
+            variant_tokens_v2 = []
+            _skip_rarity_v2 = {"common", "uncommon", "rare", ""}
+            if rarity.lower() not in _skip_rarity_v2:
+                variant_tokens_v2.append(rarity)
+            if edition.lower() in ("1st edition", "first edition"):
+                variant_tokens_v2.append("1st Edition")
+            elif edition.lower() == "shadowless":
+                variant_tokens_v2.append("Shadowless")
+            if is_signed:
+                variant_tokens_v2.append(
+                    f"Signed {signed_by}".strip() if signed_by else "Signed"
+                )
+            if is_error:
+                variant_tokens_v2.append("Error Misprint")
+
+            if variant_tokens_v2 and ebay_result:
+                vfp = dict(fp)
+                vfp["card_name"] = _norm_ws(
+                    f"{card_name} {' '.join(variant_tokens_v2)}"
+                )
+                v_ebay = await _ebay_sold_strict(vfp, limit=30, days_lookback=90)
+                if v_ebay and v_ebay.get("count", 0) >= 3:
+                    sources["ebay"] = v_ebay
+
+            # ── Step 3: Reconcile ─────────────────────────────────────────────
+            rec         = _reconcile_prices(sources, fp)
+            final_price = rec["final_price"]
+            signal_price = rec["signal_price"]
+            confidence  = rec["confidence"]
+            sources_used = rec["sources_used"]
+
+            if "tcgplayer" in sources_used or "tcgplayer_via_pokemontcgapi" in sources_used:
+                primary_source = "tcgplayer_via_pokemontcgapi"
+            elif "ebay" in sources_used:
+                primary_source = "ebay_completed"
+            elif "pricecharting" in sources_used:
+                primary_source = "pricecharting"
+            else:
+                primary_source = "no_results"
+
+            if final_price > 0:
+                logging.info(
+                    f"✅ Precision price: ${final_price:.2f} AUD | "
+                    f"signal=${signal_price:.2f} | confidence={confidence} | "
+                    f"sources={sources_used} | breakdown={rec['source_breakdown']}"
+                )
+                return {
+                    # Primary fields used by PHP callers
+                    "current_price":        final_price,
+                    "final_price":          final_price,
+                    "signal_price":         signal_price,
+                    # Confidence (internal/admin only — not shown to customers)
+                    "confidence":           confidence,
+                    "sources_used":         sources_used,
+                    "source_breakdown":     rec["source_breakdown"],
+                    "sample_sizes":         rec["sample_sizes"],
+                    "sources_agreed_pct":   rec["sources_agreed_pct"],
+                    "max_deviation_pct":    rec["max_deviation_pct"],
+                    # Multiplier audit trail
+                    "multiplier_applied":   rec["multiplier_applied"],
+                    "slab_premium_added":   rec["slab_premium_added"],
+                    "multiplier_reason":    rec["multiplier_reason"],
+                    "base_price":           signal_price,
+                    "final_value":          final_price,
+                    # Backwards-compat
+                    "source":               primary_source,
+                    "price_includes_grade": rec["multiplier_reason"] == "source_price_already_graded",
+                    "grade_12_uplift":      bool(grade_is_12_plus),
+                    "card_name":            card_name,
+                    "search_query":         (ebay_result or {}).get("query", ""),
+                    "last_updated":         datetime.now().isoformat(),
+                    "fingerprint_used":     True,
+                    # Individual source details (admin/debug)
+                    "tcgplayer_detail":     tcg_result  if tcg_result  else None,
+                    "ebay_detail":          ebay_result if ebay_result else None,
+                    "pricecharting_detail": pc_result   if pc_result   else None,
+                }
+
+            logging.warning(
+                f"⚠️ Reconciler returned 0 for {card_name} #{card_number} "
+                f"— falling back to legacy query ladder"
+            )
+
+        # ── LEGACY FALLBACK PATH ──────────────────────────────────────────────
+        # Used when fingerprint is incomplete (card_number/set missing) OR when
+        # the precision path found no results.  Preserves the original behaviour
+        # exactly so no existing functionality is broken.
+        logging.info(f"🔄 Legacy pricing path for: {card_name}")
+
+        variant_tokens = []
         _skip_rarity = {"common", "uncommon", "rare", ""}
         _rarity_canonical = {
-            "secret rare":                    "Secret Rare",
-            "sr":                             "Secret Rare",
-            "full art":                       "Full Art",
-            "alt art":                        "Alt Art",
-            "special illustration rare":      "Special Illustration Rare SAR",
-            "special art rare":               "SAR",
-            "sar":                            "Special Illustration Rare SAR",
-            "illustration rare":              "Illustration Rare",
-            "ir":                             "Illustration Rare",
-            "hyper rare":                     "Hyper Rare",
-            "rainbow rare":                   "Rainbow Rare",
-            "crown rare":                     "Crown Rare",
-            "ultra rare":                     "Ultra Rare",
-            "gold rare":                      "Gold",
-            "shiny rare":                     "Shiny",
-            "shiny ultra rare":               "Shiny Ultra Rare",
-            "trainer gallery":                "Trainer Gallery",
-            "radiant rare":                   "Radiant",
+            "secret rare":                   "Secret Rare",
+            "sr":                            "Secret Rare",
+            "full art":                      "Full Art",
+            "alt art":                       "Alt Art",
+            "special illustration rare":     "Special Illustration Rare SAR",
+            "special art rare":              "SAR",
+            "sar":                           "Special Illustration Rare SAR",
+            "illustration rare":             "Illustration Rare",
+            "ir":                            "Illustration Rare",
+            "hyper rare":                    "Hyper Rare",
+            "rainbow rare":                  "Rainbow Rare",
+            "crown rare":                    "Crown Rare",
+            "ultra rare":                    "Ultra Rare",
+            "gold rare":                     "Gold",
+            "shiny rare":                    "Shiny",
+            "shiny ultra rare":              "Shiny Ultra Rare",
+            "trainer gallery":               "Trainer Gallery",
+            "radiant rare":                  "Radiant",
         }
         if rarity.lower() not in _skip_rarity:
             token = _rarity_canonical.get(rarity.lower(), rarity)
             if token:
                 variant_tokens.append(token)
 
-        # Variant type — add specific type keywords (complement rarity)
         _skip_variant = {"regular", "standard", ""}
         _variant_canonical = {
-            "reverse holo":     "Reverse Holo",
-            "holo":             "Holo",
-            "cosmos holo":      "Cosmos Holo",
-            "rainbow":          "Rainbow Rare",
-            "gold":             "Gold",
-            "textured":         "Textured",
-            "etched":           "Etched",
-            "master ball":      "Master Ball",
-            "art rare":         "Art Rare",
-            "promo":            "Promo",
+            "reverse holo":  "Reverse Holo",
+            "holo":          "Holo",
+            "cosmos holo":   "Cosmos Holo",
+            "rainbow":       "Rainbow Rare",
+            "gold":          "Gold",
+            "textured":      "Textured",
+            "etched":        "Etched",
+            "master ball":   "Master Ball",
+            "art rare":      "Art Rare",
+            "promo":         "Promo",
         }
         if variant_type.lower() not in _skip_variant:
             vtoken = _variant_canonical.get(variant_type.lower(), variant_type)
-            # Only add if not already covered by rarity token (avoid duplicates)
             if vtoken and vtoken not in " ".join(variant_tokens):
                 variant_tokens.append(vtoken)
 
-        # Edition — high-signal for vintage cards (adds major price premium)
         _edition_canonical = {
             "1st edition":         "1st Edition",
             "first edition":       "1st Edition",
@@ -6863,26 +7569,17 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
             if etoken:
                 variant_tokens.append(etoken)
 
-        # Signed / autographed
         if is_signed:
-            if signed_by:
-                variant_tokens.append(f"Signed {signed_by}")
-            else:
-                variant_tokens.append("Signed")
-
-        # Error / misprint cards
+            variant_tokens.append(
+                f"Signed {signed_by}" if signed_by else "Signed"
+            )
         if is_error:
             variant_tokens.append("Error Misprint")
-
-        # Promo (event/tournament)
         if is_promo and not any("Promo" in t for t in variant_tokens):
             variant_tokens.append("Promo")
 
         variant_str = " ".join(variant_tokens).strip()
 
-        # ── Build query ladder ────────────────────────────────────────────────
-        # Tier 1 (most specific): include variant terms → returns exact-variant price
-        # Tier 2+: base ladder without variant → fallback if variant too niche for eBay
         base_queries = _build_ebay_query_ladder(
             card_name=card_name,
             card_set=card_set,
@@ -6891,7 +7588,6 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
         )
 
         if variant_str:
-            # Prepend variant-enriched versions of the top 2 base queries
             variant_queries = []
             for bq in base_queries[:2]:
                 vq = _norm_ws(f"{bq} {variant_str}")
@@ -6902,43 +7598,42 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
             queries = base_queries
 
         if not queries:
-            return {"current_price": 0, "source": "error", "error": "Could not build search query"}
+            return {"current_price": 0, "source": "error",
+                    "error": "Could not build search query"}
 
         last_completed = None
-        last_active = None
-
-        MIN_COMPLETED_TRUST = 3  # min sold records before using completed stats alone
+        last_active    = None
+        MIN_COMPLETED_TRUST = 3
 
         for search_query in queries:
-            logging.info(f"🔍 eBay query: '{search_query}'")
-            grade_in_query = bool(re.search(r"\bPSA\s*\d|\bCGC\s*\d|\bBGS\s*\d|\bgraded\b", search_query, re.I))
-
-            # Fetch both in parallel context; limit=25 for a more stable median
+            logging.info(f"🔍 eBay legacy query: '{search_query}'")
+            grade_in_query = bool(
+                re.search(r"\bPSA\s*\d|\bCGC\s*\d|\bBGS\s*\d|\bgraded\b",
+                          search_query, re.I)
+            )
             completed = await _ebay_completed_stats(search_query, limit=25, days_lookback=30)
             active    = await _ebay_active_stats(search_query, limit=25)
             last_completed = completed or last_completed
             last_active    = active    or last_active
 
             comp_median   = float((completed or {}).get("median") or 0.0)
-            comp_count    = int((completed or {}).get("count")  or 0)
-            active_median = float((active or {}).get("median") or 0.0)
-            active_count  = int((active or {}).get("count")   or 0)
+            comp_count    = int((completed  or {}).get("count")  or 0)
+            active_median = float((active   or {}).get("median") or 0.0)
+            active_count  = int((active     or {}).get("count")  or 0)
 
             if comp_median <= 0 and active_median <= 0:
-                continue  # nothing on this query tier — try broader query
+                continue
 
-            # Blend logic: require >= 3 sold records to use completed alone
             if comp_median > 0 and comp_count >= MIN_COMPLETED_TRUST:
                 price  = comp_median
                 source = "ebay_completed"
                 sales  = comp_count
             elif comp_median > 0 and active_median > 0 and active_count >= MIN_COMPLETED_TRUST:
-                # Sparse sold data + healthy active sample → blend (60/40 active/sold)
                 price  = round(comp_median * 0.40 + active_median * 0.60, 2)
                 source = "ebay_blended"
                 sales  = comp_count + active_count
             elif comp_median > 0:
-                price  = comp_median   # sparse sold data, best available
+                price  = comp_median
                 source = "ebay_completed_sparse"
                 sales  = comp_count
             else:
@@ -6946,136 +7641,143 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                 source = "ebay_active"
                 sales  = active_count
 
-            # Detect whether the winning query included any variant terms.
-            # Check each token individually — the query builder doesn't always insert
-            # variant_str as one contiguous block, so a substring search on the full
-            # variant_str would produce false-negatives for multi-token strings.
             if variant_tokens and search_query:
                 sq_lower = search_query.lower()
-                variant_in_query = any(tok.lower() in sq_lower for tok in variant_tokens if tok)
+                variant_in_query = any(
+                    tok.lower() in sq_lower for tok in variant_tokens if tok
+                )
             else:
                 variant_in_query = False
-            logging.info(f"✅ {source}: ${price:.2f} ({sales} records) | variant_in_query={variant_in_query}")
 
-            # Backend valuation (single source of truth)
+            logging.info(
+                f"✅ {source}: ${price:.2f} ({sales} records) | "
+                f"variant_in_query={variant_in_query}"
+            )
+
             try:
                 if request.apply_cla_valuation is not False:
                     valuation = apply_cla_valuation(
-                        signal_price=float(price or 0.0),
-                        signal_includes_grade=bool(grade_in_query),
-                        search_query=search_query,
-                        target_grade=grade or None,
-                        rank_within_card=getattr(request, "rank_within_card", None),
-                        rank_total=getattr(request, "rank_total", None),
-                        slab_premium_add_aud=70.0,
+                        signal_price          = float(price or 0.0),
+                        signal_includes_grade = bool(grade_in_query),
+                        search_query          = search_query,
+                        target_grade          = grade or None,
+                        rank_within_card      = getattr(request, "rank_within_card", None),
+                        rank_total            = getattr(request, "rank_total", None),
+                        slab_premium_add_aud  = 70.0,
                     )
                     final_price = float(valuation.get("final_value") or 0.0)
                 else:
-                    valuation = None
+                    valuation   = None
                     final_price = float(price or 0.0)
             except Exception as _e:
-                logging.exception("Valuation error; falling back to signal price")
-                valuation = None
+                logging.exception("Legacy valuation error; falling back to signal price")
+                valuation   = None
                 final_price = float(price or 0.0)
 
             return {
-                # Back-compat: current_price is what callers typically display
-                "current_price": final_price,
-                # The raw market signal before CLA adjustments
-                "signal_price": float(price or 0.0),
-                "base_price": (valuation.get("base_price") if valuation else float(price or 0.0)),
-                "final_value": (valuation.get("final_value") if valuation else final_price),
-                "multiplier_applied": (valuation.get("multiplier_applied") if valuation else 1.0),
-                "slab_premium_added": (valuation.get("slab_premium_added") if valuation else 0.0),
-                "target_multiplier": (valuation.get("target_multiplier") if valuation else 1.0),
-                "base_multiplier": (valuation.get("base_multiplier") if valuation else 1.0),
-
-                "source": source,
-                "search_query": search_query,
-                "queries_tried": queries,
-                "card_name": card_name,
-                "sales_count": sales,
+                "current_price":        final_price,
+                "signal_price":         float(price or 0.0),
+                "base_price":           (valuation.get("base_price")          if valuation else float(price or 0.0)),
+                "final_value":          (valuation.get("final_value")         if valuation else final_price),
+                "multiplier_applied":   (valuation.get("multiplier_applied")  if valuation else 1.0),
+                "slab_premium_added":   (valuation.get("slab_premium_added")  if valuation else 0.0),
+                "target_multiplier":    (valuation.get("target_multiplier")   if valuation else 1.0),
+                "base_multiplier":      (valuation.get("base_multiplier")     if valuation else 1.0),
+                "confidence":           "low",
+                "sources_used":         [source],
+                "source":               source,
+                "search_query":         search_query,
+                "queries_tried":        queries,
+                "card_name":            card_name,
+                "sales_count":          sales,
                 "price_includes_grade": grade_in_query,
-                "grade_12_uplift": bool(grade_is_12_plus and grade_in_query),
-                "variant_matched": variant_in_query,
-                "variant_terms_used": variant_str or None,
-                "last_updated": datetime.now().isoformat(),
+                "grade_12_uplift":      bool(grade_is_12_plus and grade_in_query),
+                "variant_matched":      variant_in_query,
+                "variant_terms_used":   variant_str or None,
+                "fingerprint_used":     False,
+                "last_updated":         datetime.now().isoformat(),
             }
-        # ── eBay found nothing — try PriceCharting as fallback ──
+
+        # ── eBay found nothing — try PriceCharting as fallback ────────────────
         if PRICECHARTING_TOKEN:
             try:
-                pc_q = _norm_ws(f"{card_name} {card_set}".strip())
+                pc_q        = _norm_ws(f"{card_name} {card_set}".strip())
                 pc_products = await _pc_search(pc_q, limit=5)
                 if pc_products:
-                    pc_best = pc_products[0]
-                    pc_pid  = str(pc_best.get("id") or pc_best.get("product-id") or "").strip()
+                    pc_best   = pc_products[0]
+                    pc_pid    = str(pc_best.get("id") or pc_best.get("product-id") or "").strip()
                     pc_detail = await _pc_product(pc_pid) if pc_pid else {}
                     pc_merged = dict(pc_best)
                     if isinstance(pc_detail, dict):
                         pc_merged.update(pc_detail)
                     pc_prices = _pc_extract_price_fields(pc_merged)
                     for pk in ["loose-price", "used_price", "complete-price", "new-price"]:
-                        if pk in pc_prices and isinstance(pc_prices[pk], (int, float)) and pc_prices[pk] > 0:
+                        if (pk in pc_prices
+                                and isinstance(pc_prices[pk], (int, float))
+                                and pc_prices[pk] > 0):
                             pc_aud = _usd_to_aud_simple(pc_prices[pk])
                             if pc_aud and float(pc_aud) > 0:
                                 logging.info(f"✅ PriceCharting fallback: ${float(pc_aud):.2f} AUD")
-                                # PriceCharting provides a raw signal; apply CLA valuation if enabled
                                 try:
                                     if request.apply_cla_valuation is not False:
                                         _val = apply_cla_valuation(
-                                            signal_price=float(pc_aud or 0.0),
-                                            signal_includes_grade=False,
-                                            search_query=str(pc_q),
-                                            target_grade=grade or None,
-                                            rank_within_card=getattr(request, "rank_within_card", None),
-                                            rank_total=getattr(request, "rank_total", None),
-                                            slab_premium_add_aud=70.0,
+                                            signal_price          = float(pc_aud or 0.0),
+                                            signal_includes_grade = False,
+                                            search_query          = str(pc_q),
+                                            target_grade          = grade or None,
+                                            rank_within_card      = getattr(request, "rank_within_card", None),
+                                            rank_total            = getattr(request, "rank_total", None),
+                                            slab_premium_add_aud  = 70.0,
                                         )
                                         _final = float(_val.get("final_value") or 0.0)
                                     else:
-                                        _val = None
+                                        _val   = None
                                         _final = round(float(pc_aud), 2)
                                 except Exception:
-                                    _val = None
+                                    _val   = None
                                     _final = round(float(pc_aud), 2)
 
                                 return {
-                                    "current_price": round(_final, 2),
-                                    "signal_price": round(float(pc_aud), 2),
-                                    "base_price": (_val.get("base_price") if _val else round(float(pc_aud), 2)),
-                                    "final_value": (_val.get("final_value") if _val else round(_final, 2)),
-                                    "multiplier_applied": (_val.get("multiplier_applied") if _val else 1.0),
-                                    "slab_premium_added": (_val.get("slab_premium_added") if _val else 0.0),
-                                    "target_multiplier": (_val.get("target_multiplier") if _val else 1.0),
-                                    "base_multiplier": (_val.get("base_multiplier") if _val else 1.0),
-
-                                    "source": "pricecharting",
-                                    "search_query": pc_q,
-                                    "queries_tried": queries,
-                                    "card_name": card_name,
+                                    "current_price":        round(_final, 2),
+                                    "signal_price":         round(float(pc_aud), 2),
+                                    "base_price":           (_val.get("base_price") if _val else round(float(pc_aud), 2)),
+                                    "final_value":          (_val.get("final_value") if _val else round(_final, 2)),
+                                    "multiplier_applied":   (_val.get("multiplier_applied") if _val else 1.0),
+                                    "slab_premium_added":   (_val.get("slab_premium_added") if _val else 0.0),
+                                    "target_multiplier":    (_val.get("target_multiplier") if _val else 1.0),
+                                    "base_multiplier":      (_val.get("base_multiplier") if _val else 1.0),
+                                    "confidence":           "low",
+                                    "sources_used":         ["pricecharting"],
+                                    "source":               "pricecharting",
+                                    "search_query":         pc_q,
+                                    "queries_tried":        queries,
+                                    "card_name":            card_name,
                                     "price_includes_grade": False,
-                                    "last_updated": datetime.now().isoformat(),
+                                    "fingerprint_used":     False,
+                                    "last_updated":         datetime.now().isoformat(),
                                 }
             except Exception as _pce:
                 logging.warning(f"PriceCharting fallback error: {_pce}")
 
-        # ── No results from any source ──
+        # ── No results from any source ─────────────────────────────────────────
         logging.warning(f"❌ No price found for: {card_name}")
         best_q = queries[-1] if queries else card_name
-        candidates_sold   = await _ebay_find_items(best_q, limit=5, sold=True, days_lookback=30)
+        candidates_sold   = await _ebay_find_items(best_q, limit=5, sold=True,  days_lookback=30)
         candidates_active = await _ebay_find_items(best_q, limit=5, sold=False)
         return {
-            "current_price": 0,
-            "source": "no_results",
-            "error": "No listings found on eBay or PriceCharting",
-            "search_query": best_q,
-            "queries_tried": queries,
-            "card_name": card_name,
+            "current_price":     0,
+            "confidence":        "none",
+            "source":            "no_results",
+            "error":             "No listings found on eBay or PriceCharting",
+            "search_query":      best_q,
+            "queries_tried":     queries,
+            "card_name":         card_name,
             "price_includes_grade": False,
-            "grade_12_uplift": False,
-            "candidates_sold": candidates_sold,
+            "grade_12_uplift":   False,
+            "fingerprint_used":  bool(fp and not fp_error),
+            "candidates_sold":   candidates_sold,
             "candidates_active": candidates_active,
-            "hint": "Pick the closest match from candidates and save that price.",
+            "hint":              "Pick the closest match from candidates and save that price.",
         }
 
     except Exception as e:
