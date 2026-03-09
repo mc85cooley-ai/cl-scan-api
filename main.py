@@ -6688,7 +6688,20 @@ def _resolve_card_fingerprint(
     errors = []
     if not (card_name   or "").strip(): errors.append("card_name")
     if not (card_set    or "").strip(): errors.append("card_set")
-    if not (card_number or "").strip(): errors.append("card_number")
+
+    # card_number is mandatory for TCG cards (prevents cross-card contamination)
+    # but optional for non-TCG collectibles (Star Wars, sports cards, comics etc.)
+    # where sellers typically omit the card number from eBay listing titles.
+    _tcg_games = {"pokemon", "pokémon", "ptcg", "one piece", "onepiece",
+                  "dragon ball", "dragonball", "digimon", "yugioh", "yu-gi-oh",
+                  "magic", "mtg", "flesh and blood", "fab", "weiss", "bushiroad",
+                  "cardfight", "vanguard", "lorcana"}
+    _game_lower = (game_type or "").lower().strip()
+    _is_tcg = any(t in _game_lower for t in _tcg_games) or _game_lower in _tcg_games
+
+    if _is_tcg and not (card_number or "").strip():
+        errors.append("card_number")
+
     if errors:
         raise ValueError(f"Missing required fields for precision lookup: {', '.join(errors)}")
 
@@ -6746,9 +6759,17 @@ async def _ebay_sold_strict(
         return {}
 
     card_number = (fp.get("card_number") or "").strip()
-    if not card_number:
-        logging.warning("_ebay_sold_strict: card_number missing — skipping strict lookup")
+    game_lower  = fp.get("game_type", "").lower().strip()
+    _tcg_games  = {"pokemon", "pokémon", "ptcg", "one piece", "onepiece",
+                   "dragon ball", "dragonball", "digimon", "yugioh", "yu-gi-oh",
+                   "magic", "mtg", "flesh and blood", "fab", "weiss", "bushiroad",
+                   "cardfight", "vanguard", "lorcana"}
+    _is_tcg = any(t in game_lower for t in _tcg_games) or game_lower in _tcg_games
+
+    if not card_number and _is_tcg:
+        logging.warning("_ebay_sold_strict: card_number missing for TCG card — skipping strict lookup")
         return {}
+    # Non-TCG cards without a card number proceed using name-only tiers below
 
     card_name = fp["card_name"]
     card_set  = fp["card_set"]
@@ -6763,14 +6784,20 @@ async def _ebay_sold_strict(
 
     # Build query tiers: most-specific first, broadening as we go
     tiers = []
-    if is_graded and grade_token:
-        tiers.append(_q(card_name, card_set, card_number, grade_token))
-    tiers.append(_q(card_name, card_set, card_number))
-    if language != "english":
-        tiers.append(_q(card_name, card_set, card_number, language.capitalize()))
-        tiers.append(_q(card_name, card_number, language.capitalize()))
+    if card_number:
+        if is_graded and grade_token:
+            tiers.append(_q(card_name, card_set, card_number, grade_token))
+        tiers.append(_q(card_name, card_set, card_number))
+        if language != "english":
+            tiers.append(_q(card_name, card_set, card_number, language.capitalize()))
+            tiers.append(_q(card_name, card_number, language.capitalize()))
+        else:
+            tiers.append(_q(card_name, card_number))
     else:
-        tiers.append(_q(card_name, card_number))
+        # No card number — build name+set tiers (non-TCG path)
+        if is_graded and grade_token:
+            tiers.append(_q(card_name, card_set, grade_token))
+        tiers.append(_q(card_name, card_set))
 
     # ── Extra tiers for Japanese/Korean cards ────────────────────────────────
     # When the card name contains a "/" (e.g. "ボア・ハンコック / Boa Hancock"),
@@ -6789,6 +6816,24 @@ async def _ebay_sold_strict(
             game_label = fp.get("game_type", "").title()
             if game_label:
                 tiers.append(_q(game_label, card_number))
+
+    # ── Extra tiers for non-TCG cards (Star Wars, sports, comics, etc.) ──────
+    # For non-TCG collectables, eBay sellers rarely include the card number
+    # in the title (e.g. "Boba Fett Star Wars Topps PSA 10" not "DH2").
+    # Once the card-number-enforced tiers above return 0, we fall back to
+    # name + grade without the card number so we can still find real sales.
+    _tcg_games = {"pokemon", "pokémon", "ptcg", "one piece", "onepiece",
+                  "dragon ball", "dragonball", "digimon", "yugioh", "yu-gi-oh",
+                  "magic", "mtg", "flesh and blood", "fab", "weiss", "bushiroad",
+                  "cardfight", "vanguard", "lorcana"}
+    game_lower = fp.get("game_type", "").lower().strip()
+    _is_tcg = any(t in game_lower for t in _tcg_games) or game_lower in _tcg_games
+    if not _is_tcg:
+        # Name + grade (no card number) — broad but still card-specific
+        if is_graded and grade_token:
+            tiers.append(_q(card_name, grade_token))
+        tiers.append(_q(card_name, card_set))
+        tiers.append(_q(card_name))
 
     seen: set = set()
     query_tiers = []
