@@ -6718,7 +6718,7 @@ def _resolve_card_fingerprint(
         "card_number": num,
         "language":    lang,
         "is_english":  lang == "english",
-        "game_type":   (game_type or "pokemon").lower().strip(),
+        "game_type":   (game_type or "").lower().strip(),
         "grade":       grade_clean if is_graded else "",
         "grader":      (grader or "").strip() if is_graded else "",
         "is_graded":   is_graded,
@@ -6944,7 +6944,7 @@ async def _fetch_pokemontcg_price(fp: Dict[str, Any]) -> Dict[str, Any]:
         hdrs["X-Api-Key"] = POKEMONTCG_API_KEY
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=6.0) as client:
             params = {
                 "q":      f'set.name:"{card_set}" number:"{card_number}"',
                 "select": "id,name,set,number,tcgplayer,cardmarket",
@@ -7426,7 +7426,7 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
         card_number  = (request.card_number  or "").strip()
         grade        = (request.grade        or "").strip()
         language     = (getattr(request, "language",  None) or "english").strip()
-        game_type    = (getattr(request, "game_type", None) or "pokemon").strip()
+        game_type    = (getattr(request, "game_type", None) or "").strip()
         rarity       = (request.rarity       or "").strip()
         variant_type = (request.variant_type or "").strip()
         edition      = (request.edition      or "").strip()
