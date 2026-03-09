@@ -6772,6 +6772,24 @@ async def _ebay_sold_strict(
     else:
         tiers.append(_q(card_name, card_number))
 
+    # ── Extra tiers for Japanese/Korean cards ────────────────────────────────
+    # When the card name contains a "/" (e.g. "ボア・ハンコック / Boa Hancock"),
+    # extract the English part and add English-only queries.  eBay listings for
+    # Japanese TCG cards almost always use the English name + card number, so
+    # queries containing Japanese characters typically return zero results.
+    if language != "english" and "/" in card_name:
+        # Take the part after the last "/" and strip whitespace
+        en_name = card_name.split("/")[-1].strip()
+        if en_name and en_name.lower() != card_name.lower():
+            if is_graded and grade_token:
+                tiers.append(_q(en_name, card_number, grade_token))
+            tiers.append(_q(en_name, card_number))
+            # Also try game + card number (e.g. "One Piece OP01-078") as a
+            # very broad fallback that often picks up graded auction listings
+            game_label = fp.get("game_type", "").title()
+            if game_label:
+                tiers.append(_q(game_label, card_number))
+
     seen: set = set()
     query_tiers = []
     for t in tiers:
@@ -6864,7 +6882,9 @@ async def _ebay_sold_strict(
             "card_number_enforced": True,
         }
 
-    MIN_SALES = 5
+    # Graded high-value cards have fewer total sales than raw singles;
+    # accept 3 sales for graded cards to avoid always falling to legacy path.
+    MIN_SALES = 3 if is_graded else 5
     best_result: Dict[str, Any] = {}
 
     for query in query_tiers:
@@ -7002,7 +7022,7 @@ async def _fetch_pokemontcg_price(fp: Dict[str, Any]) -> Dict[str, Any]:
                 "price_includes_grade": False,
             }
     except Exception as e:
-        logging.warning(f"PokemonTCG.io price lookup failed: {e}")
+        logging.warning(f"PokemonTCG.io price lookup failed: {type(e).__name__}: {e}")
         return {}
 
 
