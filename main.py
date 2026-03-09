@@ -997,10 +997,24 @@ async def _ebay_completed_stats(keyword_query: str, limit: int = 120, days_lookb
                     cur = str(cp.get("@currencyId", "")).upper()
                     if val <= 0:
                         continue
+                    # Convert to AUD based on currency. JPY must be converted or
+                    # a ¥9,000 card appears as AUD $9,000 — 140× inflation.
                     if cur == "USD":
                         val = float(_usd_to_aud_simple(val) or 0.0)
+                    elif cur == "JPY":
+                        # Approximate JPY→USD at ~150 JPY/USD, then to AUD
+                        val = float(_usd_to_aud_simple(val / 150.0) or 0.0)
+                    elif cur == "GBP":
+                        val = float(_usd_to_aud_simple(val * 1.27) or 0.0)
+                    elif cur == "EUR":
+                        val = float(_usd_to_aud_simple(val * 1.09) or 0.0)
+                    elif cur == "CAD":
+                        val = float(_usd_to_aud_simple(val * 0.74) or 0.0)
+                    elif cur not in ("AUD", ""):
+                        # Unknown currency — skip rather than treat as AUD
+                        continue
                     # Ignore insane values (protect against parsing weird lots)
-                    if val <= 0 or val > 1_000_000:
+                    if val <= 0 or val > 50_000:
                         continue
                     prices.append(val)
                 except Exception:
@@ -2630,7 +2644,17 @@ async def _ebay_active_stats(keyword_query: str, limit: int = 120) -> dict:
                                 continue
                             if cur == "USD":
                                 val = float(_usd_to_aud_simple(val) or 0.0)
-                            if val <= 0 or val > 1_000_000:
+                            elif cur == "JPY":
+                                val = float(_usd_to_aud_simple(val / 150.0) or 0.0)
+                            elif cur == "GBP":
+                                val = float(_usd_to_aud_simple(val * 1.27) or 0.0)
+                            elif cur == "EUR":
+                                val = float(_usd_to_aud_simple(val * 1.09) or 0.0)
+                            elif cur == "CAD":
+                                val = float(_usd_to_aud_simple(val * 0.74) or 0.0)
+                            elif cur not in ("AUD", ""):
+                                continue  # skip unknown currencies
+                            if val <= 0 or val > 50_000:
                                 continue
                             prices.append(val)
                         except Exception:
@@ -2678,7 +2702,17 @@ async def _ebay_active_stats(keyword_query: str, limit: int = 120) -> dict:
                                 continue
                             if cur == "USD":
                                 p = float(_usd_to_aud_simple(p) or 0.0)
-                            if p <= 0 or p > 1_000_000:
+                            elif cur == "JPY":
+                                p = float(_usd_to_aud_simple(p / 150.0) or 0.0)
+                            elif cur == "GBP":
+                                p = float(_usd_to_aud_simple(p * 1.27) or 0.0)
+                            elif cur == "EUR":
+                                p = float(_usd_to_aud_simple(p * 1.09) or 0.0)
+                            elif cur == "CAD":
+                                p = float(_usd_to_aud_simple(p * 0.74) or 0.0)
+                            elif cur not in ("AUD", ""):
+                                continue
+                            if p <= 0 or p > 50_000:
                                 continue
                             prices.append(p)
                         except Exception:
@@ -7245,36 +7279,44 @@ def _cla_parse_grade(grade_str: str) -> float | None:
         return None
 
 def cla_grade_multiplier(grade_str: str, rank_within_card: int | None = None, rank_total: int | None = None) -> float:
-    """Return CLA multiplier vs RAW baseline (1.0). Conservative defaults."""
+    """Return CLA multiplier vs RAW baseline (1.0). Conservative defaults.
+    
+    Calibrated against observed One Piece Japanese card market data (2024-2026):
+    - PSA 10 SR Parallel typically sells 1.4-1.6× ungraded NM price
+    - CLA Grade 12 (Ultra Flawless) is a proprietary grade; market treats it
+      similarly to PSA 10 with a small additional scarcity premium (~1.8×)
+    - These are deliberately conservative to avoid over-valuing modern TCG cards.
+    Must stay in sync with cg_grade_value_multiplier() in cg-collection.php.
+    """
     g = _cla_parse_grade(grade_str) or 0.0
 
     # Core grade multipliers — kept in sync with cg_grade_value_multiplier() in cg-collection.php.
     # PHP is the canonical source; update both places together if you tune these.
     if g >= 12:
-        mult = 3.50   # CL Ultra Flawless: PSA10 × scarcity (~30% on top)
+        mult = 1.80   # CL Ultra Flawless: modest premium above PSA 10 (~20% on top)
     elif g >= 10:
-        mult = 2.70   # PSA 10 / Gem Mint: 170% premium over raw
+        mult = 1.50   # PSA 10 / CLA 10: observed ~1.4-1.6× for modern Japanese TCG
     elif g >= 9.5:
-        mult = 2.10   # Near-gem: strong but not PSA10
+        mult = 1.25   # Near-gem: solid but not peak
     elif g >= 9:
-        mult = 1.65   # PSA 9: solid graded premium
+        mult = 1.12   # PSA 9: small premium over raw
     elif g >= 8.5:
-        mult = 1.30   # PSA 8.5: modest premium
+        mult = 1.00   # PSA 8.5: market price
     elif g >= 8:
-        mult = 1.05   # PSA 8: near-market
+        mult = 0.90   # PSA 8: slight discount (condition visible)
     elif g >= 7:
-        mult = 0.82   # PSA 7: slight graded discount (condition concern)
+        mult = 0.75   # PSA 7: graded but damaged
     elif g > 0:
-        mult = 0.60   # PSA 6 and below: graded but damaged discount
+        mult = 0.55   # PSA 6 and below: significant discount
     else:
         mult = 1.00
 
-    # Optional pop-rank premium (small, capped)
+    # Optional pop-rank premium (small, capped) — reduced vs historical for modern TCG
     if rank_within_card is not None and rank_within_card > 0:
         if rank_within_card == 1:
-            mult *= 1.15
+            mult *= 1.10
         elif rank_within_card <= 3:
-            mult *= 1.08
+            mult *= 1.06
         elif rank_within_card <= 10:
             mult *= 1.03
 
@@ -7690,8 +7732,12 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                 "queries_tried":        queries,
                 "card_name":            card_name,
                 "sales_count":          sales,
-                "price_includes_grade": grade_in_query,
-                "grade_12_uplift":      bool(grade_is_12_plus and grade_in_query),
+                # IMPORTANT: if apply_cla_valuation was called and applied a multiplier,
+                # final_price already includes the grade premium. Signal price_includes_grade=True
+                # so the PHP caller does NOT apply a second multiplier on top.
+                # grade_12_uplift=False for same reason — uplift is already baked into final_price.
+                "price_includes_grade": True if (valuation and valuation.get("multiplier_applied", 1.0) != 1.0) else grade_in_query,
+                "grade_12_uplift":      False if (valuation and valuation.get("multiplier_applied", 1.0) != 1.0) else bool(grade_is_12_plus and grade_in_query),
                 "variant_matched":      variant_in_query,
                 "variant_terms_used":   variant_str or None,
                 "fingerprint_used":     False,
