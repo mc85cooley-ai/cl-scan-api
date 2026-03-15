@@ -779,6 +779,26 @@ def _build_ebay_query_ladder(
     if not set_name and isinstance(kwargs.get("card_set"), str):
         set_name = kwargs.get("card_set", "") or ""
 
+    # ── CJK detection and English extraction ─────────────────────────────────
+    # If card_name contains Japanese/Chinese/Korean characters, eBay returns
+    # zero results. Detect CJK regardless of stored language field (which is
+    # often empty/defaulting to "english" in the DB).
+    def _has_cjk(s: str) -> bool:
+        return bool(re.search(r'[\u3000-\u9fff\uac00-\ud7af\uf900-\ufaff]', s))
+
+    if _has_cjk(card_name) and "/" in card_name:
+        # Bilingual name: "モンキー・D・ルフィ / Monkey D. Luffy" → use English part
+        card_name = card_name.split("/")[-1].strip()
+    elif _has_cjk(card_name):
+        # CJK-only name with no "/" — strip all CJK characters, keep Latin remainder
+        card_name = re.sub(r'[\u3000-\u9fff\uac00-\ud7af\uf900-\ufaff\u30a0-\u30ff\u3040-\u309f\u31f0-\u31ff]+',
+                           ' ', card_name).strip()
+        card_name = re.sub(r'\s+', ' ', card_name).strip()
+    # Also strip (Signed) prefix — signed premium is a multiplier, not a search term
+    card_name = re.sub(r'^[\(\[]\s*(?:signed|autographed?|auto)\s*[\)\]]\s*', '', card_name, flags=re.I).strip()
+    card_name = re.sub(r'^\s*(?:signed|autographed?)\s+', '', card_name, flags=re.I).strip()
+    # ──────────────────────────────────────────────────────────────────────────
+
     base = _build_ebay_search_query(
         card_name=card_name,
         card_set=set_name,
@@ -6862,14 +6882,25 @@ async def _ebay_sold_strict(
         if _raw_excl:
             tiers.append(_q(card_name, card_set, _raw_excl))
 
-    # ── Extra tiers for Japanese/Korean cards ────────────────────────────────
-    # When the card name contains a "/" (e.g. "ボア・ハンコック / Boa Hancock"),
-    # extract the English part and add English-only queries.  eBay listings for
-    # Japanese TCG cards almost always use the English name + card number, so
-    # queries containing Japanese characters typically return zero results.
-    if language != "english" and "/" in card_name:
-        # Take the part after the last "/" and strip whitespace
-        en_name = card_name.split("/")[-1].strip()
+    # ── CJK / bilingual name: always extract English part ────────────────────
+    # ROOT CAUSE FIX: the previous code gated on `language != "english"` but
+    # the language field is empty in the DB for most Japanese cards, defaulting
+    # to "english" — so the branch never fired and every eBay tier contained
+    # Japanese characters (zero results every time).
+    # Fix: detect CJK characters directly in the name, regardless of the stored
+    # language field.  Any name containing a "/" with CJK on the left side is
+    # treated as bilingual; the English part after "/" is extracted and used for
+    # all eBay queries.
+    def _has_cjk(s: str) -> bool:
+        return bool(re.search(r'[\u3000-\u9fff\uac00-\ud7af\uf900-\ufaff]', s))
+
+    _is_bilingual = "/" in card_name and _has_cjk(card_name)
+    _is_cjk_only  = _has_cjk(card_name) and not _is_bilingual
+
+    if _is_bilingual or _is_cjk_only:
+        # Extract English name: take part after last "/" for bilingual names,
+        # or use card_name as-is for purely CJK names (rare — still CJK fails on eBay).
+        en_name = card_name.split("/")[-1].strip() if _is_bilingual else card_name
         if en_name and en_name.lower() != card_name.lower():
             if is_graded and grade_token:
                 if _variant_primary:
@@ -6882,17 +6913,27 @@ async def _ebay_sold_strict(
                 if _variant_primary:
                     tiers.append(_q(en_name, card_number, _variant_primary, _raw_excl))
                 tiers.append(_q(en_name, card_number, _raw_excl))
-            # Also try game + card number (e.g. "One Piece OP01-078") as a
-            # very broad fallback that often picks up graded auction listings
+            # Broad fallback: game label + card number (e.g. "One Piece OP01-024")
+            game_label = fp.get("game_type", "").title()
+            if game_label:
+                tiers.append(_q(game_label, card_number))
+    elif language != "english" and "/" in card_name:
+        # Non-CJK bilingual fallback (e.g. Korean/French cards using "/" separator)
+        en_name = card_name.split("/")[-1].strip()
+        if en_name and en_name.lower() != card_name.lower():
+            if is_graded and grade_token:
+                tiers.append(_q(en_name, card_number, grade_token))
+            tiers.append(_q(en_name, card_number))
             game_label = fp.get("game_type", "").title()
             if game_label:
                 tiers.append(_q(game_label, card_number))
 
     # ── Extra tiers for non-TCG cards (Star Wars, sports, comics, etc.) ──────
-    # For non-TCG collectables, eBay sellers rarely include the card number
-    # in the title (e.g. "Boba Fett Star Wars Topps PSA 10" not "DH2").
-    # Once the card-number-enforced tiers above return 0, we fall back to
-    # name + PSA-equivalent grade without the card number.
+    # For non-TCG collectibles, card numbers like "DH2" or "C1" are almost never
+    # in eBay listing titles — sellers use: "Boba Fett Star Wars Topps PSA 9".
+    # FIX: name-only tiers are PRIMARY for non-TCG (not a last resort after card-
+    # number tiers fail). Card-number tiers are kept as supplementary in case
+    # the seller did happen to include it, but they can't be the only path.
     _tcg_games = {"pokemon", "pokémon", "ptcg", "one piece", "onepiece",
                   "dragon ball", "dragonball", "digimon", "yugioh", "yu-gi-oh",
                   "magic", "mtg", "flesh and blood", "fab", "weiss", "bushiroad",
@@ -6900,14 +6941,20 @@ async def _ebay_sold_strict(
     game_lower = fp.get("game_type", "").lower().strip()
     _is_tcg = any(t in game_lower for t in _tcg_games) or game_lower in _tcg_games
     if not _is_tcg:
-        # Name + PSA-equivalent grade token (works on eBay; CLA names never appear)
+        # Strip "(Signed)" prefix before searching (handled via signed_mult separately)
+        _ntcg_name = re.sub(r'^[\(\[]\s*(?:signed|autographed?|auto)\s*[\)\]]\s*', '',
+                            card_name, flags=re.I).strip()
+        _ntcg_name = re.sub(r'^\s*(?:signed|autographed?)\s+', '', _ntcg_name, flags=re.I).strip()
+        # Primary: name + grade (PSA-equivalent) — this is what eBay sellers write
         if is_graded and grade_token:
-            tiers.append(_q(card_name, grade_token))
-        tiers.append(_q(card_name, card_set))
-        # Raw baseline for non-TCG
+            tiers.append(_q(_ntcg_name, grade_token))
+        # Name + set name (broad match, no grade filter)
+        tiers.append(_q(_ntcg_name, card_set))
+        # Raw baseline (exclude slabs to get ungraded price for multiplier)
         if _raw_excl:
-            tiers.append(_q(card_name, _raw_excl))
-        tiers.append(_q(card_name))
+            tiers.append(_q(_ntcg_name, _raw_excl))
+        # Broadest: name only
+        tiers.append(_q(_ntcg_name))
 
     seen: set = set()
     query_tiers = []
