@@ -6782,6 +6782,14 @@ async def _ebay_sold_strict(
 
     grade_token = grade if is_graded else ""
 
+    # When the card is graded and we need a raw baseline to multiply, eBay results
+    # for e.g. "Boa Hancock OP01-078" contain a mix of raw copies ($30–80) AND
+    # PSA/CGC slabs ($150–300). The median gets pulled up by the graded copies,
+    # then apply_cla_valuation multiplies that already-inflated price again.
+    # Fix: build a second set of tiers with -PSA -BGS -CGC exclusions for raw baseline.
+    # These come AFTER the graded-inclusive tiers so we prefer graded comps when available.
+    _raw_excl = "-PSA -BGS -CGC" if is_graded else ""
+
     # Build query tiers: most-specific first, broadening as we go
     tiers = []
     if card_number:
@@ -6793,11 +6801,18 @@ async def _ebay_sold_strict(
             tiers.append(_q(card_name, card_number, language.capitalize()))
         else:
             tiers.append(_q(card_name, card_number))
+        # Raw-only equivalents — exclude graded slabs so we get a clean ungraded baseline
+        if _raw_excl:
+            tiers.append(_q(card_name, card_set, card_number, _raw_excl))
+            tiers.append(_q(card_name, card_number, _raw_excl))
     else:
         # No card number — build name+set tiers (non-TCG path)
         if is_graded and grade_token:
             tiers.append(_q(card_name, card_set, grade_token))
         tiers.append(_q(card_name, card_set))
+        # Raw-only tier for non-TCG graded cards (Star Wars, sports, etc.)
+        if _raw_excl:
+            tiers.append(_q(card_name, card_set, _raw_excl))
 
     # ── Extra tiers for Japanese/Korean cards ────────────────────────────────
     # When the card name contains a "/" (e.g. "ボア・ハンコック / Boa Hancock"),
@@ -7423,8 +7438,14 @@ def apply_cla_valuation(signal_price: float, signal_includes_grade: bool, search
         slab_added = 0.0
         mult_applied = (tg_mult / base_mult) if base_mult > 0 else 1.0
     elif (not signal_includes_grade) and target_grade:
-        # Raw signal → add slab premium then apply full target multiplier
-        slab_added = float(slab_premium_add_aud or 70.0)
+        # Raw signal → add slab premium then apply full target multiplier.
+        # Proportional premium: 10% of signal, floored at $5, capped at $70.
+        # The old flat $70 added 467% to a $15 card before the multiplier fired —
+        # e.g. Gold DON!! ($15 raw): ($15 + $70) × 1.5 = $127 instead of ~$30.
+        # Now: ($15 + $5) × 1.5 = $30. For a $400 card: ($400 + $40) × 1.5 = $660
+        # vs old ($470 × 1.5 = $705) — a small difference at high values, correct.
+        _raw_slab_cap = float(slab_premium_add_aud or 70.0)
+        slab_added = min(_raw_slab_cap, max(5.0, round(signal_price * 0.10, 2)))
         base_price = signal_price + slab_added
         base_mult = 1.0
         mult_applied = tg_mult
