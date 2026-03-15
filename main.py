@@ -6776,33 +6776,81 @@ async def _ebay_sold_strict(
     language  = fp.get("language", "english")
     grade     = fp.get("grade", "")
     is_graded = fp.get("is_graded", False)
+    # Variant signals passed through from the price-lookup caller
+    rarity       = (fp.get("rarity")       or "").strip()
+    variant_type = (fp.get("variant_type") or "").strip()
+
+    # Strip (Signed)/[Signed] prefix — eBay search for the base card name,
+    # signed premium is applied as a multiplier separately not as a search term
+    # (searching "(Signed) Bobba Fett DH2" finds very few results vs "Bobba Fett DH2")
+    card_name = re.sub(r'^[\(\[]\s*(?:signed|autographed?|auto)\s*[\)\]]\s*', '', card_name, flags=re.I).strip()
+    card_name = re.sub(r'^\s*(?:signed|autographed?)\s+', '', card_name, flags=re.I).strip()
 
     def _q(*parts):
         return _norm_ws(" ".join(p for p in parts if p))
 
-    grade_token = grade if is_graded else ""
+    # ── Convert CLA grade string to PSA-equivalent eBay search token ─────────
+    # CLA grades ("10 - Flawless", "12 - Ultra Flawless", "9 - Mint") never appear
+    # in eBay titles — zero results every time. Map to PSA/BGS equivalents so tier 1
+    # actually finds graded auction comps.
+    def _psa_equiv_token(g: str) -> str:
+        g = g.strip()
+        m = re.search(r"(\d+(?:\.\d+)?)", g)
+        if not m:
+            return ""
+        n = float(m.group(1))
+        if n >= 12:  return "PSA 10"   # CLA UF12 ≈ PSA 10 gem
+        if n >= 10:  return "PSA 10"   # CLA FL10 ≈ PSA 10
+        if n >= 9.5: return "PSA 9"    # CLA 9.5 ≈ PSA 9-9.5
+        if n >= 9:   return "PSA 9"
+        if n >= 8.5: return "PSA 8.5"
+        if n >= 8:   return "PSA 8"
+        if n >= 7:   return "PSA 7"
+        return "PSA 6"
 
-    # When the card is graded and we need a raw baseline to multiply, eBay results
-    # for e.g. "Boa Hancock OP01-078" contain a mix of raw copies ($30–80) AND
-    # PSA/CGC slabs ($150–300). The median gets pulled up by the graded copies,
-    # then apply_cla_valuation multiplies that already-inflated price again.
-    # Fix: build a second set of tiers with -PSA -BGS -CGC exclusions for raw baseline.
-    # These come AFTER the graded-inclusive tiers so we prefer graded comps when available.
+    grade_token = _psa_equiv_token(grade) if (is_graded and grade) else ""
+
+    # ── Variant tokens for primary tiers ────────────────────────────────────
+    # Variant (Rare Parallel, Secret Rare, etc.) previously only entered a
+    # second-pass query AFTER the primary returned results. That second pass
+    # only replaced the signal if it got >=3 sales. For low-volume variants
+    # with few eBay listings this threshold was never met, so the primary
+    # common-card price was used and then multiplied — producing $9 for a
+    # Rare Parallel that should be $40.
+    # Fix: inject variant into PRIMARY tiers directly so the first search
+    # already finds the right card type.
+    _skip_rarity_primary = {"common", "uncommon", "rare", ""}
+    _rarity_for_query = rarity.strip() if rarity.lower() not in _skip_rarity_primary else ""
+    _variant_for_query = variant_type.strip() if variant_type.lower() not in {"regular", "standard", ""} else ""
+    # Prefer rarity label if present; variant_type is secondary
+    _variant_primary = _rarity_for_query or _variant_for_query
+
+    # ── eBay exclusion token for raw baseline ────────────────────────────────
     _raw_excl = "-PSA -BGS -CGC" if is_graded else ""
 
     # Build query tiers: most-specific first, broadening as we go
     tiers = []
     if card_number:
+        # Tier 1: graded comp with PSA-equivalent grade token + variant
         if is_graded and grade_token:
+            if _variant_primary:
+                tiers.append(_q(card_name, card_set, card_number, _variant_primary, grade_token))
             tiers.append(_q(card_name, card_set, card_number, grade_token))
+        # Tier 2: variant + card number (raw, no grade filter)
+        if _variant_primary:
+            tiers.append(_q(card_name, card_set, card_number, _variant_primary))
+            tiers.append(_q(card_name, card_number, _variant_primary))
+        # Tier 3: plain card number tiers
         tiers.append(_q(card_name, card_set, card_number))
         if language != "english":
             tiers.append(_q(card_name, card_set, card_number, language.capitalize()))
             tiers.append(_q(card_name, card_number, language.capitalize()))
         else:
             tiers.append(_q(card_name, card_number))
-        # Raw-only equivalents — exclude graded slabs so we get a clean ungraded baseline
+        # Tier 4: raw baseline (exclude slabs for clean ungraded signal)
         if _raw_excl:
+            if _variant_primary:
+                tiers.append(_q(card_name, card_number, _variant_primary, _raw_excl))
             tiers.append(_q(card_name, card_set, card_number, _raw_excl))
             tiers.append(_q(card_name, card_number, _raw_excl))
     else:
@@ -6824,8 +6872,16 @@ async def _ebay_sold_strict(
         en_name = card_name.split("/")[-1].strip()
         if en_name and en_name.lower() != card_name.lower():
             if is_graded and grade_token:
+                if _variant_primary:
+                    tiers.append(_q(en_name, card_number, _variant_primary, grade_token))
                 tiers.append(_q(en_name, card_number, grade_token))
+            if _variant_primary:
+                tiers.append(_q(en_name, card_number, _variant_primary))
             tiers.append(_q(en_name, card_number))
+            if _raw_excl:
+                if _variant_primary:
+                    tiers.append(_q(en_name, card_number, _variant_primary, _raw_excl))
+                tiers.append(_q(en_name, card_number, _raw_excl))
             # Also try game + card number (e.g. "One Piece OP01-078") as a
             # very broad fallback that often picks up graded auction listings
             game_label = fp.get("game_type", "").title()
@@ -6836,7 +6892,7 @@ async def _ebay_sold_strict(
     # For non-TCG collectables, eBay sellers rarely include the card number
     # in the title (e.g. "Boba Fett Star Wars Topps PSA 10" not "DH2").
     # Once the card-number-enforced tiers above return 0, we fall back to
-    # name + grade without the card number so we can still find real sales.
+    # name + PSA-equivalent grade without the card number.
     _tcg_games = {"pokemon", "pokémon", "ptcg", "one piece", "onepiece",
                   "dragon ball", "dragonball", "digimon", "yugioh", "yu-gi-oh",
                   "magic", "mtg", "flesh and blood", "fab", "weiss", "bushiroad",
@@ -6844,10 +6900,13 @@ async def _ebay_sold_strict(
     game_lower = fp.get("game_type", "").lower().strip()
     _is_tcg = any(t in game_lower for t in _tcg_games) or game_lower in _tcg_games
     if not _is_tcg:
-        # Name + grade (no card number) — broad but still card-specific
+        # Name + PSA-equivalent grade token (works on eBay; CLA names never appear)
         if is_graded and grade_token:
             tiers.append(_q(card_name, grade_token))
         tiers.append(_q(card_name, card_set))
+        # Raw baseline for non-TCG
+        if _raw_excl:
+            tiers.append(_q(card_name, _raw_excl))
         tiers.append(_q(card_name))
 
     seen: set = set()
@@ -7551,7 +7610,16 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                 "pricecharting": pc_result,
             }
 
-            # Re-run eBay with variant tokens when we have strong variant signals
+            # ── Variant second-pass ──────────────────────────────────────────
+            # Pass rarity/variant into the fingerprint so _ebay_sold_strict
+            # builds primary tiers that already include the variant token.
+            # Previously: vfp['card_name'] prepended variant → Japanese chars
+            # in tiers 1-4 still got searched first, returning nothing.
+            # Now: fp carries rarity/variant_type directly → _ebay_sold_strict
+            # injects _variant_primary into tiers 1-2 before Japanese chars.
+            # Also: run the variant pass even when the base ebay_result is empty
+            # (base may return nothing because common-card results were sparse,
+            # but the specific variant may have its own sales).
             variant_tokens_v2 = []
             _skip_rarity_v2 = {"common", "uncommon", "rare", ""}
             if rarity.lower() not in _skip_rarity_v2:
@@ -7567,14 +7635,24 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
             if is_error:
                 variant_tokens_v2.append("Error Misprint")
 
-            if variant_tokens_v2 and ebay_result:
+            if variant_tokens_v2:
                 vfp = dict(fp)
-                vfp["card_name"] = _norm_ws(
-                    f"{card_name} {' '.join(variant_tokens_v2)}"
-                )
-                v_ebay = await _ebay_sold_strict(vfp, limit=30, days_lookback=90)
-                if v_ebay and v_ebay.get("count", 0) >= 3:
+                # Pass rarity and variant_type into the fingerprint so
+                # _ebay_sold_strict._variant_primary picks them up directly,
+                # rather than prepending to card_name (which adds Japanese chars).
+                vfp["rarity"]       = " ".join(variant_tokens_v2)
+                vfp["variant_type"] = " ".join(variant_tokens_v2)
+                # Keep English-only card name for variant queries (strip Japanese)
+                if "/" in card_name:
+                    vfp["card_name"] = card_name.split("/")[-1].strip()
+                v_ebay = await _ebay_sold_strict(vfp, limit=40, days_lookback=120)
+                # Lower threshold: 2 sales (graded variants are low-volume)
+                if v_ebay and v_ebay.get("count", 0) >= 2:
                     sources["ebay"] = v_ebay
+                    logging.info(
+                        f"✅ Variant eBay: ${v_ebay.get('median',0):.2f} AUD "
+                        f"from {v_ebay.get('count',0)} sales | variant={variant_tokens_v2}"
+                    )
 
             # ── Step 3: Reconcile ─────────────────────────────────────────────
             rec         = _reconcile_prices(sources, fp)
