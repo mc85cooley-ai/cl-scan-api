@@ -6832,23 +6832,6 @@ async def _ebay_sold_strict(
     card_name = re.sub(r'^[\(\[]\s*(?:signed|autographed?|auto)\s*[\)\]]\s*', '', card_name, flags=re.I).strip()
     card_name = re.sub(r'^\s*(?:signed|autographed?)\s+', '', card_name, flags=re.I).strip()
 
-    # ── CJK / bilingual: extract English part BEFORE building any tier ───────
-    # Root cause of "Reconciler returned 0" for One Piece / bilingual cards:
-    # initial tiers were built with the raw CJK name ("モンキー・D・ルフィ /
-    # Monkey D. Luffy"), eBay returns 0 for every CJK query (AU/US markets are
-    # English), burning API calls and hitting rate limits before the English
-    # tiers appended at the *end* could run.  Fix: detect CJK here and rewrite
-    # card_name to English immediately — all tiers are now English from tier 1.
-    def _has_cjk_s(s: str) -> bool:
-        return bool(re.search(r'[\u3000-\u9fff\uac00-\ud7af\uf900-\ufaff]', s))
-    if _has_cjk_s(card_name) and "/" in card_name:
-        card_name = card_name.split("/")[-1].strip()   # "Monkey D. Luffy"
-    elif _has_cjk_s(card_name):
-        card_name = re.sub(
-            r'[\u3000-\u9fff\uac00-\ud7af\uf900-\ufaff\u30a0-\u30ff\u3040-\u309f\u31f0-\u31ff]+',
-            ' ', card_name).strip()
-        card_name = re.sub(r'\s+', ' ', card_name).strip()
-
     def _q(*parts):
         return _norm_ws(" ".join(p for p in parts if p))
 
@@ -7074,6 +7057,12 @@ async def _ebay_sold_strict(
             idx = max(0, min(len(lst)-1, int(len(lst)*p/100)))
             return float(lst[idx])
         med = float(statistics.median(trimmed))
+        # Stamp whether this query was grade-filtered (PSA/BGS/CGC/SGC token present).
+        # Propagated to the reconciler — if True, no second grade multiplier is applied.
+        _grade_in_q = bool(re.search(
+            r'\bPSA\s*\d|\bBGS\s*\d|\bCGC\s*\d|\bSGC\s*\d|\bgraded\b',
+            query, re.I
+        ))
         return {
             "source":               "ebay",
             "market":               market,
@@ -7089,6 +7078,7 @@ async def _ebay_sold_strict(
             "min":                  float(trimmed[0]),
             "max":                  float(trimmed[-1]),
             "card_number_enforced": True,
+            "price_includes_grade": _grade_in_q,
         }
 
     # Graded high-value cards have fewer total sales than raw singles;
@@ -7346,12 +7336,27 @@ def _reconcile_prices(
     grade     = fp.get("grade", "")
     is_graded = fp.get("is_graded", False)
 
-    SOURCE_WEIGHTS = {
-        "tcgplayer":                   3,
-        "tcgplayer_via_pokemontcgapi": 3,
-        "ebay":                        2,
-        "pricecharting":               1,
-    }
+    # ── Source weights ────────────────────────────────────────────────────────
+    # For UNGRADED cards TCGPlayer 30-day market price is the gold standard.
+    # For GRADED cards TCGPlayer only reports raw/ungraded prices — weighting it
+    # ×3 then applying a grade multiplier on top produced the $2k Charizard:
+    # TCGPlayer ×3 dominated the signal at $1,000 raw, then ×1.80 grade
+    # multiplier = ~$1,900.  When graded, promote eBay (which has actual graded-
+    # sale comps) to ×3 and demote TCGPlayer to ×1 (cross-check only).
+    if is_graded:
+        SOURCE_WEIGHTS = {
+            "tcgplayer":                   1,
+            "tcgplayer_via_pokemontcgapi": 1,
+            "ebay":                        3,
+            "pricecharting":               1,
+        }
+    else:
+        SOURCE_WEIGHTS = {
+            "tcgplayer":                   3,
+            "tcgplayer_via_pokemontcgapi": 3,
+            "ebay":                        2,
+            "pricecharting":               1,
+        }
 
     signals: Dict[str, Dict[str, Any]] = {}
     for src_key, result in sources.items():
@@ -7440,7 +7445,7 @@ def _reconcile_prices(
                     signal_includes_grade = False,
                     search_query          = f"{fp['card_name']} {fp['card_set']}",
                     target_grade          = grade,
-                    slab_premium_add_aud  = 70.0,
+                    slab_premium_add_aud  = 0.0,
                 )
                 final_price       = float(val.get("final_value") or raw_signal)
                 multiplier        = float(val.get("multiplier_applied") or 1.0)
@@ -7450,6 +7455,21 @@ def _reconcile_prices(
                 logging.warning(f"apply_cla_valuation failed in reconciler: {_e}")
                 final_price       = raw_signal
                 multiplier_reason = "valuation_error_fallback"
+
+    # ── Python-side sanity cap ───────────────────────────────────────────────
+    # Never let the final price exceed the raw signal by more than 1.5× for graded
+    # cards, or 1.1× for ungraded.  This catches any remaining multiplier bugs
+    # before they corrupt collection values.
+    if raw_signal > 0:
+        _max_ratio = 1.50 if is_graded else 1.10
+        _cap       = round(raw_signal * _max_ratio, 2)
+        if final_price > _cap:
+            logging.warning(
+                f"⚠️ Sanity cap: final_price={final_price:.2f} > cap={_cap:.2f} "
+                f"(signal={raw_signal:.2f} × {_max_ratio}). Capping."
+            )
+            final_price       = _cap
+            multiplier_reason = multiplier_reason + "_sanity_capped"
 
     return {
         "final_price":        round(final_price,  2),
@@ -7507,47 +7527,70 @@ def _cla_parse_grade(grade_str: str) -> float | None:
     except Exception:
         return None
 
-def cla_grade_multiplier(grade_str: str, rank_within_card: int | None = None, rank_total: int | None = None) -> float:
-    """Return CLA multiplier vs RAW baseline (1.0). Conservative defaults.
-    
-    Calibrated against observed One Piece Japanese card market data (2024-2026):
-    - PSA 10 SR Parallel typically sells 1.4-1.6× ungraded NM price
-    - CLA Grade 12 (Ultra Flawless) is a proprietary grade; market treats it
-      similarly to PSA 10 with a small additional scarcity premium (~1.8×)
-    - These are deliberately conservative to avoid over-valuing modern TCG cards.
+def cla_grade_multiplier(grade_str: str, rank_within_card: int | None = None, rank_total: int | None = None,
+                         signal_price: float = 0.0) -> float:
+    """Return CLA multiplier vs RAW baseline (1.0).
+
+    Price-scaled design rationale
+    ──────────────────────────────
+    The grading premium as a percentage of raw value shrinks as raw value rises:
+      • A $10 card PSA 10 might sell for 2–3× raw (grading cost is trivial vs card value)
+      • A $200 card PSA 10 typically sells for 1.3–1.5× raw
+      • A $1,000 card PSA 10 typically sells for 1.05–1.15× raw (grade adds modest
+        liquidity/confidence premium; most of the value is already the card itself)
+
+    Flat multipliers (old approach) were calibrated on low/mid-value One Piece cards
+    and badly over-valued high-value cards.  This version scales the cap down with
+    signal_price so the math stays grounded at every price point.
+
     Must stay in sync with cg_grade_value_multiplier() in cg-collection.php.
     """
     g = _cla_parse_grade(grade_str) or 0.0
 
-    # Core grade multipliers — kept in sync with cg_grade_value_multiplier() in cg-collection.php.
-    # PHP is the canonical source; update both places together if you tune these.
+    # ── Base grade tier ───────────────────────────────────────────────────────
     if g >= 12:
-        mult = 1.80   # CL Ultra Flawless: modest premium above PSA 10 (~20% on top)
+        mult = 1.35   # CLA Ultra Flawless ≈ PSA 10 + small proprietary premium
     elif g >= 10:
-        mult = 1.50   # PSA 10 / CLA 10: observed ~1.4-1.6× for modern Japanese TCG
+        mult = 1.25   # PSA 10 / CLA 10
     elif g >= 9.5:
-        mult = 1.25   # Near-gem: solid but not peak
+        mult = 1.15   # Near-gem
     elif g >= 9:
-        mult = 1.12   # PSA 9: small premium over raw
+        mult = 1.08   # PSA 9: small premium
     elif g >= 8.5:
-        mult = 1.00   # PSA 8.5: market price
+        mult = 1.00   # PSA 8.5: at market
     elif g >= 8:
-        mult = 0.90   # PSA 8: slight discount (condition visible)
+        mult = 0.92   # PSA 8: slight discount
     elif g >= 7:
-        mult = 0.75   # PSA 7: graded but damaged
+        mult = 0.78   # PSA 7: visible condition
     elif g > 0:
-        mult = 0.55   # PSA 6 and below: significant discount
+        mult = 0.58   # PSA 6 and below
     else:
         mult = 1.00
 
-    # Optional pop-rank premium (small, capped) — reduced vs historical for modern TCG
+    # ── Price-based cap: premium shrinks as raw value rises ───────────────────
+    # For high-value cards, the grade adds authentication/liquidity value but
+    # not a large % premium — the card itself is where the value lives.
+    # Cap schedule (only ever reduces, never increases):
+    #   raw < $50     → no cap  (low-value cards, grading cost matters most)
+    #   raw $50-$200  → cap 1.40×
+    #   raw $200-$500 → cap 1.25×
+    #   raw $500+     → cap 1.15×
+    if signal_price > 0:
+        if signal_price >= 500:
+            mult = min(mult, 1.15)
+        elif signal_price >= 200:
+            mult = min(mult, 1.25)
+        elif signal_price >= 50:
+            mult = min(mult, 1.40)
+
+    # ── Pop-rank scarcity premium (kept small) ────────────────────────────────
     if rank_within_card is not None and rank_within_card > 0:
         if rank_within_card == 1:
-            mult *= 1.10
+            mult = min(mult * 1.08, mult + 0.10)
         elif rank_within_card <= 3:
-            mult *= 1.06
+            mult = min(mult * 1.05, mult + 0.07)
         elif rank_within_card <= 10:
-            mult *= 1.03
+            mult = min(mult * 1.03, mult + 0.04)
 
     return float(round(mult, 6))
 
@@ -7577,31 +7620,30 @@ def apply_cla_valuation(signal_price: float, signal_includes_grade: bool, search
             "base_multiplier": 1.0,
         }
 
-    tg_mult = cla_grade_multiplier(target_grade or "", rank_within_card, rank_total) if target_grade else 1.0
+    # Pass signal_price into grade multiplier so the price-scaled cap applies.
+    tg_mult = cla_grade_multiplier(target_grade or "", rank_within_card, rank_total,
+                                   signal_price=signal_price) if target_grade else 1.0
 
     if signal_includes_grade and target_grade:
-        # Assume the signal is for a known graded baseline (e.g. PSA 10). Parse grade from query when possible.
-        base_grade = _parse_grade_from_query(search_query) or 10.0
-        base_mult = cla_grade_multiplier(str(base_grade))
-        base_price = signal_price
-        slab_added = 0.0
+        # Signal already reflects graded comps — re-base to target grade only.
+        base_grade   = _parse_grade_from_query(search_query) or 10.0
+        base_mult    = cla_grade_multiplier(str(base_grade), signal_price=signal_price)
+        base_price   = signal_price
+        slab_added   = 0.0
         mult_applied = (tg_mult / base_mult) if base_mult > 0 else 1.0
     elif (not signal_includes_grade) and target_grade:
-        # Raw signal → add slab premium then apply full target multiplier.
-        # Proportional premium: 10% of signal, floored at $5, capped at $70.
-        # The old flat $70 added 467% to a $15 card before the multiplier fired —
-        # e.g. Gold DON!! ($15 raw): ($15 + $70) × 1.5 = $127 instead of ~$30.
-        # Now: ($15 + $5) × 1.5 = $30. For a $400 card: ($400 + $40) × 1.5 = $660
-        # vs old ($470 × 1.5 = $705) — a small difference at high values, correct.
-        _raw_slab_cap = float(slab_premium_add_aud or 70.0)
-        slab_added = min(_raw_slab_cap, max(5.0, round(signal_price * 0.10, 2)))
-        base_price = signal_price + slab_added
-        base_mult = 1.0
+        # Raw signal → apply grade multiplier only.
+        # Slab premium removed: the multiplier already encodes the full grade-vs-raw
+        # premium (grading cost, authentication, liquidity).  Adding a separate slab
+        # fee on top was double-counting and inflated high-value cards severely.
+        slab_added   = 0.0
+        base_price   = signal_price
+        base_mult    = 1.0
         mult_applied = tg_mult
     else:
-        slab_added = 0.0
-        base_price = signal_price
-        base_mult = 1.0
+        slab_added   = 0.0
+        base_price   = signal_price
+        base_mult    = 1.0
         mult_applied = 1.0
 
     final_value = round(base_price * mult_applied, 2)
@@ -7959,7 +8001,7 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                         target_grade          = grade or None,
                         rank_within_card      = getattr(request, "rank_within_card", None),
                         rank_total            = getattr(request, "rank_total", None),
-                        slab_premium_add_aud  = 70.0,
+                        slab_premium_add_aud  = 0.0,
                     )
                     final_price = float(valuation.get("final_value") or 0.0)
                 else:
@@ -8027,7 +8069,7 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                                             target_grade          = grade or None,
                                             rank_within_card      = getattr(request, "rank_within_card", None),
                                             rank_total            = getattr(request, "rank_total", None),
-                                            slab_premium_add_aud  = 70.0,
+                                            slab_premium_add_aud  = 0.0,
                                         )
                                         _final = float(_val.get("final_value") or 0.0)
                                     else:
