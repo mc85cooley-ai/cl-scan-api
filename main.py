@@ -1,6 +1,18 @@
 """
 The Collectors League Australia - Scan API
-Futureproof v6.9.1 (2026-02-26)
+Futureproof v6.9.2 (2026-03-16)
+
+What changed vs v6.9.1 (2026-02-26)
+- ✅ CRITICAL FIX: surface_texture "Not captured" — block 6b was silently failing due to
+  `bytes(b for px in _crop32.getdata() for b in px)` generator expression. In Pillow >= 11
+  the ImagingCore pixel values returned by getdata() can cause a TypeError that the bare
+  `except: pass` swallowed silently. Fixed by replacing with `.tobytes()` — the canonical
+  Pillow API for raw pixel bytes, safe across all versions.
+- ✅ FIX: All 6 fingerprint blocks now log exceptions via logging.warning() and write errors
+  into a new `fp_errors` dict in the API response, so "Not captured" is self-diagnosing
+  without needing to grep Render logs.
+- ✅ FIX: PIL_AVAILABLE=False and empty front_proc are now explicit elif branches with
+  warning-level log messages, not a single silent `if PIL_AVAILABLE and front_proc:` guard.
 
 What changed vs v6.9.0 (2026-02-26)
 - ✅ CRITICAL FIX: Removed second-pass AI call from /api/verify — was exceeding Render 512MB memory limit (502 Bad Gateway)
@@ -9086,8 +9098,15 @@ async def defect_scan(
     # ──────────────────────────────────────────────────────────────────────────
 
     _fp: Dict[str, Any] = {}
+    _fp_errors: Dict[str, str] = {}  # surfaces per-block failures in the API response
 
-    if PIL_AVAILABLE and front_proc:
+    if not PIL_AVAILABLE:
+        logging.warning("fingerprint_vectors: Pillow not available — all fingerprint fields empty.")
+        _fp_errors["pil"] = "Pillow not installed"
+    elif not front_proc:
+        logging.warning("fingerprint_vectors: front_proc empty — cannot compute fingerprints.")
+        _fp_errors["front_proc"] = "front_proc bytes were empty"
+    else:
         # ── 6a. dHash (64-bit difference hash) — identical to PHP GD dHash ──
         # 9×8 grayscale → compare adjacent columns → 64-bit → 16-char hex.
         # Used as both phash (primary identity) and print_dot_hash (print pixel proxy).
@@ -9100,21 +9119,27 @@ async def defect_scan(
             _dhex = "".join(format(int(_bits[_i:_i+4], 2), "x") for _i in range(0, 64, 4)).zfill(16)
             _fp["phash"]          = _dhex
             _fp["print_dot_hash"] = _dhex  # dHash IS derived from the physical print pixels
-        except Exception:
-            pass
+        except Exception as _e:
+            _fp_errors["phash"] = str(_e)
+            logging.warning("fingerprint_vectors: dHash failed — %s", _e)
 
         # ── 6b. Surface hash — SHA-256 of 32×32 centre crop pixel data ───────
         # Captures ink/foil micro-pattern of the card face independent of border noise.
+        # FIX (v6.9.2): Use .tobytes() instead of bytes(b for px in getdata() for b in px).
+        #   getdata() returns an ImagingCore sequence; iterating it with a generator expression
+        #   can raise a TypeError in Pillow >= 11 when internal pixel representation changes.
+        #   .tobytes() is the canonical Pillow API for raw pixel bytes and is always safe.
         try:
             _im_surf = Image.open(io.BytesIO(front_proc)).convert("RGB")
             _sw, _sh = _im_surf.size
             _crop32  = _im_surf.crop((int(_sw * 0.25), int(_sh * 0.25),
                                       int(_sw * 0.75), int(_sh * 0.75))).resize((32, 32), Image.LANCZOS)
-            _surf_buf = bytes(b for px in _crop32.getdata() for b in px)
+            _surf_buf = _crop32.tobytes()  # raw RGB pixel bytes — safe across all Pillow versions
             _fp["surface_hash"]    = hashlib.sha256(_surf_buf).hexdigest()
             _fp["surface_texture"] = _fp["surface_hash"]  # alias PHP reads
-        except Exception:
-            pass
+        except Exception as _e:
+            _fp_errors["surface_texture"] = str(_e)
+            logging.warning("fingerprint_vectors: surface_texture failed — %s", _e)
 
         # ── 6c. Colour zones (3×3 grid) → 9 zones × 3 RGB channels = 27 dims ─
         _zones: Dict[str, list] = {}
@@ -9129,8 +9154,9 @@ async def defect_scan(
                     _means = ImageStat.Stat(_reg).mean
                     _zones[f"z{_gy * 3 + _gx}"] = [round(_means[0]), round(_means[1]), round(_means[2])]
             _fp["color_zones_front"] = _zones
-        except Exception:
-            pass
+        except Exception as _e:
+            _fp_errors["color_zones"] = str(_e)
+            logging.warning("fingerprint_vectors: colour zones failed — %s", _e)
 
         # ── 6d. Intensity histogram (16 buckets) ──────────────────────────────
         _hist16: List[int] = []
@@ -9139,8 +9165,9 @@ async def defect_scan(
             _raw_hist = _im_gray.histogram()  # 256 bins
             _hist16   = [sum(_raw_hist[_i * 16:(_i + 1) * 16]) for _i in range(16)]
             _fp["intensity_hist_front"] = _hist16
-        except Exception:
-            pass
+        except Exception as _e:
+            _fp_errors["intensity_hist"] = str(_e)
+            logging.warning("fingerprint_vectors: intensity histogram failed — %s", _e)
 
         # ── 6e. Embedding: 43-dim vector (27 colour dims + 16 histogram dims) ─
         # Local proxy for CNN embedding — genuine pixel-derived feature vector.
@@ -9153,8 +9180,9 @@ async def defect_scan(
                 _vec += [round(_c / _htot, 6) for _c in _hist16]
             if len(_vec) >= 16:
                 _fp["embedding"] = _vec
-        except Exception:
-            pass
+        except Exception as _e:
+            _fp_errors["embedding"] = str(_e)
+            logging.warning("fingerprint_vectors: embedding failed — %s", _e)
 
         # ── 6f. Keypoints — 8 border luminance landmark vectors ──────────────
         # 64 luminance samples from the 4 borders, grouped into 8 descriptors.
@@ -9186,10 +9214,11 @@ async def defect_scan(
                     "side":    "front",
                     "source":  "api_border",
                 })
-            _fp["keypoints"]       = _kp
+            _fp["keypoints"]        = _kp
             _fp["border_sig_front"] = bytes(min(255, max(0, _v)) for _v in _lum).hex()
-        except Exception:
-            pass
+        except Exception as _e:
+            _fp_errors["keypoints"] = str(_e)
+            logging.warning("fingerprint_vectors: keypoints failed — %s", _e)
 
     # ── Write all fingerprint fields into response ────────────────────────────
     response["phash"]                = _fp.get("phash", "")
@@ -9202,6 +9231,10 @@ async def defect_scan(
     response["color_zones_front"]    = _fp.get("color_zones_front", {})
     response["intensity_hist_front"] = _fp.get("intensity_hist_front", [])
     response["fp_source"]            = "api" if _fp.get("phash") else "unavailable"
+    # fp_errors only appears in the response when something went wrong.
+    # An empty dict (all blocks succeeded) is omitted to keep the response clean.
+    if _fp_errors:
+        response["fp_errors"] = _fp_errors
 
     return JSONResponse(content=response)
 
