@@ -6846,7 +6846,17 @@ async def _ebay_sold_strict(
 
     if _has_cjk_early(card_name) and "/" in card_name:
         # "モンキー・D・ルフィ / Monkey D. Luffy" → "Monkey D. Luffy"
-        card_name = card_name.split("/")[-1].strip()
+        # "ドン!!カード / DON!! Card / Textured – Polka/Apple" → "DON!! Card"
+        # Take the FIRST non-CJK segment, not the last — multi-slash names like
+        # the DON!! card would otherwise give us "Polka/Apple" as the search term.
+        _cjk_parts = card_name.split("/")
+        _english_part = None
+        for _cp in _cjk_parts:
+            _cp = _cp.strip()
+            if _cp and not _has_cjk_early(_cp):
+                _english_part = _cp
+                break
+        card_name = _english_part if _english_part else _cjk_parts[-1].strip()
     elif _has_cjk_early(card_name):
         # CJK-only with no "/" — strip CJK, keep any Latin remainder
         card_name = re.sub(
@@ -7967,6 +7977,7 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
         game_type    = (getattr(request, "game_type", None) or "").strip()
         rarity       = (request.rarity       or "").strip()
         variant_type = (request.variant_type or "").strip()
+        finish       = (request.finish        or "").strip()
         edition      = (request.edition      or "").strip()
         is_signed    = bool(request.is_signed)
         signed_by    = (request.signed_by    or "").strip()
@@ -8309,11 +8320,23 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                 # Rare Parallel Mr. 3).  Skip these signals entirely — a wrong
                 # low price is worse than no price.
                 if variant_tokens and not variant_in_query:
-                    logging.warning(
-                        f"⚠️ Skipping signal ${price:.2f} from query '{search_query}' "
-                        f"— variant token {variant_tokens} not present (likely wrong card)"
-                    )
-                    continue
+                    # Only skip LOW-value signals — a cheap price without the variant
+                    # token means a bulk common was matched (e.g. $0.29 Mr. 3 common
+                    # instead of the $35 Rare Parallel).  High-value signals ($30+)
+                    # for the correct card name/number are almost certainly right even
+                    # if the rarity label wasn't in the query string.
+                    _VARIANT_SKIP_THRESHOLD = 30.0
+                    if price < _VARIANT_SKIP_THRESHOLD:
+                        logging.warning(
+                            f"⚠️ Skipping low-value signal ${price:.2f} from query '{search_query}' "
+                            f"— variant token {variant_tokens} not present (likely wrong card)"
+                        )
+                        continue
+                    else:
+                        logging.info(
+                            f"ℹ️ High-value signal ${price:.2f} accepted without variant token "
+                            f"from query '{search_query}' — likely correct card"
+                        )
             else:
                 variant_in_query = False
 
