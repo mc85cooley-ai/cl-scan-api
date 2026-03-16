@@ -6832,6 +6832,29 @@ async def _ebay_sold_strict(
     card_name = re.sub(r'^[\(\[]\s*(?:signed|autographed?|auto)\s*[\)\]]\s*', '', card_name, flags=re.I).strip()
     card_name = re.sub(r'^\s*(?:signed|autographed?)\s+', '', card_name, flags=re.I).strip()
 
+    # ── CJK / bilingual: rewrite card_name to English BEFORE building any tier ─
+    # ROOT CAUSE of "Reconciler returned 0" on bilingual One Piece cards:
+    # The late CJK block (below) was appending English tiers at the END of the
+    # tier list.  By then eBay had already processed 6–10 zero-result Japanese
+    # queries, hit its rate limit, and the English tiers never ran.
+    # Fix: detect CJK here and rewrite card_name immediately so EVERY tier —
+    # including tier 1 — is built from the English name.
+    # The late CJK block becomes a harmless no-op for bilingual cards (card_name
+    # is already English, _has_cjk returns False, no duplicate tiers added).
+    def _has_cjk_early(s: str) -> bool:
+        return bool(re.search(r'[\u3000-\u9fff\uac00-\ud7af\uf900-\ufaff]', s))
+
+    if _has_cjk_early(card_name) and "/" in card_name:
+        # "モンキー・D・ルフィ / Monkey D. Luffy" → "Monkey D. Luffy"
+        card_name = card_name.split("/")[-1].strip()
+    elif _has_cjk_early(card_name):
+        # CJK-only with no "/" — strip CJK, keep any Latin remainder
+        card_name = re.sub(
+            r'[\u3000-\u9fff\uac00-\ud7af\uf900-\ufaff'
+            r'\u30a0-\u30ff\u3040-\u309f\u31f0-\u31ff]+',
+            ' ', card_name).strip()
+        card_name = re.sub(r'\s+', ' ', card_name).strip()
+
     def _q(*parts):
         return _norm_ws(" ".join(p for p in parts if p))
 
@@ -7456,10 +7479,9 @@ def _reconcile_prices(
                 final_price       = raw_signal
                 multiplier_reason = "valuation_error_fallback"
 
-    # ── Python-side sanity cap ───────────────────────────────────────────────
-    # Never let the final price exceed the raw signal by more than 1.5× for graded
-    # cards, or 1.1× for ungraded.  This catches any remaining multiplier bugs
-    # before they corrupt collection values.
+    # ── Python-side sanity cap (ceiling) ────────────────────────────────────
+    # For graded cards: cap at 1.5× raw signal.
+    # For ungraded cards: cap at 1.1× raw signal.
     if raw_signal > 0:
         _max_ratio = 1.50 if is_graded else 1.10
         _cap       = round(raw_signal * _max_ratio, 2)
@@ -7470,6 +7492,40 @@ def _reconcile_prices(
             )
             final_price       = _cap
             multiplier_reason = multiplier_reason + "_sanity_capped"
+
+    # ── Minimum floor guard (floor) ───────────────────────────────────────────
+    # A graded card priced below the minimum grading cost floor almost always
+    # means the eBay signal matched the WRONG card (e.g. bulk common instead of
+    # a Rare Parallel).  Return final_price = 0 so the collection value is not
+    # updated with a clearly wrong price — the UI will show "no price" rather
+    # than a misleading $0.39.
+    #
+    # Floor schedule:
+    #   Grade 10+ (Gem/Flawless/Ultra Flawless) → $15 AUD minimum
+    #   Grade 9–9.5 (Mint/Near-Gem)             → $10 AUD minimum
+    #   Grade 8–8.5 (Near Mint)                 → $5 AUD minimum
+    #   Grade < 8                               → no floor (lower grades on low-value cards are valid)
+    if is_graded and grade and final_price > 0:
+        try:
+            _gv = float(re.search(r"(\d+(?:\.\d+)?)", grade).group(1))
+        except Exception:
+            _gv = 0.0
+        if _gv >= 10:
+            _floor = 15.0
+        elif _gv >= 9:
+            _floor = 10.0
+        elif _gv >= 8:
+            _floor = 5.0
+        else:
+            _floor = 0.0
+        if _floor > 0 and final_price < _floor:
+            logging.warning(
+                f"⚠️ Floor guard: final_price={final_price:.2f} < floor={_floor:.2f} "
+                f"for grade={grade}. Signal likely matched wrong card — price zeroed, "
+                f"attribute estimate will be used by caller."
+            )
+            final_price       = 0.0
+            multiplier_reason = "floor_guard_no_reliable_price"
 
     return {
         "final_price":        round(final_price,  2),
@@ -7511,6 +7567,220 @@ class MarketPriceLookupRequest(BaseModel):
     language: Optional[str] = None         # Japanese, Korean, Chinese — omit/None for English default
     extra_attributes: Optional[str] = None # Catch-all: Prerelease stamp, Staff stamp, Galaxy foil etc.
 
+
+
+# ========================================
+# CLA ATTRIBUTE-BASED VALUATION (no-comps fallback)
+# ========================================
+def _cla_estimate_from_attributes(
+    game_type:    str,
+    rarity:       str,
+    variant_type: str,
+    finish:       str,
+    language:     str,
+    is_signed:    bool,
+    grade:        str,
+    rank_within_card: int | None = None,
+    rank_total:       int | None = None,
+    card_set:     str = "",
+    card_number:  str = "",
+) -> Dict[str, Any]:
+    """
+    Derive a conservative estimated value when no eBay / PriceCharting comps exist.
+
+    Logic:
+      1. Determine a RAW base price from game + rarity + language + finish tier.
+         These are conservative medians observed in the AU collector market (AUD).
+      2. Apply cla_grade_multiplier on the base to get the graded estimate.
+      3. Apply signed multiplier if applicable.
+      4. Return with confidence="estimate" and source="cla_attribute_estimate" so
+         the UI can clearly distinguish this from a live market price.
+
+    Base-price tables are intentionally conservative — better to under-estimate
+    than to over-estimate when no real comps exist.
+    """
+    game    = (game_type    or "").lower().strip()
+    rarity  = (rarity       or "").lower().strip()
+    variant = (variant_type or "").lower().strip()
+    fin     = (finish       or "").lower().strip()
+    lang    = (language     or "english").lower().strip()
+    is_jp   = lang in ("japanese", "jp", "ja")
+
+    # ── Step 1: Rarity-tier base prices (AUD, raw NM condition) ──────────────
+    # Structured as: game → rarity_key → base_aud
+    # "rarity_key" is matched via substring so partial labels work
+    # (e.g. "special illustration rare" hits "illustration rare" key).
+    # Keys are checked in order — put more-specific keys first.
+
+    # ── One Piece TCG rarity hierarchy ───────────────────────────────────────
+    # IMPORTANT: Parallel cards are NOT a sub-tier of their base rarity.
+    # They are a separate short-printed layer that sits ABOVE the base rarity:
+    #
+    #   L★  Leader Parallel   → rarest card in most sets ($200–$1,500+)
+    #   SR★ Super Rare Parallel → rarer than SEC ($100–$500)
+    #   R★  Rare Parallel       → rarer than plain SR ($25–$100)
+    #   SEC Secret Rare         → ($40–$150)
+    #   SR  Super Rare          → ($15–$50)
+    #   R   Rare                → ($3–$8)
+    #   UC  Uncommon            → ($1–$3)
+    #   C   Common              → ($0.50–$1.50)
+    #
+    # Keys are matched by substring against rarity+variant combined string.
+    # More-specific keys MUST come before less-specific ones.
+    # Conservative medians used — better to under-estimate than over-estimate.
+    _ONE_PIECE_BASES: List[tuple] = [
+        # ── Parallel tiers (rarest — check these BEFORE base rarity keys) ──
+        ("leader parallel",           400.0),  # L★ Leader Parallel: rarest pull in any set
+        ("l parallel",                400.0),  # alternate label
+        ("super rare parallel",       130.0),  # SR★ Parallel: rarer than SEC
+        ("sr parallel",               130.0),  # alternate label
+        ("sr★",                       130.0),
+        ("rare parallel",              35.0),  # R★ Parallel (e.g. Mr. 3 OP09-056 R★)
+        ("r★",                         35.0),  # star notation stored directly
+        ("r parallel",                 35.0),
+        # ── Non-parallel special tiers ──────────────────────────────────────
+        ("leader rare",               180.0),  # L (plain Leader, no parallel): still valuable
+        ("secret rare",                55.0),  # SEC
+        ("sec",                        55.0),
+        ("super rare",                 20.0),  # SR
+        ("sr",                         20.0),
+        # ── Named special treatments (check before generic "rare") ──────────
+        ("illustration rare",          18.0),  # IR: special illustration print
+        ("full art",                   18.0),
+        ("alt art",                    18.0),
+        # ── Base rarities ────────────────────────────────────────────────────
+        ("rare",                        5.0),  # R
+        ("uncommon",                    1.75), # UC
+        ("common",                      0.80), # C
+        # ── Generic parallel fallback (if no base rarity matched) ────────────
+        ("parallel",                   25.0),  # unknown-base parallel: conservative mid
+    ]
+
+    # ── Pokémon TCG rarity hierarchy ─────────────────────────────────────────
+    # Crown Rare > Hyper Rare/Special Illustration Rare > Illustration Rare >
+    # Full Art > Ultra Rare > Holo Rare > Reverse Holo > Common/Uncommon
+    _POKEMON_BASES: List[tuple] = [
+        ("crown rare",                280.0),  # ACE SPEC / Crown: extremely scarce
+        ("special illustration rare", 130.0),  # SIR — highest regular print run rarity
+        ("special art rare",          130.0),
+        ("sar",                       130.0),
+        ("hyper rare",                 70.0),  # Gold alt art
+        ("shiny ultra rare",           50.0),  # Shiny Vault UR
+        ("shiny rare",                 18.0),  # Shiny Vault R
+        ("secret rare",                55.0),  # numbered secret
+        ("illustration rare",          40.0),  # IR
+        ("full art",                   30.0),
+        ("rainbow rare",               28.0),
+        ("alt art",                    28.0),
+        ("ultra rare",                 18.0),  # V-STAR, ex UR etc.
+        ("radiant rare",               15.0),
+        ("trainer gallery",            12.0),
+        ("holo rare",                   6.0),
+        ("reverse holo",                3.50),
+        ("rare",                        2.50),
+        ("uncommon",                    0.90),
+        ("common",                      0.45),
+    ]
+
+    # ── Dragon Ball Super Card Game ───────────────────────────────────────────
+    _DBZ_BASES: List[tuple] = [
+        ("special rare",               80.0),  # SPR: the rarest DBS tier
+        ("spr",                        80.0),
+        ("secret rare",                50.0),
+        ("special art",                50.0),
+        ("ultra rare",                 25.0),
+        ("super rare",                 12.0),
+        ("rare",                        5.0),
+        ("uncommon",                    2.0),
+        ("common",                      1.0),
+    ]
+
+    # ── Generic / Other TCG ──────────────────────────────────────────────────
+    _GENERIC_BASES: List[tuple] = [
+        ("parallel",                   20.0),  # any parallel is meaningfully rare
+        ("secret rare",                45.0),
+        ("ultra rare",                 20.0),
+        ("full art",                   15.0),
+        ("rare",                        5.0),
+        ("uncommon",                    2.0),
+        ("common",                      1.0),
+    ]
+
+    game_table: List[tuple]
+    if "one piece" in game or "onepiece" in game or game == "op":
+        game_table = _ONE_PIECE_BASES
+    elif "pokemon" in game or "ptcg" in game:
+        game_table = _POKEMON_BASES
+    elif "dragon ball" in game or "dragonball" in game or "dbz" in game:
+        game_table = _DBZ_BASES
+    else:
+        game_table = _GENERIC_BASES
+
+    # Combine rarity + variant for matching (e.g. "rare parallel" matches both)
+    search_str = f"{rarity} {variant} {fin}".lower()
+
+    base_aud = 2.0  # absolute fallback if nothing matches
+    matched_tier = "unknown"
+    for key, price in game_table:
+        if key in search_str:
+            base_aud     = price
+            matched_tier = key
+            break
+
+    # ── Step 2: Language premium ──────────────────────────────────────────────
+    # Japanese One Piece / Pokemon cards typically sell at a premium in AU
+    # because they are the original/authentic print run.
+    if is_jp:
+        if "one piece" in game or "onepiece" in game:
+            base_aud *= 1.20   # JP One Piece: modest premium (AU buyers prefer JP)
+        elif "pokemon" in game:
+            base_aud *= 1.10   # JP Pokemon: slight premium on rare tiers
+        # else: no premium for non-TCG JP
+
+    # ── Step 3: Finish premium ────────────────────────────────────────────────
+    if any(f in fin for f in ("textured", "galaxy", "cosmos", "etched", "gilded")):
+        base_aud *= 1.30   # premium finish adds meaningful value
+
+    # ── Step 4: Grade multiplier on the estimated base ────────────────────────
+    grade_mult = cla_grade_multiplier(
+        grade, rank_within_card, rank_total, signal_price=base_aud
+    ) if grade else 1.0
+
+    graded_est = round(base_aud * grade_mult, 2)
+
+    # ── Step 5: Signed multiplier ─────────────────────────────────────────────
+    signed_mult = 1.8 if is_signed else 1.0
+    if is_signed:
+        graded_est = round(graded_est * signed_mult, 2)
+
+    logging.info(
+        f"📊 Attribute estimate: game={game} | tier={matched_tier} | "
+        f"base=${base_aud:.2f} | grade_mult={grade_mult:.4f} | "
+        f"jp={is_jp} | signed={is_signed} → ${graded_est:.2f} AUD"
+    )
+
+    return {
+        "current_price":        graded_est,
+        "final_price":          graded_est,
+        "signal_price":         base_aud,
+        "final_value":          graded_est,
+        "base_price":           base_aud,
+        "multiplier_applied":   round(grade_mult, 4),
+        "slab_premium_added":   0.0,
+        "multiplier_reason":    f"attribute_estimate_{matched_tier}",
+        "confidence":           "estimate",
+        "source":               "cla_attribute_estimate",
+        "sources_used":         ["cla_attribute_estimate"],
+        "price_includes_grade": True,
+        "grade_12_uplift":      False,
+        "variant_matched":      True,
+        "matched_rarity_tier":  matched_tier,
+        "is_jp":                is_jp,
+        "signed_multiplier":    signed_mult,
+        "fingerprint_used":     False,
+        "estimated":            True,   # UI flag: show as estimate, not market price
+        "last_updated":         datetime.now().isoformat(),
+    }
 
 
 # ========================================
@@ -7842,7 +8112,43 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
 
             logging.warning(
                 f"⚠️ Reconciler returned 0 for {card_name} #{card_number} "
-                f"— falling back to legacy query ladder"
+                f"— attempting attribute estimate before legacy ladder"
+            )
+            # Try attribute estimate now — the precision path found sources but
+            # the floor guard (or all-zero signals) killed the price.  The legacy
+            # ladder may just repeat the same bad signal; the estimate is more
+            # reliable for known-rarity cards with no viable comps.
+            _has_meaningful_rarity_p = bool(
+                rarity and rarity.lower() not in ("", "common", "uncommon")
+            ) or bool(variant_type and variant_type.lower() not in ("", "regular", "standard"))
+            if grade or _has_meaningful_rarity_p:
+                try:
+                    _pest = _cla_estimate_from_attributes(
+                        game_type    = game_type,
+                        rarity       = rarity,
+                        variant_type = variant_type,
+                        finish       = finish,
+                        language     = language,
+                        is_signed    = is_signed,
+                        grade        = grade,
+                        rank_within_card = getattr(request, "rank_within_card", None),
+                        rank_total       = getattr(request, "rank_total",       None),
+                        card_set     = card_set,
+                        card_number  = card_number,
+                    )
+                    if _pest.get("current_price", 0) > 0:
+                        _pest["card_name"]     = card_name
+                        _pest["search_query"]  = ""
+                        _pest["fingerprint_used"] = True
+                        logging.info(
+                            f"📊 Precision→attribute estimate: ${_pest['current_price']:.2f} AUD "
+                            f"for {card_name} #{card_number}"
+                        )
+                        return _pest
+                except Exception as _pe:
+                    logging.warning(f"Precision attribute estimate failed: {_pe}")
+            logging.warning(
+                f"⚠️ Falling back to legacy query ladder for {card_name} #{card_number}"
             )
 
         # ── LEGACY FALLBACK PATH ──────────────────────────────────────────────
@@ -7931,6 +8237,8 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                 vq = _norm_ws(f"{bq} {variant_str}")
                 if vq not in variant_queries:
                     variant_queries.append(vq)
+            # Non-variant queries kept as fallback, but flagged so we can
+            # reject their signals when they don't contain the variant token.
             queries = variant_queries + [q for q in base_queries if q not in variant_queries]
         else:
             queries = base_queries
@@ -7984,6 +8292,17 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                 variant_in_query = any(
                     tok.lower() in sq_lower for tok in variant_tokens if tok
                 )
+                # If rarity/variant is set and this query doesn't include it,
+                # the result is from a broadened query that matched a cheaper
+                # common version of the card (e.g. common Mr. 3 instead of
+                # Rare Parallel Mr. 3).  Skip these signals entirely — a wrong
+                # low price is worse than no price.
+                if variant_tokens and not variant_in_query:
+                    logging.warning(
+                        f"⚠️ Skipping signal ${price:.2f} from query '{search_query}' "
+                        f"— variant token {variant_tokens} not present (likely wrong card)"
+                    )
+                    continue
             else:
                 variant_in_query = False
 
@@ -8102,7 +8421,44 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                 logging.warning(f"PriceCharting fallback error: {_pce}")
 
         # ── No results from any source ─────────────────────────────────────────
-        logging.warning(f"❌ No price found for: {card_name}")
+        # Before returning 0, attempt an attribute-based estimate.
+        # This fires when the card has a rarity/variant/grade but no eBay comps
+        # exist (new set, niche card, obscure variant).  A conservative estimate
+        # is better than $0 which makes the collection total meaningless.
+        logging.warning(f"❌ No market comps found for: {card_name} — attempting attribute estimate")
+
+        _has_meaningful_rarity = bool(
+            rarity and rarity.lower() not in ("", "common", "uncommon")
+        ) or bool(variant_type and variant_type.lower() not in ("", "regular", "standard"))
+        _has_grade = bool(grade)
+
+        if _has_grade or _has_meaningful_rarity:
+            try:
+                est = _cla_estimate_from_attributes(
+                    game_type    = game_type,
+                    rarity       = rarity,
+                    variant_type = variant_type,
+                    finish       = finish,
+                    language     = language,
+                    is_signed    = is_signed,
+                    grade        = grade,
+                    rank_within_card = getattr(request, "rank_within_card", None),
+                    rank_total       = getattr(request, "rank_total",       None),
+                    card_set     = card_set,
+                    card_number  = card_number,
+                )
+                if est.get("current_price", 0) > 0:
+                    est["search_query"]  = ""
+                    est["queries_tried"] = queries
+                    est["card_name"]     = card_name
+                    logging.info(
+                        f"📊 Attribute estimate used: ${est['current_price']:.2f} AUD "
+                        f"for {card_name} (no comps found)"
+                    )
+                    return est
+            except Exception as _est_err:
+                logging.warning(f"Attribute estimate failed: {_est_err}")
+
         best_q = queries[-1] if queries else card_name
         candidates_sold   = await _ebay_find_items(best_q, limit=5, sold=True,  days_lookback=30)
         candidates_active = await _ebay_find_items(best_q, limit=5, sold=False)
