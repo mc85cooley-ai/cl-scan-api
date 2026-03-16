@@ -7548,6 +7548,34 @@ def _reconcile_prices(
             final_price       = 0.0
             multiplier_reason = "floor_guard_no_reliable_price"
 
+    # ── Price reliability gate ────────────────────────────────────────────────
+    # PHP callers check this field before writing to the DB.
+    # "auto_save"   → price is trustworthy enough to overwrite the stored value.
+    # "needs_review" → keep old value; flag the item for manual inspection.
+    #
+    # Rules (any one failing → needs_review):
+    #   1. Confidence must be "high" or "medium".
+    #   2. If only a single source returned data, we need ≥3 sold comps.
+    #      One sale = one lucky (or unlucky) listing — not a market.
+    #   3. "suspect" confidence (sources disagree by >100%) is always needs_review.
+    _total_samples = sum(v["count"] for v in signals.values())
+    _n_sources     = len(signals)
+    if confidence in ("none",):
+        _reliability = "needs_review"
+        _reliability_reason = "no_price_data"
+    elif confidence == "suspect":
+        _reliability = "needs_review"
+        _reliability_reason = f"sources_disagree_by_{round(max_dev*100)}pct"
+    elif confidence == "low":
+        _reliability = "needs_review"
+        _reliability_reason = f"low_confidence_{_total_samples}_samples_{_n_sources}_sources"
+    elif _n_sources == 1 and _total_samples < 3:
+        _reliability = "needs_review"
+        _reliability_reason = f"single_source_only_{_total_samples}_comps"
+    else:
+        _reliability = "auto_save"
+        _reliability_reason = f"{confidence}_{_total_samples}_samples_{_n_sources}_sources"
+
     return {
         "final_price":        round(final_price,  2),
         "signal_price":       round(raw_signal,   2),
@@ -7560,6 +7588,9 @@ def _reconcile_prices(
         "multiplier_reason":  multiplier_reason,
         "sources_agreed_pct": within_30,
         "max_deviation_pct":  round(max_dev * 100, 1),
+        # ── Reliability gate (PHP checks this before saving) ──────────────────
+        "price_reliability":        _reliability,
+        "price_reliability_reason": _reliability_reason,
     }
 
 class MarketPriceLookupRequest(BaseModel):
@@ -7946,6 +7977,125 @@ def apply_cla_valuation(signal_price: float, signal_includes_grade: bool, search
         "target_multiplier": round(tg_mult, 6),
         "base_multiplier": round(base_mult, 6),
     }
+
+def _rarity_price_band(
+    game_type: str,
+    rarity: str,
+    is_graded: bool,
+    price_aud: float,
+) -> dict:
+    """
+    Return {"ok": bool, "reason": str, "floor": float, "ceiling": float}.
+
+    Validates a returned price against known realistic ranges per game × rarity.
+    Prices outside the band are flagged as needs_review — not zeroed or capped,
+    because the band logic may be wrong for edge cases.  The caller can still
+    show the price to the user but should not auto-save it.
+
+    All values in AUD.  Floors and ceilings are intentionally wide to only
+    catch egregious mismatches (wrong card matched), not minor variance.
+
+    Raw bands are for ungraded cards.  For graded the ceiling is doubled
+    (a PSA 10 chase card can legitimately be 2-3× raw) and the floor is kept
+    the same (a low grade doesn't become more valuable just because it's slabbed).
+    """
+    g = (game_type or "").lower().strip()
+    r = (rarity    or "").lower().strip()
+
+    # ── Band definitions: (floor_aud, ceiling_aud) ─────────────────────────
+    # Bands cover the realistic secondary market range.
+    # Anything outside is almost certainly a wrong-card match or a data error.
+    BANDS: dict[str, dict[str, tuple]] = {
+        "one piece": {
+            "common":                 (0.10,   25.0),
+            "uncommon":               (0.20,   40.0),
+            "rare":                   (0.50,   80.0),
+            "super rare":             (1.00,  200.0),
+            "leader":                 (2.00,  400.0),
+            "secret rare":            (5.00,  800.0),
+            "special art rare":       (10.0, 1500.0),
+            "alt art":                (10.0, 1500.0),
+            "ultra rare":             (5.00,  800.0),
+            "promo":                  (2.00,  500.0),
+            "gold":                   (5.00,  600.0),
+            "don":                    (0.10,   80.0),   # DON!! cards
+            "":                       (0.10, 1500.0),   # unknown rarity — wide band
+        },
+        "pokemon": {
+            "common":                 (0.05,   30.0),
+            "uncommon":               (0.10,   50.0),
+            "rare":                   (0.50,  150.0),
+            "holo rare":              (1.00,  400.0),
+            "ultra rare":             (5.00, 2000.0),
+            "full art":               (5.00, 2000.0),
+            "secret rare":            (10.0, 3000.0),
+            "rainbow rare":           (8.00, 2000.0),
+            "illustration rare":      (5.00, 1500.0),
+            "special illustration rare": (10.0, 6000.0),
+            "hyper rare":             (10.0, 4000.0),
+            "crown rare":             (20.0, 8000.0),
+            "promo":                  (0.50, 1000.0),
+            "":                       (0.05, 8000.0),
+        },
+        "dragon ball": {
+            "common":                 (0.10,   30.0),
+            "uncommon":               (0.20,   50.0),
+            "rare":                   (0.50,  100.0),
+            "super rare":             (2.00,  300.0),
+            "special rare":           (5.00,  500.0),
+            "secret rare":            (10.0, 1000.0),
+            "":                       (0.10, 1000.0),
+        },
+    }
+
+    # Normalise rarity string to the closest known key
+    def _best_key(rarity_str: str, band_dict: dict) -> str:
+        rs = rarity_str.lower()
+        # Exact match first
+        if rs in band_dict:
+            return rs
+        # Substring match (longest wins)
+        matches = [(k, len(k)) for k in band_dict if k and k in rs]
+        if matches:
+            return max(matches, key=lambda x: x[1])[0]
+        # DON!! special case
+        if "don" in rs:
+            return "don" if "don" in band_dict else ""
+        return ""
+
+    game_bands = None
+    for gk in BANDS:
+        if gk in g or g in gk:
+            game_bands = BANDS[gk]
+            break
+
+    if game_bands is None:
+        # Unknown game — no band check
+        return {"ok": True, "reason": "unknown_game_no_band", "floor": 0.0, "ceiling": 99999.0}
+
+    key    = _best_key(r, game_bands)
+    floor_, ceil_ = game_bands.get(key, game_bands.get("", (0.0, 99999.0)))
+
+    if is_graded:
+        ceil_ = ceil_ * 2.5   # graded copies can legitimately be 2-3× raw
+        # floor stays same — grade doesn't rescue a worthless card
+
+    if price_aud < floor_:
+        return {
+            "ok":      False,
+            "reason":  f"price_{price_aud:.2f}_below_floor_{floor_:.2f}_for_{game_type}_{rarity}",
+            "floor":   floor_,
+            "ceiling": ceil_,
+        }
+    if price_aud > ceil_:
+        return {
+            "ok":      False,
+            "reason":  f"price_{price_aud:.2f}_above_ceiling_{ceil_:.2f}_for_{game_type}_{rarity}",
+            "floor":   floor_,
+            "ceiling": ceil_,
+        }
+    return {"ok": True, "reason": "within_band", "floor": floor_, "ceiling": ceil_}
+
 
 @app.post("/api/market/price-lookup")
 @safe_endpoint
