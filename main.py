@@ -6832,6 +6832,23 @@ async def _ebay_sold_strict(
     card_name = re.sub(r'^[\(\[]\s*(?:signed|autographed?|auto)\s*[\)\]]\s*', '', card_name, flags=re.I).strip()
     card_name = re.sub(r'^\s*(?:signed|autographed?)\s+', '', card_name, flags=re.I).strip()
 
+    # ── CJK / bilingual: extract English part BEFORE building any tier ───────
+    # Root cause of "Reconciler returned 0" for One Piece / bilingual cards:
+    # initial tiers were built with the raw CJK name ("モンキー・D・ルフィ /
+    # Monkey D. Luffy"), eBay returns 0 for every CJK query (AU/US markets are
+    # English), burning API calls and hitting rate limits before the English
+    # tiers appended at the *end* could run.  Fix: detect CJK here and rewrite
+    # card_name to English immediately — all tiers are now English from tier 1.
+    def _has_cjk_s(s: str) -> bool:
+        return bool(re.search(r'[\u3000-\u9fff\uac00-\ud7af\uf900-\ufaff]', s))
+    if _has_cjk_s(card_name) and "/" in card_name:
+        card_name = card_name.split("/")[-1].strip()   # "Monkey D. Luffy"
+    elif _has_cjk_s(card_name):
+        card_name = re.sub(
+            r'[\u3000-\u9fff\uac00-\ud7af\uf900-\ufaff\u30a0-\u30ff\u3040-\u309f\u31f0-\u31ff]+',
+            ' ', card_name).strip()
+        card_name = re.sub(r'\s+', ' ', card_name).strip()
+
     def _q(*parts):
         return _norm_ws(" ".join(p for p in parts if p))
 
