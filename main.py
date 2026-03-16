@@ -7501,11 +7501,27 @@ def _reconcile_prices(
                 multiplier_reason = "valuation_error_fallback"
 
     # ── Python-side sanity cap (ceiling) ────────────────────────────────────
-    # For graded cards: cap at 1.5× raw signal.
-    # For ungraded cards: cap at 1.1× raw signal.
+    # Tiered by raw signal: cheap cards legitimately command a larger grade
+    # premium (PSA 10 on a $5 raw is routinely 3-5× raw in the AU market).
+    # High-value cards: grade adds authentication/liquidity but not large %.
+    #   raw < $20   → cap 3.0×   (cheap card, grading cost significant)
+    #   raw < $50   → cap 2.5×   (low-mid range)
+    #   raw < $200  → cap 2.0×   (mid range)
+    #   raw ≥ $200  → cap 1.5×   (high value)
+    #   ungraded    → cap 1.1×   (no grade uplift expected)
     if raw_signal > 0:
-        _max_ratio = 1.50 if is_graded else 1.10
-        _cap       = round(raw_signal * _max_ratio, 2)
+        if is_graded:
+            if raw_signal < 20:
+                _max_ratio = 3.00
+            elif raw_signal < 50:
+                _max_ratio = 2.50
+            elif raw_signal < 200:
+                _max_ratio = 2.00
+            else:
+                _max_ratio = 1.50
+        else:
+            _max_ratio = 1.10
+        _cap = round(raw_signal * _max_ratio, 2)
         if final_price > _cap:
             logging.warning(
                 f"⚠️ Sanity cap: final_price={final_price:.2f} > cap={_cap:.2f} "
@@ -7548,6 +7564,38 @@ def _reconcile_prices(
             final_price       = 0.0
             multiplier_reason = "floor_guard_no_reliable_price"
 
+    # ── Rarity band check — catch mismatched lookups ─────────────────────────────
+    # Validates final_price against known realistic floors/ceilings per game × rarity.
+    # ROOT CAUSE of Charizard-at-$1,180: eBay matched a wrong/rarer Charizard variant
+    # and the $944 raw signal passed through unchecked.  This band check catches it:
+    #   "Double Rare" has a ceiling of $150 raw (×2.5 for graded = $375 max).
+    #   $944 >> $375 → flagged as needs_review, old value kept, UI shows ⚠️ badge.
+    _fp_game   = (fp.get("game_type")  or "").lower().strip()
+    _fp_rarity = (fp.get("rarity")     or "").lower().strip()
+    _band_checked = False
+    if _fp_game and _fp_rarity and final_price > 0:
+        try:
+            _band = _rarity_price_band(_fp_game, _fp_rarity, is_graded, final_price)
+            _band_checked = True
+            if not _band["ok"]:
+                logging.warning(
+                    f"⚠️ Band check failed: {_band['reason']} — flagging needs_review "
+                    f"(price={final_price:.2f}, floor={_band['floor']:.2f}, "
+                    f"ceil={_band['ceiling']:.2f}, game={_fp_game}, rarity={_fp_rarity})"
+                )
+                _band_reliability        = "needs_review"
+                _band_reliability_reason = _band["reason"]
+            else:
+                _band_reliability        = None
+                _band_reliability_reason = None
+        except Exception as _be:
+            logging.warning(f"Band check error (non-fatal): {_be}")
+            _band_reliability        = None
+            _band_reliability_reason = None
+    else:
+        _band_reliability        = None
+        _band_reliability_reason = None
+
     # ── Price reliability gate ────────────────────────────────────────────────
     # PHP callers check this field before writing to the DB.
     # "auto_save"   → price is trustworthy enough to overwrite the stored value.
@@ -7558,6 +7606,7 @@ def _reconcile_prices(
     #   2. If only a single source returned data, we need ≥3 sold comps.
     #      One sale = one lucky (or unlucky) listing — not a market.
     #   3. "suspect" confidence (sources disagree by >100%) is always needs_review.
+    #   4. Price outside rarity band (caught above) → needs_review.
     _total_samples = sum(v["count"] for v in signals.values())
     _n_sources     = len(signals)
     if confidence in ("none",):
@@ -7572,6 +7621,11 @@ def _reconcile_prices(
     elif _n_sources == 1 and _total_samples < 3:
         _reliability = "needs_review"
         _reliability_reason = f"single_source_only_{_total_samples}_comps"
+    elif _band_reliability == "needs_review":
+        # Rarity band check failed — price is outside the realistic range for
+        # this game × rarity combination (most likely a wrong-card match).
+        _reliability        = "needs_review"
+        _reliability_reason = _band_reliability_reason or "rarity_band_exceeded"
     else:
         _reliability = "auto_save"
         _reliability_reason = f"{confidence}_{_total_samples}_samples_{_n_sources}_sources"
@@ -7758,6 +7812,23 @@ def _cla_estimate_from_attributes(
         ("common",                      1.0),
     ]
 
+    # ── Star Wars (vintage Topps / Lucasfilm trading cards) ─────────────────────
+    # Conservative NM raw medians (AUD) for 1993–1996 Topps sets:
+    # Galaxy Series 1/2, Dark Empire, Shadows of the Empire, etc.
+    # These are genuine vintage collectibles — NOT modern TCG bulk.
+    # Hologram inserts from Galaxy Series are the rarest / most valuable.
+    _STAR_WARS_BASES: List[tuple] = [
+        ("hologram",          50.0),   # Galaxy hologram inserts (very limited)
+        ("limited edition",   50.0),   # Official limited edition variants
+        ("foil",              25.0),   # Foil / chrome insert variants
+        ("chrome",            25.0),
+        ("embossed",          20.0),
+        ("galaxy",            12.0),   # Galaxy Series base cards
+        ("rare",              10.0),   # Short-printed / chase cards
+        ("uncommon",           6.0),
+        ("common",             4.0),   # Standard base cards
+    ]
+
     game_table: List[tuple]
     if "one piece" in game or "onepiece" in game or game == "op":
         game_table = _ONE_PIECE_BASES
@@ -7765,6 +7836,8 @@ def _cla_estimate_from_attributes(
         game_table = _POKEMON_BASES
     elif "dragon ball" in game or "dragonball" in game or "dbz" in game:
         game_table = _DBZ_BASES
+    elif any(g in game for g in ("star wars", "starwars")):
+        game_table = _STAR_WARS_BASES
     else:
         game_table = _GENERIC_BASES
 
@@ -7800,10 +7873,38 @@ def _cla_estimate_from_attributes(
 
     graded_est = round(base_aud * grade_mult, 2)
 
-    # ── Step 5: Signed multiplier ─────────────────────────────────────────────
-    signed_mult = 1.8 if is_signed else 1.0
+    # ── Step 5: Signed / autographed item multiplier ───────────────────────────
+    # IMPORTANT: Vintage non-TCG signed items (Star Wars, sports, memorabilia)
+    # have fundamentally different economics to modern TCG artist autographs.
+    # A signed Jeremy Bulloch Boba Fett or Carrie Fisher card is a celebrity
+    # autograph collectible — not a 1.8× bump on a bulk-priced card.
+    #
+    # Also: PHP (cg_ajax_update_collection_values) applies its own signed mult
+    # in its fallback path. The backend returns signed_multiplier in the response
+    # so PHP can detect it was already applied and skip double-applying.
+    #
+    # Multipliers:
+    #   TCG artist auto (modern):     1.8×  — artist sigs on Pokemon/OP cards
+    #   Vintage / non-TCG celebrity:  4.5×  — actor/athlete on vintage cards
+    #
+    # Floors (minimum regardless of base × mult):
+    #   Signed TCG:      $20 AUD  (covers grading cost at minimum)
+    #   Signed non-TCG:  $80 AUD  (celebrity autograph collectibles have a real floor)
+    _tcg_games_signed = (
+        "pokemon", "one piece", "dragon ball", "yugioh", "yu-gi-oh",
+        "magic", "mtg", "digimon", "lorcana", "weiss", "vanguard", "fab",
+    )
+    _is_tcg_for_signed = any(g in game for g in _tcg_games_signed)
     if is_signed:
-        graded_est = round(graded_est * signed_mult, 2)
+        if _is_tcg_for_signed:
+            signed_mult  = 1.8
+            signed_floor = 20.0
+        else:
+            signed_mult  = 4.5   # vintage / celebrity autograph premium
+            signed_floor = 80.0  # celebrity signed vintage should never be below $80
+        graded_est = round(max(graded_est * signed_mult, signed_floor), 2)
+    else:
+        signed_mult = 1.0
 
     logging.info(
         f"📊 Attribute estimate: game={game} | tier={matched_tier} | "
@@ -7870,40 +7971,45 @@ def cla_grade_multiplier(grade_str: str, rank_within_card: int | None = None, ra
     g = _cla_parse_grade(grade_str) or 0.0
 
     # ── Base grade tier ───────────────────────────────────────────────────────
+    # Calibrated against observed AU CLA/PSA graded card market (2024-2026).
+    # CLA grades map to PSA equivalents for eBay comp purposes.
+    # Must stay in sync with cg_grade_value_multiplier() in cg-collection.php.
     if g >= 12:
-        mult = 1.35   # CLA Ultra Flawless ≈ PSA 10 + small proprietary premium
+        mult = 1.50   # CLA Ultra Flawless — proprietary top grade, AU premium
     elif g >= 10:
-        mult = 1.25   # PSA 10 / CLA 10
+        mult = 1.40   # CLA/PSA 10 Flawless — gem mint, real AU market premium
     elif g >= 9.5:
-        mult = 1.15   # Near-gem
+        mult = 1.25   # Near-gem
     elif g >= 9:
-        mult = 1.08   # PSA 9: small premium
+        mult = 1.12   # PSA 9: solid premium in AU market
     elif g >= 8.5:
         mult = 1.00   # PSA 8.5: at market
     elif g >= 8:
-        mult = 0.92   # PSA 8: slight discount
+        mult = 0.90   # PSA 8: slight discount
     elif g >= 7:
-        mult = 0.78   # PSA 7: visible condition
+        mult = 0.75   # PSA 7: visible condition discount
     elif g > 0:
-        mult = 0.58   # PSA 6 and below
+        mult = 0.55   # PSA 6 and below
     else:
         mult = 1.00
 
     # ── Price-based cap: premium shrinks as raw value rises ───────────────────
-    # For high-value cards, the grade adds authentication/liquidity value but
-    # not a large % premium — the card itself is where the value lives.
+    # For cheap cards the grading cost itself is significant vs card value,
+    # so the % premium is real and meaningful.  For expensive cards the grade
+    # adds authentication/liquidity value but not a large % premium.
     # Cap schedule (only ever reduces, never increases):
-    #   raw < $50     → no cap  (low-value cards, grading cost matters most)
-    #   raw $50-$200  → cap 1.40×
-    #   raw $200-$500 → cap 1.25×
-    #   raw $500+     → cap 1.15×
+    #   raw < $50     → no cap  (grading cost matters most; 3× raw is legitimate)
+    #   raw $50–$200  → cap 1.60×
+    #   raw $200–$500 → cap 1.35×
+    #   raw $500+     → cap 1.20×
     if signal_price > 0:
         if signal_price >= 500:
-            mult = min(mult, 1.15)
+            mult = min(mult, 1.20)
         elif signal_price >= 200:
-            mult = min(mult, 1.25)
+            mult = min(mult, 1.35)
         elif signal_price >= 50:
-            mult = min(mult, 1.40)
+            mult = min(mult, 1.60)
+        # Under $50: no cap — grading premium is meaningful vs card value
 
     # ── Pop-rank scarcity premium (kept small) ────────────────────────────────
     if rank_within_card is not None and rank_within_card > 0:
@@ -8024,7 +8130,8 @@ def _rarity_price_band(
         "pokemon": {
             "common":                 (0.05,   30.0),
             "uncommon":               (0.10,   50.0),
-            "rare":                   (0.50,  150.0),
+            "rare":                   (0.50,  100.0),
+            "double rare":            (1.00,  150.0),  # Modern ex/vstar Double Rare
             "holo rare":              (1.00,  400.0),
             "ultra rare":             (5.00, 2000.0),
             "full art":               (5.00, 2000.0),
