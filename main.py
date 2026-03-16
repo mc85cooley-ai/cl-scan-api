@@ -1,6 +1,20 @@
 """
 The Collectors League Australia - Scan API
-Futureproof v6.9.2 (2026-03-16)
+Futureproof v6.9.3 (2026-03-16)
+
+What changed vs v6.9.2 (2026-03-16)
+- ✅ CRITICAL FIX: Added missing /api/fingerprint/generate endpoint — was returning 404,
+  causing the "Generate LingérPrint™ DNA" button in the DNA viewer to fail entirely.
+  cg-grading-dashboard.php (cgd_ajax_fingerprint_generate) calls this endpoint directly;
+  without it the PHP fell through to cgd_generate_local_fingerprint only, which lacks
+  surface_texture and returns "Not captured" for all API-derived fields.
+  The new endpoint accepts front/back multipart uploads OR image_front_url/image_back_url
+  form fields, runs the full fingerprint pipeline (dHash, surface SHA-256, colour zones,
+  histogram, embedding, keypoints) and returns {"success": true, "fingerprint": {...}}.
+- ✅ CRITICAL FIX: Added missing /api/fingerprint/match endpoint — was returning 404.
+  PHP has a local cgd_hash_similarity fallback that activates when this returns no matches,
+  so the endpoint returning 200 + empty matches list is all that's needed.
+- ✅ CARRIED: surface_texture .tobytes() fix from v6.9.2 applies to the new endpoint too.
 
 What changed vs v6.9.1 (2026-02-26)
 - ✅ CRITICAL FIX: surface_texture "Not captured" — block 6b was silently failing due to
@@ -554,7 +568,7 @@ def safe_endpoint(func):
 # ==============================
 # Config
 # ==============================
-APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-02-26-v7.0.0")
+APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-03-16-v6.9.3")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
@@ -10631,6 +10645,268 @@ High Value Cards (>$100): {len(high_value)}
         summary += f"\n{idx}. {card.get('card_name', 'Unknown')} - Grade {card.get('estimated_grade', 'N/A')} - ${float(card.get('estimated_value', 0) or 0):.2f}"
 
     return summary
+
+
+# ========================================
+# FINGERPRINT ENDPOINTS
+# ========================================
+# These endpoints are called by cg-grading-dashboard.php (cgd_ajax_fingerprint_generate
+# and cgd_ajax_fingerprint_match). They were missing from the API, causing 404 errors
+# which meant the DNA viewer always showed "Not captured" for surface_texture and all
+# other fingerprint fields when using the "Generate LingérPrint™ DNA" button.
+#
+# /api/fingerprint/generate  — accepts front/back image uploads (multipart) or
+#                              image_front_url / image_back_url form fields.
+#                              Runs the full fingerprint pipeline (same blocks 6a-6f
+#                              as /api/defect-scan) and returns:
+#                              { "success": true, "fingerprint": { phash, surface_texture,
+#                                print_dot_hash, keypoints, embedding, ... } }
+#
+# /api/fingerprint/match     — accepts submission_id + fingerprint_hash + fingerprint_json.
+#                              Returns { "matches": [] } — matching is done locally in PHP
+#                              (cgd_hash_similarity). This endpoint exists so the PHP does
+#                              not get a 404, and can be extended later for server-side
+#                              registry matching if a shared DB is added.
+# ========================================
+
+@app.post("/api/fingerprint/generate")
+@safe_endpoint
+async def fingerprint_generate(
+    request: Request,
+    front: Optional[UploadFile]     = File(None),
+    back:  Optional[UploadFile]     = File(None),
+    submission_id:    Optional[str] = Form(None),
+    card_name:        Optional[str] = Form(None),
+    card_set:         Optional[str] = Form(None),
+    image_front_url:  Optional[str] = Form(None),
+    image_back_url:   Optional[str] = Form(None),
+):
+    """
+    Generate a full pixel-derived fingerprint for a card image.
+
+    PHP calls this from cgd_ajax_fingerprint_generate in cg-grading-dashboard.php.
+    It sends either:
+      (a) multipart with front/back image files, or
+      (b) form fields with image_front_url / image_back_url to download.
+
+    Returns { "success": true, "fingerprint": { all CV feature fields } }.
+    The PHP then smart-merges the returned fingerprint over its local GD result,
+    only overwriting fields where this API returns a non-empty value.
+    """
+    # ── 1. Resolve front image bytes ─────────────────────────────────────────
+    front_bytes: bytes = b""
+    back_bytes:  bytes = b""
+
+    if front is not None:
+        front_bytes = await front.read()
+
+    if not front_bytes and image_front_url:
+        try:
+            client = _get_http_client()
+            r = await client.get(image_front_url, timeout=20.0)
+            if r.status_code == 200 and len(r.content) > 200:
+                front_bytes = r.content
+        except Exception as _e:
+            logging.warning("fingerprint_generate: could not download image_front_url — %s", _e)
+
+    if not front_bytes or len(front_bytes) < 200:
+        return JSONResponse(status_code=400, content={
+            "success": False,
+            "error":   "Front image required — upload a file or provide image_front_url",
+        })
+
+    if back is not None:
+        back_bytes = await back.read()
+
+    if not back_bytes and image_back_url:
+        try:
+            client = _get_http_client()
+            r2 = await client.get(image_back_url, timeout=20.0)
+            if r2.status_code == 200 and len(r2.content) > 200:
+                back_bytes = r2.content
+        except Exception:
+            pass
+
+    # ── 2. Compress (same helper as defect-scan) ──────────────────────────────
+    def _compress_fp(raw: bytes, max_long: int = 1200, quality: int = 88) -> bytes:
+        if not PIL_AVAILABLE or not raw or len(raw) < 200:
+            return raw
+        try:
+            im = Image.open(io.BytesIO(raw)).convert("RGB")
+            im = ImageOps.exif_transpose(im)
+            w, h = im.size
+            long_edge = max(w, h)
+            if long_edge > max_long:
+                scale = max_long / long_edge
+                im = im.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=quality, optimize=True)
+            return buf.getvalue()
+        except Exception:
+            return raw
+
+    front_proc = _compress_fp(front_bytes)
+    # back not needed for fingerprint vectors but kept for future use
+
+    # ── 3. Run fingerprint pipeline (same blocks 6a-6f as defect-scan) ───────
+    _fp:       Dict[str, Any] = {}
+    _fp_errors: Dict[str, str] = {}
+
+    if not PIL_AVAILABLE:
+        logging.warning("fingerprint_generate: Pillow not available.")
+        _fp_errors["pil"] = "Pillow not installed"
+    elif not front_proc:
+        _fp_errors["front_proc"] = "front_proc bytes were empty"
+    else:
+        # 3a. dHash — 64-bit perceptual hash
+        try:
+            _im_dh = Image.open(io.BytesIO(front_proc)).convert("L").resize((9, 8), Image.LANCZOS)
+            _bits  = ""
+            for _y in range(8):
+                for _x in range(8):
+                    _bits += "1" if _im_dh.getpixel((_x, _y)) < _im_dh.getpixel((_x + 1, _y)) else "0"
+            _dhex = "".join(format(int(_bits[_i:_i+4], 2), "x") for _i in range(0, 64, 4)).zfill(16)
+            _fp["phash"]          = _dhex
+            _fp["print_dot_hash"] = _dhex
+        except Exception as _e:
+            _fp_errors["phash"] = str(_e)
+            logging.warning("fingerprint_generate: dHash failed — %s", _e)
+
+        # 3b. Surface hash — SHA-256 of 32×32 centre crop (.tobytes() fix)
+        try:
+            _im_sf = Image.open(io.BytesIO(front_proc)).convert("RGB")
+            _sw, _sh = _im_sf.size
+            _crop32  = _im_sf.crop((int(_sw * 0.25), int(_sh * 0.25),
+                                    int(_sw * 0.75), int(_sh * 0.75))).resize((32, 32), Image.LANCZOS)
+            _surf_buf = _crop32.tobytes()
+            _fp["surface_hash"]    = hashlib.sha256(_surf_buf).hexdigest()
+            _fp["surface_texture"] = _fp["surface_hash"]
+        except Exception as _e:
+            _fp_errors["surface_texture"] = str(_e)
+            logging.warning("fingerprint_generate: surface_texture failed — %s", _e)
+
+        # 3c. Colour zones 3×3 grid
+        _zones: Dict[str, list] = {}
+        try:
+            _im_rgb = Image.open(io.BytesIO(front_proc)).convert("RGB")
+            _cw, _ch = _im_rgb.size
+            for _gy in range(3):
+                for _gx in range(3):
+                    _x0, _x1 = int(_cw * _gx / 3), int(_cw * (_gx + 1) / 3)
+                    _y0, _y1 = int(_ch * _gy / 3), int(_ch * (_gy + 1) / 3)
+                    _reg   = _im_rgb.crop((_x0, _y0, _x1, _y1))
+                    _means = ImageStat.Stat(_reg).mean
+                    _zones[f"z{_gy * 3 + _gx}"] = [round(_means[0]), round(_means[1]), round(_means[2])]
+            _fp["color_zones_front"] = _zones
+        except Exception as _e:
+            _fp_errors["color_zones"] = str(_e)
+            logging.warning("fingerprint_generate: colour zones failed — %s", _e)
+
+        # 3d. Intensity histogram 16 buckets
+        _hist16: List[int] = []
+        try:
+            _im_gray  = Image.open(io.BytesIO(front_proc)).convert("L")
+            _raw_hist = _im_gray.histogram()
+            _hist16   = [sum(_raw_hist[_i * 16:(_i + 1) * 16]) for _i in range(16)]
+            _fp["intensity_hist_front"] = _hist16
+        except Exception as _e:
+            _fp_errors["intensity_hist"] = str(_e)
+            logging.warning("fingerprint_generate: intensity hist failed — %s", _e)
+
+        # 3e. Embedding: 43-dim vector
+        try:
+            _vec: List[float] = []
+            for _z in _zones.values():
+                _vec += [round(_z[0] / 255.0, 4), round(_z[1] / 255.0, 4), round(_z[2] / 255.0, 4)]
+            if _hist16:
+                _htot = max(sum(_hist16), 1)
+                _vec += [round(_c / _htot, 6) for _c in _hist16]
+            if len(_vec) >= 16:
+                _fp["embedding"] = _vec
+        except Exception as _e:
+            _fp_errors["embedding"] = str(_e)
+            logging.warning("fingerprint_generate: embedding failed — %s", _e)
+
+        # 3f. Keypoints — 8 border luminance landmarks
+        try:
+            _im_brd  = Image.open(io.BytesIO(front_proc)).convert("L")
+            _bw, _bh = _im_brd.size
+            _bp      = max(2, int(min(_bw, _bh) * 0.03))
+            _lum: List[int] = []
+            for _i in range(16):
+                _lum.append(_im_brd.getpixel((int(_bw * (_i + 0.5) / 16), _bp)))
+            for _i in range(16):
+                _lum.append(_im_brd.getpixel((_bw - _bp - 1, int(_bh * (_i + 0.5) / 16))))
+            for _i in range(15, -1, -1):
+                _lum.append(_im_brd.getpixel((int(_bw * (_i + 0.5) / 16), _bh - _bp - 1)))
+            for _i in range(15, -1, -1):
+                _lum.append(_im_brd.getpixel((_bp, int(_bh * (_i + 0.5) / 16))))
+            _kp = []
+            for _i in range(8):
+                _sl   = _lum[_i * 8:(_i + 1) * 8]
+                _mean = sum(_sl) / max(len(_sl), 1)
+                _kp.append({
+                    "x":        round((_i / 8.0) * 1000),
+                    "y":        round((_mean / 255.0) * 1000),
+                    "strength": round(_mean / 255.0, 3),
+                    "side":     "front",
+                    "source":   "api_border",
+                })
+            _fp["keypoints"]        = _kp
+            _fp["border_sig_front"] = bytes(min(255, max(0, _v)) for _v in _lum).hex()
+        except Exception as _e:
+            _fp_errors["keypoints"] = str(_e)
+            logging.warning("fingerprint_generate: keypoints failed — %s", _e)
+
+    # ── 4. Build response fingerprint dict ───────────────────────────────────
+    fingerprint = {
+        "phash":                _fp.get("phash", ""),
+        "print_dot_hash":       _fp.get("print_dot_hash", ""),
+        "surface_hash":         _fp.get("surface_hash", ""),
+        "surface_texture":      _fp.get("surface_texture", ""),
+        "keypoints":            _fp.get("keypoints") or [],
+        "embedding":            _fp.get("embedding") or [],
+        "border_sig_front":     _fp.get("border_sig_front", ""),
+        "color_zones_front":    _fp.get("color_zones_front", {}),
+        "intensity_hist_front": _fp.get("intensity_hist_front", []),
+        "fp_source":            "api" if _fp.get("phash") else "unavailable",
+        "source":               "api" if _fp.get("phash") else "unavailable",
+    }
+    if _fp_errors:
+        fingerprint["fp_errors"] = _fp_errors
+
+    return JSONResponse(content={
+        "success":     True,
+        "fingerprint": fingerprint,
+    })
+
+
+@app.post("/api/fingerprint/match")
+@safe_endpoint
+async def fingerprint_match(
+    submission_id:    Optional[str] = Form(None),
+    fingerprint_hash: Optional[str] = Form(None),
+    fingerprint_json: Optional[str] = Form(None),
+):
+    """
+    Registry match endpoint — returns matches for a given fingerprint hash.
+
+    PHP calls this from cgd_ajax_fingerprint_match in cg-grading-dashboard.php.
+    The Python API does not maintain a card registry DB, so it always returns
+    an empty matches list. PHP automatically falls back to its own local
+    cgd_hash_similarity scan when this returns no matches — so this endpoint
+    existing (returning 200 + empty matches) is all that's needed to stop the
+    404 and let the PHP fallback run correctly.
+
+    If a shared registry DB is added to this service in future, implement
+    the match logic here.
+    """
+    return JSONResponse(content={
+        "success": True,
+        "matches": [],
+        "total":   0,
+        "note":    "Registry matching is performed locally by the WordPress plugin.",
+    })
 
 
 # ========================================
