@@ -7037,6 +7037,76 @@ async def _ebay_sold_strict(
     url      = "https://svcs.ebay.com/services/search/FindingService/v1"
     headers  = {"User-Agent": UA}
 
+    # ── Title-match filter: require card number in listing title ────────────
+    # ROOT FIX for wrong-card mismatches.
+    # "Mega Charizard X ex PSA 10" without a number filter returns ANY Charizard
+    # graded PSA 10 — including rare variants at $500-900+ that inflate the signal.
+    # Requiring the card number token (e.g. "013" from "013/094") in the listing
+    # title eliminates cross-variant contamination.
+    _cn_tokens: List[str] = []
+    if card_number:
+        _cn_parts = re.findall(r'\d+', card_number)
+        if _cn_parts:
+            _cn_tokens = [_cn_parts[-1]]
+            _cn_bare = re.sub(r'[^0-9A-Za-z]', '', card_number)
+            if _cn_bare and _cn_bare not in _cn_tokens:
+                _cn_tokens.append(_cn_bare)
+
+    # Rarity upgrade keywords that indicate a rarer variant contaminating results
+    _RARITY_UPGRADES = [
+        "special illustration rare", "special art rare", "illustration rare",
+        "full art", "rainbow rare", "hyper rare", "alt art", "secret rare", "crown rare",
+    ]
+    _target_rarity = (rarity or "").lower()
+    _base_rarities = {"double rare", "rare", "uncommon", "common", ""}
+
+    def _title_matches_card(title: str) -> bool:
+        tl = title.lower()
+        # Card number must appear in title (when known)
+        if _cn_tokens and not any(tok in tl for tok in _cn_tokens):
+            return False
+        # Reject if title describes a rarer variant than what we searched for
+        if _target_rarity in _base_rarities:
+            for upgrade in _RARITY_UPGRADES:
+                if upgrade in tl:
+                    return False
+        return True
+
+    # ── Title-match filter: require card number in listing title ────────────
+    # ROOT FIX for wrong-card mismatches.
+    # "Mega Charizard X ex PSA 10" without a number filter returns ANY Charizard
+    # graded PSA 10 — including rare variants at $500-900+ that inflate the signal.
+    # Requiring the card number token (e.g. "013" from "013/094") in the listing
+    # title eliminates cross-variant contamination.
+    _cn_tokens: List[str] = []
+    if card_number:
+        _cn_parts = re.findall(r'\d+', card_number)
+        if _cn_parts:
+            _cn_tokens = [_cn_parts[-1]]
+            _cn_bare = re.sub(r'[^0-9A-Za-z]', '', card_number)
+            if _cn_bare and _cn_bare not in _cn_tokens:
+                _cn_tokens.append(_cn_bare)
+
+    # Rarity upgrade keywords that indicate a rarer variant contaminating results
+    _RARITY_UPGRADES = [
+        "special illustration rare", "special art rare", "illustration rare",
+        "full art", "rainbow rare", "hyper rare", "alt art", "secret rare", "crown rare",
+    ]
+    _target_rarity = (rarity or "").lower()
+    _base_rarities = {"double rare", "rare", "uncommon", "common", ""}
+
+    def _title_matches_card(title: str) -> bool:
+        tl = title.lower()
+        # Card number must appear in title (when known)
+        if _cn_tokens and not any(tok in tl for tok in _cn_tokens):
+            return False
+        # Reject if title describes a rarer variant than what we searched for
+        if _target_rarity in _base_rarities:
+            for upgrade in _RARITY_UPGRADES:
+                if upgrade in tl:
+                    return False
+        return True
+
     async def _fetch_market(global_id: str, query: str) -> List[float]:
         prices: List[float] = []
         target = max(1, int(limit))
@@ -7061,8 +7131,10 @@ async def _ebay_sold_strict(
                     j = r.json()
                     resp  = (j.get("findCompletedItemsResponse") or [{}])[0]
                     items = ((resp.get("searchResult") or [{}])[0].get("item") or [])
+                    skipped = 0
                     for item in items:
                         try:
+                            title = str((item.get("title") or [""])[0])
                             sp   = item.get("sellingStatus", [{}])[0]
                             csp  = sp.get("convertedCurrentPrice", [{}])[0]
                             val  = float(csp.get("__value__") or 0.0)
@@ -7070,9 +7142,17 @@ async def _ebay_sold_strict(
                             if curr != "AUD":
                                 val = float(_usd_to_aud_simple(val) or 0.0)
                             if val > 0:
-                                prices.append(val)
+                                if _title_matches_card(title):
+                                    prices.append(val)
+                                else:
+                                    skipped += 1
                         except Exception:
                             pass
+                    if skipped:
+                        logging.info(
+                            f"🔍 eBay title-filter: {skipped} listings rejected "
+                            f"(card_number/rarity mismatch) on '{query}'"
+                        )
                     total = int(
                         ((resp.get("paginationOutput") or [{}])[0]
                          .get("totalEntries") or [0])[0]
@@ -7101,8 +7181,6 @@ async def _ebay_sold_strict(
             idx = max(0, min(len(lst)-1, int(len(lst)*p/100)))
             return float(lst[idx])
         med = float(statistics.median(trimmed))
-        # Stamp whether this query was grade-filtered (PSA/BGS/CGC/SGC token present).
-        # Propagated to the reconciler — if True, no second grade multiplier is applied.
         _grade_in_q = bool(re.search(
             r'\bPSA\s*\d|\bBGS\s*\d|\bCGC\s*\d|\bSGC\s*\d|\bgraded\b',
             query, re.I
@@ -7125,8 +7203,6 @@ async def _ebay_sold_strict(
             "price_includes_grade": _grade_in_q,
         }
 
-    # Graded high-value cards have fewer total sales than raw singles;
-    # accept 3 sales for graded cards to avoid always falling to legacy path.
     MIN_SALES = 3 if is_graded else 5
     best_result: Dict[str, Any] = {}
 
