@@ -7501,24 +7501,24 @@ def _reconcile_prices(
                 multiplier_reason = "valuation_error_fallback"
 
     # ── Python-side sanity cap (ceiling) ────────────────────────────────────
-    # Tiered by raw signal: cheap cards legitimately command a larger grade
-    # premium (PSA 10 on a $5 raw is routinely 3-5× raw in the AU market).
-    # High-value cards: grade adds authentication/liquidity but not large %.
-    #   raw < $20   → cap 3.0×   (cheap card, grading cost significant)
-    #   raw < $50   → cap 2.5×   (low-mid range)
-    #   raw < $200  → cap 2.0×   (mid range)
-    #   raw ≥ $200  → cap 1.5×   (high value)
-    #   ungraded    → cap 1.1×   (no grade uplift expected)
+    # Synced with the _CLA_GRADE_TIERS table above.
+    # The new tiered grade mult allows up to 5× for Grade 12 on a $3 raw card,
+    # so the cap must accommodate those values.  The cap is intentionally wider
+    # than the expected mult — it only catches genuine outliers (e.g. $5 raw
+    # signal × 10 = $50 final would fire the cap at the <$20 tier).
+    #
+    # Cap schedule (only fires when final > raw × cap):
+    #   raw < $15   → cap 6.0×   (Grade 12 on very cheap card can be 5× legitimately)
+    #   raw < $50   → cap 4.0×
+    #   raw < $200  → cap 3.0×
+    #   raw ≥ $200  → cap 2.0×
+    #   ungraded    → cap 1.1×
     if raw_signal > 0:
         if is_graded:
-            if raw_signal < 20:
-                _max_ratio = 3.00
-            elif raw_signal < 50:
-                _max_ratio = 2.50
-            elif raw_signal < 200:
-                _max_ratio = 2.00
-            else:
-                _max_ratio = 1.50
+            if   raw_signal < 15:   _max_ratio = 6.00
+            elif raw_signal < 50:   _max_ratio = 4.00
+            elif raw_signal < 200:  _max_ratio = 3.00
+            else:                   _max_ratio = 2.00
         else:
             _max_ratio = 1.10
         _cap = round(raw_signal * _max_ratio, 2)
@@ -7531,28 +7531,36 @@ def _reconcile_prices(
             multiplier_reason = multiplier_reason + "_sanity_capped"
 
     # ── Minimum floor guard (floor) ───────────────────────────────────────────
-    # A graded card priced below the minimum grading cost floor almost always
-    # means the eBay signal matched the WRONG card (e.g. bulk common instead of
-    # a Rare Parallel).  Return final_price = 0 so the collection value is not
-    # updated with a clearly wrong price — the UI will show "no price" rather
-    # than a misleading $0.39.
+    # Catches signals where eBay matched the WRONG card (e.g. $0.43 raw for a
+    # Grade 12 Rare Parallel — that's a bulk common price, not the actual card).
+    # Returns final_price=0 so the caller falls back to the attribute estimate.
     #
-    # Floor schedule:
-    #   Grade 10+ (Gem/Flawless/Ultra Flawless) → $15 AUD minimum
-    #   Grade 9–9.5 (Mint/Near-Gem)             → $10 AUD minimum
-    #   Grade 8–8.5 (Near Mint)                 → $5 AUD minimum
-    #   Grade < 8                               → no floor (lower grades on low-value cards are valid)
+    # Calibration rationale:
+    #   The old floors ($15 for G10, $10 for G9) were designed for premium cards
+    #   but were killing valid prices for common/uncommon cards that legitimately
+    #   sell for $5–$13 graded (e.g. Sanji OP-06 at $13.20 was valid, not a mismatch).
+    #   Lowered to catch only genuine garbage signals (sub-$5 for a graded card),
+    #   not to second-guess a reasonable comp.
+    #
+    # Floor schedule (all AUD):
+    #   Grade 12+ (Ultra Flawless) → $6  (below this = almost certainly wrong card)
+    #   Grade 10–11 (Flawless/Gem) → $4
+    #   Grade 9–9.5 (Mint)         → $2
+    #   Grade 8–8.5 (Near Mint)    → $1
+    #   Grade < 8                  → no floor
     if is_graded and grade and final_price > 0:
         try:
             _gv = float(re.search(r"(\d+(?:\.\d+)?)", grade).group(1))
         except Exception:
             _gv = 0.0
-        if _gv >= 10:
-            _floor = 15.0
+        if _gv >= 12:
+            _floor = 6.0
+        elif _gv >= 10:
+            _floor = 4.0
         elif _gv >= 9:
-            _floor = 10.0
+            _floor = 2.0
         elif _gv >= 8:
-            _floor = 5.0
+            _floor = 1.0
         else:
             _floor = 0.0
         if _floor > 0 and final_price < _floor:
@@ -7690,95 +7698,69 @@ def _cla_estimate_from_attributes(
     rank_total:       int | None = None,
     card_set:     str = "",
     card_number:  str = "",
+    is_error:     bool = False,
+    is_promo:     bool = False,
 ) -> Dict[str, Any]:
     """
-    Derive a conservative estimated value when no eBay / PriceCharting comps exist.
+    CLA attribute-based estimate using the Layered Valuation Engine v3.
 
-    Logic:
-      1. Determine a RAW base price from game + rarity + language + finish tier.
-         These are conservative medians observed in the AU collector market (AUD).
-      2. Apply cla_grade_multiplier on the base to get the graded estimate.
-      3. Apply signed multiplier if applicable.
-      4. Return with confidence="estimate" and source="cla_attribute_estimate" so
-         the UI can clearly distinguish this from a live market price.
+    Flow:
+      1. Determine raw NM base price from game × rarity tier table (AUD).
+      2. Feed into cla_layered_valuation() which stacks all attribute checks.
+      3. Return result with source="cla_attribute_estimate" so the UI can
+         distinguish this from a live market price.
 
-    Base-price tables are intentionally conservative — better to under-estimate
-    than to over-estimate when no real comps exist.
+    This is called when no reliable market comps exist (eBay/TCGPlayer/PC
+    returned nothing, or the floor guard rejected a garbage signal).
+    The layered engine ensures every known attribute adds its correct premium.
     """
-    game    = (game_type    or "").lower().strip()
-    rarity  = (rarity       or "").lower().strip()
-    variant = (variant_type or "").lower().strip()
-    fin     = (finish       or "").lower().strip()
-    lang    = (language     or "english").lower().strip()
-    is_jp   = lang in ("japanese", "jp", "ja")
+    game   = (game_type    or "").lower().strip()
+    rar    = (rarity       or "").lower().strip()
+    var    = (variant_type or "").lower().strip()
+    fin    = (finish       or "").lower().strip()
+    lang   = (language     or "english").lower().strip()
+    is_jp  = lang in ("japanese", "jp", "ja")
 
-    # ── Step 1: Rarity-tier base prices (AUD, raw NM condition) ──────────────
-    # Structured as: game → rarity_key → base_aud
-    # "rarity_key" is matched via substring so partial labels work
-    # (e.g. "special illustration rare" hits "illustration rare" key).
-    # Keys are checked in order — put more-specific keys first.
-
-    # ── One Piece TCG rarity hierarchy ───────────────────────────────────────
-    # IMPORTANT: Parallel cards are NOT a sub-tier of their base rarity.
-    # They are a separate short-printed layer that sits ABOVE the base rarity:
-    #
-    #   L★  Leader Parallel   → rarest card in most sets ($200–$1,500+)
-    #   SR★ Super Rare Parallel → rarer than SEC ($100–$500)
-    #   R★  Rare Parallel       → rarer than plain SR ($25–$100)
-    #   SEC Secret Rare         → ($40–$150)
-    #   SR  Super Rare          → ($15–$50)
-    #   R   Rare                → ($3–$8)
-    #   UC  Uncommon            → ($1–$3)
-    #   C   Common              → ($0.50–$1.50)
-    #
-    # Keys are matched by substring against rarity+variant combined string.
-    # More-specific keys MUST come before less-specific ones.
-    # Conservative medians used — better to under-estimate than over-estimate.
+    # ── Step 1: Raw NM base price from game × rarity table (AUD) ─────────────
+    # Keys are matched by substring so partial labels work.
+    # More-specific keys MUST come first.
     _ONE_PIECE_BASES: List[tuple] = [
-        # ── Parallel tiers (rarest — check these BEFORE base rarity keys) ──
-        ("leader parallel",           400.0),  # L★ Leader Parallel: rarest pull in any set
-        ("l parallel",                400.0),  # alternate label
-        ("super rare parallel",       130.0),  # SR★ Parallel: rarer than SEC
-        ("sr parallel",               130.0),  # alternate label
+        ("leader parallel",           400.0),
+        ("l parallel",                400.0),
+        ("super rare parallel",       130.0),
+        ("sr parallel",               130.0),
         ("sr★",                       130.0),
-        ("rare parallel",              35.0),  # R★ Parallel (e.g. Mr. 3 OP09-056 R★)
-        ("r★",                         35.0),  # star notation stored directly
+        ("rare parallel",              35.0),
+        ("r★",                         35.0),
         ("r parallel",                 35.0),
-        # ── Non-parallel special tiers ──────────────────────────────────────
-        ("leader rare",               180.0),  # L (plain Leader, no parallel): still valuable
-        ("secret rare",                55.0),  # SEC
+        ("leader rare",               180.0),
+        ("secret rare",                55.0),
         ("sec",                        55.0),
-        ("super rare",                 20.0),  # SR
+        ("super rare",                 20.0),
         ("sr",                         20.0),
-        # ── Named special treatments (check before generic "rare") ──────────
-        ("illustration rare",          18.0),  # IR: special illustration print
+        ("illustration rare",          18.0),
         ("full art",                   18.0),
         ("alt art",                    18.0),
-        # ── Base rarities ────────────────────────────────────────────────────
-        ("rare",                        5.0),  # R
-        ("uncommon",                    1.75), # UC
-        ("common",                      0.80), # C
-        # ── Generic parallel fallback (if no base rarity matched) ────────────
-        ("parallel",                   25.0),  # unknown-base parallel: conservative mid
+        ("rare",                        5.0),
+        ("uncommon",                    1.75),
+        ("common",                      0.80),
+        ("parallel",                   25.0),
     ]
-
-    # ── Pokémon TCG rarity hierarchy ─────────────────────────────────────────
-    # Crown Rare > Hyper Rare/Special Illustration Rare > Illustration Rare >
-    # Full Art > Ultra Rare > Holo Rare > Reverse Holo > Common/Uncommon
     _POKEMON_BASES: List[tuple] = [
-        ("crown rare",                280.0),  # ACE SPEC / Crown: extremely scarce
-        ("special illustration rare", 130.0),  # SIR — highest regular print run rarity
+        ("crown rare",                280.0),
+        ("special illustration rare", 130.0),
         ("special art rare",          130.0),
         ("sar",                       130.0),
-        ("hyper rare",                 70.0),  # Gold alt art
-        ("shiny ultra rare",           50.0),  # Shiny Vault UR
-        ("shiny rare",                 18.0),  # Shiny Vault R
-        ("secret rare",                55.0),  # numbered secret
-        ("illustration rare",          40.0),  # IR
+        ("hyper rare",                 70.0),
+        ("shiny ultra rare",           50.0),
+        ("shiny rare",                 18.0),
+        ("secret rare",                55.0),
+        ("illustration rare",          40.0),
         ("full art",                   30.0),
         ("rainbow rare",               28.0),
         ("alt art",                    28.0),
-        ("ultra rare",                 18.0),  # V-STAR, ex UR etc.
+        ("ultra rare",                 18.0),
+        ("double rare",                 5.0),
         ("radiant rare",               15.0),
         ("trainer gallery",            12.0),
         ("holo rare",                   6.0),
@@ -7787,10 +7769,8 @@ def _cla_estimate_from_attributes(
         ("uncommon",                    0.90),
         ("common",                      0.45),
     ]
-
-    # ── Dragon Ball Super Card Game ───────────────────────────────────────────
     _DBZ_BASES: List[tuple] = [
-        ("special rare",               80.0),  # SPR: the rarest DBS tier
+        ("special rare",               80.0),
         ("spr",                        80.0),
         ("secret rare",                50.0),
         ("special art",                50.0),
@@ -7800,10 +7780,19 @@ def _cla_estimate_from_attributes(
         ("uncommon",                    2.0),
         ("common",                      1.0),
     ]
-
-    # ── Generic / Other TCG ──────────────────────────────────────────────────
+    _STAR_WARS_BASES: List[tuple] = [
+        ("hologram",          50.0),
+        ("limited edition",   50.0),
+        ("foil",              25.0),
+        ("chrome",            25.0),
+        ("embossed",          20.0),
+        ("galaxy",            12.0),
+        ("rare",              10.0),
+        ("uncommon",           6.0),
+        ("common",             4.0),
+    ]
     _GENERIC_BASES: List[tuple] = [
-        ("parallel",                   20.0),  # any parallel is meaningfully rare
+        ("parallel",                   20.0),
         ("secret rare",                45.0),
         ("ultra rare",                 20.0),
         ("full art",                   15.0),
@@ -7812,25 +7801,7 @@ def _cla_estimate_from_attributes(
         ("common",                      1.0),
     ]
 
-    # ── Star Wars (vintage Topps / Lucasfilm trading cards) ─────────────────────
-    # Conservative NM raw medians (AUD) for 1993–1996 Topps sets:
-    # Galaxy Series 1/2, Dark Empire, Shadows of the Empire, etc.
-    # These are genuine vintage collectibles — NOT modern TCG bulk.
-    # Hologram inserts from Galaxy Series are the rarest / most valuable.
-    _STAR_WARS_BASES: List[tuple] = [
-        ("hologram",          50.0),   # Galaxy hologram inserts (very limited)
-        ("limited edition",   50.0),   # Official limited edition variants
-        ("foil",              25.0),   # Foil / chrome insert variants
-        ("chrome",            25.0),
-        ("embossed",          20.0),
-        ("galaxy",            12.0),   # Galaxy Series base cards
-        ("rare",              10.0),   # Short-printed / chase cards
-        ("uncommon",           6.0),
-        ("common",             4.0),   # Standard base cards
-    ]
-
-    game_table: List[tuple]
-    if "one piece" in game or "onepiece" in game or game == "op":
+    if   "one piece" in game or "onepiece" in game or game == "op":
         game_table = _ONE_PIECE_BASES
     elif "pokemon" in game or "ptcg" in game:
         game_table = _POKEMON_BASES
@@ -7841,10 +7812,20 @@ def _cla_estimate_from_attributes(
     else:
         game_table = _GENERIC_BASES
 
-    # Combine rarity + variant for matching (e.g. "rare parallel" matches both)
-    search_str = f"{rarity} {variant} {fin}".lower()
+    # Game-specific fallback when rarity is unknown/empty
+    _GAME_FALLBACKS = {
+        "one piece": 8.0, "pokemon": 5.0, "dragon ball": 6.0,
+        "star wars": 8.0, "sports": 8.0,  "marvel": 5.0,
+        "dc": 5.0, "yugioh": 6.0, "magic": 5.0, "digimon": 5.0, "lorcana": 5.0,
+    }
+    _fallback = 3.0
+    for _gk, _gv in _GAME_FALLBACKS.items():
+        if _gk in game:
+            _fallback = _gv
+            break
 
-    base_aud = 2.0  # absolute fallback if nothing matches
+    search_str  = f"{rar} {var} {fin}".lower()
+    base_aud    = _fallback
     matched_tier = "unknown"
     for key, price in game_table:
         if key in search_str:
@@ -7852,75 +7833,42 @@ def _cla_estimate_from_attributes(
             matched_tier = key
             break
 
-    # ── Step 2: Language premium ──────────────────────────────────────────────
-    # Japanese One Piece / Pokemon cards typically sell at a premium in AU
-    # because they are the original/authentic print run.
-    if is_jp:
-        if "one piece" in game or "onepiece" in game:
-            base_aud *= 1.20   # JP One Piece: modest premium (AU buyers prefer JP)
-        elif "pokemon" in game:
-            base_aud *= 1.10   # JP Pokemon: slight premium on rare tiers
-        # else: no premium for non-TCG JP
-
-    # ── Step 3: Finish premium ────────────────────────────────────────────────
-    if any(f in fin for f in ("textured", "galaxy", "cosmos", "etched", "gilded")):
-        base_aud *= 1.30   # premium finish adds meaningful value
-
-    # ── Step 4: Grade multiplier on the estimated base ────────────────────────
-    grade_mult = cla_grade_multiplier(
-        grade, rank_within_card, rank_total, signal_price=base_aud
-    ) if grade else 1.0
-
-    graded_est = round(base_aud * grade_mult, 2)
-
-    # ── Step 5: Signed / autographed item multiplier ───────────────────────────
-    # IMPORTANT: Vintage non-TCG signed items (Star Wars, sports, memorabilia)
-    # have fundamentally different economics to modern TCG artist autographs.
-    # A signed Jeremy Bulloch Boba Fett or Carrie Fisher card is a celebrity
-    # autograph collectible — not a 1.8× bump on a bulk-priced card.
-    #
-    # Also: PHP (cg_ajax_update_collection_values) applies its own signed mult
-    # in its fallback path. The backend returns signed_multiplier in the response
-    # so PHP can detect it was already applied and skip double-applying.
-    #
-    # Multipliers:
-    #   TCG artist auto (modern):     1.8×  — artist sigs on Pokemon/OP cards
-    #   Vintage / non-TCG celebrity:  4.5×  — actor/athlete on vintage cards
-    #
-    # Floors (minimum regardless of base × mult):
-    #   Signed TCG:      $20 AUD  (covers grading cost at minimum)
-    #   Signed non-TCG:  $80 AUD  (celebrity autograph collectibles have a real floor)
-    _tcg_games_signed = (
-        "pokemon", "one piece", "dragon ball", "yugioh", "yu-gi-oh",
-        "magic", "mtg", "digimon", "lorcana", "weiss", "vanguard", "fab",
+    # ── Step 2: Feed everything into the layered valuation engine ─────────────
+    lv = cla_layered_valuation(
+        raw_base_aud     = base_aud,
+        grade            = grade,
+        rarity           = rarity,
+        variant_type     = variant_type,
+        finish           = finish,
+        language         = language,
+        edition          = "",
+        is_signed        = is_signed,
+        game_type        = game_type,
+        rank_within_card = rank_within_card,
+        rank_total       = rank_total,
+        is_error         = is_error,
+        is_promo         = is_promo,
     )
-    _is_tcg_for_signed = any(g in game for g in _tcg_games_signed)
-    if is_signed:
-        if _is_tcg_for_signed:
-            signed_mult  = 1.8
-            signed_floor = 20.0
-        else:
-            signed_mult  = 4.5   # vintage / celebrity autograph premium
-            signed_floor = 80.0  # celebrity signed vintage should never be below $80
-        graded_est = round(max(graded_est * signed_mult, signed_floor), 2)
-    else:
-        signed_mult = 1.0
+
+    final_value = lv["final_value"]
+    grade_mult  = lv["grade_mult"]
+    signed_mult = lv["signed_mult"]
 
     logging.info(
-        f"📊 Attribute estimate: game={game} | tier={matched_tier} | "
-        f"base=${base_aud:.2f} | grade_mult={grade_mult:.4f} | "
-        f"jp={is_jp} | signed={is_signed} → ${graded_est:.2f} AUD"
+        f"📊 Attribute estimate v3: game={game} | tier={matched_tier} | "
+        f"base=${base_aud:.2f} | checks={lv['active_checks']} → ${final_value:.2f} AUD"
     )
 
     return {
-        "current_price":        graded_est,
-        "final_price":          graded_est,
+        "current_price":        final_value,
+        "final_price":          final_value,
         "signal_price":         base_aud,
-        "final_value":          graded_est,
+        "final_value":          final_value,
         "base_price":           base_aud,
-        "multiplier_applied":   round(grade_mult, 4),
+        "multiplier_applied":   round(lv["total_mult"], 4),
+        "grade_multiplier":     round(grade_mult, 4),
         "slab_premium_added":   0.0,
-        "multiplier_reason":    f"attribute_estimate_{matched_tier}",
+        "multiplier_reason":    f"layered_estimate_{matched_tier}",
         "confidence":           "estimate",
         "source":               "cla_attribute_estimate",
         "sources_used":         ["cla_attribute_estimate"],
@@ -7931,7 +7879,9 @@ def _cla_estimate_from_attributes(
         "is_jp":                is_jp,
         "signed_multiplier":    signed_mult,
         "fingerprint_used":     False,
-        "estimated":            True,   # UI flag: show as estimate, not market price
+        "estimated":            True,
+        "layered_checks":       lv["checks"],
+        "active_checks":        lv["active_checks"],
         "last_updated":         datetime.now().isoformat(),
     }
 
@@ -7950,75 +7900,273 @@ def _cla_parse_grade(grade_str: str) -> float | None:
     except Exception:
         return None
 
-def cla_grade_multiplier(grade_str: str, rank_within_card: int | None = None, rank_total: int | None = None,
-                         signal_price: float = 0.0) -> float:
-    """Return CLA multiplier vs RAW baseline (1.0).
+# ========================================
+# CLA LAYERED VALUATION ENGINE v3
+# ========================================
+# Architecture: raw_base × grade × pop_rank × language × finish ×
+#               edition × signed × error × promo
+#
+# Each check is independent and stacks multiplicatively.
+# The grade multiplier is price-tiered via interpolation between five
+# raw-price breakpoints, calibrated against AU PSA/CLA market data 2023-2026.
+# ========================================
 
-    Price-scaled design rationale
-    ──────────────────────────────
-    The grading premium as a percentage of raw value shrinks as raw value rises:
-      • A $10 card PSA 10 might sell for 2–3× raw (grading cost is trivial vs card value)
-      • A $200 card PSA 10 typically sells for 1.3–1.5× raw
-      • A $1,000 card PSA 10 typically sells for 1.05–1.15× raw (grade adds modest
-        liquidity/confidence premium; most of the value is already the card itself)
+# ── Grade tier table ──────────────────────────────────────────────────────────
+# Each row: (min_grade, (mult_at_$3, mult_at_$15, mult_at_$50, mult_at_$150, mult_at_$500+))
+# Represents final_graded_price / raw_nm_price at that price point.
+# Cheap cards attract a higher grade % premium because the grading cost itself
+# is significant vs the card's raw value.  Expensive cards: grade adds
+# authentication and liquidity but not a proportionally large % premium.
+#
+# Calibration examples (AU market, 2023-2026):
+#   $3 raw → Grade 12: ~$15 (5×)  |  Grade 10: ~$12 (4×)  |  Grade 9: ~$7.50 (2.5×)
+#   $15 raw → Grade 12: ~$52 (3.5×) | Grade 10: ~$45 (3×)  | Grade 9: ~$30 (2×)
+#   $50 raw → Grade 12: ~$125 (2.5×) | Grade 10: ~$110 (2.2×) | Grade 9: ~$80 (1.6×)
+#   $150 raw → Grade 12: ~$270 (1.8×) | Grade 10: ~$240 (1.6×) | Grade 9: ~$195 (1.3×)
+#   $500 raw → Grade 12: ~$750 (1.5×) | Grade 10: ~$675 (1.35×) | Grade 9: ~$575 (1.15×)
+#
+_CLA_GRADE_TIERS: List[tuple] = [
+    # (min_grade, (mult_$3, mult_$15, mult_$50, mult_$150, mult_$500))
+    (12.0, (5.0,  3.5,  2.5,  1.80, 1.50)),  # CLA Ultra Flawless — CLA's premium grade
+    (10.0, (4.0,  3.0,  2.2,  1.60, 1.35)),  # CLA/PSA 10 Flawless
+    ( 9.5, (3.0,  2.4,  1.9,  1.45, 1.25)),  # Near-gem
+    ( 9.0, (2.5,  2.0,  1.6,  1.30, 1.15)),  # PSA 9 Mint
+    ( 8.5, (1.5,  1.3,  1.15, 1.05, 1.00)),  # PSA 8.5 NM+
+    ( 8.0, (1.00, 0.92, 0.90, 0.88, 0.85)),  # PSA 8: at/slightly below market
+    ( 7.0, (0.80, 0.75, 0.72, 0.70, 0.68)),  # PSA 7: visible condition
+    ( 0.1, (0.65, 0.60, 0.55, 0.52, 0.50)),  # PSA 6 and below
+]
+_CLA_GRADE_BREAKPOINTS: List[float] = [3.0, 15.0, 50.0, 150.0, 500.0]
 
-    Flat multipliers (old approach) were calibrated on low/mid-value One Piece cards
-    and badly over-valued high-value cards.  This version scales the cap down with
-    signal_price so the math stays grounded at every price point.
+
+def _cla_grade_mult_tiered(grade_str: str, raw_base_aud: float = 0.0) -> float:
+    """
+    Price-tiered grade premium multiplier.
+
+    Returns the multiplier (final_graded / raw_nm) for a given CLA grade at
+    a given raw base price.  Interpolates linearly between the five breakpoints
+    in _CLA_GRADE_BREAKPOINTS.
 
     Must stay in sync with cg_grade_value_multiplier() in cg-collection.php.
     """
-    g = _cla_parse_grade(grade_str) or 0.0
+    g   = _cla_parse_grade(grade_str) or 0.0
+    if g == 0:
+        return 1.0
 
-    # ── Base grade tier ───────────────────────────────────────────────────────
-    # Calibrated against observed AU CLA/PSA graded card market (2024-2026).
-    # CLA grades map to PSA equivalents for eBay comp purposes.
-    # Must stay in sync with cg_grade_value_multiplier() in cg-collection.php.
-    if g >= 12:
-        mult = 1.50   # CLA Ultra Flawless — proprietary top grade, AU premium
-    elif g >= 10:
-        mult = 1.40   # CLA/PSA 10 Flawless — gem mint, real AU market premium
-    elif g >= 9.5:
-        mult = 1.25   # Near-gem
-    elif g >= 9:
-        mult = 1.12   # PSA 9: solid premium in AU market
-    elif g >= 8.5:
-        mult = 1.00   # PSA 8.5: at market
-    elif g >= 8:
-        mult = 0.90   # PSA 8: slight discount
-    elif g >= 7:
-        mult = 0.75   # PSA 7: visible condition discount
-    elif g > 0:
-        mult = 0.55   # PSA 6 and below
-    else:
-        mult = 1.00
+    mults: Optional[tuple] = None
+    for min_g, tier in _CLA_GRADE_TIERS:
+        if g >= min_g:
+            mults = tier
+            break
+    if mults is None:
+        return 1.0
 
-    # ── Price-based cap: premium shrinks as raw value rises ───────────────────
-    # For cheap cards the grading cost itself is significant vs card value,
-    # so the % premium is real and meaningful.  For expensive cards the grade
-    # adds authentication/liquidity value but not a large % premium.
-    # Cap schedule (only ever reduces, never increases):
-    #   raw < $50     → no cap  (grading cost matters most; 3× raw is legitimate)
-    #   raw $50–$200  → cap 1.60×
-    #   raw $200–$500 → cap 1.35×
-    #   raw $500+     → cap 1.20×
-    if signal_price > 0:
-        if signal_price >= 500:
-            mult = min(mult, 1.20)
-        elif signal_price >= 200:
-            mult = min(mult, 1.35)
-        elif signal_price >= 50:
-            mult = min(mult, 1.60)
-        # Under $50: no cap — grading premium is meaningful vs card value
+    raw = float(raw_base_aud or 0.0)
+    bp  = _CLA_GRADE_BREAKPOINTS
 
-    # ── Pop-rank scarcity premium (kept small) ────────────────────────────────
+    if raw <= 0 or raw <= bp[0]:
+        return float(mults[0])
+    if raw >= bp[-1]:
+        return float(mults[-1])
+
+    # Linear interpolation between adjacent breakpoints
+    for i in range(len(bp) - 1):
+        if bp[i] <= raw < bp[i + 1]:
+            t = (raw - bp[i]) / (bp[i + 1] - bp[i])
+            return float(round(mults[i] + t * (mults[i + 1] - mults[i]), 4))
+
+    return float(mults[-1])
+
+
+def cla_layered_valuation(
+    raw_base_aud:     float,
+    grade:            str   = "",
+    rarity:           str   = "",
+    variant_type:     str   = "",
+    finish:           str   = "",
+    language:         str   = "english",
+    edition:          str   = "",
+    is_signed:        bool  = False,
+    game_type:        str   = "",
+    rank_within_card: Optional[int] = None,
+    rank_total:       Optional[int] = None,
+    is_error:         bool  = False,
+    is_promo:         bool  = False,
+) -> Dict[str, Any]:
+    """
+    CLA Layered Valuation Engine v3 — the single source of truth for
+    attribute-based pricing.
+
+    Architecture
+    ─────────────
+    final_value = raw_base × CHECK1_grade × CHECK2_pop_rank ×
+                  CHECK3_language × CHECK4_finish × CHECK5_edition ×
+                  CHECK6_signed × CHECK7_error × CHECK8_promo
+
+    Each check is independent and stacks multiplicatively.  This mirrors how
+    TCGPlayer and PriceCharting work: find the raw/ungraded market price, then
+    stack premiums for every attribute that adds collector value.
+
+    Returns a full breakdown dict so the UI can explain every dollar.
+    """
+    raw_base_aud = max(float(raw_base_aud or 0.0), 0.0)
+    checks: Dict[str, float] = {}
+    running = raw_base_aud
+
+    game = (game_type or "").lower().strip()
+    fin  = (finish    or "").lower().strip()
+    vt   = (variant_type or "").lower().strip()
+    ed   = (edition   or "").lower().strip()
+    lang = (language  or "english").lower().strip()
+
+    # ── CHECK 1: Grade premium ────────────────────────────────────────────────
+    # The biggest driver.  Uses the tiered interpolated table above.
+    grade_mult = _cla_grade_mult_tiered(grade, raw_base_aud) if grade else 1.0
+    checks["grade"] = grade_mult
+    running *= grade_mult
+
+    # ── CHECK 2: Population rank scarcity ─────────────────────────────────────
+    # Top-pop graded cards command a scarcity premium — there are only so many
+    # gem copies in existence, and being #1 pop means you own the best one.
+    pop_mult = 1.0
+    if grade and rank_within_card is not None and rank_within_card > 0:
+        if   rank_within_card == 1:   pop_mult = 1.25   # sole #1 — unique in the registry
+        elif rank_within_card <= 3:   pop_mult = 1.15
+        elif rank_within_card <= 5:   pop_mult = 1.08
+        elif rank_within_card <= 10:  pop_mult = 1.04
+    checks["pop_rank"] = pop_mult
+    running *= pop_mult
+
+    # ── CHECK 3: Language premium ─────────────────────────────────────────────
+    # IMPORTANT: Language premiums must reflect the CURRENT market, not assumptions.
+    #
+    # One Piece JP:
+    #   Japanese is the ORIGINAL print run. Sets release in JP first (sometimes
+    #   exclusively). The AU One Piece collector community actively prefers JP.
+    #   A modest +15% is defensible based on observed AU market data.
+    #
+    # Pokémon JP:
+    #   NO premium applied. In the current (2024–2026) EN-dominant market,
+    #   English Pokémon cards frequently sell for MORE than their Japanese
+    #   equivalents — EN SIRs, Crown Rares, and ex cards are the collector
+    #   standard globally. Japanese Pokémon bulk is actively cheaper.
+    #   Applying a JP premium here would OVER-value JP Pokémon cards.
+    #
+    # All other games:
+    #   No language premium by default. Most other TCGs (YGO, DBS, Digimon)
+    #   have no consistent JP vs EN price differential in the AU market.
+    #   If evidence of a consistent premium emerges for a specific game,
+    #   add it here with a market reference.
+    is_jp = lang in ("japanese", "jp", "ja")
+    lang_mult = 1.0
+    if is_jp:
+        if "one piece" in game:
+            lang_mult = 1.15   # JP OP: modest premium, original print run
+        # Pokémon: no JP premium — EN is the dominant/higher-value language currently
+        # Other games: no premium — insufficient evidence of consistent JP differential
+    checks["language"] = lang_mult
+    running *= lang_mult
+
+    # ── CHECK 4: Finish / treatment premium ───────────────────────────────────
+    # Special finishes are short-printed variants that command meaningful premiums.
+    combined = f"{fin} {vt}"
+    finish_mult = 1.0
+    if   any(f in combined for f in ("textured", "etched", "gilded")):  finish_mult = 1.40
+    elif any(f in combined for f in ("galaxy", "cosmos")):              finish_mult = 1.25
+    elif "holo" in combined and "reverse" not in combined:              finish_mult = 1.10
+    checks["finish"] = finish_mult
+    running *= finish_mult
+
+    # ── CHECK 5: Edition premium ──────────────────────────────────────────────
+    # 1st Edition and Shadowless are genuinely scarce and historically significant.
+    edition_mult = 1.0
+    if   "1st edition" in ed or "first edition" in ed:  edition_mult = 2.50
+    elif "shadowless"  in ed:                            edition_mult = 2.00
+    elif "collector"   in ed and "edition" in ed:        edition_mult = 1.30
+    checks["edition"] = edition_mult
+    running *= edition_mult
+
+    # ── CHECK 6: Signed / autograph premium ───────────────────────────────────
+    # TCG artist autos (1.8×) vs vintage celebrity autographs (4.5×) have very
+    # different economics.  Signed floor ensures a minimum regardless of base price.
+    _tcg_games_s = ("pokemon", "one piece", "dragon ball", "yugioh", "magic",
+                     "mtg", "digimon", "lorcana", "weiss", "vanguard", "fab")
+    _is_tcg = any(g in game for g in _tcg_games_s)
+    signed_mult  = 1.0
+    signed_floor = 0.0
+    if is_signed:
+        if _is_tcg:
+            signed_mult  = 1.80
+            signed_floor = 20.0
+        else:
+            signed_mult  = 4.50   # vintage / celebrity autograph
+            signed_floor = 80.0
+    checks["signed"] = signed_mult
+    running *= signed_mult
+    if is_signed and running < signed_floor:
+        running = signed_floor
+
+    # ── CHECK 7: Error / misprint premium ─────────────────────────────────────
+    # Documented factory errors (misprints, miscuts, wrong-back) are scarce and
+    # desirable to error collectors.  2× is a conservative starting point.
+    error_mult = 1.0
+    if is_error:
+        error_mult = 2.0
+    checks["error"] = error_mult
+    running *= error_mult
+
+    # ── CHECK 8: Promo premium ────────────────────────────────────────────────
+    # Tournament / staff / event promos are limited-distribution and command a
+    # modest premium over the standard print.
+    promo_mult = 1.0
+    if is_promo:
+        promo_mult = 1.30
+    checks["promo"] = promo_mult
+    running *= promo_mult
+
+    final_value = round(running, 2)
+    total_mult  = round(final_value / raw_base_aud, 4) if raw_base_aud > 0 else 1.0
+
+    # Build a human-readable check summary for UI tooltips
+    active_checks = {k: round(v, 4) for k, v in checks.items() if abs(v - 1.0) > 0.001}
+
+    return {
+        "final_value":    final_value,
+        "raw_base":       raw_base_aud,
+        "total_mult":     total_mult,
+        "checks":         checks,           # ALL checks (1.0 = no premium)
+        "active_checks":  active_checks,    # only checks that added/reduced value
+        "grade_mult":     grade_mult,
+        "pop_mult":       pop_mult,
+        "lang_mult":      lang_mult,
+        "finish_mult":    finish_mult,
+        "edition_mult":   edition_mult,
+        "signed_mult":    signed_mult,
+        "error_mult":     error_mult,
+        "promo_mult":     promo_mult,
+    }
+
+
+def cla_grade_multiplier(grade_str: str, rank_within_card: int | None = None,
+                         rank_total: int | None = None,
+                         signal_price: float = 0.0) -> float:
+    """
+    Backward-compatible wrapper — calls the new tiered grade table.
+
+    Callers in the reconciler path pass signal_price as the raw base so the
+    interpolation uses the actual card value rather than a default.
+
+    Must stay in sync with cg_grade_value_multiplier() in cg-collection.php.
+    """
+    mult = _cla_grade_mult_tiered(grade_str, signal_price)
+
+    # Pop-rank premium (kept in this wrapper for reconciler path which passes
+    # rank separately rather than via cla_layered_valuation).
     if rank_within_card is not None and rank_within_card > 0:
-        if rank_within_card == 1:
-            mult = min(mult * 1.08, mult + 0.10)
-        elif rank_within_card <= 3:
-            mult = min(mult * 1.05, mult + 0.07)
-        elif rank_within_card <= 10:
-            mult = min(mult * 1.03, mult + 0.04)
+        if   rank_within_card == 1:   mult *= 1.25
+        elif rank_within_card <= 3:   mult *= 1.15
+        elif rank_within_card <= 5:   mult *= 1.08
+        elif rank_within_card <= 10:  mult *= 1.04
 
     return float(round(mult, 6))
 
@@ -8276,6 +8424,18 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
             logging.warning(
                 f"⚠️ Fingerprint incomplete ({ve}) — falling back to legacy lookup"
             )
+
+        # ── Inject request-level variant/rarity into fp ───────────────────────
+        # _resolve_card_fingerprint only knows name/set/number/grade/language.
+        # The rarity band check in _reconcile_prices reads fp.get("rarity") —
+        # without this injection fp["rarity"] is always empty → band check skipped
+        # → wrong-card prices like the $944 Charizard (Double Rare, ceiling $150)
+        # pass through undetected.
+        if fp:
+            if rarity:       fp["rarity"]       = rarity
+            if variant_type: fp["variant_type"]  = variant_type
+            if finish:       fp["finish"]        = finish
+            if edition:      fp["edition"]       = edition
 
         # ── Step 2 (PRECISION PATH) ───────────────────────────────────────────
         if fp and not fp_error:
