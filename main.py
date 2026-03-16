@@ -6897,37 +6897,48 @@ async def _ebay_sold_strict(
     # ── eBay exclusion token for raw baseline ────────────────────────────────
     _raw_excl = "-PSA -BGS -CGC" if is_graded else ""
 
-    # Build query tiers: most-specific first, broadening as we go
+    # ── Build query tiers: most-specific first, broadening as we go ─────────
+    #
+    # Card number strategy:
+    #   • TCG cards (One Piece, Pokémon etc.): card_number (e.g. OP01-024) is the
+    #     single most important token — it uniquely identifies the card on eBay.
+    #     Sellers nearly always include it.  card_set name is OMITTED from the
+    #     primary tiers because adding it as a 5th AND-token reduces recall without
+    #     improving precision (e.g. "Monkey D. Luffy One Piece Emperors OP01-024"
+    #     matches far fewer listings than "Monkey D. Luffy OP01-024").
+    #     card_set is only added in secondary/fallback tiers.
+    #   • Non-TCG (Star Wars, sports, comics): sellers rarely include the card number
+    #     in listing titles.  Name + grade token is primary; card number is secondary.
     tiers = []
     if card_number:
-        # Tier 1: graded comp with PSA-equivalent grade token + variant
+        # ── Primary tiers: card_name + card_number (no set name) ─────────────
+        # These are the highest-recall queries for TCG cards on eBay AU/US.
         if is_graded and grade_token:
             if _variant_primary:
-                tiers.append(_q(card_name, card_set, card_number, _variant_primary, grade_token))
+                tiers.append(_q(card_name, card_number, _variant_primary, grade_token))
+            tiers.append(_q(card_name, card_number, grade_token))
+        if _variant_primary:
+            tiers.append(_q(card_name, card_number, _variant_primary))
+        tiers.append(_q(card_name, card_number))
+
+        # ── Secondary tiers: add card_set for disambiguation ──────────────────
+        # Used when the primary tiers return too few results (<MIN_SALES).
+        if is_graded and grade_token:
             tiers.append(_q(card_name, card_set, card_number, grade_token))
-        # Tier 2: variant + card number (raw, no grade filter)
         if _variant_primary:
             tiers.append(_q(card_name, card_set, card_number, _variant_primary))
-            tiers.append(_q(card_name, card_number, _variant_primary))
-        # Tier 3: plain card number tiers
         tiers.append(_q(card_name, card_set, card_number))
-        if language != "english":
-            tiers.append(_q(card_name, card_set, card_number, language.capitalize()))
-            tiers.append(_q(card_name, card_number, language.capitalize()))
-        else:
-            tiers.append(_q(card_name, card_number))
-        # Tier 4: raw baseline (exclude slabs for clean ungraded signal)
+
+        # ── Tertiary: raw baseline (exclude graded slabs) ─────────────────────
         if _raw_excl:
             if _variant_primary:
                 tiers.append(_q(card_name, card_number, _variant_primary, _raw_excl))
-            tiers.append(_q(card_name, card_set, card_number, _raw_excl))
             tiers.append(_q(card_name, card_number, _raw_excl))
     else:
-        # No card number — build name+set tiers (non-TCG path)
+        # No card number — name + set tiers (non-TCG path)
         if is_graded and grade_token:
             tiers.append(_q(card_name, card_set, grade_token))
         tiers.append(_q(card_name, card_set))
-        # Raw-only tier for non-TCG graded cards (Star Wars, sports, etc.)
         if _raw_excl:
             tiers.append(_q(card_name, card_set, _raw_excl))
 
