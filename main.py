@@ -568,7 +568,7 @@ def safe_endpoint(func):
 # ==============================
 # Config
 # ==============================
-APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-03-17-v6.9.6")
+APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-03-17-v6.9.14")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
@@ -7531,43 +7531,102 @@ async def _fetch_pricecharting_strict(fp: Dict[str, Any]) -> Dict[str, Any]:
 
     pc_prices = _pc_extract_price_fields(pc_merged)
 
-    raw_usd = None
-    for pk in ("loose-price", "loose_price", "used_price"):
-        if pk in pc_prices and isinstance(pc_prices[pk], (int, float)) and pc_prices[pk] > 0:
-            raw_usd = float(pc_prices[pk])
-            break
+    # ── PriceCharting field mapping for CARDS (from official docs) ──────────
+    # loose-price       = Ungraded raw
+    # manual-only-price = PSA 10  ← the correct PSA 10 field
+    # graded-price      = PSA 9   ← NOT PSA 10 as previously assumed
+    # box-only-price    = BGS 9.5 GemMint
+    # bgs-10-price      = BGS 10 Pristine
+    # new-price         = Graded 8 or 8.5
+    # condition-17-price= CGC 10
+    # condition-18-price= SGC 10
 
-    graded_usd = None
-    for pk in ("graded-price", "graded_price"):
-        if pk in pc_prices and isinstance(pc_prices[pk], (int, float)) and pc_prices[pk] > 0:
-            graded_usd = float(pc_prices[pk])
-            break
+    def _get_price(keys):
+        for k in keys:
+            v = pc_prices.get(k)
+            if isinstance(v, (int, float)) and float(v) > 0:
+                return float(v)
+        return None
+
+    raw_usd         = _get_price(["loose-price","loose_price","used_price"])
+    psa_10_usd      = _get_price(["manual-only-price","manual_only_price"])
+    psa_9_usd       = _get_price(["graded-price","graded_price"])
+    bgs_gem_usd     = _get_price(["box-only-price","box_only_price"])    # BGS 9.5 GemMint
+    bgs_10_usd      = _get_price(["bgs-10-price","bgs_10_price"])        # BGS 10 Pristine
+    cgc_10_usd      = _get_price(["condition-17-price","condition_17_price"])
+    sgc_10_usd      = _get_price(["condition-18-price","condition_18_price"])
+    grade_8_usd     = _get_price(["new-price","new_price"])              # Graded 8/8.5
+    grade_7_usd     = _get_price(["cib-price","cib_price"])              # Graded 7/7.5
+
+    # Use PSA 10 as primary graded signal; fall back to PSA 9
+    graded_usd = psa_10_usd or psa_9_usd
 
     if raw_usd is None and graded_usd is None:
         return {}
 
-    raw_aud    = _usd_to_aud_simple(raw_usd)    if raw_usd    else None
-    graded_aud = _usd_to_aud_simple(graded_usd) if graded_usd else None
+    raw_aud     = _usd_to_aud_simple(raw_usd)     if raw_usd     else None
+    psa_10_aud  = _usd_to_aud_simple(psa_10_usd)  if psa_10_usd  else None
+    psa_9_aud   = _usd_to_aud_simple(psa_9_usd)   if psa_9_usd   else None
+    graded_aud  = psa_10_aud or psa_9_aud
+    bgs_gem_aud = _usd_to_aud_simple(bgs_gem_usd) if bgs_gem_usd else None
+    bgs_10_aud  = _usd_to_aud_simple(bgs_10_usd)  if bgs_10_usd  else None
+    cgc_10_aud  = _usd_to_aud_simple(cgc_10_usd)  if cgc_10_usd  else None
+    sgc_10_aud  = _usd_to_aud_simple(sgc_10_usd)  if sgc_10_usd  else None
+    grade_8_aud = _usd_to_aud_simple(grade_8_usd) if grade_8_usd else None
+    grade_7_aud = _usd_to_aud_simple(grade_7_usd) if grade_7_usd else None
 
     logging.info(
-        f"✅ PriceCharting: raw=${raw_aud} AUD | graded=${graded_aud} AUD | "
-        f"number_validated={number_validated} | "
+        f"✅ PriceCharting: raw=${raw_aud} PSA10=${psa_10_aud} PSA9=${psa_9_aud} "
+        f"BGS_Gem=${bgs_gem_aud} BGS10={bgs_10_aud} CGC10={cgc_10_aud} SGC10={sgc_10_aud} | "
         f"product='{pc_merged.get('product-name') or pc_merged.get('name')}'"
     )
+
+    # For the reconciler: use PSA 10 as the primary signal (it's what eBay comps
+    # are also PSA-10 based). The grader brand factor will be applied on top.
+    _is_graded_lookup = fp.get("is_graded", False)
+    if _is_graded_lookup:
+        # Prefer PSA 10 (manual-only-price) as the graded signal.
+        # Fall back to PSA 9 (graded-price) only if PSA 10 not available.
+        # Raw is used when no graded price exists.
+        if psa_10_aud and psa_10_aud > 0:
+            _pc_median   = psa_10_aud
+            _pc_incl_grd = True
+        elif psa_9_aud and psa_9_aud > 0:
+            _pc_median   = psa_9_aud
+            _pc_incl_grd = True
+        else:
+            _pc_median   = raw_aud
+            _pc_incl_grd = False
+    else:
+        _pc_median   = raw_aud
+        _pc_incl_grd = False
+
     return {
         "source":                "pricecharting",
         "product_name":          pc_merged.get("product-name") or pc_merged.get("name"),
         "product_id":            pc_pid,
         "product_url":           pc_merged.get("url"),
+        # Ungraded
         "raw_price_usd":         raw_usd,
         "raw_price_aud":         raw_aud,
+        # PSA grades
+        "psa_10_price_aud":      psa_10_aud,
+        "psa_9_price_aud":       psa_9_aud,
         "graded_price_usd":      graded_usd,
         "graded_price_aud":      graded_aud,
-        "median":                raw_aud,
+        # Other graders
+        "bgs_gem_price_aud":     bgs_gem_aud,   # BGS 9.5
+        "bgs_10_price_aud":      bgs_10_aud,    # BGS 10 Pristine
+        "cgc_10_price_aud":      cgc_10_aud,
+        "sgc_10_price_aud":      sgc_10_aud,
+        "grade_8_price_aud":     grade_8_aud,
+        "grade_7_price_aud":     grade_7_aud,
+        # Reconciler signal
+        "median":                _pc_median,
         "card_number_validated": number_validated,
         "query":                 q_full,
         "count":                 5,
-        "price_includes_grade":  False,
+        "price_includes_grade":  _pc_incl_grd,
     }
 
 
@@ -8162,7 +8221,7 @@ def _cla_parse_grade(grade_str: str) -> float | None:
 #
 _CLA_GRADE_TIERS: List[tuple] = [
     # (min_grade, (mult_$3, mult_$15, mult_$50, mult_$150, mult_$500))
-    (12.0, (5.0,  3.5,  2.5,  1.80, 1.50)),  # CLA Ultra Flawless — CLA's premium grade
+    (12.0, (23.5, 17.6, 12.9,  9.40, 7.93)),  # CLA 12 Ultra Flawless = 90% BGS Black (CLA_10 × 5.8734)
     (10.0, (4.0,  3.0,  2.2,  1.60, 1.35)),  # CLA/PSA 10 Flawless
     ( 9.5, (3.0,  2.4,  1.9,  1.45, 1.25)),  # Near-gem
     ( 9.0, (2.5,  2.0,  1.6,  1.30, 1.15)),  # PSA 9 Mint
@@ -8528,14 +8587,14 @@ def _grader_brand_factor(grader: str, grade_str: str = "") -> float:
             factor = 0.810  # CGC 10 standard — calibrated from Baby5 (Charizard excluded as outlier)
 
     # ── CLA: 12-point scale ───────────────────────────────────────────────────
-    # CLA 10 Flawless       = PSA 10           → 1.000× (confirmed equivalency)
-    # CLA 11                = interpolated      → 2.554× (geometric mean 10↔12)
-    # CLA 12 Ultra Flawless = BGS 10 Black      → 6.525× (perfect grade)
+    # CLA 10 Flawless       = PSA 10            → 1.000× (confirmed equivalency)
+    # CLA 11                = interpolated       → 2.4235× (geometric mean 10↔12)
+    # CLA 12 Ultra Flawless = 90% of BGS Black  → 5.8734× (= 6.526 × 0.90)
     elif g == "CLA":
         if gv >= 12:
-            factor = 6.526  # Ultra Flawless = BGS 10 Black (3-card calibrated avg)
+            factor = 5.8734  # Ultra Flawless = 90% of BGS 10 Black
         elif gv >= 11:
-            factor = 2.554  # geometric interpolation between CLA 10 and CLA 12
+            factor = 2.4235  # geometric interpolation between CLA 10 and CLA 12
         else:
             factor = 1.000  # CLA 10 Flawless = PSA 10 (confirmed by CLA grading standard)
 
@@ -8805,6 +8864,29 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
             if finish:       fp["finish"]        = finish
             if edition:      fp["edition"]       = edition
 
+        # ── Pre-compute attribute estimate (always, for fallback + comparison) ──
+        # Uses CLA-native grade tiers — no grader brand factor applied.
+        # Available whether precision path succeeds or fails.
+        _attr_est: Dict[str, Any] = {}
+        try:
+            _attr_est = _cla_estimate_from_attributes(
+                game_type    = game_type,
+                rarity       = rarity,
+                variant_type = variant_type,
+                finish       = finish,
+                language     = language,
+                is_signed    = is_signed,
+                grade        = grade,
+                rank_within_card = getattr(request, "rank_within_card", None),
+                rank_total       = getattr(request, "rank_total",       None),
+                card_set     = card_set,
+                card_number  = card_number,
+                is_error     = is_error,
+                is_promo     = is_promo,
+            )
+        except Exception as _ae:
+            logging.info(f"Attr estimate skipped: {_ae}")
+
         # ── Step 2 (PRECISION PATH) ───────────────────────────────────────────
         if fp and not fp_error:
             # For CLA 12 (Ultra Flawless) — search BGS Black directly.
@@ -8826,14 +8908,63 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                     _fetch_pricecharting_strict(fp),
                     _ebay_sold_strict(_bgs_fp, limit=30, days_lookback=180),
                 )
-                # If BGS Black search found real sales, prefer it over PSA comp
+                # Priority 1: BGS Black eBay sold comps (most accurate)
                 if bgs_black_result and bgs_black_result.get("count", 0) >= 1:
                     logging.info(
-                        f"🏆 CLA 12: using BGS Black comp ${bgs_black_result.get('median', 0):.2f} AUD "
+                        f"🏆 CLA 12: using BGS Black eBay comp ${bgs_black_result.get('median', 0):.2f} AUD "
                         f"({bgs_black_result.get('count', 0)} sales) for {card_name}"
                     )
-                    # BGS Black IS the CLA 12 price — apply 1.0× factor (same grade)
+                    # BGS Black IS the CLA 12 price — grader factor already = 1.0 (same grade)
                     ebay_result = bgs_black_result
+
+                # Priority 2: PC BGS 10 Pristine × scale to CLA 12
+                # bgs-10-price = BGS 10 Pristine (1.307× PSA 10)
+                # CLA 12 = 5.8734× PSA 10, so CLA 12 = BGS10 × (5.8734/1.307) = × 4.494
+                elif pc_result and pc_result.get("bgs_10_price_aud"):
+                    _pc_bgs10  = float(pc_result["bgs_10_price_aud"])
+                    _cla12_from_pc = round(_pc_bgs10 * 4.494, 2)
+                    logging.info(
+                        f"🏆 CLA 12: PC BGS10 Pristine ${_pc_bgs10:.2f} AUD × 4.494 "
+                        f"= ${_cla12_from_pc:.2f} AUD for {card_name}"
+                    )
+                    ebay_result = {
+                        "source":               "pc_bgs10_scaled",
+                        "median":               _cla12_from_pc,
+                        "count":                3,
+                        "price_includes_grade": True,
+                        "query":                f"{card_name} BGS 10 Pristine (PriceCharting scaled)",
+                    }
+                # Priority 3: PC PSA 10 (manual-only-price) × 5.8734
+                elif pc_result and pc_result.get("psa_10_price_aud") and not ebay_result:
+                    _pc_psa10  = float(pc_result["psa_10_price_aud"])
+                    _cla12_from_pc = round(_pc_psa10 * 5.8734, 2)
+                    logging.info(
+                        f"🏆 CLA 12: PC PSA10 ${_pc_psa10:.2f} AUD × 5.8734 "
+                        f"= ${_cla12_from_pc:.2f} AUD for {card_name}"
+                    )
+                    ebay_result = {
+                        "source":               "pc_psa10_scaled",
+                        "median":               _cla12_from_pc,
+                        "count":                3,
+                        "price_includes_grade": True,
+                        "query":                f"{card_name} PSA 10 (PriceCharting scaled)",
+                    }
+                # Priority 4: PC graded-price (PSA 9) × 6.526 (one grade below PSA 10)
+                elif pc_result and pc_result.get("graded_price_aud") and not ebay_result:
+                    _pc_psa9   = float(pc_result["graded_price_aud"])
+                    # PSA 9 → PSA 10: approx 1.4× step, then × 5.8734
+                    _cla12_from_pc = round(_pc_psa9 * 1.40 * 5.8734, 2)
+                    logging.info(
+                        f"🏆 CLA 12: PC PSA9 ${_pc_psa9:.2f} AUD × 1.40 × 5.8734 "
+                        f"= ${_cla12_from_pc:.2f} AUD for {card_name}"
+                    )
+                    ebay_result = {
+                        "source":               "pc_psa9_scaled",
+                        "median":               _cla12_from_pc,
+                        "count":                2,
+                        "price_includes_grade": True,
+                        "query":                f"{card_name} PSA 9 (PriceCharting scaled)",
+                    }
             else:
                 tcg_result, ebay_result, pc_result = await asyncio.gather(
                     _fetch_pokemontcg_price(fp),
@@ -8956,12 +9087,29 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                     "tcgplayer_detail":     tcg_result  if tcg_result  else None,
                     "ebay_detail":          ebay_result if ebay_result else None,
                     "pricecharting_detail": pc_result   if pc_result   else None,
+                    "attr_estimate":        _attr_est.get("current_price", 0) if _attr_est else 0,
+                    "attr_estimate_detail": _attr_est if _attr_est else None,
+                    "price_source":         "market_comp",
                 }
 
-            logging.warning(
-                f"⚠️ Reconciler returned 0 for {card_name} #{card_number} "
-                f"— attempting attribute estimate before legacy ladder"
+            logging.info(
+                f"ℹ️ No market comps for {card_name} #{card_number} "
+                f"— using pre-computed attribute estimate"
             )
+            if _attr_est and _attr_est.get("current_price", 0) > 0:
+                _attr_est["card_name"]          = card_name
+                _attr_est["search_query"]       = ""
+                _attr_est["fingerprint_used"]   = True
+                _attr_est["grader_brand_factor"] = 1.0
+                _attr_est["price_source"]       = "attr_estimate"
+                _attr_est["tcgplayer_detail"]   = tcg_result  if tcg_result  else None
+                _attr_est["ebay_detail"]        = ebay_result if ebay_result else None
+                _attr_est["pricecharting_detail"] = pc_result if pc_result   else None
+                logging.info(
+                    f"📊 Attr estimate: ${_attr_est['current_price']:.2f} AUD "
+                    f"for {card_name} | tier={_attr_est.get('matched_rarity_tier','?')}"
+                )
+                return _attr_est
             # Try attribute estimate now — the precision path found sources but
             # the floor guard (or all-zero signals) killed the price.  The legacy
             # ladder may just repeat the same bad signal; the estimate is more
@@ -8985,14 +9133,10 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                         card_number  = card_number,
                     )
                     if _pest.get("current_price", 0) > 0:
-                        # Apply grader brand factor to attribute estimate
-                        _gbf_attr = _grader_brand_factor(grader, grade)
-                        if _gbf_attr != 1.0 and grader:
-                            _pest["current_price"] = round(float(_pest["current_price"]) * _gbf_attr, 2)
-                            _pest["final_value"]   = _pest["current_price"]
-                            _pest["final_price"]   = _pest["current_price"]
-                            logging.info(f"🏷️ Grader brand factor (attr est): {grader} {_gbf_attr:.2f}x → ${_pest['current_price']:.2f}")
-                        _pest["grader_brand_factor"] = _gbf_attr
+                        # Do NOT apply grader brand factor to attribute estimates.
+                        # The attr estimate uses CLA-specific grade multipliers already.
+                        # Brand factor only applies when converting PSA eBay comps.
+                        _pest["grader_brand_factor"] = 1.0
                         _pest["card_name"]     = card_name
                         _pest["search_query"]  = ""
                         _pest["fingerprint_used"] = True
