@@ -8343,60 +8343,127 @@ def _parse_grade_from_query(q: str) -> float | None:
 
 
 # ── Grader brand factor ──────────────────────────────────────────────────────
-# eBay comps are almost always PSA-graded. A CLA/CGC/BGS slab of the same card
-# in the same grade commands a different resale price. This factor converts a
-# PSA-based comp into the equivalent value for whichever grader holds the card.
+# eBay comps are almost always PSA-graded. Converts a PSA-based comp price into
+# the estimated resale value for whichever grader + grade actually holds the card.
 #
-# Grader tier (resale value relative to PSA baseline, AU market 2025):
-#   PSA  1.00  — dominant global brand, highest liquidity worldwide
-#   CGC  0.90  — strong brand, gap to PSA closing fast (especially TCG)
-#   BGS  0.85  — Beckett; strong for sports/vintage, slightly below PSA for TCG
-#   SGC  0.78  — solid vintage brand, being acquired by PSA parent company
-#   CLA  0.85  — Collectors League; worldwide service, strong AU community,
-#                proprietary 12-point scale (Grade 12 = Ultra Flawless unique)
-#   CGA  0.70  — Card Grading Australia; AU regional only, limited liquidity
-#   TAG  0.80  — AI-driven grading; growing acceptance, competitive pricing
-#   HGA  0.75  — Hybrid Grading Approach; niche, limited global liquidity
-#   ACE  0.72  — ACE Grading (UK); limited AU market presence
+# Calibrated from real PriceCharting data (Baby 5 Alt Art OP05-034, Mar 2026):
+#   SGC 10:          $35  → 0.602× PSA 10
+#   CGC 10:          $47  → 0.809× PSA 10
+#   PSA 10:          $58  → 1.000× (baseline)
+#   BGS 10 Pristine: $76  → 1.307× PSA 10  ← BGS 10 > PSA 10 (much rarer)
+#   CGC 10 Pristine: $85  → 1.462× PSA 10
+#   BGS 10 Black:   $380  → 6.537× PSA 10  ← Perfect score, near impossible
 #
-# CLA Grade 12 (Ultra Flawless):
-#   No PSA 12 exists. CLA12 slabs are unique collector items. We apply a small
-#   10% premium over the base CLA factor, capped at PSA parity (1.0), to
-#   reflect the scarcity value of the highest-certified copy.
+# CRITICAL — BGS grading scale differs from PSA:
+#   BGS 9.5 Gem Mint  ≈ PSA 10 (standard gem grade, similar price to CGC 10)
+#   BGS 10 Pristine   > PSA 10 (rarer, 1.3× more valuable)
+#   BGS 10 Black      >> PSA 10 (all sub-grades perfect, 6× more valuable)
+#
+# CLA (Collectors League — worldwide grader, 12-point scale):
+#   CLA 10 Flawless      ≈ 0.70× PSA 10  (between SGC 0.60 and CGC 0.81)
+#   CLA 12 Ultra Flawless ≈ 0.95× PSA 10  (premium unique grade, near PSA parity)
+#
+# The function is GRADE-AWARE for BGS/CGC/CLA since those graders use
+# non-standard scales or have distinct tiers within the same numeric grade.
 
-_GRADER_BRAND_FACTORS: Dict[str, float] = {
-    "PSA":        1.00,
-    "CGC":        0.90,
-    "BGS":        0.85,
-    "BECKETT":    0.85,
-    "SGC":        0.78,
-    "CLA":        0.85,
-    "COLLECTORS LEAGUE": 0.85,
-    "CGA":        0.70,
-    "TAG":        0.80,
-    "HGA":        0.75,
-    "ACE":        0.72,
-    "":           0.80,   # unknown grader — conservative default
+# Base factors calibrated from real PriceCharting data (2 cards, Mar 2026)
+# and CLA grading philosophy (confirmed by CLA):
+#
+#   CLA grading equivalency (confirmed):
+#     CLA 10 Flawless       = PSA 10          → 1.000× PSA
+#     CLA 11                = interpolated     → 2.554× PSA (geometric mean of 10 and 12)
+#     CLA 12 Ultra Flawless = BGS 10 Black     → 6.525× PSA (perfect grade, all sub-scores max)
+#
+#   Other graders (calibrated from real PriceCharting data):
+#     SGC 10:          0.599× avg (Baby5 + Charizard — high confidence)
+#     CGC 10:          0.810× (Baby5; Charizard excluded as thin-market outlier)
+#     BGS 9.5 GemMint: 0.810× (≈ CGC 10, same price tier)
+#     BGS 10 Pristine: 1.305× (consistently above PSA 10 across both cards)
+#     BGS 10 Black:    6.525× (= CLA 12, perfect grade, near impossible)
+#     CGC 10 Pristine: 1.280× (averaged from both cards)
+#     TAG 10:          0.930× (Charizard only — single point)
+#     ACE 10:          0.490× (Charizard only — single point)
+
+_GRADER_BASE_FACTORS: Dict[str, float] = {
+    "PSA":        1.000,
+    "CGC":        0.810,  # calibrated (Baby5 reliable); Charizard thin-market excluded
+    "BGS":        0.810,  # BGS 9.5 GemMint default — grade-aware logic handles Pristine/Black
+    "BECKETT":    0.810,
+    "SGC":        0.600,  # 0.599× averaged across 2 cards — high confidence
+    "CLA":        1.000,  # CLA 10 = PSA 10 (confirmed by CLA grading standard)
+    "COLLECTORS LEAGUE": 1.000,
+    "CGA":        0.600,  # regional AU only, similar to SGC
+    "TAG":        0.930,  # real data (Charizard) — single point, use cautiously
+    "HGA":        0.650,  # estimated
+    "ACE":        0.490,  # real data (Charizard) — single point
+    "":           0.800,  # unknown — conservative default
 }
 
 def _grader_brand_factor(grader: str, grade_str: str = "") -> float:
+    """
+    Return multiplier to convert a PSA-based eBay comp into estimated value
+    for the actual grader + grade on the slab.
+
+    Grade-aware for BGS (9.5/10/10 Black), CGC (10/Pristine), and
+    CLA (10 Flawless / 12 Ultra Flawless).
+    """
     g = (grader or "").strip().upper()
+    # Normalise aliases
     if g in ("COLLECTORS LEAGUE", "COLLECTORS LEAGUE AUSTRALIA", "CL"):
         g = "CLA"
     if g in ("BECKETT", "BECKETT GRADING", "BVG"):
         g = "BGS"
     if g in ("CERTIFIED GUARANTY", "CERTIFIED GUARANTY COMPANY"):
         g = "CGC"
-    factor = _GRADER_BRAND_FACTORS.get(g, _GRADER_BRAND_FACTORS[""])
-    # CLA 12 (Ultra Flawless) earns a small premium — unique grade, no PSA equiv
-    if g == "CLA" and grade_str:
+
+    factor = _GRADER_BASE_FACTORS.get(g, _GRADER_BASE_FACTORS[""])
+
+    # Parse numeric grade value
+    gv = 0.0
+    grade_lower = (grade_str or "").lower()
+    if grade_str:
         try:
-            import re as _re
-            gv = float(_re.search(r"(\d+(?:\.\d+)?)", grade_str).group(1))
-            if gv >= 12:
-                factor = min(factor * 1.10, 1.00)
+            m = re.search(r"(\d+(?:\.\d+)?)", grade_str)
+            if m:
+                gv = float(m.group(1))
         except Exception:
             pass
+
+    # ── BGS: grade-aware tiers ────────────────────────────────────────────────
+    # BGS 9.5 GemMint ≈ PSA 10 in grade but ~0.81× in price (same as CGC 10)
+    # BGS 10 Pristine > PSA 10: 1.307× (real data)
+    # BGS 10 Black (Perfect): all sub-grades 10 — ~6.5× PSA 10 (near impossible)
+    if g == "BGS":
+        is_black    = "black" in grade_lower or "perfect" in grade_lower
+        is_pristine = gv >= 10.0 and not is_black
+        if is_black:
+            factor = 6.50   # BGS 10 Black / Perfect
+        elif is_pristine:
+            factor = 1.307  # BGS 10 Pristine — rarer, MORE than PSA 10
+        else:
+            factor = 0.810  # BGS 9.5 Gem Mint — equivalent grade to PSA 10
+
+    # ── CGC: standard 10 vs Pristine tier ────────────────────────────────────
+    # CGC 10 standard = 0.81× PSA 10
+    # CGC 10 Pristine = 1.46× PSA 10 (real data)
+    elif g == "CGC":
+        if "pristine" in grade_lower:
+            factor = 1.280  # CGC 10 Pristine — averaged Baby5(1.462) + Charizard(1.101)
+        else:
+            factor = 0.810  # CGC 10 standard — calibrated from Baby5 (Charizard excluded as outlier)
+
+    # ── CLA: 12-point scale ───────────────────────────────────────────────────
+    # CLA 10 Flawless       = PSA 10           → 1.000× (confirmed equivalency)
+    # CLA 11                = interpolated      → 2.554× (geometric mean 10↔12)
+    # CLA 12 Ultra Flawless = BGS 10 Black      → 6.525× (perfect grade)
+    elif g == "CLA":
+        if gv >= 12:
+            factor = 6.525  # Ultra Flawless = BGS 10 Black — perfect, all sub-scores max
+        elif gv >= 11:
+            factor = 2.554  # geometric interpolation between CLA 10 and CLA 12
+        else:
+            factor = 1.000  # CLA 10 Flawless = PSA 10 (confirmed by CLA grading standard)
+
     return round(factor, 4)
 
 def apply_cla_valuation(signal_price: float, signal_includes_grade: bool, search_query: str, target_grade: str | None,
