@@ -3292,6 +3292,15 @@ def root():
 def head_root():
     return Response(status_code=200)
 
+@app.get("/robots.txt", include_in_schema=False)
+def robots_txt():
+    """Tell crawlers this is a private API - nothing to index."""
+    return Response(
+        content="User-agent: *\nDisallow: /\n",
+        media_type="text/plain",
+    )
+
+
 @app.get("/health")
 def health():
     return {
@@ -6891,7 +6900,8 @@ async def _ebay_sold_strict(
         if n >= 7:   return "PSA 7"
         return "PSA 6"
 
-    grade_token = _psa_equiv_token(grade) if (is_graded and grade) else ""
+    # Allow caller to override the grade token (used for CLA 12 → BGS Black search)
+    grade_token = fp.get("_grade_token_override") or (_psa_equiv_token(grade) if (is_graded and grade) else "")
 
     # ── Variant tokens for primary tiers ────────────────────────────────────
     # Variant (Rare Parallel, Secret Rare, etc.) previously only entered a
@@ -7405,9 +7415,12 @@ async def _fetch_pokemontcg_price(fp: Dict[str, Any]) -> Dict[str, Any]:
 async def _fetch_pricecharting_strict(fp: Dict[str, Any]) -> Dict[str, Any]:
     """
     PriceCharting lookup with card-number validation.
-    Queries using card name + set + number.  Validates that the returned
-    product's name or URL contains the card number before using its price,
-    preventing cross-card contamination from fuzzy name matching.
+
+    Fixes applied:
+    1. Category passed to _pc_search (avoids cross-game false matches)
+    2. Query ladder: full → name+number only → name+set → name only
+    3. Number validation relaxed: also checks bare number suffix (e.g. '024' from 'OP01-024')
+    4. Detailed logging of what PC returns so mismatches are diagnosable
     """
     if not PRICECHARTING_TOKEN:
         return {}
@@ -7415,34 +7428,88 @@ async def _fetch_pricecharting_strict(fp: Dict[str, Any]) -> Dict[str, Any]:
     card_name   = fp["card_name"]
     card_set    = fp["card_set"]
     card_number = fp.get("card_number", "")
+    game_type   = (fp.get("game_type") or "").lower().strip()
+
+    # Map game_type to PriceCharting category slug
+    _PC_CAT_MAP = {
+        "pokemon":     "pokemon-cards",
+        "pokémon":     "pokemon-cards",
+        "ptcg":        "pokemon-cards",
+        "one piece":   "one-piece-cards",
+        "onepiece":    "one-piece-cards",
+        "magic":       "magic-cards",
+        "mtg":         "magic-cards",
+        "yugioh":      "yugioh-cards",
+        "dragon ball":  "dragon-ball-super-cards",
+        "dragonball":  "dragon-ball-super-cards",
+        "digimon":     "digimon-cards",
+        "sports":      "sports-cards",
+    }
+    pc_category = None
+    for gk, cat in _PC_CAT_MAP.items():
+        if gk in game_type:
+            pc_category = cat
+            break
+
+    # Number variants for validation — including bare suffix (e.g. '024' from 'OP01-024')
+    num_lower   = card_number.lower().strip()
+    num_bare    = re.sub(r'^[a-z]+0*', '', num_lower)  # 'op01-024' → '1-024', strip to '024'
+    num_bare    = re.sub(r'^\d+-', '', num_bare)       # '1-024' → '024'
+    num_variants = list(dict.fromkeys(filter(None, [
+        num_lower,
+        f"#{num_lower}",
+        f"/{num_lower}",
+        num_bare,
+        f"#{num_bare}",
+        f"/{num_bare}",
+    ])))
+
+    name_first_word = (card_name.split()[0]).lower() if card_name.split() else ""
 
     async def _try_query(q: str, require_number: bool) -> Optional[Dict[str, Any]]:
-        products = await _pc_search(q, limit=8)
+        products = await _pc_search(q, category=pc_category, limit=10)
+        logging.info(
+            f"🔍 PC search: '{q}' cat={pc_category} → {len(products)} results"
+        )
         if not products:
             return None
-        num_lower        = card_number.lower()
-        name_first_word  = (card_name.split()[0]).lower() if card_name.split() else ""
-        num_variants     = [num_lower, f"#{num_lower}", f"/{num_lower}", f"- {num_lower}"]
         for product in products:
             pname = str(product.get("product-name") or product.get("name") or "").lower()
             purl  = str(product.get("url") or "").lower()
-            num_matched  = any(v in pname or v in purl
-                               for v in num_variants if v.strip("#/- "))
+            num_matched  = any(v in pname or v in purl for v in num_variants if v)
             name_matched = name_first_word and name_first_word in pname
+            logging.info(
+                f"   PC candidate: '{pname}' | name_matched={name_matched} num_matched={num_matched}"
+            )
             if require_number and num_matched and name_matched:
                 return product
             elif (not require_number) and name_matched:
                 return product
         return None
 
-    q_full    = _norm_ws(f"{card_name} {card_set} {card_number}")
-    validated = await _try_query(q_full, require_number=True)
-    number_validated = True
+    # ── Query ladder: most specific → broadest ────────────────────────────────
+    # Tier 1: name + set + number (full fingerprint)
+    q_full     = _norm_ws(f"{card_name} {card_set} {card_number}")
+    # Tier 2: name + number only (skips noisy set name)
+    q_num_only = _norm_ws(f"{card_name} {card_number}")
+    # Tier 3: name + set (no number)
+    q_base     = _norm_ws(f"{card_name} {card_set}")
+    # Tier 4: name only (broadest — only used without number requirement)
+    q_name     = _norm_ws(card_name)
 
-    if not validated:
-        q_base    = _norm_ws(f"{card_name} {card_set}")
-        validated = await _try_query(q_base, require_number=False)
-        number_validated = False
+    validated        = None
+    number_validated = False
+
+    for q, req_num in [
+        (q_full,     True),
+        (q_num_only, True),   # ← key fix: name+number without noisy set name
+        (q_base,     False),
+        (q_name,     False),
+    ]:
+        validated = await _try_query(q, require_number=req_num)
+        if validated:
+            number_validated = req_num
+            break
 
     if not validated:
         logging.info(f"PriceCharting: no validated match for {card_name} #{card_number}")
@@ -8732,11 +8799,39 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
 
         # ── Step 2 (PRECISION PATH) ───────────────────────────────────────────
         if fp and not fp_error:
-            tcg_result, ebay_result, pc_result = await asyncio.gather(
-                _fetch_pokemontcg_price(fp),
-                _ebay_sold_strict(fp, limit=60, days_lookback=90),
-                _fetch_pricecharting_strict(fp),
-            )
+            # For CLA 12 (Ultra Flawless) — search BGS Black directly.
+            # CLA 12 = BGS 10 Black by grading standard. The BGS Black price
+            # is card-specific and cannot be derived from PSA × fixed_factor
+            # (e.g. Luffy: BGS Black=$1,000 but PSA=$43 → 22.8× vs avg 6.5×).
+            # Searching BGS Black directly gives the correct card-specific price.
+            _is_cla12 = grade_is_12_plus and grader.upper() in ("CLA", "COLLECTORS LEAGUE", "")
+            if _is_cla12:
+                _bgs_fp = dict(fp)
+                _bgs_fp["grade"]    = "10"
+                _bgs_fp["is_graded"] = True
+                # "BGS 10 Black" or "BGS 10" with Black keyword — FindingService will
+                # match "BGS 10 Black" in listing titles
+                _bgs_fp["_grade_token_override"] = "BGS 10 Black"
+                tcg_result, ebay_result, pc_result, bgs_black_result = await asyncio.gather(
+                    _fetch_pokemontcg_price(fp),
+                    _ebay_sold_strict(fp, limit=60, days_lookback=90),
+                    _fetch_pricecharting_strict(fp),
+                    _ebay_sold_strict(_bgs_fp, limit=30, days_lookback=180),
+                )
+                # If BGS Black search found real sales, prefer it over PSA comp
+                if bgs_black_result and bgs_black_result.get("count", 0) >= 1:
+                    logging.info(
+                        f"🏆 CLA 12: using BGS Black comp ${bgs_black_result.get('median', 0):.2f} AUD "
+                        f"({bgs_black_result.get('count', 0)} sales) for {card_name}"
+                    )
+                    # BGS Black IS the CLA 12 price — apply 1.0× factor (same grade)
+                    ebay_result = bgs_black_result
+            else:
+                tcg_result, ebay_result, pc_result = await asyncio.gather(
+                    _fetch_pokemontcg_price(fp),
+                    _ebay_sold_strict(fp, limit=60, days_lookback=90),
+                    _fetch_pricecharting_strict(fp),
+                )
 
             sources = {
                 "tcgplayer":     tcg_result,
