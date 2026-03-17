@@ -7813,6 +7813,7 @@ class MarketPriceLookupRequest(BaseModel):
     is_promo: Optional[bool] = None        # Tournament / event / prerelease promo
     language: Optional[str] = None         # Japanese, Korean, Chinese — omit/None for English default
     extra_attributes: Optional[str] = None # Catch-all: Prerelease stamp, Staff stamp, Galaxy foil etc.
+    grader: Optional[str] = None           # PSA / BGS / CGC / SGC / CLA / CGA / TAG etc.
 
 
 
@@ -8340,6 +8341,64 @@ def _parse_grade_from_query(q: str) -> float | None:
     except Exception:
         return None
 
+
+# ── Grader brand factor ──────────────────────────────────────────────────────
+# eBay comps are almost always PSA-graded. A CLA/CGC/BGS slab of the same card
+# in the same grade commands a different resale price. This factor converts a
+# PSA-based comp into the equivalent value for whichever grader holds the card.
+#
+# Grader tier (resale value relative to PSA baseline, AU market 2025):
+#   PSA  1.00  — dominant global brand, highest liquidity worldwide
+#   CGC  0.90  — strong brand, gap to PSA closing fast (especially TCG)
+#   BGS  0.85  — Beckett; strong for sports/vintage, slightly below PSA for TCG
+#   SGC  0.78  — solid vintage brand, being acquired by PSA parent company
+#   CLA  0.85  — Collectors League; worldwide service, strong AU community,
+#                proprietary 12-point scale (Grade 12 = Ultra Flawless unique)
+#   CGA  0.70  — Card Grading Australia; AU regional only, limited liquidity
+#   TAG  0.80  — AI-driven grading; growing acceptance, competitive pricing
+#   HGA  0.75  — Hybrid Grading Approach; niche, limited global liquidity
+#   ACE  0.72  — ACE Grading (UK); limited AU market presence
+#
+# CLA Grade 12 (Ultra Flawless):
+#   No PSA 12 exists. CLA12 slabs are unique collector items. We apply a small
+#   10% premium over the base CLA factor, capped at PSA parity (1.0), to
+#   reflect the scarcity value of the highest-certified copy.
+
+_GRADER_BRAND_FACTORS: Dict[str, float] = {
+    "PSA":        1.00,
+    "CGC":        0.90,
+    "BGS":        0.85,
+    "BECKETT":    0.85,
+    "SGC":        0.78,
+    "CLA":        0.85,
+    "COLLECTORS LEAGUE": 0.85,
+    "CGA":        0.70,
+    "TAG":        0.80,
+    "HGA":        0.75,
+    "ACE":        0.72,
+    "":           0.80,   # unknown grader — conservative default
+}
+
+def _grader_brand_factor(grader: str, grade_str: str = "") -> float:
+    g = (grader or "").strip().upper()
+    if g in ("COLLECTORS LEAGUE", "COLLECTORS LEAGUE AUSTRALIA", "CL"):
+        g = "CLA"
+    if g in ("BECKETT", "BECKETT GRADING", "BVG"):
+        g = "BGS"
+    if g in ("CERTIFIED GUARANTY", "CERTIFIED GUARANTY COMPANY"):
+        g = "CGC"
+    factor = _GRADER_BRAND_FACTORS.get(g, _GRADER_BRAND_FACTORS[""])
+    # CLA 12 (Ultra Flawless) earns a small premium — unique grade, no PSA equiv
+    if g == "CLA" and grade_str:
+        try:
+            import re as _re
+            gv = float(_re.search(r"(\d+(?:\.\d+)?)", grade_str).group(1))
+            if gv >= 12:
+                factor = min(factor * 1.10, 1.00)
+        except Exception:
+            pass
+    return round(factor, 4)
+
 def apply_cla_valuation(signal_price: float, signal_includes_grade: bool, search_query: str, target_grade: str | None,
                         rank_within_card: int | None = None, rank_total: int | None = None,
                         slab_premium_add_aud: float = 70.0) -> dict:
@@ -8554,6 +8613,7 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
         signed_by    = (request.signed_by    or "").strip()
         is_error     = bool(request.is_error_card)
         is_promo     = bool(request.is_promo)
+        grader       = (getattr(request, "grader", None) or "").strip().upper()
 
         if not card_name:
             return {"current_price": 0, "source": "error", "error": "card_name required"}
@@ -8678,9 +8738,20 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                 primary_source = "no_results"
 
             if final_price > 0:
+                # Apply grader brand factor — eBay comps are almost always PSA.
+                # Adjust the final price to reflect the actual grader on the slab.
+                _gbf = _grader_brand_factor(grader, grade)
+                if _gbf != 1.0 and grader:
+                    _pre_brand = final_price
+                    final_price = round(final_price * _gbf, 2)
+                    logging.info(
+                        f"🏷️ Grader brand factor: {grader} {_gbf:.2f}x | "
+                        f"${_pre_brand:.2f} → ${final_price:.2f} AUD"
+                    )
                 logging.info(
                     f"✅ Precision price: ${final_price:.2f} AUD | "
                     f"signal=${signal_price:.2f} | confidence={confidence} | "
+                    f"grader={grader or 'PSA'} brand_factor={_gbf:.2f} | "
                     f"sources={sources_used} | breakdown={rec['source_breakdown']}"
                 )
                 return {
@@ -8709,6 +8780,8 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                     "search_query":         (ebay_result or {}).get("query", ""),
                     "last_updated":         datetime.now().isoformat(),
                     "fingerprint_used":     True,
+                    "grader":               grader or "PSA",
+                    "grader_brand_factor":  _gbf,
                     # Individual source details (admin/debug)
                     "tcgplayer_detail":     tcg_result  if tcg_result  else None,
                     "ebay_detail":          ebay_result if ebay_result else None,
@@ -8742,6 +8815,14 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                         card_number  = card_number,
                     )
                     if _pest.get("current_price", 0) > 0:
+                        # Apply grader brand factor to attribute estimate
+                        _gbf_attr = _grader_brand_factor(grader, grade)
+                        if _gbf_attr != 1.0 and grader:
+                            _pest["current_price"] = round(float(_pest["current_price"]) * _gbf_attr, 2)
+                            _pest["final_value"]   = _pest["current_price"]
+                            _pest["final_price"]   = _pest["current_price"]
+                            logging.info(f"🏷️ Grader brand factor (attr est): {grader} {_gbf_attr:.2f}x → ${_pest['current_price']:.2f}")
+                        _pest["grader_brand_factor"] = _gbf_attr
                         _pest["card_name"]     = card_name
                         _pest["search_query"]  = ""
                         _pest["fingerprint_used"] = True
@@ -8948,6 +9029,11 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                 valuation   = None
                 final_price = float(price or 0.0)
 
+            # Apply grader brand factor — legacy ladder path
+            _gbf_leg = _grader_brand_factor(grader, grade)
+            if _gbf_leg != 1.0 and grader:
+                final_price = round(final_price * _gbf_leg, 2)
+                logging.info(f"🏷️ Grader brand factor (legacy): {grader} {_gbf_leg:.2f}x → ${final_price:.2f}")
             return {
                 "current_price":        final_price,
                 "signal_price":         float(price or 0.0),
@@ -8958,6 +9044,8 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                 "target_multiplier":    (valuation.get("target_multiplier")   if valuation else 1.0),
                 "base_multiplier":      (valuation.get("base_multiplier")     if valuation else 1.0),
                 "confidence":           "low",
+                "grader":               grader or "PSA",
+                "grader_brand_factor":  _gbf_leg,
                 "sources_used":         [source],
                 "source":               source,
                 "search_query":         search_query,
