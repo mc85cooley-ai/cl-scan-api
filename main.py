@@ -8437,7 +8437,7 @@ def _grader_brand_factor(grader: str, grade_str: str = "") -> float:
         is_black    = "black" in grade_lower or "perfect" in grade_lower
         is_pristine = gv >= 10.0 and not is_black
         if is_black:
-            factor = 6.50   # BGS 10 Black / Perfect
+            factor = 6.526  # BGS 10 Black — Baby5+Charizard avg (6.537+6.514); Luffy pop-anomaly excluded
         elif is_pristine:
             factor = 1.307  # BGS 10 Pristine — rarer, MORE than PSA 10
         else:
@@ -8458,7 +8458,7 @@ def _grader_brand_factor(grader: str, grade_str: str = "") -> float:
     # CLA 12 Ultra Flawless = BGS 10 Black      → 6.525× (perfect grade)
     elif g == "CLA":
         if gv >= 12:
-            factor = 6.525  # Ultra Flawless = BGS 10 Black — perfect, all sub-scores max
+            factor = 6.526  # Ultra Flawless = BGS 10 Black (3-card calibrated avg)
         elif gv >= 11:
             factor = 2.554  # geometric interpolation between CLA 10 and CLA 12
         else:
