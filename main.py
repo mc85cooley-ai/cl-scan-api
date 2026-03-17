@@ -568,7 +568,7 @@ def safe_endpoint(func):
 # ==============================
 # Config
 # ==============================
-APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-03-17-v6.9.5")
+APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-03-17-v6.9.6")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
