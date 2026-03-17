@@ -7245,12 +7245,9 @@ async def _ebay_sold_strict(
         return best_result
 
     # ── Active listings fallback (new/thin-market sets) ──────────────────────
-    # When findCompletedItems returns nothing (e.g. a brand-new set like
-    # Phantasmal Flames with few sold comps yet), fall back to active BUY-IT-NOW
-    # listings via the Browse API so the card still gets a price signal.
-    # Active prices are typically slightly higher than sold prices, so we bias
-    # toward the low end (p20) as the baseline rather than the median.
-    logging.info(f"⚠️ eBay strict: no sold comps found — attempting active listings fallback")
+    # When findCompletedItems returns nothing (e.g. a brand-new set with few
+    # sold comps yet), fall back to active BUY-IT-NOW listings via Browse API.
+    logging.info("⚠️ eBay strict: no sold comps found — attempting active listings fallback")
     try:
         active_query = query_tiers[0] if query_tiers else _q(card_name, card_number)
         active_items = await _ebay_find_items(active_query, limit=20, sold=False)
@@ -7268,10 +7265,14 @@ async def _ebay_sold_strict(
             def _apct(lst, p):
                 idx = max(0, min(len(lst)-1, int(len(lst)*p/100)))
                 return float(lst[idx])
+            _grade_in_active_q = bool(re.search(
+                r'\bPSA\s*\d|\bBGS\s*\d|\bCGC\s*\d|\bgraded\b',
+                active_query, re.I
+            ))
             logging.info(
                 f"✅ eBay active fallback: {len(active_prices)} listings | "
                 f"low={_apct(active_prices,20):.2f} median={_apct(active_prices,50):.2f} | "
-                f"query='{active_query}'"
+                f"price_includes_grade={_grade_in_active_q} | query='{active_query}'"
             )
             return {
                 "source":               "ebay_active",
@@ -7288,7 +7289,7 @@ async def _ebay_sold_strict(
                 "min":                  float(active_prices[0]),
                 "max":                  float(active_prices[-1]),
                 "card_number_enforced": True,
-                "price_includes_grade": False,
+                "price_includes_grade": _grade_in_active_q,
                 "note":                 "Active listing prices (no sold comps available yet for this set)",
             }
     except Exception as _e:
@@ -7956,7 +7957,28 @@ def _cla_estimate_from_attributes(
             _fallback = _gv
             break
 
-    search_str  = f"{rar} {var} {fin}".lower()
+    # Normalise ASCII star (*) to Unicode ★ and expand shorthand notations
+    # so stored values like "Rare *", "SR*", "R*" all resolve correctly.
+    def _norm_rarity_str(s: str) -> str:
+        s = s.lower().strip()
+        # Most-specific patterns first (super rare before rare, leader before r)
+        s = re.sub(r'super\s+rare\s+\*(\s+parallel)?', 'super rare parallel', s)
+        s = re.sub(r'leader\s+\*(\s+parallel)?',        'leader parallel',     s)
+        s = re.sub(r'rare\s+\*(\s+parallel)?',          'rare parallel',       s)
+        # Bare SR* / R* / L* (no trailing word boundary needed: * is non-word)
+        s = re.sub(r'\bsr\*', 'super rare parallel', s)
+        s = re.sub(r'\br\*',  'rare parallel',       s)
+        s = re.sub(r'\bl\*',  'leader parallel',     s)
+        # Unicode star shorthand already in DB
+        s = re.sub(r'\bsr★', 'super rare parallel', s)
+        s = re.sub(r'\br★',  'rare parallel',       s)
+        s = re.sub(r'\bl★',  'leader parallel',     s)
+        # Written-out "SR Parallel" / "R Parallel"
+        s = re.sub(r'\bsr\s+parallel\b', 'super rare parallel', s)
+        s = re.sub(r'\br\s+parallel\b',  'rare parallel',       s)
+        return s
+
+    search_str = _norm_rarity_str(f"{rar} {var} {fin}")
     base_aud    = _fallback
     matched_tier = "unknown"
     for key, price in game_table:
@@ -8386,7 +8408,14 @@ def _rarity_price_band(
     the same (a low grade doesn't become more valuable just because it's slabbed).
     """
     g = (game_type or "").lower().strip()
-    r = (rarity    or "").lower().strip()
+    _r_raw = (rarity or "").lower().strip()
+    # Normalise ASCII * to Unicode ★ and expand shorthand (matches _cla_estimate_from_attributes)
+    _r_raw = re.sub(r'\br\*\b',  'r★',  _r_raw)
+    _r_raw = re.sub(r'\bsr\*\b', 'sr★', _r_raw)
+    _r_raw = re.sub(r'rare\s+\*',          'rare parallel',       _r_raw)
+    _r_raw = re.sub(r'super\s+rare\s+\*', 'super rare parallel', _r_raw)
+    _r_raw = re.sub(r'leader\s+\*',        'leader parallel',     _r_raw)
+    r = _r_raw
 
     # ── Band definitions: (floor_aud, ceiling_aud) ─────────────────────────
     # Bands cover the realistic secondary market range.
