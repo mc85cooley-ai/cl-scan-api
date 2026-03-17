@@ -7914,12 +7914,11 @@ def _cla_estimate_from_attributes(
         ("common",                      1.0),
     ]
     _STAR_WARS_BASES: List[tuple] = [
-        # Most-specific / highest-value first
-        ("hologram",          60.0),   # Factory Set holograms — scarce inserts
-        ("limited edition",   55.0),   # Limited/numbered parallels
-        ("series ii",         35.0),   # Galaxy Series II (Limited Edition) — low print run
-        ("galaxy",            30.0),   # Galaxy Series base — premium oversized art cards
-        ("dark empire",       22.0),   # Dark Empire / Dark Empire II painted cards
+        ("hologram",          60.0),
+        ("limited edition",   55.0),
+        ("series ii",         35.0),
+        ("galaxy",            30.0),
+        ("dark empire",       22.0),
         ("chromium",          25.0),
         ("chrome",            25.0),
         ("foil",              20.0),
@@ -7970,14 +7969,15 @@ def _cla_estimate_from_attributes(
         s = re.sub(r'super\s+rare\s+\*(\s+parallel)?', 'super rare parallel', s)
         s = re.sub(r'leader\s+\*(\s+parallel)?',        'leader parallel',     s)
         s = re.sub(r'rare\s+\*(\s+parallel)?',          'rare parallel',       s)
-        # Bare SR* / R* / L* (no trailing word boundary needed: * is non-word)
-        s = re.sub(r'\bsr\*', 'super rare parallel', s)
-        s = re.sub(r'\br\*',  'rare parallel',       s)
-        s = re.sub(r'\bl\*',  'leader parallel',     s)
-        # Unicode star shorthand already in DB
-        s = re.sub(r'\bsr★', 'super rare parallel', s)
-        s = re.sub(r'\br★',  'rare parallel',       s)
-        s = re.sub(r'\bl★',  'leader parallel',     s)
+        # Abbreviations with OPTIONAL space before *: "SR * Parallel", "SR*", "SR *"
+        # \s* allows zero or more spaces between the abbreviation and the star
+        s = re.sub(r'\bsr\s*\*(\s+parallel)?', 'super rare parallel', s)
+        s = re.sub(r'\br\s*\*(\s+parallel)?',  'rare parallel',       s)
+        s = re.sub(r'\bl\s*\*(\s+parallel)?',  'leader parallel',     s)
+        # Unicode star shorthand (with optional space): "SR★", "SR ★"
+        s = re.sub(r'\bsr\s*★(\s+parallel)?', 'super rare parallel', s)
+        s = re.sub(r'\br\s*★(\s+parallel)?',  'rare parallel',       s)
+        s = re.sub(r'\bl\s*★(\s+parallel)?',  'leader parallel',     s)
         # Written-out "SR Parallel" / "R Parallel"
         s = re.sub(r'\bsr\s+parallel\b', 'super rare parallel', s)
         s = re.sub(r'\br\s+parallel\b',  'rare parallel',       s)
@@ -8259,7 +8259,7 @@ def cla_layered_valuation(
             signed_floor = 20.0
         else:
             signed_mult  = 4.50   # vintage / celebrity autograph
-            signed_floor = 150.0  # graded celebrity auto floor (e.g. PSA 9 signed Boba Fett)
+            signed_floor = 150.0  # graded celebrity auto floor
     checks["signed"] = signed_mult
     running *= signed_mult
     if is_signed and running < signed_floor:
