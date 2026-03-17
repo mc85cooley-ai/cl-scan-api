@@ -7914,15 +7914,20 @@ def _cla_estimate_from_attributes(
         ("common",                      1.0),
     ]
     _STAR_WARS_BASES: List[tuple] = [
-        ("hologram",          50.0),
-        ("limited edition",   50.0),
-        ("foil",              25.0),
+        # Most-specific / highest-value first
+        ("hologram",          60.0),   # Factory Set holograms — scarce inserts
+        ("limited edition",   55.0),   # Limited/numbered parallels
+        ("series ii",         35.0),   # Galaxy Series II (Limited Edition) — low print run
+        ("galaxy",            30.0),   # Galaxy Series base — premium oversized art cards
+        ("dark empire",       22.0),   # Dark Empire / Dark Empire II painted cards
+        ("chromium",          25.0),
         ("chrome",            25.0),
-        ("embossed",          20.0),
-        ("galaxy",            12.0),
+        ("foil",              20.0),
+        ("embossed",          18.0),
+        ("prism",             18.0),
         ("rare",              10.0),
-        ("uncommon",           6.0),
-        ("common",             4.0),
+        ("uncommon",           5.0),
+        ("common",             3.0),
     ]
     _GENERIC_BASES: List[tuple] = [
         ("parallel",                   20.0),
@@ -8254,7 +8259,7 @@ def cla_layered_valuation(
             signed_floor = 20.0
         else:
             signed_mult  = 4.50   # vintage / celebrity autograph
-            signed_floor = 80.0
+            signed_floor = 150.0  # graded celebrity auto floor (e.g. PSA 9 signed Boba Fett)
     checks["signed"] = signed_mult
     running *= signed_mult
     if is_signed and running < signed_floor:
