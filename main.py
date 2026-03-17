@@ -5275,7 +5275,11 @@ async def market_context(
     # Source 2: PriceCharting fallback (when eBay disabled OR eBay returns thin/empty results)
     if not USE_EBAY_API:
         # eBay not enabled in this deployment — fall back to PriceCharting.
-        q_pc = _norm_ws(item_name or n or description or "").strip()
+        q_pc = _norm_ws(" ".join(filter(None, [
+            item_name or n or description or "",
+            sname,
+            num_display,
+        ]))).strip()
         return await _market_context_pricecharting(q_pc, category_hint="", pid=product_id or "")
 
     # --------------------------
@@ -7238,7 +7242,59 @@ async def _ebay_sold_strict(
             f"⚠️ eBay strict: best={best_result.get('count',0)} sales "
             f"(below {MIN_SALES} threshold) — low-confidence signal"
         )
-    return best_result
+        return best_result
+
+    # ── Active listings fallback (new/thin-market sets) ──────────────────────
+    # When findCompletedItems returns nothing (e.g. a brand-new set like
+    # Phantasmal Flames with few sold comps yet), fall back to active BUY-IT-NOW
+    # listings via the Browse API so the card still gets a price signal.
+    # Active prices are typically slightly higher than sold prices, so we bias
+    # toward the low end (p20) as the baseline rather than the median.
+    logging.info(f"⚠️ eBay strict: no sold comps found — attempting active listings fallback")
+    try:
+        active_query = query_tiers[0] if query_tiers else _q(card_name, card_number)
+        active_items = await _ebay_find_items(active_query, limit=20, sold=False)
+        active_prices = []
+        for it in active_items:
+            try:
+                price = float(it.get("price") or 0.0)
+                title = str(it.get("title") or "")
+                if price > 0 and _title_matches_card(title):
+                    active_prices.append(price)
+            except Exception:
+                pass
+        if active_prices:
+            active_prices = sorted(active_prices)
+            def _apct(lst, p):
+                idx = max(0, min(len(lst)-1, int(len(lst)*p/100)))
+                return float(lst[idx])
+            logging.info(
+                f"✅ eBay active fallback: {len(active_prices)} listings | "
+                f"low={_apct(active_prices,20):.2f} median={_apct(active_prices,50):.2f} | "
+                f"query='{active_query}'"
+            )
+            return {
+                "source":               "ebay_active",
+                "market":               "EBAY-AU-ACTIVE",
+                "query":                active_query,
+                "count":                len(active_prices),
+                "trimmed_count":        len(active_prices),
+                "currency":             "AUD",
+                "prices":               active_prices[:40],
+                "low":                  _apct(active_prices, 20),
+                "median":               _apct(active_prices, 50),
+                "high":                 _apct(active_prices, 80),
+                "avg":                  float(sum(active_prices)/len(active_prices)),
+                "min":                  float(active_prices[0]),
+                "max":                  float(active_prices[-1]),
+                "card_number_enforced": True,
+                "price_includes_grade": False,
+                "note":                 "Active listing prices (no sold comps available yet for this set)",
+            }
+    except Exception as _e:
+        logging.warning(f"eBay active fallback failed: {_e}")
+
+    return {}
 
 
 async def _fetch_pokemontcg_price(fp: Dict[str, Any]) -> Dict[str, Any]:
