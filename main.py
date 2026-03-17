@@ -568,7 +568,7 @@ def safe_endpoint(func):
 # ==============================
 # Config
 # ==============================
-APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-03-16-v6.9.3")
+APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-03-17-v6.9.5")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
@@ -6746,11 +6746,10 @@ def _resolve_card_fingerprint(
     """
     errors = []
     if not (card_name   or "").strip(): errors.append("card_name")
-    if not (card_set    or "").strip(): errors.append("card_set")
 
-    # card_number is mandatory for TCG cards (prevents cross-card contamination)
-    # but optional for non-TCG collectibles (Star Wars, sports cards, comics etc.)
-    # where sellers typically omit the card number from eBay listing titles.
+    # card_number is mandatory for TCG cards — prevents cross-card contamination.
+    # card_set is preferred but NOT required when card_number is present:
+    # a card number like "OP01-024" already uniquely identifies the card.
     _tcg_games = {"pokemon", "pokémon", "ptcg", "one piece", "onepiece",
                   "dragon ball", "dragonball", "digimon", "yugioh", "yu-gi-oh",
                   "magic", "mtg", "flesh and blood", "fab", "weiss", "bushiroad",
@@ -6758,8 +6757,17 @@ def _resolve_card_fingerprint(
     _game_lower = (game_type or "").lower().strip()
     _is_tcg = any(t in _game_lower for t in _tcg_games) or _game_lower in _tcg_games
 
-    if _is_tcg and not (card_number or "").strip():
+    _has_number = bool((card_number or "").strip())
+    _has_set    = bool((card_set    or "").strip())
+
+    # For TCG cards: require card_number. card_set is a bonus for disambiguation.
+    # For non-TCG: card_number is optional; card_set or name is sufficient.
+    if _is_tcg and not _has_number:
         errors.append("card_number")
+    # Only require card_set for TCG when we also have no card_number (both missing = useless)
+    if _is_tcg and not _has_number and not _has_set:
+        errors.append("card_set")
+    # Non-TCG: require at least a name (already checked above)
 
     if errors:
         raise ValueError(f"Missing required fields for precision lookup: {', '.join(errors)}")
