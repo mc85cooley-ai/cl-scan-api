@@ -568,7 +568,7 @@ def safe_endpoint(func):
 # ==============================
 # Config
 # ==============================
-APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-03-17-v6.9.14")
+APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-03-17-v6.9.17")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
@@ -7474,6 +7474,20 @@ async def _fetch_pricecharting_strict(fp: Dict[str, Any]) -> Dict[str, Any]:
 
     name_first_word = (card_name.split()[0]).lower() if card_name.split() else ""
 
+    # Name alias map for cards where our stored name differs from PC's name
+    # e.g. "Don Quixote Rocinante" → PC stores as "Donquixote Rosinante"
+    _PC_NAME_ALIASES = {
+        "don quixote":  "donquixote",
+        "rocinante":    "rosinante",
+        "monkey d.":    "monkey d",
+        "monkey.d.":    "monkey d",
+    }
+    def _alias_name(n: str) -> str:
+        n_lower = n.lower()
+        for orig, alias in _PC_NAME_ALIASES.items():
+            n_lower = n_lower.replace(orig, alias)
+        return n_lower
+
     async def _try_query(q: str, require_number: bool) -> Optional[Dict[str, Any]]:
         products = await _pc_search(q, category=pc_category, limit=10)
         logging.info(
@@ -7481,11 +7495,13 @@ async def _fetch_pricecharting_strict(fp: Dict[str, Any]) -> Dict[str, Any]:
         )
         if not products:
             return None
+        # Check both original and aliased name forms
+        name_words = [name_first_word, _alias_name(name_first_word)] if name_first_word else []
         for product in products:
             pname = str(product.get("product-name") or product.get("name") or "").lower()
             purl  = str(product.get("url") or "").lower()
             num_matched  = any(v in pname or v in purl for v in num_variants if v)
-            name_matched = name_first_word and name_first_word in pname
+            name_matched = any(w and w in pname for w in name_words)
             logging.info(
                 f"   PC candidate: '{pname}' | name_matched={name_matched} num_matched={num_matched}"
             )
@@ -7993,8 +8009,11 @@ def _cla_estimate_from_attributes(
     # Keys are matched by substring so partial labels work.
     # More-specific keys MUST come first.
     _ONE_PIECE_BASES: List[tuple] = [
+        # Most-specific first to avoid substring matches
         ("leader parallel",           400.0),
         ("l parallel",                400.0),
+        ("gold parallel",             192.0),   # Gold DON!! PC ungraded: $123.79 USD = ~$192 AUD
+        ("gold",                      192.0),   # catch-all for gold foil variants
         ("super rare parallel",       130.0),
         ("sr parallel",               130.0),
         ("sr★",                       130.0),
@@ -8008,7 +8027,9 @@ def _cla_estimate_from_attributes(
         ("sr",                         20.0),
         ("illustration rare",          18.0),
         ("full art",                   18.0),
-        ("alt art",                    18.0),
+        ("alt art",                    18.0),  # Rocinante OP12-108 is Alt Art
+        ("textured",                   40.0),
+        ("manga",                      45.0),
         ("rare",                        5.0),
         ("uncommon",                    1.75),
         ("common",                      0.80),
@@ -8118,7 +8139,11 @@ def _cla_estimate_from_attributes(
         s = re.sub(r'\br\s+parallel\b',  'rare parallel',       s)
         return s
 
-    search_str = _norm_rarity_str(f"{rar} {var} {fin}")
+    # Include card_set in search so set-based keys work (Star Wars, sports, etc.)
+    # e.g. "Dark Empire II" → matches "dark empire" in _STAR_WARS_BASES
+    # Also combine rarity+variant so "Gold" + "Parallel" → "gold parallel"
+    _set_lower = (card_set or "").lower().strip()
+    search_str = _norm_rarity_str(f"{rar} {var} {fin} {_set_lower}")
     base_aud    = _fallback
     matched_tier = "unknown"
     for key, price in game_table:
