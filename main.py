@@ -9232,13 +9232,15 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
         candidates_active = await _ebay_find_items(best_q, limit=5, sold=False)
         return {
             "current_price":     0,
+            "final_value":       0,
+            "multiplier_applied":1.0,   # prevents PHP double-mult on zero price
             "confidence":        "none",
             "source":            "no_results",
             "error":             "No listings found on eBay or PriceCharting",
             "search_query":      best_q,
             "queries_tried":     queries,
             "card_name":         card_name,
-            "price_includes_grade": False,
+            "price_includes_grade": True,  # nothing to multiply
             "grade_12_uplift":   False,
             "fingerprint_used":  bool(fp and not fp_error),
             "candidates_sold":   candidates_sold,
