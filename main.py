@@ -1,67 +1,134 @@
 """
 The Collectors League Australia - Scan API
-Futureproof v6.9.3 (2026-03-16)
+v6.9.21 (2026-03-18)
+
+What changed vs v6.9.3 (2026-03-16)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PRICING ARCHITECTURE OVERHAUL
+- ✅ CRITICAL FIX: Bulk "Update All" was serving cached prices on every run — delete_transient()
+  now called before every bulk fetch, guaranteeing fresh API hits.
+- ✅ CRITICAL FIX: cg-market.php bulk SELECT was missing submission_id, rarity, variant_type,
+  finish, edition, is_signed, signed_by, is_error_card, is_promo, language columns — these were
+  always blank for bulk updates, causing the API to price without variant context.
+- ✅ CRITICAL FIX: card_set enriched from card_submissions table when blank in cg_collections —
+  many cards had no set stored, causing _resolve_card_fingerprint to throw ValueError and fall
+  through to attribute estimate, bypassing eBay and PriceCharting entirely.
+- ✅ CRITICAL FIX: _resolve_card_fingerprint no longer requires card_set when card_number is
+  present — a number like "OP01-024" uniquely identifies a card without the set name.
+
+PRICECHARTING FIELD MAPPING (correct field names per official PC docs)
+- ✅ FIX: loose-price       = Ungraded raw (was correctly used)
+- ✅ FIX: manual-only-price = PSA 10 (was using graded-price which is PSA 9 — undervaluing by ~40%)
+- ✅ FIX: graded-price      = PSA 9 (not PSA 10 as previously assumed)
+- ✅ FIX: box-only-price    = BGS 9.5 GemMint
+- ✅ FIX: bgs-10-price      = BGS 10 Pristine
+- ✅ FIX: condition-17-price= CGC 10
+- ✅ FIX: condition-18-price= SGC 10
+- ✅ NEW: PriceCharting now returns all grader-specific prices; CLA 12 path uses
+  bgs_10_price_aud × 4.494 (Priority 2) or psa_10_price_aud × 5.8734 (Priority 3)
+
+GRADER BRAND FACTOR SYSTEM
+- ✅ NEW: _grader_brand_factor(grader, grade) — calibrated from real PriceCharting data
+  (Baby5 Alt Art, Mega Charizard PFL, Luffy OP01-024):
+    CLA 10 Flawless       = PSA 10           → 1.000× (confirmed by CLA grading standard)
+    CLA 11                = interpolated      → 2.424× (geometric mean)
+    CLA 12 Ultra Flawless = 90% of BGS Black  → 5.873× (= BGS_Black_avg × 0.90)
+    BGS 9.5 GemMint       = PSA 10 equiv      → 0.810×
+    BGS 10 Pristine       > PSA 10            → 1.307×
+    BGS 10 Black          >> PSA 10           → 6.526× (Baby5+Charizard avg; Luffy excluded as pop anomaly)
+    CGC 10                ≈ BGS 9.5           → 0.810×
+    CGC 10 Pristine       > CGC 10            → 1.280×
+    SGC 10                < PSA 10            → 0.597×
+- ✅ FIX: Grader brand factor NOT applied to attribute estimates — the CLA grade tier table
+  already uses CLA-native multipliers; applying the factor on top was double-counting.
+- ✅ FIX: Factor applied only to PSA/eBay market comps, not to CLA-internal calculations.
+
+CLA 12 PRICING (BGS BLACK EQUIVALENT)
+- ✅ NEW: CLA 12 precision path searches eBay for BGS 10 Black sold comps directly
+  (using _grade_token_override) — gives card-specific price rather than fixed factor.
+- ✅ Priority chain for CLA 12:
+    1. eBay BGS Black sold comps → factor = 1.0 (same grade tier)
+    2. PC bgs-10-price (BGS 10 Pristine) × 4.494
+    3. PC manual-only-price (PSA 10) × 5.873
+    4. PC graded-price (PSA 9) × 1.40 × 5.873
+    5. Attribute estimate (CLA-native grade tiers, no factor)
+
+ATTRIBUTE ESTIMATE OVERHAUL
+- ✅ OVERHAUL: Hardcoded dollar tables replaced with ratio-based anchored system.
+  All rarity bases are now: anchor_AUD × rarity_ratio (e.g. OP Common $0.80 × SR ratio 25 = $20).
+  Changing one anchor rescales the entire game's tier table automatically.
+- ✅ NEW: PC live loose-price used as base when available — real market data overrides
+  ratio table. Attr estimate re-run after PC fetch with actual ungraded price.
+- ✅ FIX: Returns source="no_market_data" with price=0 when no base exists — no fabricated prices.
+
+FLOOR GUARD & SANITY CAP
+- ✅ NEW: Raw signal minimum floor — rejects eBay wrong-card matches before grade mult amplifies them:
+    Grade 12: raw_signal < $5   → reject (zeroed, falls to attr estimate)
+    Grade 10: raw_signal < $1.50 → reject
+    Grade 9:  raw_signal < $0.50 → reject
+- ✅ FIX: Final price floor raised:
+    Grade 12: $6 → $20  (a $2.33 wrong-card × 14.91× = $34.75 was passing the old $6 floor)
+    Grade 10: $4 → $8
+- ✅ FIX: price_reliability gate in cg-market.php — if backend returns needs_review
+  (rarity band check failed, sources disagree >100%, single eBay comp), PHP now keeps
+  the old stored value and writes market_data_json only (for UI ⚠️ badge). Previously
+  all prices were written regardless of reliability, causing e.g. Charizard $1,284.
+
+SIGNED AUTOGRAPH TIERS
+- ✅ NEW: Three-tier signed multiplier system (previously only TCG vs non-TCG):
+    TCG artist (Ken Sugimori, Mitsuhiro Arita):    1.8×  floor $20 AUD
+    Comic/card artist (Cam Kennedy, Hildebrandt):  2.2×  floor $45 AUD  ← NEW
+    Celebrity/actor (Harrison Ford, Mark Hamill):  4.5×  floor $150 AUD
+  Classification via signed_by field — celebrity names auto-detected by keyword list.
+
+EBAY INTEGRATION FIXES
+- ✅ FIX: Active listings fallback when sold comps below MIN_SALES threshold
+- ✅ FIX: _fetch_pricecharting_strict query ladder:
+    Tier 1: name + set + number (full)
+    Tier 2: name + number only (skips noisy set name)  ← key fix
+    Tier 3: name + set (no number)
+    Tier 4: name only
+- ✅ FIX: PC search now passes game category (one-piece-cards, pokemon-cards etc.)
+- ✅ FIX: Reconciler warning "Reconciler returned 0" downgraded to INFO (expected for vintage)
+
+PARALLEL SOURCE ARCHITECTURE
+- ✅ NEW: Attribute estimate pre-computed in parallel with eBay/PC/TCG fetches
+- ✅ NEW: Response always includes attr_estimate and all source details for transparency
+- ✅ NEW: When reconciler returns 0, pre-computed attr_est used immediately (no re-run)
 
 What changed vs v6.9.2 (2026-03-16)
-- ✅ CRITICAL FIX: Added missing /api/fingerprint/generate endpoint — was returning 404,
-  causing the "Generate LingérPrint™ DNA" button in the DNA viewer to fail entirely.
-  cg-grading-dashboard.php (cgd_ajax_fingerprint_generate) calls this endpoint directly;
-  without it the PHP fell through to cgd_generate_local_fingerprint only, which lacks
-  surface_texture and returns "Not captured" for all API-derived fields.
-  The new endpoint accepts front/back multipart uploads OR image_front_url/image_back_url
-  form fields, runs the full fingerprint pipeline (dHash, surface SHA-256, colour zones,
-  histogram, embedding, keypoints) and returns {"success": true, "fingerprint": {...}}.
-- ✅ CRITICAL FIX: Added missing /api/fingerprint/match endpoint — was returning 404.
-  PHP has a local cgd_hash_similarity fallback that activates when this returns no matches,
-  so the endpoint returning 200 + empty matches list is all that's needed.
-- ✅ CARRIED: surface_texture .tobytes() fix from v6.9.2 applies to the new endpoint too.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- ✅ CRITICAL FIX: Added missing /api/fingerprint/generate endpoint (was 404)
+- ✅ CRITICAL FIX: Added missing /api/fingerprint/match endpoint (was 404)
+- ✅ CARRIED: surface_texture .tobytes() fix
 
 What changed vs v6.9.1 (2026-02-26)
-- ✅ CRITICAL FIX: surface_texture "Not captured" — block 6b was silently failing due to
-  `bytes(b for px in _crop32.getdata() for b in px)` generator expression. In Pillow >= 11
-  the ImagingCore pixel values returned by getdata() can cause a TypeError that the bare
-  `except: pass` swallowed silently. Fixed by replacing with `.tobytes()` — the canonical
-  Pillow API for raw pixel bytes, safe across all versions.
-- ✅ FIX: All 6 fingerprint blocks now log exceptions via logging.warning() and write errors
-  into a new `fp_errors` dict in the API response, so "Not captured" is self-diagnosing
-  without needing to grep Render logs.
-- ✅ FIX: PIL_AVAILABLE=False and empty front_proc are now explicit elif branches with
-  warning-level log messages, not a single silent `if PIL_AVAILABLE and front_proc:` guard.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- ✅ CRITICAL FIX: surface_texture "Not captured" — .tobytes() replaces broken generator
+- ✅ FIX: Fingerprint blocks log exceptions to fp_errors dict
+- ✅ FIX: PIL_AVAILABLE=False now explicit elif with warning log
 
 What changed vs v6.9.0 (2026-02-26)
-- ✅ CRITICAL FIX: Removed second-pass AI call from /api/verify — was exceeding Render 512MB memory limit (502 Bad Gateway)
-- ✅ CRITICAL FIX: Disabled _openai_label_rois in /api/verify and memorabilia endpoints — memory budget
-- ✅ NOTE: Single-pass mode — primary OpenAI vision call handles defect detection; second pass was redundant overhead
-- ✅ NOTE: defect_filters kept in response schema (returns empty dict) for frontend compatibility
-- ✅ FIX: _grade_bucket() now supports Grade 12 (CL Ultra Flawless) — was silently dropping to N/A
-- ✅ FIX: Removed duplicate /api/collection/update-values endpoint (mock was overwriting real)
-- ✅ FIX: Memorabilia assessment now uses detail:high images (was low — couldn't see seal damage)
-- ✅ FIX: Assessment prompt rule numbering corrected (was 1,2,3,5,4)
-- ✅ FIX: _grade_distribution() now covers full grade range 1-12 (was only 8-10)
-- ✅ FIX: predict-grade endpoint updated for half-grades and full range
-- ✅ FIX: Assessment max_tokens bumped 2200→3000 for expanded output
-- ✅ NEW: Half-grade support (9.5, 8.5, 7.5 etc.) — _parse_half_grade(), pregrade normalization
-- ✅ NEW: Grading standard selector (PSA/BGS/CGC/CL) via grading_standard param on /api/verify
-- ✅ NEW: Error card / misprint / factory defect detection (miscut, crimped, wrong-back, holo bleed etc.)
-- ✅ NEW: Expanded surface condition factors (silvering vs whitening, yellowing, foxing, ink transfer, warp, gloss)
-- ✅ NEW: Rarity / variant / edition / finish / artist / promo / error detection in /api/identify
-- ✅ NEW: Sleeve/toploader detection in assessment (accounts for artifacts)
-- ✅ NEW: Card warp/bowing + back pattern awareness
-- ✅ NEW: Expanded _normalize_card_type() — 20+ TCGs + specific sports (AFL, NRL, Cricket, NBA etc.)
-- ✅ NEW: Expanded authenticity checks — rosette pattern, card stock, back pattern, light/weight test guidance
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- ✅ CRITICAL FIX: Removed second-pass AI call from /api/verify (Render 512MB OOM → 502)
+- ✅ FIX: _grade_bucket() supports Grade 12 (CL Ultra Flawless)
+- ✅ FIX: Removed duplicate /api/collection/update-values endpoint
+- ✅ FIX: Memorabilia assessment uses detail:high images
+- ✅ FIX: _grade_distribution() covers full grade range 1–12
+- ✅ NEW: Half-grade support (9.5, 8.5, 7.5 etc.)
+- ✅ NEW: Grading standard selector (PSA/BGS/CGC/CL)
+- ✅ NEW: Error card / misprint / factory defect detection
+- ✅ NEW: Expanded _normalize_card_type() — 20+ TCGs + sports
 
-Market data architecture (unchanged)
-- ✅ PriceCharting API as primary market source for cards + sealed/memorabilia (current prices).
-- ✅ Keeps PokemonTCG.io for identification + metadata enrichment (NOT price history).
-- ✅ Weekly snapshot option (store PriceCharting CSV/API snapshots on a schedule) to build your own price history.
-- ✅ eBay API scaffolding included but DISABLED by default (waiting for your dev account approval).
-- ✅ Market endpoints return "click-only" informational context + no ROI language.
-
-Env vars
-- OPENAI_API_KEY (required for vision grading/ID)
-- POKEMONTCG_API_KEY (optional; used for Pokemon metadata enrichment)
-- PRICECHARTING_TOKEN (recommended; enables pricing for cards + sealed/memorabilia)
-- USE_EBAY_API=0/1 (default 0) + EBAY_APP_ID/EBAY_CERT_ID/EBAY_DEV_ID/EBAY_OAUTH_TOKEN (optional; scaffold only)
+Environment variables
+━━━━━━━━━━━━━━━━━━━━━
+- OPENAI_API_KEY        (required — vision grading/ID)
+- POKEMONTCG_API_KEY    (optional — Pokemon metadata enrichment)
+- PRICECHARTING_TOKEN   (required — all card pricing)
+- USE_EBAY_API=1        + EBAY_CLIENT_ID / EBAY_CLIENT_SECRET (eBay OAuth)
+- CL_USD_TO_AUD_MULTIPLIER (default 1.44 — override FX rate)
+- CL_SCAN_VERSION       (override version string shown in /health)
 """
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Depends, Security, status, Request, Body
@@ -568,7 +635,7 @@ def safe_endpoint(func):
 # ==============================
 # Config
 # ==============================
-APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-03-17-v6.9.19")
+APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-03-18-v6.9.21")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
@@ -7783,6 +7850,32 @@ def _reconcile_prices(
                 final_price       = raw_signal
                 multiplier_reason = "valuation_error_fallback"
 
+    # ── Raw signal minimum — catches wrong-card eBay matches ─────────────────
+    # A $2.33 raw signal for a CLA 12 card is impossible — the cheapest card
+    # ever graded CLA 12 would be a common at $0.80 raw, but CLA 12 implies
+    # the card has real collectible value.  Any signal below these thresholds
+    # indicates a wrong card match from eBay and should be rejected.
+    #
+    # These are MINIMUM raw signal values (AUD) by grade tier:
+    #   Grade 12 (Ultra Flawless): raw must be ≥ $5  (cheapest legit CLA12 card)
+    #   Grade 10 (Flawless):       raw must be ≥ $1.50
+    #   Grade 9  (Mint):           raw must be ≥ $0.50
+    if is_graded and grade and raw_signal > 0:
+        try:
+            _gv_raw = float(re.search(r"(\d+(?:\.\d+)?)", grade).group(1))
+        except Exception:
+            _gv_raw = 0.0
+        _raw_min = 0.0
+        if   _gv_raw >= 12: _raw_min = 5.0
+        elif _gv_raw >= 10: _raw_min = 1.5
+        elif _gv_raw >= 9:  _raw_min = 0.5
+        if _raw_min > 0 and raw_signal < _raw_min:
+            logging.warning(
+                f"⚠️ Raw signal floor: signal={raw_signal:.2f} < min={_raw_min:.2f} "                f"for grade={grade} — wrong card match, zeroing price"
+            )
+            final_price       = 0.0
+            multiplier_reason = "raw_signal_floor_rejected"
+
     # ── Python-side sanity cap (ceiling) ────────────────────────────────────
     # Synced with the _CLA_GRADE_TIERS table above.
     # The new tiered grade mult allows up to 5× for Grade 12 on a $3 raw card,
@@ -7837,13 +7930,13 @@ def _reconcile_prices(
         except Exception:
             _gv = 0.0
         if _gv >= 12:
-            _floor = 6.0
+            _floor = 20.0  # CLA 12 Ultra Flawless — $2.33 wrong-card signals must not survive
         elif _gv >= 10:
-            _floor = 4.0
+            _floor = 8.0   # CLA/PSA 10 — below $8 is certainly a wrong card
         elif _gv >= 9:
-            _floor = 2.0
+            _floor = 4.0   # PSA 9 Mint
         elif _gv >= 8:
-            _floor = 1.0
+            _floor = 2.0   # PSA 8 NM
         else:
             _floor = 0.0
         if _floor > 0 and final_price < _floor:
@@ -8439,20 +8532,31 @@ def cla_layered_valuation(
     running *= edition_mult
 
     # ── CHECK 6: Signed / autograph premium ───────────────────────────────────
-    # TCG artist autos (1.8×) vs vintage celebrity autographs (4.5×) have very
-    # different economics.  Signed floor ensures a minimum regardless of base price.
+    # Three tiers:
+    #   TCG artist (Ken Sugimori etc):          1.8×  floor $20
+    #   Comic/card artist (Cam Kennedy etc):    2.2×  floor $45
+    #   Celebrity/actor (Harrison Ford etc):    4.5×  floor $150
     _tcg_games_s = ("pokemon", "one piece", "dragon ball", "yugioh", "magic",
                      "mtg", "digimon", "lorcana", "weiss", "vanguard", "fab")
     _is_tcg = any(g in game for g in _tcg_games_s)
+    _signer_lower = (signed_by or "").lower().strip()
+    _is_celebrity = any(w in _signer_lower for w in (
+        "actor", "actress", "celebrity",
+        "harrison", "hamill", "fisher", "prowse", "ford",
+        "williams", "mayhew", "daniels", "oz",
+    ))
     signed_mult  = 1.0
     signed_floor = 0.0
     if is_signed:
         if _is_tcg:
-            signed_mult  = 1.80
+            signed_mult  = 1.80   # TCG artist auto
             signed_floor = 20.0
+        elif _is_celebrity:
+            signed_mult  = 4.50   # Celebrity / major actor
+            signed_floor = 150.0
         else:
-            signed_mult  = 4.50   # vintage / celebrity autograph
-            signed_floor = 150.0  # graded celebrity auto floor
+            signed_mult  = 2.20   # Comic / card artist (Cam Kennedy, Hildebrandt etc)
+            signed_floor = 45.0
     checks["signed"] = signed_mult
     running *= signed_mult
     if is_signed and running < signed_floor:
