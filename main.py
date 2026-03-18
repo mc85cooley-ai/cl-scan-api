@@ -8317,6 +8317,223 @@ def _grader_brand_factor(grader: str, grade_str: str = "") -> float:
 
     return round(factor, 4)
 
+def _cla_resolve_price(
+    pc_result:        Dict[str, Any],
+    grade:            str,
+    card_name:        str,
+    game_type:        str        = "",
+    rarity:           str        = "",
+    variant_type:     str        = "",
+    finish:           str        = "",
+    language:         str        = "english",
+    edition:          str        = "",
+    is_signed:        bool       = False,
+    signed_by:        str        = "",
+    is_error:         bool       = False,
+    is_promo:         bool       = False,
+    rank_within_card: Optional[int] = None,
+    rank_total:       Optional[int] = None,
+    card_set:         str        = "",
+    card_number:      str        = "",
+) -> Dict[str, Any]:
+    """
+    CLA 10 / CLA 12 price resolver — single source of truth.
+
+    Takes whatever PriceCharting returned (any combination of graded/raw fields),
+    picks the best available source using a dynamic conversion factor, then applies
+    the CLA layered attribute multipliers exactly once.
+
+    No grader brand factor. No legacy path. No apply_cla_valuation.
+    Multiplier is applied once here and never again.
+
+    PSA-equivalency table (PSA 10 = 1.000):
+        BGS 10 Black   = 6.525
+        BGS 10 Pristine= 1.307
+        PSA 10         = 1.000
+        CGC 10         = 0.810
+        BGS 9.5 Gem    = 0.810
+        PSA 9          = 0.667
+        SGC 10         = 0.600
+        Raw            = via grade tier table (no PSA equiv — handled separately)
+
+    CLA targets:
+        CLA 10 = 1.000 PSA equiv
+        CLA 12 = 6.525 PSA equiv
+
+    Dynamic factor = cla_target_psa_equiv / source_psa_equiv
+    Best source = smallest abs(factor - 1.0) — i.e. smallest correction needed.
+    """
+    # ── Determine target PSA equiv from grade ────────────────────────────────
+    _gv = _cla_parse_grade(grade) or 0.0
+    if _gv >= 12:
+        _cla_psa_equiv = 6.525   # CLA 12 = BGS Black
+        _grade_label   = "CLA 12"
+    else:
+        _cla_psa_equiv = 1.000   # CLA 10 = PSA 10
+        _grade_label   = "CLA 10"
+
+    # ── PSA-equivalency for each PC source ───────────────────────────────────
+    # (source_key, psa_equiv, label)
+    # Ordered by proximity to CLA 10 target by default; re-ranked dynamically below.
+    _PC_SOURCES = [
+        ("bgs_black_price_aud", 6.525, "BGS Black"),
+        ("bgs_10_price_aud",    1.307, "BGS 10 Pristine"),
+        ("psa_10_price_aud",    1.000, "PSA 10"),
+        ("cgc_10_price_aud",    0.810, "CGC 10"),
+        ("bgs_gem_price_aud",   0.810, "BGS 9.5"),
+        ("psa_9_price_aud",     0.667, "PSA 9"),
+        ("sgc_10_price_aud",    0.600, "SGC 10"),
+    ]
+
+    # ── Build candidate list from whatever PC actually returned ───────────────
+    candidates = []
+    for field, src_psa_equiv, label in _PC_SOURCES:
+        val = (pc_result or {}).get(field)
+        if not val:
+            continue
+        try:
+            val = float(val)
+        except (TypeError, ValueError):
+            continue
+        if val <= 0:
+            continue
+
+        factor   = _cla_psa_equiv / src_psa_equiv
+        implied  = round(val * factor, 2)
+        distance = abs(factor - 1.0)   # 0 = perfect match, higher = more correction
+        candidates.append({
+            "field":    field,
+            "label":    label,
+            "pc_price": val,
+            "factor":   round(factor, 4),
+            "implied":  implied,
+            "distance": distance,
+        })
+        logging.debug(
+            f"  CLA candidate: {label} ${val:.2f} × {factor:.4f} = ${implied:.2f} "
+            f"(distance={distance:.4f})"
+        )
+
+    # ── Sort by distance — closest source wins ────────────────────────────────
+    candidates.sort(key=lambda c: c["distance"])
+
+    raw_base_aud   = 0.0
+    best_candidate = None
+
+    if candidates:
+        best_candidate = candidates[0]
+        raw_base_aud   = best_candidate["implied"]
+        logging.info(
+            f"🎯 {_grade_label}: best PC source = {best_candidate['label']} "
+            f"${best_candidate['pc_price']:.2f} × {best_candidate['factor']:.4f} "
+            f"= ${raw_base_aud:.2f} AUD for {card_name}"
+        )
+    else:
+        # No graded PC data — fall back to raw price, then rarity table
+        _raw = float((pc_result or {}).get("raw_price_aud") or 0.0)
+        if _raw > 0:
+            raw_base_aud = _raw
+            logging.info(
+                f"📦 {_grade_label}: no graded PC data — using raw ${_raw:.2f} AUD "
+                f"(grade multiplier will apply via layered engine) for {card_name}"
+            )
+        else:
+            logging.info(
+                f"📦 {_grade_label}: no PC data at all — using rarity table base for {card_name}"
+            )
+
+    # ── If we have a grade-converted base, skip the grade multiplier ──────────
+    # The conversion factor already prices the card at the CLA target grade.
+    # Pass grade="" to cla_layered_valuation so it doesn't apply grade mult again.
+    # Only apply grade mult when we're starting from raw (no graded source found).
+    _apply_grade = (best_candidate is None)
+
+    # ── If still no base — use rarity table via _cla_estimate_from_attributes ─
+    if raw_base_aud <= 0:
+        est = _cla_estimate_from_attributes(
+            game_type        = game_type,
+            rarity           = rarity,
+            variant_type     = variant_type,
+            finish           = finish,
+            language         = language,
+            is_signed        = is_signed,
+            signed_by        = signed_by,
+            grade            = grade,
+            rank_within_card = rank_within_card,
+            rank_total       = rank_total,
+            card_set         = card_set,
+            card_number      = card_number,
+            is_error         = is_error,
+            is_promo         = is_promo,
+        )
+        est["price_source"]      = f"attr_estimate_{_grade_label.lower().replace(' ','')}"
+        est["grader_brand_factor"] = 1.0
+        est["card_name"]         = card_name
+        logging.info(
+            f"📊 {_grade_label}: rarity table estimate "
+            f"${est.get('current_price', 0):.2f} AUD for {card_name}"
+        )
+        return est
+
+    # ── Apply remaining attribute multipliers exactly once ────────────────────
+    # grade="" when we already have a grade-converted base (don't double-apply).
+    # grade=grade when starting from raw (grade mult still needed).
+    lv = cla_layered_valuation(
+        raw_base_aud     = raw_base_aud,
+        grade            = grade if _apply_grade else "",
+        rarity           = rarity,
+        variant_type     = variant_type,
+        finish           = finish,
+        language         = language,
+        edition          = edition,
+        is_signed        = is_signed,
+        signed_by        = signed_by,
+        game_type        = game_type,
+        rank_within_card = rank_within_card,
+        rank_total       = rank_total,
+        is_error         = is_error,
+        is_promo         = is_promo,
+    )
+
+    final_price = lv["final_value"]
+    logging.info(
+        f"✅ {_grade_label} final: ${raw_base_aud:.2f} base × attr checks "
+        f"{lv['active_checks']} = ${final_price:.2f} AUD for {card_name}"
+    )
+
+    return {
+        "current_price":        final_price,
+        "final_price":          final_price,
+        "final_value":          final_price,
+        "signal_price":         raw_base_aud,
+        "base_price":           raw_base_aud,
+        "multiplier_applied":   round(lv["total_mult"], 4),
+        "grade_multiplier":     round(lv["grade_mult"], 4),
+        "slab_premium_added":   0.0,
+        "multiplier_reason":    (
+            f"{_grade_label}_pc_{best_candidate['label'].lower().replace(' ','_')}"
+            if best_candidate else
+            f"{_grade_label}_raw_grade_table"
+        ),
+        "confidence":           "medium" if best_candidate else "estimate",
+        "source":               "pc_cla_resolved",
+        "sources_used":         ["pricecharting"],
+        "price_includes_grade": True,
+        "grade_12_uplift":      (_gv >= 12),
+        "grader_brand_factor":  1.0,
+        "card_name":            card_name,
+        "last_updated":         datetime.now().isoformat(),
+        "fingerprint_used":     True,
+        "estimated":            (best_candidate is None),
+        "pc_source_used":       best_candidate["label"] if best_candidate else "rarity_table",
+        "pc_source_factor":     best_candidate["factor"] if best_candidate else None,
+        "pc_source_price":      best_candidate["pc_price"] if best_candidate else None,
+        "layered_checks":       lv["checks"],
+        "active_checks":        lv["active_checks"],
+        "all_pc_candidates":    candidates,   # full audit trail
+    }
+
+
 def apply_cla_valuation(signal_price: float, signal_includes_grade: bool, search_query: str, target_grade: str | None,
                         rank_within_card: int | None = None, rank_total: int | None = None,
                         slab_premium_add_aud: float = 70.0) -> dict:
@@ -8541,16 +8758,73 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
             f"num={card_number} | grade={grade} | lang={language}"
         )
 
-        # ── Detect CL Grade 12+ (used in both paths) ──────────────────────────
+        # ── Detect CLA grader and grade ──────────────────────────────────────
+        _grader_norm = grader.upper()
+        _is_cla = _grader_norm in ("CLA", "COLLECTORS LEAGUE", "COLLECTORS LEAGUE AUSTRALIA", "")
         grade_is_12_plus = False
+        grade_is_10_plus = False
         try:
             _gm = re.search(r"(\d+(?:\.\d+)?)", grade)
-            if _gm and float(_gm.group(1)) >= 12:
-                grade_is_12_plus = True
+            if _gm:
+                _gv = float(_gm.group(1))
+                if _gv >= 12: grade_is_12_plus = True
+                if _gv >= 10: grade_is_10_plus = True
         except Exception:
             pass
 
-        # ── Step 1: Build fingerprint ─────────────────────────────────────────
+        # ── CLA 10 / 12: dedicated resolver — runs before everything else ─────
+        # Fetches PC, picks the best available source (graded fields ranked by
+        # proximity to CLA target), applies attribute factors once, returns.
+        # No eBay graded comps. No grader brand factor. No legacy path. Ever.
+        if _is_cla and (grade_is_10_plus or grade_is_12_plus):
+            # Still need fingerprint for PC lookup
+            fp: Dict[str, Any] = {}
+            fp_error: Optional[str] = None
+            try:
+                fp = _resolve_card_fingerprint(
+                    card_name   = card_name,
+                    card_set    = card_set,
+                    card_number = card_number,
+                    language    = language,
+                    game_type   = game_type,
+                    grade       = grade,
+                    grader      = "",
+                )
+            except ValueError as ve:
+                fp_error = str(ve)
+                logging.warning(f"⚠️ CLA fingerprint incomplete ({ve}) — will use rarity table")
+
+            pc_result: Dict[str, Any] = {}
+            if fp and not fp_error:
+                try:
+                    pc_result = await _fetch_pricecharting_strict(fp) or {}
+                except Exception as _pce:
+                    logging.warning(f"⚠️ CLA PC fetch failed: {_pce}")
+
+            result = _cla_resolve_price(
+                pc_result        = pc_result,
+                grade            = grade,
+                card_name        = card_name,
+                game_type        = game_type,
+                rarity           = rarity,
+                variant_type     = variant_type,
+                finish           = finish,
+                language         = language,
+                edition          = edition,
+                is_signed        = is_signed,
+                signed_by        = signed_by,
+                is_error         = is_error,
+                is_promo         = is_promo,
+                rank_within_card = getattr(request, "rank_within_card", None),
+                rank_total       = getattr(request, "rank_total",       None),
+                card_set         = card_set,
+                card_number      = card_number,
+            )
+            result["pricecharting_detail"] = pc_result if pc_result else None
+            result["grader"]               = grader or "CLA"
+            return result
+
+        # ── Step 1: Build fingerprint (non-CLA path) ──────────────────────────
         fp: Dict[str, Any] = {}
         fp_error: Optional[str] = None
         try:
@@ -8608,87 +8882,12 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
 
         # ── Step 2 (PRECISION PATH) ───────────────────────────────────────────
         if fp and not fp_error:
-            # For CLA 12 (Ultra Flawless) — search BGS Black directly.
-            # CLA 12 = BGS 10 Black by grading standard. The BGS Black price
-            # is card-specific and cannot be derived from PSA × fixed_factor
-            # (e.g. Luffy: BGS Black=$1,000 but PSA=$43 → 22.8× vs avg 6.5×).
-            # Searching BGS Black directly gives the correct card-specific price.
-            _is_cla12 = grade_is_12_plus and grader.upper() in ("CLA", "COLLECTORS LEAGUE", "")
-            if _is_cla12:
-                _bgs_fp = dict(fp)
-                _bgs_fp["grade"]    = "10"
-                _bgs_fp["is_graded"] = True
-                # "BGS 10 Black" or "BGS 10" with Black keyword — FindingService will
-                # match "BGS 10 Black" in listing titles
-                _bgs_fp["_grade_token_override"] = "BGS 10 Black"
-                tcg_result, ebay_result, pc_result, bgs_black_result = await asyncio.gather(
-                    _fetch_pokemontcg_price(fp),
-                    _ebay_sold_strict(fp, limit=60, days_lookback=90),
-                    _fetch_pricecharting_strict(fp),
-                    _ebay_sold_strict(_bgs_fp, limit=30, days_lookback=180),
-                )
-                # Priority 1: BGS Black eBay sold comps (most accurate)
-                if bgs_black_result and bgs_black_result.get("count", 0) >= 1:
-                    _bgs_median = float(bgs_black_result.get('median') or 0)
-                    # CLA 12 = 90% of BGS Black — convert here so grader factor is NOT applied
-                    _cla12_price = round(_bgs_median * 0.90, 2)
-                    logging.info(
-                        f"🏆 CLA 12: BGS Black ${_bgs_median:.2f} × 0.90 = ${_cla12_price:.2f} AUD "
-                        f"({bgs_black_result.get('count', 0)} sales) for {card_name}"
-                    )
-                    ebay_result = dict(bgs_black_result)
-                    ebay_result["median"] = _cla12_price
-                    ebay_result["price_includes_grade"] = True
-                    ebay_result["_bgs_black_converted"] = True  # skip grader factor below
-
-                # ── PC grade-based scaling: use highest available grade ──────────
-                # All multipliers calibrated from Baby5+Charizard data (Luffy excluded as pop anomaly)
-                # Grade relationship: CLA12 = PSA10 × 5.87
-                # Derived from that: each grade below PSA10 scales proportionally
-                #   BGS10 Pristine (1.307× PSA10) → CLA12 = BGS10 × (5.87/1.307) = × 4.494
-                #   Grade 9.5      (0.800× PSA10) → CLA12 = G9.5  × (5.87/0.800) = × 7.34
-                #   PSA 9          (0.667× PSA10) → CLA12 = PSA9  × (5.87/0.667) = × 8.81
-                #   Ungraded raw                  → use grade tier mult from base table
-                else:
-                    _pc_source = None
-                    _cla12_from_pc = 0.0
-
-                    if pc_result and pc_result.get("bgs_10_price_aud"):
-                        _val = float(pc_result["bgs_10_price_aud"])
-                        _cla12_from_pc = round(_val * 4.494, 2)
-                        _pc_source = f"PC BGS10 ${_val:.2f} × 4.494"
-                    elif pc_result and pc_result.get("psa_10_price_aud"):
-                        _val = float(pc_result["psa_10_price_aud"])
-                        _cla12_from_pc = round(_val * 5.87, 2)
-                        _pc_source = f"PC PSA10 ${_val:.2f} × 5.87"
-                    elif pc_result and pc_result.get("bgs_gem_price_aud"):
-                        _val = float(pc_result["bgs_gem_price_aud"])
-                        _cla12_from_pc = round(_val * 7.34, 2)
-                        _pc_source = f"PC G9.5 ${_val:.2f} × 7.34"
-                    elif pc_result and pc_result.get("psa_9_price_aud"):
-                        _val = float(pc_result["psa_9_price_aud"])
-                        _cla12_from_pc = round(_val * 8.81, 2)
-                        _pc_source = f"PC PSA9 ${_val:.2f} × 8.81"
-                    elif pc_result and pc_result.get("raw_price_aud"):
-                        # Ungraded → use attr estimate (already computed as _attr_est)
-                        pass
-
-                    if _cla12_from_pc > 0 and _pc_source:
-                        logging.info(f"🏆 CLA 12: {_pc_source} = ${_cla12_from_pc:.2f} AUD for {card_name}")
-                        ebay_result = {
-                            "source":               "pc_scaled",
-                            "median":               _cla12_from_pc,
-                            "count":                3,
-                            "price_includes_grade": True,
-                            "_bgs_black_converted": True,
-                            "query":                f"{card_name} ({_pc_source})",
-                        }
-            else:
-                tcg_result, ebay_result, pc_result = await asyncio.gather(
-                    _fetch_pokemontcg_price(fp),
-                    _ebay_sold_strict(fp, limit=60, days_lookback=90),
-                    _fetch_pricecharting_strict(fp),
-                )
+            # Standard (non-CLA) precision path — fetch all sources in parallel
+            tcg_result, ebay_result, pc_result = await asyncio.gather(
+                _fetch_pokemontcg_price(fp),
+                _ebay_sold_strict(fp, limit=60, days_lookback=90),
+                _fetch_pricecharting_strict(fp),
+            )
 
             sources = {
                 "tcgplayer":     tcg_result,
@@ -8906,29 +9105,8 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
         # ── LEGACY FALLBACK PATH ──────────────────────────────────────────────
         # Used when fingerprint is incomplete (card_number/set missing) OR when
         # the precision path found no results.
-        #
-        # SKIP legacy entirely for CLA 12: the legacy path calls apply_cla_valuation
-        # which upgrades grade 10 → 12, and if the signal is already a BGS Black price
-        # (grade 12 equivalent) this double-multiplies. CLA 12 attr estimate is safer.
-        _skip_legacy_cla12 = grade_is_12_plus and grader.upper() in ("CLA", "COLLECTORS LEAGUE", "")
-        if _skip_legacy_cla12:
-            if _attr_est and _attr_est.get("current_price", 0) > 0:
-                _attr_est["card_name"]         = card_name
-                _attr_est["price_source"]      = "attr_estimate_cla12"
-                _attr_est["grader_brand_factor"] = 1.0
-                logging.info(
-                    f"📊 CLA 12: using attr estimate ${_attr_est['current_price']:.2f} AUD "                    f"(skipped legacy to avoid double-multiply) for {card_name}"
-                )
-                return _attr_est
-            # attr estimate also empty — return no_results
-            return {
-                "current_price": 0, "final_value": 0, "multiplier_applied": 1.0,
-                "source": "no_results", "confidence": "none",
-                "price_includes_grade": True, "grade_12_uplift": False,
-                "card_name": card_name,
-            }
-        # Preserves the original behaviour
-        # exactly so no existing functionality is broken.
+        # NOTE: CLA 10/12 cards never reach here — they are handled by the
+        # dedicated _cla_resolve_price path at the top of this function.
         logging.info(f"🔄 Legacy pricing path for: {card_name}")
 
         variant_tokens = []
