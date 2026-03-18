@@ -1,6 +1,6 @@
 """
 The Collectors League Australia - Scan API
-Futureproof v6.9.23 (2026-03-16)
+Futureproof v6.9.25 (2026-03-16)
 
 What changed vs v6.9.2 (2026-03-16)
 - ✅ CRITICAL FIX: Added missing /api/fingerprint/generate endpoint — was returning 404,
@@ -568,7 +568,7 @@ def safe_endpoint(func):
 # ==============================
 # Config
 # ==============================
-APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-03-18-v6.9.24")
+APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-03-18-v6.9.25")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
@@ -8629,12 +8629,17 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                 )
                 # Priority 1: BGS Black eBay sold comps (most accurate)
                 if bgs_black_result and bgs_black_result.get("count", 0) >= 1:
+                    _bgs_median = float(bgs_black_result.get('median') or 0)
+                    # CLA 12 = 90% of BGS Black — convert here so grader factor is NOT applied
+                    _cla12_price = round(_bgs_median * 0.90, 2)
                     logging.info(
-                        f"🏆 CLA 12: using BGS Black eBay comp ${bgs_black_result.get('median', 0):.2f} AUD "
+                        f"🏆 CLA 12: BGS Black ${_bgs_median:.2f} × 0.90 = ${_cla12_price:.2f} AUD "
                         f"({bgs_black_result.get('count', 0)} sales) for {card_name}"
                     )
-                    # BGS Black IS the CLA 12 price — grader factor already = 1.0 (same grade)
-                    ebay_result = bgs_black_result
+                    ebay_result = dict(bgs_black_result)
+                    ebay_result["median"] = _cla12_price
+                    ebay_result["price_includes_grade"] = True
+                    ebay_result["_bgs_black_converted"] = True  # skip grader factor below
 
                 # Priority 2: PC BGS 10 Pristine × scale to CLA 12
                 # bgs-10-price = BGS 10 Pristine (1.307× PSA 10)
@@ -8789,8 +8794,10 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
 
             if final_price > 0:
                 # Apply grader brand factor — eBay comps are almost always PSA.
-                # Adjust the final price to reflect the actual grader on the slab.
-                _gbf = _grader_brand_factor(grader, grade)
+                # SKIP when signal was already converted from BGS Black (CLA 12 path)
+                # — that conversion already accounts for the CLA 12 premium.
+                _bgs_converted = (ebay_result or {}).get("_bgs_black_converted", False)
+                _gbf = 1.0 if _bgs_converted else _grader_brand_factor(grader, grade)
                 if _gbf != 1.0 and grader:
                     _pre_brand = final_price
                     final_price = round(final_price * _gbf, 2)
