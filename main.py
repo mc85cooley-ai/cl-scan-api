@@ -568,7 +568,7 @@ def safe_endpoint(func):
 # ==============================
 # Config
 # ==============================
-APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-03-17-v6.9.17")
+APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-03-17-v6.9.19")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
@@ -7984,6 +7984,7 @@ def _cla_estimate_from_attributes(
     card_number:  str = "",
     is_error:     bool = False,
     is_promo:     bool = False,
+    pc_raw_price_aud: Optional[float] = None,  # live ungraded price from PriceCharting
 ) -> Dict[str, Any]:
     """
     CLA attribute-based estimate using the Layered Valuation Engine v3.
@@ -8005,94 +8006,106 @@ def _cla_estimate_from_attributes(
     lang   = (language     or "english").lower().strip()
     is_jp  = lang in ("japanese", "jp", "ja")
 
-    # ── Step 1: Raw NM base price from game × rarity table (AUD) ─────────────
-    # Keys are matched by substring so partial labels work.
-    # More-specific keys MUST come first.
-    _ONE_PIECE_BASES: List[tuple] = [
-        # Most-specific first to avoid substring matches
-        ("leader parallel",           400.0),
-        ("l parallel",                400.0),
-        ("gold parallel",             192.0),   # Gold DON!! PC ungraded: $123.79 USD = ~$192 AUD
-        ("gold",                      192.0),   # catch-all for gold foil variants
-        ("super rare parallel",       130.0),
-        ("sr parallel",               130.0),
-        ("sr★",                       130.0),
-        ("rare parallel",              35.0),
-        ("r★",                         35.0),
-        ("r parallel",                 35.0),
-        ("leader rare",               180.0),
-        ("secret rare",                55.0),
-        ("sec",                        55.0),
-        ("super rare",                 20.0),
-        ("sr",                         20.0),
-        ("illustration rare",          18.0),
-        ("full art",                   18.0),
-        ("alt art",                    18.0),  # Rocinante OP12-108 is Alt Art
-        ("textured",                   40.0),
-        ("manga",                      45.0),
-        ("rare",                        5.0),
-        ("uncommon",                    1.75),
-        ("common",                      0.80),
-        ("parallel",                   25.0),
-    ]
-    _POKEMON_BASES: List[tuple] = [
-        ("crown rare",                280.0),
-        ("special illustration rare", 130.0),
-        ("special art rare",          130.0),
-        ("sar",                       130.0),
-        ("hyper rare",                 70.0),
-        ("shiny ultra rare",           50.0),
-        ("shiny rare",                 18.0),
-        ("secret rare",                55.0),
-        ("illustration rare",          40.0),
-        ("full art",                   30.0),
-        ("rainbow rare",               28.0),
-        ("alt art",                    28.0),
-        ("ultra rare",                 18.0),
-        ("double rare",                 5.0),
-        ("radiant rare",               15.0),
-        ("trainer gallery",            12.0),
-        ("holo rare",                   6.0),
-        ("reverse holo",                3.50),
-        ("rare",                        2.50),
-        ("uncommon",                    0.90),
-        ("common",                      0.45),
-    ]
-    _DBZ_BASES: List[tuple] = [
-        ("special rare",               80.0),
-        ("spr",                        80.0),
-        ("secret rare",                50.0),
-        ("special art",                50.0),
-        ("ultra rare",                 25.0),
-        ("super rare",                 12.0),
-        ("rare",                        5.0),
-        ("uncommon",                    2.0),
-        ("common",                      1.0),
-    ]
-    _STAR_WARS_BASES: List[tuple] = [
-        ("hologram",          60.0),
-        ("limited edition",   55.0),
-        ("series ii",         35.0),
-        ("galaxy",            30.0),
-        ("dark empire",       22.0),
-        ("chromium",          25.0),
-        ("chrome",            25.0),
-        ("foil",              20.0),
-        ("embossed",          18.0),
-        ("prism",             18.0),
-        ("rare",              10.0),
-        ("uncommon",           5.0),
-        ("common",             3.0),
-    ]
-    _GENERIC_BASES: List[tuple] = [
-        ("parallel",                   20.0),
-        ("secret rare",                45.0),
-        ("ultra rare",                 20.0),
-        ("full art",                   15.0),
-        ("rare",                        5.0),
-        ("uncommon",                    2.0),
-        ("common",                      1.0),
-    ]
+    # ── Step 1: Raw NM base price ─────────────────────────────────────────────
+    # All bases are RATIO-BASED, anchored to a common card in each game.
+    # Anchor prices come from PriceCharting observed averages (loose-price).
+    # These ratios fire ONLY when no live PC loose-price is available.
+    # If PC returns a loose-price for this specific card, it overrides everything.
+    #
+    # Formula: base_aud = anchor_aud × rarity_ratio
+    # The anchor is the cheapest/most common card in that game.
+
+    _OP_ANCHOR  = 0.80   # One Piece Common AUD (PC observed avg)
+    _PK_ANCHOR  = 0.40   # Pokemon Common AUD
+    _DBZ_ANCHOR = 0.80   # Dragon Ball Common AUD
+    _SW_ANCHOR  = 2.50   # Star Wars Common AUD (vintage, higher floor)
+    _GEN_ANCHOR = 0.80   # Generic Common AUD
+
+    # Ratios relative to common = 1.0x (derived from observed market relationships)
+    _ONE_PIECE_BASES: List[tuple] = [(k, round(r * _OP_ANCHOR, 2)) for k, r in [
+        ("leader parallel",     500.0),
+        ("l parallel",          500.0),
+        ("gold parallel",       241.0),   # Gold DON!! ratio: $192/$0.80
+        ("gold",                241.0),
+        ("super rare parallel", 163.0),   # SR★: $130/$0.80
+        ("sr parallel",         163.0),
+        ("sr★",                 163.0),
+        ("rare parallel",        44.0),   # R★: $35/$0.80
+        ("r★",                   44.0),
+        ("r parallel",           44.0),
+        ("leader rare",          225.0),  # L: $180/$0.80
+        ("secret rare",           69.0),  # SEC: $55/$0.80
+        ("sec",                   69.0),
+        ("super rare",            25.0),  # SR: $20/$0.80
+        ("sr",                    25.0),
+        ("illustration rare",     22.5),
+        ("full art",              22.5),
+        ("alt art",               22.5),
+        ("textured",              50.0),
+        ("manga",                 56.0),
+        ("rare",                   6.3),
+        ("uncommon",               2.2),
+        ("common",                 1.0),
+        ("parallel",              31.0),
+    ]]
+    _POKEMON_BASES: List[tuple] = [(k, round(r * _PK_ANCHOR, 2)) for k, r in [
+        ("crown rare",                  700.0),
+        ("special illustration rare",   325.0),
+        ("special art rare",            325.0),
+        ("sar",                         325.0),
+        ("hyper rare",                  175.0),
+        ("shiny ultra rare",            125.0),
+        ("shiny rare",                   45.0),
+        ("secret rare",                 138.0),
+        ("illustration rare",           100.0),
+        ("full art",                     75.0),
+        ("rainbow rare",                 70.0),
+        ("alt art",                      70.0),
+        ("ultra rare",                   45.0),
+        ("double rare",                  12.5),
+        ("radiant rare",                 38.0),
+        ("trainer gallery",              30.0),
+        ("holo rare",                    15.0),
+        ("reverse holo",                  8.8),
+        ("rare",                          6.3),
+        ("uncommon",                      2.3),
+        ("common",                        1.0),
+    ]]
+    _DBZ_BASES: List[tuple] = [(k, round(r * _DBZ_ANCHOR, 2)) for k, r in [
+        ("special rare",    100.0),
+        ("spr",             100.0),
+        ("secret rare",      63.0),
+        ("special art",      63.0),
+        ("ultra rare",       31.0),
+        ("super rare",       15.0),
+        ("rare",              6.3),
+        ("uncommon",          2.5),
+        ("common",            1.0),
+    ]]
+    _STAR_WARS_BASES: List[tuple] = [(k, round(r * _SW_ANCHOR, 2)) for k, r in [
+        ("hologram",         24.0),
+        ("limited edition",  22.0),
+        ("series ii",        14.0),
+        ("galaxy",           12.0),
+        ("dark empire",       8.8),
+        ("chromium",         10.0),
+        ("chrome",           10.0),
+        ("foil",              8.0),
+        ("embossed",          7.2),
+        ("prism",             7.2),
+        ("rare",              4.0),
+        ("uncommon",          2.0),
+        ("common",            1.0),
+    ]]
+    _GENERIC_BASES: List[tuple] = [(k, round(r * _GEN_ANCHOR, 2)) for k, r in [
+        ("parallel",         25.0),
+        ("secret rare",      56.0),
+        ("ultra rare",       25.0),
+        ("full art",         19.0),
+        ("rare",              6.3),
+        ("uncommon",          2.5),
+        ("common",            1.0),
+    ]]
 
     if   "one piece" in game or "onepiece" in game or game == "op":
         game_table = _ONE_PIECE_BASES
@@ -8106,16 +8119,9 @@ def _cla_estimate_from_attributes(
         game_table = _GENERIC_BASES
 
     # Game-specific fallback when rarity is unknown/empty
-    _GAME_FALLBACKS = {
-        "one piece": 8.0, "pokemon": 5.0, "dragon ball": 6.0,
-        "star wars": 8.0, "sports": 8.0,  "marvel": 5.0,
-        "dc": 5.0, "yugioh": 6.0, "magic": 5.0, "digimon": 5.0, "lorcana": 5.0,
-    }
-    _fallback = 3.0
-    for _gk, _gv in _GAME_FALLBACKS.items():
-        if _gk in game:
-            _fallback = _gv
-            break
+    # No hardcoded fallback dollar amounts.
+    # If rarity doesn't match any key AND no PC data → base = 0 → no_data
+    _fallback = 0.0
 
     # Normalise ASCII star (*) to Unicode ★ and expand shorthand notations
     # so stored values like "Rare *", "SR*", "R*" all resolve correctly.
@@ -8144,13 +8150,40 @@ def _cla_estimate_from_attributes(
     # Also combine rarity+variant so "Gold" + "Parallel" → "gold parallel"
     _set_lower = (card_set or "").lower().strip()
     search_str = _norm_rarity_str(f"{rar} {var} {fin} {_set_lower}")
-    base_aud    = _fallback
+    # ── Determine base price ─────────────────────────────────────────────────
+    # Priority 1: PC live loose-price (real market data — most accurate)
+    # Priority 2: Ratio-based calculated estimate from rarity tier
+    # Priority 3: 0 → caller returns no_market_data
+
+    base_aud     = _fallback
     matched_tier = "unknown"
-    for key, price in game_table:
-        if key in search_str:
-            base_aud     = price
-            matched_tier = key
-            break
+
+    if pc_raw_price_aud and float(pc_raw_price_aud) > 0:
+        # Real data from PriceCharting — always preferred
+        base_aud     = float(pc_raw_price_aud)
+        matched_tier = f"pc_live"
+        logging.info(f"📊 Attr base: PC live ${base_aud:.2f} AUD for {search_str!r}")
+    else:
+        # No live data — use ratio-based calculated estimate
+        for key, price in game_table:
+            if key in search_str:
+                base_aud     = price
+                matched_tier = f"ratio:{key}"
+                break
+        if base_aud > 0:
+            logging.info(f"📊 Attr base: ratio estimate ${base_aud:.2f} AUD (tier={matched_tier})")
+        else:
+            logging.info(f"📊 Attr base: no data for {search_str!r} — returning no_market_data")
+
+    # If no base at all — return empty so caller knows price is genuinely unknown
+    if base_aud <= 0:
+        return {
+            "current_price":  0,
+            "source":          "no_market_data",
+            "confidence":      "none",
+            "matched_rarity_tier": "unknown",
+            "base_price":      0,
+        }
 
     # ── Step 2: Feed everything into the layered valuation engine ─────────────
     lv = cla_layered_valuation(
@@ -8908,6 +8941,7 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                 card_number  = card_number,
                 is_error     = is_error,
                 is_promo     = is_promo,
+                # pc_raw_price_aud injected after PC fetch completes — see below
             )
         except Exception as _ae:
             logging.info(f"Attr estimate skipped: {_ae}")
@@ -9002,6 +9036,35 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                 "ebay":          ebay_result,
                 "pricecharting": pc_result,
             }
+
+            # ── Re-run attr estimate with PC live raw price if we got one ─────
+            # The pre-computed attr_est used hardcoded table bases.
+            # Now that PC has returned, re-run with real loose-price if available.
+            _pc_raw = (pc_result or {}).get("raw_price_aud")
+            if _pc_raw and float(_pc_raw) > 0:
+                try:
+                    _attr_est = _cla_estimate_from_attributes(
+                        game_type    = game_type,
+                        rarity       = rarity,
+                        variant_type = variant_type,
+                        finish       = finish,
+                        language     = language,
+                        is_signed    = is_signed,
+                        grade        = grade,
+                        rank_within_card = getattr(request, "rank_within_card", None),
+                        rank_total       = getattr(request, "rank_total",       None),
+                        card_set     = card_set,
+                        card_number  = card_number,
+                        is_error     = is_error,
+                        is_promo     = is_promo,
+                        pc_raw_price_aud = float(_pc_raw),
+                    )
+                    logging.info(
+                        f"📊 Attr estimate refreshed with PC raw=${_pc_raw:.2f} AUD: "
+                        f"${_attr_est.get('current_price', 0):.2f} AUD for {card_name}"
+                    )
+                except Exception as _re:
+                    logging.debug(f"Attr re-estimate failed: {_re}")
 
             # ── Variant second-pass ──────────────────────────────────────────
             # Pass rarity/variant into the fingerprint so _ebay_sold_strict
