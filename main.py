@@ -1,6 +1,6 @@
 """
 The Collectors League Australia - Scan API
-Futureproof v6.9.27 (2026-03-16)
+Futureproof v6.9.28 (2026-03-16)
 
 What changed vs v6.9.2 (2026-03-16)
 - ✅ CRITICAL FIX: Added missing /api/fingerprint/generate endpoint — was returning 404,
@@ -568,7 +568,7 @@ def safe_endpoint(func):
 # ==============================
 # Config
 # ==============================
-APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-03-18-v6.9.27")
+APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-03-18-v6.9.28")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
@@ -8905,7 +8905,29 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
 
         # ── LEGACY FALLBACK PATH ──────────────────────────────────────────────
         # Used when fingerprint is incomplete (card_number/set missing) OR when
-        # the precision path found no results.  Preserves the original behaviour
+        # the precision path found no results.
+        #
+        # SKIP legacy entirely for CLA 12: the legacy path calls apply_cla_valuation
+        # which upgrades grade 10 → 12, and if the signal is already a BGS Black price
+        # (grade 12 equivalent) this double-multiplies. CLA 12 attr estimate is safer.
+        _skip_legacy_cla12 = grade_is_12_plus and grader.upper() in ("CLA", "COLLECTORS LEAGUE", "")
+        if _skip_legacy_cla12:
+            if _attr_est and _attr_est.get("current_price", 0) > 0:
+                _attr_est["card_name"]         = card_name
+                _attr_est["price_source"]      = "attr_estimate_cla12"
+                _attr_est["grader_brand_factor"] = 1.0
+                logging.info(
+                    f"📊 CLA 12: using attr estimate ${_attr_est['current_price']:.2f} AUD "                    f"(skipped legacy to avoid double-multiply) for {card_name}"
+                )
+                return _attr_est
+            # attr estimate also empty — return no_results
+            return {
+                "current_price": 0, "final_value": 0, "multiplier_applied": 1.0,
+                "source": "no_results", "confidence": "none",
+                "price_includes_grade": True, "grade_12_uplift": False,
+                "card_name": card_name,
+            }
+        # Preserves the original behaviour
         # exactly so no existing functionality is broken.
         logging.info(f"🔄 Legacy pricing path for: {card_name}")
 
