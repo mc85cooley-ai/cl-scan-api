@@ -1,6 +1,6 @@
 """
 The Collectors League Australia - Scan API
-Futureproof v6.9.3 (2026-03-16)
+Futureproof v6.9.23 (2026-03-16)
 
 What changed vs v6.9.2 (2026-03-16)
 - ✅ CRITICAL FIX: Added missing /api/fingerprint/generate endpoint — was returning 404,
@@ -568,7 +568,7 @@ def safe_endpoint(func):
 # ==============================
 # Config
 # ==============================
-APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-03-18-v6.9.22")
+APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-03-18-v6.9.23")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
@@ -7630,6 +7630,7 @@ def _cla_estimate_from_attributes(
     is_error:     bool = False,
     is_promo:     bool = False,
     pc_raw_price_aud: Optional[float] = None,  # live ungraded price from PriceCharting
+    signed_by:    str = "",                    # signer name for celebrity vs artist tier
 ) -> Dict[str, Any]:
     """
     CLA attribute-based estimate using the Layered Valuation Engine v3.
@@ -8590,6 +8591,7 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                 finish       = finish,
                 language     = language,
                 is_signed    = is_signed,
+                signed_by    = signed_by,
                 grade        = grade,
                 rank_within_card = getattr(request, "rank_within_card", None),
                 rank_total       = getattr(request, "rank_total",       None),
@@ -8706,6 +8708,7 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                         finish       = finish,
                         language     = language,
                         is_signed    = is_signed,
+                        signed_by    = signed_by,
                         grade        = grade,
                         rank_within_card = getattr(request, "rank_within_card", None),
                         rank_total       = getattr(request, "rank_total",       None),
@@ -8870,6 +8873,7 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                         finish       = finish,
                         language     = language,
                         is_signed    = is_signed,
+                        signed_by    = signed_by,
                         grade        = grade,
                         rank_within_card = getattr(request, "rank_within_card", None),
                         rank_total       = getattr(request, "rank_total",       None),
@@ -9204,6 +9208,7 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                     finish       = finish,
                     language     = language,
                     is_signed    = is_signed,
+                        signed_by    = signed_by,
                     grade        = grade,
                     rank_within_card = getattr(request, "rank_within_card", None),
                     rank_total       = getattr(request, "rank_total",       None),
