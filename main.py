@@ -568,7 +568,7 @@ def safe_endpoint(func):
 # ==============================
 # Config
 # ==============================
-APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-03-18-v6.9.23")
+APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-03-18-v6.9.24")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
@@ -7841,6 +7841,7 @@ def _cla_estimate_from_attributes(
         language         = language,
         edition          = "",
         is_signed        = is_signed,
+        signed_by        = signed_by,
         game_type        = game_type,
         rank_within_card = rank_within_card,
         rank_total       = rank_total,
@@ -7985,6 +7986,7 @@ def cla_layered_valuation(
     language:         str   = "english",
     edition:          str   = "",
     is_signed:        bool  = False,
+    signed_by:        str   = "",
     game_type:        str   = "",
     rank_within_card: Optional[int] = None,
     rank_total:       Optional[int] = None,
