@@ -1,6 +1,6 @@
 """
 The Collectors League Australia - Scan API
-Futureproof v6.9.25 (2026-03-16)
+Futureproof v6.9.27 (2026-03-16)
 
 What changed vs v6.9.2 (2026-03-16)
 - ✅ CRITICAL FIX: Added missing /api/fingerprint/generate endpoint — was returning 404,
@@ -568,7 +568,7 @@ def safe_endpoint(func):
 # ==============================
 # Config
 # ==============================
-APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-03-18-v6.9.25")
+APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-03-18-v6.9.27")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
@@ -8641,54 +8641,48 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                     ebay_result["price_includes_grade"] = True
                     ebay_result["_bgs_black_converted"] = True  # skip grader factor below
 
-                # Priority 2: PC BGS 10 Pristine × scale to CLA 12
-                # bgs-10-price = BGS 10 Pristine (1.307× PSA 10)
-                # CLA 12 = 5.8734× PSA 10, so CLA 12 = BGS10 × (5.8734/1.307) = × 4.494
-                elif pc_result and pc_result.get("bgs_10_price_aud"):
-                    _pc_bgs10  = float(pc_result["bgs_10_price_aud"])
-                    _cla12_from_pc = round(_pc_bgs10 * 4.494, 2)
-                    logging.info(
-                        f"🏆 CLA 12: PC BGS10 Pristine ${_pc_bgs10:.2f} AUD × 4.494 "
-                        f"= ${_cla12_from_pc:.2f} AUD for {card_name}"
-                    )
-                    ebay_result = {
-                        "source":               "pc_bgs10_scaled",
-                        "median":               _cla12_from_pc,
-                        "count":                3,
-                        "price_includes_grade": True,
-                        "query":                f"{card_name} BGS 10 Pristine (PriceCharting scaled)",
-                    }
-                # Priority 3: PC PSA 10 (manual-only-price) × 5.8734
-                elif pc_result and pc_result.get("psa_10_price_aud") and not ebay_result:
-                    _pc_psa10  = float(pc_result["psa_10_price_aud"])
-                    _cla12_from_pc = round(_pc_psa10 * 5.8734, 2)
-                    logging.info(
-                        f"🏆 CLA 12: PC PSA10 ${_pc_psa10:.2f} AUD × 5.8734 "
-                        f"= ${_cla12_from_pc:.2f} AUD for {card_name}"
-                    )
-                    ebay_result = {
-                        "source":               "pc_psa10_scaled",
-                        "median":               _cla12_from_pc,
-                        "count":                3,
-                        "price_includes_grade": True,
-                        "query":                f"{card_name} PSA 10 (PriceCharting scaled)",
-                    }
-                # Priority 4: PC graded-price (PSA 9) × 6.526 (one grade below PSA 10)
-                elif pc_result and pc_result.get("graded_price_aud") and not ebay_result:
-                    _pc_psa9   = float(pc_result["graded_price_aud"])
-                    # PSA 9 → PSA 10: approx 1.4× step, then × 5.8734
-                    _cla12_from_pc = round(_pc_psa9 * 1.40 * 5.8734, 2)
-                    logging.info(
-                        f"🏆 CLA 12: PC PSA9 ${_pc_psa9:.2f} AUD × 1.40 × 5.8734 "
-                        f"= ${_cla12_from_pc:.2f} AUD for {card_name}"
-                    )
-                    ebay_result = {
-                        "source":               "pc_psa9_scaled",
-                        "median":               _cla12_from_pc,
-                        "count":                2,
-                        "price_includes_grade": True,
-                        "query":                f"{card_name} PSA 9 (PriceCharting scaled)",
-                    }
+                # ── PC grade-based scaling: use highest available grade ──────────
+                # All multipliers calibrated from Baby5+Charizard data (Luffy excluded as pop anomaly)
+                # Grade relationship: CLA12 = PSA10 × 5.87
+                # Derived from that: each grade below PSA10 scales proportionally
+                #   BGS10 Pristine (1.307× PSA10) → CLA12 = BGS10 × (5.87/1.307) = × 4.494
+                #   Grade 9.5      (0.800× PSA10) → CLA12 = G9.5  × (5.87/0.800) = × 7.34
+                #   PSA 9          (0.667× PSA10) → CLA12 = PSA9  × (5.87/0.667) = × 8.81
+                #   Ungraded raw                  → use grade tier mult from base table
+                else:
+                    _pc_source = None
+                    _cla12_from_pc = 0.0
+
+                    if pc_result and pc_result.get("bgs_10_price_aud"):
+                        _val = float(pc_result["bgs_10_price_aud"])
+                        _cla12_from_pc = round(_val * 4.494, 2)
+                        _pc_source = f"PC BGS10 ${_val:.2f} × 4.494"
+                    elif pc_result and pc_result.get("psa_10_price_aud"):
+                        _val = float(pc_result["psa_10_price_aud"])
+                        _cla12_from_pc = round(_val * 5.87, 2)
+                        _pc_source = f"PC PSA10 ${_val:.2f} × 5.87"
+                    elif pc_result and pc_result.get("bgs_gem_price_aud"):
+                        _val = float(pc_result["bgs_gem_price_aud"])
+                        _cla12_from_pc = round(_val * 7.34, 2)
+                        _pc_source = f"PC G9.5 ${_val:.2f} × 7.34"
+                    elif pc_result and pc_result.get("psa_9_price_aud"):
+                        _val = float(pc_result["psa_9_price_aud"])
+                        _cla12_from_pc = round(_val * 8.81, 2)
+                        _pc_source = f"PC PSA9 ${_val:.2f} × 8.81"
+                    elif pc_result and pc_result.get("raw_price_aud"):
+                        # Ungraded → use attr estimate (already computed as _attr_est)
+                        pass
+
+                    if _cla12_from_pc > 0 and _pc_source:
+                        logging.info(f"🏆 CLA 12: {_pc_source} = ${_cla12_from_pc:.2f} AUD for {card_name}")
+                        ebay_result = {
+                            "source":               "pc_scaled",
+                            "median":               _cla12_from_pc,
+                            "count":                3,
+                            "price_includes_grade": True,
+                            "_bgs_black_converted": True,
+                            "query":                f"{card_name} ({_pc_source})",
+                        }
             else:
                 tcg_result, ebay_result, pc_result = await asyncio.gather(
                     _fetch_pokemontcg_price(fp),
@@ -8794,10 +8788,11 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
 
             if final_price > 0:
                 # Apply grader brand factor — eBay comps are almost always PSA.
-                # SKIP when signal was already converted from BGS Black (CLA 12 path)
-                # — that conversion already accounts for the CLA 12 premium.
-                _bgs_converted = (ebay_result or {}).get("_bgs_black_converted", False)
-                _gbf = 1.0 if _bgs_converted else _grader_brand_factor(grader, grade)
+                # NEVER apply for CLA 12: the entire precision path for CLA 12
+                # already converts to CLA 12 price (BGS Black × 0.90, PC × 5.87 etc.)
+                # Applying the factor again would double-multiply every time.
+                _is_cla12_result = grade_is_12_plus and grader.upper() in ("CLA", "COLLECTORS LEAGUE", "")
+                _gbf = 1.0 if _is_cla12_result else _grader_brand_factor(grader, grade)
                 if _gbf != 1.0 and grader:
                     _pre_brand = final_price
                     final_price = round(final_price * _gbf, 2)
@@ -9101,7 +9096,9 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                 final_price = float(price or 0.0)
 
             # Apply grader brand factor — legacy ladder path
-            _gbf_leg = _grader_brand_factor(grader, grade)
+            # NEVER apply for CLA 12 (legacy path already applies full CLA grade mult)
+            _is_cla12_leg = grade_is_12_plus and grader.upper() in ("CLA", "COLLECTORS LEAGUE", "")
+            _gbf_leg = 1.0 if _is_cla12_leg else _grader_brand_factor(grader, grade)
             if _gbf_leg != 1.0 and grader:
                 final_price = round(final_price * _gbf_leg, 2)
                 logging.info(f"🏷️ Grader brand factor (legacy): {grader} {_gbf_leg:.2f}x → ${final_price:.2f}")
