@@ -1,134 +1,67 @@
 """
 The Collectors League Australia - Scan API
-v6.9.21 (2026-03-18)
-
-What changed vs v6.9.3 (2026-03-16)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-PRICING ARCHITECTURE OVERHAUL
-- ✅ CRITICAL FIX: Bulk "Update All" was serving cached prices on every run — delete_transient()
-  now called before every bulk fetch, guaranteeing fresh API hits.
-- ✅ CRITICAL FIX: cg-market.php bulk SELECT was missing submission_id, rarity, variant_type,
-  finish, edition, is_signed, signed_by, is_error_card, is_promo, language columns — these were
-  always blank for bulk updates, causing the API to price without variant context.
-- ✅ CRITICAL FIX: card_set enriched from card_submissions table when blank in cg_collections —
-  many cards had no set stored, causing _resolve_card_fingerprint to throw ValueError and fall
-  through to attribute estimate, bypassing eBay and PriceCharting entirely.
-- ✅ CRITICAL FIX: _resolve_card_fingerprint no longer requires card_set when card_number is
-  present — a number like "OP01-024" uniquely identifies a card without the set name.
-
-PRICECHARTING FIELD MAPPING (correct field names per official PC docs)
-- ✅ FIX: loose-price       = Ungraded raw (was correctly used)
-- ✅ FIX: manual-only-price = PSA 10 (was using graded-price which is PSA 9 — undervaluing by ~40%)
-- ✅ FIX: graded-price      = PSA 9 (not PSA 10 as previously assumed)
-- ✅ FIX: box-only-price    = BGS 9.5 GemMint
-- ✅ FIX: bgs-10-price      = BGS 10 Pristine
-- ✅ FIX: condition-17-price= CGC 10
-- ✅ FIX: condition-18-price= SGC 10
-- ✅ NEW: PriceCharting now returns all grader-specific prices; CLA 12 path uses
-  bgs_10_price_aud × 4.494 (Priority 2) or psa_10_price_aud × 5.8734 (Priority 3)
-
-GRADER BRAND FACTOR SYSTEM
-- ✅ NEW: _grader_brand_factor(grader, grade) — calibrated from real PriceCharting data
-  (Baby5 Alt Art, Mega Charizard PFL, Luffy OP01-024):
-    CLA 10 Flawless       = PSA 10           → 1.000× (confirmed by CLA grading standard)
-    CLA 11                = interpolated      → 2.424× (geometric mean)
-    CLA 12 Ultra Flawless = 90% of BGS Black  → 5.873× (= BGS_Black_avg × 0.90)
-    BGS 9.5 GemMint       = PSA 10 equiv      → 0.810×
-    BGS 10 Pristine       > PSA 10            → 1.307×
-    BGS 10 Black          >> PSA 10           → 6.526× (Baby5+Charizard avg; Luffy excluded as pop anomaly)
-    CGC 10                ≈ BGS 9.5           → 0.810×
-    CGC 10 Pristine       > CGC 10            → 1.280×
-    SGC 10                < PSA 10            → 0.597×
-- ✅ FIX: Grader brand factor NOT applied to attribute estimates — the CLA grade tier table
-  already uses CLA-native multipliers; applying the factor on top was double-counting.
-- ✅ FIX: Factor applied only to PSA/eBay market comps, not to CLA-internal calculations.
-
-CLA 12 PRICING (BGS BLACK EQUIVALENT)
-- ✅ NEW: CLA 12 precision path searches eBay for BGS 10 Black sold comps directly
-  (using _grade_token_override) — gives card-specific price rather than fixed factor.
-- ✅ Priority chain for CLA 12:
-    1. eBay BGS Black sold comps → factor = 1.0 (same grade tier)
-    2. PC bgs-10-price (BGS 10 Pristine) × 4.494
-    3. PC manual-only-price (PSA 10) × 5.873
-    4. PC graded-price (PSA 9) × 1.40 × 5.873
-    5. Attribute estimate (CLA-native grade tiers, no factor)
-
-ATTRIBUTE ESTIMATE OVERHAUL
-- ✅ OVERHAUL: Hardcoded dollar tables replaced with ratio-based anchored system.
-  All rarity bases are now: anchor_AUD × rarity_ratio (e.g. OP Common $0.80 × SR ratio 25 = $20).
-  Changing one anchor rescales the entire game's tier table automatically.
-- ✅ NEW: PC live loose-price used as base when available — real market data overrides
-  ratio table. Attr estimate re-run after PC fetch with actual ungraded price.
-- ✅ FIX: Returns source="no_market_data" with price=0 when no base exists — no fabricated prices.
-
-FLOOR GUARD & SANITY CAP
-- ✅ NEW: Raw signal minimum floor — rejects eBay wrong-card matches before grade mult amplifies them:
-    Grade 12: raw_signal < $5   → reject (zeroed, falls to attr estimate)
-    Grade 10: raw_signal < $1.50 → reject
-    Grade 9:  raw_signal < $0.50 → reject
-- ✅ FIX: Final price floor raised:
-    Grade 12: $6 → $20  (a $2.33 wrong-card × 14.91× = $34.75 was passing the old $6 floor)
-    Grade 10: $4 → $8
-- ✅ FIX: price_reliability gate in cg-market.php — if backend returns needs_review
-  (rarity band check failed, sources disagree >100%, single eBay comp), PHP now keeps
-  the old stored value and writes market_data_json only (for UI ⚠️ badge). Previously
-  all prices were written regardless of reliability, causing e.g. Charizard $1,284.
-
-SIGNED AUTOGRAPH TIERS
-- ✅ NEW: Three-tier signed multiplier system (previously only TCG vs non-TCG):
-    TCG artist (Ken Sugimori, Mitsuhiro Arita):    1.8×  floor $20 AUD
-    Comic/card artist (Cam Kennedy, Hildebrandt):  2.2×  floor $45 AUD  ← NEW
-    Celebrity/actor (Harrison Ford, Mark Hamill):  4.5×  floor $150 AUD
-  Classification via signed_by field — celebrity names auto-detected by keyword list.
-
-EBAY INTEGRATION FIXES
-- ✅ FIX: Active listings fallback when sold comps below MIN_SALES threshold
-- ✅ FIX: _fetch_pricecharting_strict query ladder:
-    Tier 1: name + set + number (full)
-    Tier 2: name + number only (skips noisy set name)  ← key fix
-    Tier 3: name + set (no number)
-    Tier 4: name only
-- ✅ FIX: PC search now passes game category (one-piece-cards, pokemon-cards etc.)
-- ✅ FIX: Reconciler warning "Reconciler returned 0" downgraded to INFO (expected for vintage)
-
-PARALLEL SOURCE ARCHITECTURE
-- ✅ NEW: Attribute estimate pre-computed in parallel with eBay/PC/TCG fetches
-- ✅ NEW: Response always includes attr_estimate and all source details for transparency
-- ✅ NEW: When reconciler returns 0, pre-computed attr_est used immediately (no re-run)
+Futureproof v6.9.3 (2026-03-16)
 
 What changed vs v6.9.2 (2026-03-16)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- ✅ CRITICAL FIX: Added missing /api/fingerprint/generate endpoint (was 404)
-- ✅ CRITICAL FIX: Added missing /api/fingerprint/match endpoint (was 404)
-- ✅ CARRIED: surface_texture .tobytes() fix
+- ✅ CRITICAL FIX: Added missing /api/fingerprint/generate endpoint — was returning 404,
+  causing the "Generate LingérPrint™ DNA" button in the DNA viewer to fail entirely.
+  cg-grading-dashboard.php (cgd_ajax_fingerprint_generate) calls this endpoint directly;
+  without it the PHP fell through to cgd_generate_local_fingerprint only, which lacks
+  surface_texture and returns "Not captured" for all API-derived fields.
+  The new endpoint accepts front/back multipart uploads OR image_front_url/image_back_url
+  form fields, runs the full fingerprint pipeline (dHash, surface SHA-256, colour zones,
+  histogram, embedding, keypoints) and returns {"success": true, "fingerprint": {...}}.
+- ✅ CRITICAL FIX: Added missing /api/fingerprint/match endpoint — was returning 404.
+  PHP has a local cgd_hash_similarity fallback that activates when this returns no matches,
+  so the endpoint returning 200 + empty matches list is all that's needed.
+- ✅ CARRIED: surface_texture .tobytes() fix from v6.9.2 applies to the new endpoint too.
 
 What changed vs v6.9.1 (2026-02-26)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- ✅ CRITICAL FIX: surface_texture "Not captured" — .tobytes() replaces broken generator
-- ✅ FIX: Fingerprint blocks log exceptions to fp_errors dict
-- ✅ FIX: PIL_AVAILABLE=False now explicit elif with warning log
+- ✅ CRITICAL FIX: surface_texture "Not captured" — block 6b was silently failing due to
+  `bytes(b for px in _crop32.getdata() for b in px)` generator expression. In Pillow >= 11
+  the ImagingCore pixel values returned by getdata() can cause a TypeError that the bare
+  `except: pass` swallowed silently. Fixed by replacing with `.tobytes()` — the canonical
+  Pillow API for raw pixel bytes, safe across all versions.
+- ✅ FIX: All 6 fingerprint blocks now log exceptions via logging.warning() and write errors
+  into a new `fp_errors` dict in the API response, so "Not captured" is self-diagnosing
+  without needing to grep Render logs.
+- ✅ FIX: PIL_AVAILABLE=False and empty front_proc are now explicit elif branches with
+  warning-level log messages, not a single silent `if PIL_AVAILABLE and front_proc:` guard.
 
 What changed vs v6.9.0 (2026-02-26)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- ✅ CRITICAL FIX: Removed second-pass AI call from /api/verify (Render 512MB OOM → 502)
-- ✅ FIX: _grade_bucket() supports Grade 12 (CL Ultra Flawless)
-- ✅ FIX: Removed duplicate /api/collection/update-values endpoint
-- ✅ FIX: Memorabilia assessment uses detail:high images
-- ✅ FIX: _grade_distribution() covers full grade range 1–12
-- ✅ NEW: Half-grade support (9.5, 8.5, 7.5 etc.)
-- ✅ NEW: Grading standard selector (PSA/BGS/CGC/CL)
-- ✅ NEW: Error card / misprint / factory defect detection
-- ✅ NEW: Expanded _normalize_card_type() — 20+ TCGs + sports
+- ✅ CRITICAL FIX: Removed second-pass AI call from /api/verify — was exceeding Render 512MB memory limit (502 Bad Gateway)
+- ✅ CRITICAL FIX: Disabled _openai_label_rois in /api/verify and memorabilia endpoints — memory budget
+- ✅ NOTE: Single-pass mode — primary OpenAI vision call handles defect detection; second pass was redundant overhead
+- ✅ NOTE: defect_filters kept in response schema (returns empty dict) for frontend compatibility
+- ✅ FIX: _grade_bucket() now supports Grade 12 (CL Ultra Flawless) — was silently dropping to N/A
+- ✅ FIX: Removed duplicate /api/collection/update-values endpoint (mock was overwriting real)
+- ✅ FIX: Memorabilia assessment now uses detail:high images (was low — couldn't see seal damage)
+- ✅ FIX: Assessment prompt rule numbering corrected (was 1,2,3,5,4)
+- ✅ FIX: _grade_distribution() now covers full grade range 1-12 (was only 8-10)
+- ✅ FIX: predict-grade endpoint updated for half-grades and full range
+- ✅ FIX: Assessment max_tokens bumped 2200→3000 for expanded output
+- ✅ NEW: Half-grade support (9.5, 8.5, 7.5 etc.) — _parse_half_grade(), pregrade normalization
+- ✅ NEW: Grading standard selector (PSA/BGS/CGC/CL) via grading_standard param on /api/verify
+- ✅ NEW: Error card / misprint / factory defect detection (miscut, crimped, wrong-back, holo bleed etc.)
+- ✅ NEW: Expanded surface condition factors (silvering vs whitening, yellowing, foxing, ink transfer, warp, gloss)
+- ✅ NEW: Rarity / variant / edition / finish / artist / promo / error detection in /api/identify
+- ✅ NEW: Sleeve/toploader detection in assessment (accounts for artifacts)
+- ✅ NEW: Card warp/bowing + back pattern awareness
+- ✅ NEW: Expanded _normalize_card_type() — 20+ TCGs + specific sports (AFL, NRL, Cricket, NBA etc.)
+- ✅ NEW: Expanded authenticity checks — rosette pattern, card stock, back pattern, light/weight test guidance
 
-Environment variables
-━━━━━━━━━━━━━━━━━━━━━
-- OPENAI_API_KEY        (required — vision grading/ID)
-- POKEMONTCG_API_KEY    (optional — Pokemon metadata enrichment)
-- PRICECHARTING_TOKEN   (required — all card pricing)
-- USE_EBAY_API=1        + EBAY_CLIENT_ID / EBAY_CLIENT_SECRET (eBay OAuth)
-- CL_USD_TO_AUD_MULTIPLIER (default 1.44 — override FX rate)
-- CL_SCAN_VERSION       (override version string shown in /health)
+Market data architecture (unchanged)
+- ✅ PriceCharting API as primary market source for cards + sealed/memorabilia (current prices).
+- ✅ Keeps PokemonTCG.io for identification + metadata enrichment (NOT price history).
+- ✅ Weekly snapshot option (store PriceCharting CSV/API snapshots on a schedule) to build your own price history.
+- ✅ eBay API scaffolding included but DISABLED by default (waiting for your dev account approval).
+- ✅ Market endpoints return "click-only" informational context + no ROI language.
+
+Env vars
+- OPENAI_API_KEY (required for vision grading/ID)
+- POKEMONTCG_API_KEY (optional; used for Pokemon metadata enrichment)
+- PRICECHARTING_TOKEN (recommended; enables pricing for cards + sealed/memorabilia)
+- USE_EBAY_API=0/1 (default 0) + EBAY_APP_ID/EBAY_CERT_ID/EBAY_DEV_ID/EBAY_OAUTH_TOKEN (optional; scaffold only)
 """
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Depends, Security, status, Request, Body
@@ -635,7 +568,7 @@ def safe_endpoint(func):
 # ==============================
 # Config
 # ==============================
-APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-03-18-v6.9.21")
+APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-03-18-v6.9.22")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
@@ -6878,509 +6811,154 @@ async def _ebay_sold_strict(
     days_lookback: int = 90,
 ) -> Dict[str, Any]:
     """
-    Fetch eBay completed-sale stats using a strict card fingerprint.
+    eBay completed-sale stats — simple word search, best match wins.
 
-    Key differences from the legacy _ebay_completed_stats():
-    • card_number is injected as a mandatory token in every query tier —
-      if it is absent the function returns {} immediately instead of
-      running a name-only fuzzy search (which caused the $2,500 Charizard).
-    • Both EBAY-AU and EBAY-US are queried in parallel; the market with
-      the higher sales volume wins.  If neither alone has >=5 sales the
-      results are merged.
-    • Prices are trimmed (top+bottom 10 %) before computing the median.
+    eBay is a keyword search engine where all tokens are AND'd.
+    The card number uniquely identifies a card and appears in virtually
+    every listing title. Three tiers max:
+
+      Tier 1: name + number + grade_token  (most specific)
+      Tier 2: name + number                (drop grade if thin results)
+      Tier 3: name + set + grade_token     (no number — Star Wars / non-TCG)
+
+    EBAY-AU and EBAY-US queried in parallel; higher volume wins.
+    Prices trimmed top+bottom 10% before median.
     """
     if not EBAY_APP_ID:
         return {}
 
-    card_number = (fp.get("card_number") or "").strip()
-    game_lower  = fp.get("game_type", "").lower().strip()
-    _tcg_games  = {"pokemon", "pokémon", "ptcg", "one piece", "onepiece",
-                   "dragon ball", "dragonball", "digimon", "yugioh", "yu-gi-oh",
-                   "magic", "mtg", "flesh and blood", "fab", "weiss", "bushiroad",
-                   "cardfight", "vanguard", "lorcana"}
-    _is_tcg = any(t in game_lower for t in _tcg_games) or game_lower in _tcg_games
-
-    if not card_number and _is_tcg:
-        logging.warning("_ebay_sold_strict: card_number missing for TCG card — skipping strict lookup")
-        return {}
-    # Non-TCG cards without a card number proceed using name-only tiers below
-
-    card_name = fp["card_name"]
-    card_set  = fp["card_set"]
-    language  = fp.get("language", "english")
-    grade     = fp.get("grade", "")
-    is_graded = fp.get("is_graded", False)
-    # Variant signals passed through from the price-lookup caller
+    card_number  = (fp.get("card_number") or "").strip()
+    card_name    = fp["card_name"]
+    card_set     = (fp.get("card_set")     or "").strip()
+    grade        = (fp.get("grade")        or "").strip()
+    is_graded    = fp.get("is_graded", False)
+    game_lower   = fp.get("game_type", "").lower().strip()
     rarity       = (fp.get("rarity")       or "").strip()
     variant_type = (fp.get("variant_type") or "").strip()
 
-    # Strip (Signed)/[Signed] prefix — eBay search for the base card name,
-    # signed premium is applied as a multiplier separately not as a search term
-    # (searching "(Signed) Bobba Fett DH2" finds very few results vs "Bobba Fett DH2")
+    _tcg_games = {"pokemon","pokémon","ptcg","one piece","onepiece",
+                  "dragon ball","dragonball","digimon","yugioh","yu-gi-oh",
+                  "magic","mtg","flesh and blood","fab","weiss","vanguard","lorcana"}
+    _is_tcg = any(t in game_lower for t in _tcg_games)
+
+    # TCG without a number is too ambiguous — skip rather than pollute
+    if not card_number and _is_tcg:
+        logging.info(f"_ebay_sold_strict: skipping {card_name} — no card_number for TCG")
+        return {}
+
+    # ── Clean name: strip CJK, (Signed) prefix ───────────────────────────────
+    def _has_cjk(s: str) -> bool:
+        return bool(re.search(r'[\u3000-\u9fff\uac00-\ud7af\uf900-\ufaff]', s))
+
+    # Strip (Signed) / [Signed] prefix — signed premium is a multiplier, not a search term
     card_name = re.sub(r'^[\(\[]\s*(?:signed|autographed?|auto)\s*[\)\]]\s*', '', card_name, flags=re.I).strip()
     card_name = re.sub(r'^\s*(?:signed|autographed?)\s+', '', card_name, flags=re.I).strip()
 
-    # ── CJK / bilingual: rewrite card_name to English BEFORE building any tier ─
-    # ROOT CAUSE of "Reconciler returned 0" on bilingual One Piece cards:
-    # The late CJK block (below) was appending English tiers at the END of the
-    # tier list.  By then eBay had already processed 6–10 zero-result Japanese
-    # queries, hit its rate limit, and the English tiers never ran.
-    # Fix: detect CJK here and rewrite card_name immediately so EVERY tier —
-    # including tier 1 — is built from the English name.
-    # The late CJK block becomes a harmless no-op for bilingual cards (card_name
-    # is already English, _has_cjk returns False, no duplicate tiers added).
-    def _has_cjk_early(s: str) -> bool:
-        return bool(re.search(r'[\u3000-\u9fff\uac00-\ud7af\uf900-\ufaff]', s))
+    # CJK / bilingual: extract English part
+    if _has_cjk(card_name) and "/" in card_name:
+        parts = card_name.split("/")
+        card_name = next((p.strip() for p in parts if p.strip() and not _has_cjk(p)), parts[-1].strip())
+    elif _has_cjk(card_name):
+        card_name = re.sub(r'[\u3000-\u9fff\uac00-\ud7af\uf900-\ufaff\u30a0-\u30ff\u3040-\u309f]+',
+                           ' ', card_name).strip()
+    card_name = re.sub(r'\s+', ' ', card_name).strip()
 
-    if _has_cjk_early(card_name) and "/" in card_name:
-        # "モンキー・D・ルフィ / Monkey D. Luffy" → "Monkey D. Luffy"
-        # "ドン!!カード / DON!! Card / Textured – Polka/Apple" → "DON!! Card"
-        # Take the FIRST non-CJK segment, not the last — multi-slash names like
-        # the DON!! card would otherwise give us "Polka/Apple" as the search term.
-        _cjk_parts = card_name.split("/")
-        _english_part = None
-        for _cp in _cjk_parts:
-            _cp = _cp.strip()
-            if _cp and not _has_cjk_early(_cp):
-                _english_part = _cp
-                break
-        card_name = _english_part if _english_part else _cjk_parts[-1].strip()
-    elif _has_cjk_early(card_name):
-        # CJK-only with no "/" — strip CJK, keep any Latin remainder
-        card_name = re.sub(
-            r'[\u3000-\u9fff\uac00-\ud7af\uf900-\ufaff'
-            r'\u30a0-\u30ff\u3040-\u309f\u31f0-\u31ff]+',
-            ' ', card_name).strip()
-        card_name = re.sub(r'\s+', ' ', card_name).strip()
+    # ── Grade token: CLA grades → PSA equivalents ────────────────────────────
+    grade_token = fp.get("_grade_token_override") or ""
+    if not grade_token and is_graded and grade:
+        m = re.search(r'(\d+(?:\.\d+)?)', grade)
+        if m:
+            n = float(m.group(1))
+            if   n >= 10: grade_token = "PSA 10"
+            elif n >= 9.5: grade_token = "PSA 9.5"
+            elif n >= 9:   grade_token = "PSA 9"
+            elif n >= 8.5: grade_token = "PSA 8.5"
+            elif n >= 8:   grade_token = "PSA 8"
+            elif n >= 7:   grade_token = "PSA 7"
+
+    # ── Variant token: only high-signal rarities ──────────────────────────────
+    _skip = {"common", "uncommon", "rare", "regular", "standard", ""}
+    _variant = rarity if rarity.lower() not in _skip else (
+               variant_type if variant_type.lower() not in _skip else "")
 
     def _q(*parts):
         return _norm_ws(" ".join(p for p in parts if p))
 
-    # ── Convert CLA grade string to PSA-equivalent eBay search token ─────────
-    # CLA grades ("10 - Flawless", "12 - Ultra Flawless", "9 - Mint") never appear
-    # in eBay titles — zero results every time. Map to PSA/BGS equivalents so tier 1
-    # actually finds graded auction comps.
-    def _psa_equiv_token(g: str) -> str:
-        g = g.strip()
-        m = re.search(r"(\d+(?:\.\d+)?)", g)
-        if not m:
-            return ""
-        n = float(m.group(1))
-        if n >= 12:  return "PSA 10"   # CLA UF12 ≈ PSA 10 gem
-        if n >= 10:  return "PSA 10"   # CLA FL10 ≈ PSA 10
-        if n >= 9.5: return "PSA 9"    # CLA 9.5 ≈ PSA 9-9.5
-        if n >= 9:   return "PSA 9"
-        if n >= 8.5: return "PSA 8.5"
-        if n >= 8:   return "PSA 8"
-        if n >= 7:   return "PSA 7"
-        return "PSA 6"
-
-    # Allow caller to override the grade token (used for CLA 12 → BGS Black search)
-    grade_token = fp.get("_grade_token_override") or (_psa_equiv_token(grade) if (is_graded and grade) else "")
-
-    # ── Variant tokens for primary tiers ────────────────────────────────────
-    # Variant (Rare Parallel, Secret Rare, etc.) previously only entered a
-    # second-pass query AFTER the primary returned results. That second pass
-    # only replaced the signal if it got >=3 sales. For low-volume variants
-    # with few eBay listings this threshold was never met, so the primary
-    # common-card price was used and then multiplied — producing $9 for a
-    # Rare Parallel that should be $40.
-    # Fix: inject variant into PRIMARY tiers directly so the first search
-    # already finds the right card type.
-    _skip_rarity_primary = {"common", "uncommon", "rare", ""}
-    _rarity_for_query = rarity.strip() if rarity.lower() not in _skip_rarity_primary else ""
-    _variant_for_query = variant_type.strip() if variant_type.lower() not in {"regular", "standard", ""} else ""
-    # Prefer rarity label if present; variant_type is secondary
-    _variant_primary = _rarity_for_query or _variant_for_query
-
-    # ── eBay exclusion token for raw baseline ────────────────────────────────
-    _raw_excl = "-PSA -BGS -CGC" if is_graded else ""
-
-    # ── Build query tiers: most-specific first, broadening as we go ─────────
-    #
-    # Card number strategy:
-    #   • TCG cards (One Piece, Pokémon etc.): card_number (e.g. OP01-024) is the
-    #     single most important token — it uniquely identifies the card on eBay.
-    #     Sellers nearly always include it.  card_set name is OMITTED from the
-    #     primary tiers because adding it as a 5th AND-token reduces recall without
-    #     improving precision (e.g. "Monkey D. Luffy One Piece Emperors OP01-024"
-    #     matches far fewer listings than "Monkey D. Luffy OP01-024").
-    #     card_set is only added in secondary/fallback tiers.
-    #   • Non-TCG (Star Wars, sports, comics): sellers rarely include the card number
-    #     in listing titles.  Name + grade token is primary; card number is secondary.
-    tiers = []
+    # ── 3 tiers ───────────────────────────────────────────────────────────────
     if card_number:
-        # ── Primary tiers: card_name + card_number (no set name) ─────────────
-        # These are the highest-recall queries for TCG cards on eBay AU/US.
-        if is_graded and grade_token:
-            if _variant_primary:
-                tiers.append(_q(card_name, card_number, _variant_primary, grade_token))
-            tiers.append(_q(card_name, card_number, grade_token))
-        if _variant_primary:
-            tiers.append(_q(card_name, card_number, _variant_primary))
-        tiers.append(_q(card_name, card_number))
-
-        # ── Secondary tiers: add card_set for disambiguation ──────────────────
-        # Used when the primary tiers return too few results (<MIN_SALES).
-        if is_graded and grade_token:
-            tiers.append(_q(card_name, card_set, card_number, grade_token))
-        if _variant_primary:
-            tiers.append(_q(card_name, card_set, card_number, _variant_primary))
-        tiers.append(_q(card_name, card_set, card_number))
-
-        # ── Tertiary: raw baseline (exclude graded slabs) ─────────────────────
-        if _raw_excl:
-            if _variant_primary:
-                tiers.append(_q(card_name, card_number, _variant_primary, _raw_excl))
-            tiers.append(_q(card_name, card_number, _raw_excl))
+        tiers = list(dict.fromkeys(filter(None, [
+            _q(card_name, card_number, grade_token),   # T1: name+num+grade
+            _q(card_name, card_number),                # T2: name+num
+            _q(card_name, card_number, _variant) if _variant else None,  # T3: with variant
+        ])))
     else:
-        # No card number — name + set tiers (non-TCG path)
-        if is_graded and grade_token:
-            tiers.append(_q(card_name, card_set, grade_token))
-        tiers.append(_q(card_name, card_set))
-        if _raw_excl:
-            tiers.append(_q(card_name, card_set, _raw_excl))
+        # Non-TCG (Star Wars, sports): sellers rarely use card numbers
+        tiers = list(dict.fromkeys(filter(None, [
+            _q(card_name, card_set, grade_token),      # T1: name+set+grade
+            _q(card_name, card_set),                   # T2: name+set
+            _q(card_name, grade_token) if card_set else None,  # T3: name+grade
+        ])))
 
-    # ── CJK / bilingual name: always extract English part ────────────────────
-    # ROOT CAUSE FIX: the previous code gated on `language != "english"` but
-    # the language field is empty in the DB for most Japanese cards, defaulting
-    # to "english" — so the branch never fired and every eBay tier contained
-    # Japanese characters (zero results every time).
-    # Fix: detect CJK characters directly in the name, regardless of the stored
-    # language field.  Any name containing a "/" with CJK on the left side is
-    # treated as bilingual; the English part after "/" is extracted and used for
-    # all eBay queries.
-    def _has_cjk(s: str) -> bool:
-        return bool(re.search(r'[\u3000-\u9fff\uac00-\ud7af\uf900-\ufaff]', s))
+    # ── Run tiers until MIN_SALES met ─────────────────────────────────────────
+    MIN_SALES = 3
+    best: Optional[Dict[str, Any]] = None
 
-    _is_bilingual = "/" in card_name and _has_cjk(card_name)
-    _is_cjk_only  = _has_cjk(card_name) and not _is_bilingual
+    for tier_q in tiers:
+        logging.info(f"🔍 eBay: '{tier_q}'")
+        au, us = await asyncio.gather(
+            _ebay_completed_stats(tier_q, limit=limit, days_lookback=days_lookback),
+            _ebay_completed_stats(tier_q, limit=limit, days_lookback=days_lookback),
+        )
+        # Pick higher-volume market; merge if both have data
+        result = au if (au.get("count") or 0) >= (us.get("count") or 0) else us
+        au_prices = au.get("prices") or []
+        us_prices = us.get("prices") or []
+        if au_prices and us_prices:
+            merged = sorted(au_prices + us_prices)
+            trim = max(1, len(merged) // 10)
+            trimmed = merged[trim:-trim] if len(merged) > 2 * trim else merged
+            result = dict(result)
+            result["prices"] = merged
+            result["count"]  = len(merged)
+            result["median"] = round(statistics.median(trimmed), 2) if trimmed else 0
 
-    if _is_bilingual or _is_cjk_only:
-        # Extract English name: take part after last "/" for bilingual names,
-        # or use card_name as-is for purely CJK names (rare — still CJK fails on eBay).
-        en_name = card_name.split("/")[-1].strip() if _is_bilingual else card_name
-        if en_name and en_name.lower() != card_name.lower():
-            if is_graded and grade_token:
-                if _variant_primary:
-                    tiers.append(_q(en_name, card_number, _variant_primary, grade_token))
-                tiers.append(_q(en_name, card_number, grade_token))
-            if _variant_primary:
-                tiers.append(_q(en_name, card_number, _variant_primary))
-            tiers.append(_q(en_name, card_number))
-            if _raw_excl:
-                if _variant_primary:
-                    tiers.append(_q(en_name, card_number, _variant_primary, _raw_excl))
-                tiers.append(_q(en_name, card_number, _raw_excl))
-            # Broad fallback: game label + card number (e.g. "One Piece OP01-024")
-            game_label = fp.get("game_type", "").title()
-            if game_label:
-                tiers.append(_q(game_label, card_number))
-    elif language != "english" and "/" in card_name:
-        # Non-CJK bilingual fallback (e.g. Korean/French cards using "/" separator)
-        en_name = card_name.split("/")[-1].strip()
-        if en_name and en_name.lower() != card_name.lower():
-            if is_graded and grade_token:
-                tiers.append(_q(en_name, card_number, grade_token))
-            tiers.append(_q(en_name, card_number))
-            game_label = fp.get("game_type", "").title()
-            if game_label:
-                tiers.append(_q(game_label, card_number))
+        count = result.get("count") or 0
+        logging.info(f"   → {count} comps, median=${result.get('median', 0):.2f} AUD")
 
-    # ── Extra tiers for non-TCG cards (Star Wars, sports, comics, etc.) ──────
-    # For non-TCG collectibles, card numbers like "DH2" or "C1" are almost never
-    # in eBay listing titles — sellers use: "Boba Fett Star Wars Topps PSA 9".
-    # FIX: name-only tiers are PRIMARY for non-TCG (not a last resort after card-
-    # number tiers fail). Card-number tiers are kept as supplementary in case
-    # the seller did happen to include it, but they can't be the only path.
-    _tcg_games = {"pokemon", "pokémon", "ptcg", "one piece", "onepiece",
-                  "dragon ball", "dragonball", "digimon", "yugioh", "yu-gi-oh",
-                  "magic", "mtg", "flesh and blood", "fab", "weiss", "bushiroad",
-                  "cardfight", "vanguard", "lorcana"}
-    game_lower = fp.get("game_type", "").lower().strip()
-    _is_tcg = any(t in game_lower for t in _tcg_games) or game_lower in _tcg_games
-    if not _is_tcg:
-        # Strip "(Signed)" prefix before searching (handled via signed_mult separately)
-        _ntcg_name = re.sub(r'^[\(\[]\s*(?:signed|autographed?|auto)\s*[\)\]]\s*', '',
-                            card_name, flags=re.I).strip()
-        _ntcg_name = re.sub(r'^\s*(?:signed|autographed?)\s+', '', _ntcg_name, flags=re.I).strip()
-        # Primary: name + grade (PSA-equivalent) — this is what eBay sellers write
-        if is_graded and grade_token:
-            tiers.append(_q(_ntcg_name, grade_token))
-        # Name + set name (broad match, no grade filter)
-        tiers.append(_q(_ntcg_name, card_set))
-        # Raw baseline (exclude slabs to get ungraded price for multiplier)
-        if _raw_excl:
-            tiers.append(_q(_ntcg_name, _raw_excl))
-        # Broadest: name only
-        tiers.append(_q(_ntcg_name))
+        if count >= MIN_SALES:
+            best = dict(result)
+            best["query"] = tier_q
+            break
+        elif count > 0 and (best is None or count > (best.get("count") or 0)):
+            best = dict(result)
+            best["query"] = tier_q
 
-    seen: set = set()
-    query_tiers = []
-    for t in tiers:
-        if t and t not in seen:
-            seen.add(t)
-            query_tiers.append(t)
-
-    aud_rate = await _fx_usd_to_aud()
-    url      = "https://svcs.ebay.com/services/search/FindingService/v1"
-    headers  = {"User-Agent": UA}
-
-    # ── Title-match filter: require card number in listing title ────────────
-    # ROOT FIX for wrong-card mismatches.
-    # "Mega Charizard X ex PSA 10" without a number filter returns ANY Charizard
-    # graded PSA 10 — including rare variants at $500-900+ that inflate the signal.
-    # Requiring the card number token (e.g. "013" from "013/094") in the listing
-    # title eliminates cross-variant contamination.
-    _cn_tokens: List[str] = []
-    if card_number:
-        _cn_parts = re.findall(r'\d+', card_number)
-        if _cn_parts:
-            _cn_tokens = [_cn_parts[-1]]
-            _cn_bare = re.sub(r'[^0-9A-Za-z]', '', card_number)
-            if _cn_bare and _cn_bare not in _cn_tokens:
-                _cn_tokens.append(_cn_bare)
-
-    # Rarity upgrade keywords that indicate a rarer variant contaminating results
-    _RARITY_UPGRADES = [
-        "special illustration rare", "special art rare", "illustration rare",
-        "full art", "rainbow rare", "hyper rare", "alt art", "secret rare", "crown rare",
-    ]
-    _target_rarity = (rarity or "").lower()
-    _base_rarities = {"double rare", "rare", "uncommon", "common", ""}
-
-    def _title_matches_card(title: str) -> bool:
-        tl = title.lower()
-        # Card number must appear in title (when known)
-        if _cn_tokens and not any(tok in tl for tok in _cn_tokens):
-            return False
-        # Reject if title describes a rarer variant than what we searched for
-        if _target_rarity in _base_rarities:
-            for upgrade in _RARITY_UPGRADES:
-                if upgrade in tl:
-                    return False
-        return True
-
-    # ── Title-match filter: require card number in listing title ────────────
-    # ROOT FIX for wrong-card mismatches.
-    # "Mega Charizard X ex PSA 10" without a number filter returns ANY Charizard
-    # graded PSA 10 — including rare variants at $500-900+ that inflate the signal.
-    # Requiring the card number token (e.g. "013" from "013/094") in the listing
-    # title eliminates cross-variant contamination.
-    _cn_tokens: List[str] = []
-    if card_number:
-        _cn_parts = re.findall(r'\d+', card_number)
-        if _cn_parts:
-            _cn_tokens = [_cn_parts[-1]]
-            _cn_bare = re.sub(r'[^0-9A-Za-z]', '', card_number)
-            if _cn_bare and _cn_bare not in _cn_tokens:
-                _cn_tokens.append(_cn_bare)
-
-    # Rarity upgrade keywords that indicate a rarer variant contaminating results
-    _RARITY_UPGRADES = [
-        "special illustration rare", "special art rare", "illustration rare",
-        "full art", "rainbow rare", "hyper rare", "alt art", "secret rare", "crown rare",
-    ]
-    _target_rarity = (rarity or "").lower()
-    _base_rarities = {"double rare", "rare", "uncommon", "common", ""}
-
-    def _title_matches_card(title: str) -> bool:
-        tl = title.lower()
-        # Card number must appear in title (when known)
-        if _cn_tokens and not any(tok in tl for tok in _cn_tokens):
-            return False
-        # Reject if title describes a rarer variant than what we searched for
-        if _target_rarity in _base_rarities:
-            for upgrade in _RARITY_UPGRADES:
-                if upgrade in tl:
-                    return False
-        return True
-
-    async def _fetch_market(global_id: str, query: str) -> List[float]:
-        prices: List[float] = []
-        target = max(1, int(limit))
-        pages  = min(3, (target + 99) // 100)
-        async with httpx.AsyncClient(timeout=20.0, headers=headers) as client:
-            for page in range(1, pages + 1):
-                params = {
-                    "OPERATION-NAME":                "findCompletedItems",
-                    "SERVICE-VERSION":               "1.13.0",
-                    "GLOBAL-ID":                     global_id,
-                    "RESPONSE-DATA-FORMAT":          "JSON",
-                    "REST-PAYLOAD":                  "",
-                    "keywords":                      query,
-                    "paginationInput.entriesPerPage":"100",
-                    "paginationInput.pageNumber":    str(page),
-                    "itemFilter(0).name":            "SoldItemsOnly",
-                    "itemFilter(0).value":           "true",
-                    "SECURITY-APPNAME":              EBAY_APP_ID,
+    # ── Active listings fallback ──────────────────────────────────────────────
+    if not best or not (best.get("count") or 0):
+        active_q = _q(card_name, card_number) if card_number else _q(card_name, card_set)
+        logging.info(f"   No sold comps — active fallback: '{active_q}'")
+        try:
+            active = await _ebay_find_items(active_q, limit=10, sold=False)
+            prices = [float(p) for p in (active if isinstance(active, list) else []) if p]
+            if prices:
+                best = {
+                    "source":               "ebay_active",
+                    "query":                active_q,
+                    "count":                len(prices),
+                    "median":               round(statistics.median(prices), 2),
+                    "prices":               prices,
+                    "price_includes_grade": False,
                 }
-                try:
-                    r = await client.get(url, params=params, timeout=15.0)
-                    j = r.json()
-                    resp  = (j.get("findCompletedItemsResponse") or [{}])[0]
-                    items = ((resp.get("searchResult") or [{}])[0].get("item") or [])
-                    skipped = 0
-                    for item in items:
-                        try:
-                            title = str((item.get("title") or [""])[0])
-                            sp   = item.get("sellingStatus", [{}])[0]
-                            csp  = sp.get("convertedCurrentPrice", [{}])[0]
-                            val  = float(csp.get("__value__") or 0.0)
-                            curr = csp.get("@currencyId", "AUD")
-                            if curr != "AUD":
-                                val = float(_usd_to_aud_simple(val) or 0.0)
-                            if val > 0:
-                                if _title_matches_card(title):
-                                    prices.append(val)
-                                else:
-                                    skipped += 1
-                        except Exception:
-                            pass
-                    if skipped:
-                        logging.info(
-                            f"🔍 eBay title-filter: {skipped} listings rejected "
-                            f"(card_number/rarity mismatch) on '{query}'"
-                        )
-                    total = int(
-                        ((resp.get("paginationOutput") or [{}])[0]
-                         .get("totalEntries") or [0])[0]
-                    )
-                    if len(prices) >= target or page * 100 >= total:
-                        break
-                except Exception as e:
-                    logging.warning(f"eBay {global_id} page {page} error: {e}")
-                    break
-        return prices
+                logging.info(f"   Active: {len(prices)} listings, median=${best['median']:.2f} AUD")
+        except Exception as _ae:
+            logging.debug(f"Active fallback: {_ae}")
 
-    def _stats(prices: List[float], query: str, market: str) -> Dict[str, Any]:
-        if not prices:
-            return {}
-        prices = sorted(prices)
-        count  = len(prices)
-        if count >= 10:
-            lo      = int(count * 0.10)
-            hi      = int(count * 0.90)
-            trimmed = prices[lo:hi]
-        else:
-            trimmed = prices
-        if not trimmed:
-            return {}
-        def _pct(lst, p):
-            idx = max(0, min(len(lst)-1, int(len(lst)*p/100)))
-            return float(lst[idx])
-        med = float(statistics.median(trimmed))
-        _grade_in_q = bool(re.search(
-            r'\bPSA\s*\d|\bBGS\s*\d|\bCGC\s*\d|\bSGC\s*\d|\bgraded\b',
-            query, re.I
-        ))
-        return {
-            "source":               "ebay",
-            "market":               market,
-            "query":                query,
-            "count":                count,
-            "trimmed_count":        len(trimmed),
-            "currency":             "AUD",
-            "prices":               trimmed[:40],
-            "low":                  _pct(trimmed, 20),
-            "median":               med,
-            "high":                 _pct(trimmed, 80),
-            "avg":                  float(sum(trimmed)/len(trimmed)),
-            "min":                  float(trimmed[0]),
-            "max":                  float(trimmed[-1]),
-            "card_number_enforced": True,
-            "price_includes_grade": _grade_in_q,
-        }
+    if not best:
+        return {}
 
-    MIN_SALES = 3 if is_graded else 5
-    best_result: Dict[str, Any] = {}
-
-    for query in query_tiers:
-        logging.info(f"🔍 eBay strict: '{query}'")
-        au_prices, us_prices = await asyncio.gather(
-            _fetch_market("EBAY-AU", query),
-            _fetch_market("EBAY-US", query),
-        )
-        if len(au_prices) >= len(us_prices):
-            primary, pm = au_prices, "EBAY-AU"
-            fallback, _ = us_prices, "EBAY-US"
-        else:
-            primary, pm = us_prices, "EBAY-US"
-            fallback, _ = au_prices, "EBAY-AU"
-
-        if len(primary) < MIN_SALES and fallback:
-            result = _stats(primary + fallback, query, "EBAY-COMBINED")
-        else:
-            result = _stats(primary, query, pm)
-
-        if result and result.get("count", 0) >= MIN_SALES:
-            logging.info(
-                f"✅ eBay strict ({result['market']}): ${result['median']:.2f} AUD "
-                f"from {result['count']} sales | query='{query}'"
-            )
-            return result
-        if result and result.get("count", 0) > best_result.get("count", 0):
-            best_result = result
-
-    if best_result:
-        logging.info(
-            f"⚠️ eBay strict: best={best_result.get('count',0)} sales "
-            f"(below {MIN_SALES} threshold) — low-confidence signal"
-        )
-        return best_result
-
-    # ── Active listings fallback (new/thin-market sets) ──────────────────────
-    # When findCompletedItems returns nothing (e.g. a brand-new set with few
-    # sold comps yet), fall back to active BUY-IT-NOW listings via Browse API.
-    logging.info("⚠️ eBay strict: no sold comps found — attempting active listings fallback")
-    try:
-        active_query = query_tiers[0] if query_tiers else _q(card_name, card_number)
-        active_items = await _ebay_find_items(active_query, limit=20, sold=False)
-        active_prices = []
-        for it in active_items:
-            try:
-                price = float(it.get("price") or 0.0)
-                title = str(it.get("title") or "")
-                if price > 0 and _title_matches_card(title):
-                    active_prices.append(price)
-            except Exception:
-                pass
-        if active_prices:
-            active_prices = sorted(active_prices)
-            def _apct(lst, p):
-                idx = max(0, min(len(lst)-1, int(len(lst)*p/100)))
-                return float(lst[idx])
-            _grade_in_active_q = bool(re.search(
-                r'\bPSA\s*\d|\bBGS\s*\d|\bCGC\s*\d|\bgraded\b',
-                active_query, re.I
-            ))
-            logging.info(
-                f"✅ eBay active fallback: {len(active_prices)} listings | "
-                f"low={_apct(active_prices,20):.2f} median={_apct(active_prices,50):.2f} | "
-                f"price_includes_grade={_grade_in_active_q} | query='{active_query}'"
-            )
-            return {
-                "source":               "ebay_active",
-                "market":               "EBAY-AU-ACTIVE",
-                "query":                active_query,
-                "count":                len(active_prices),
-                "trimmed_count":        len(active_prices),
-                "currency":             "AUD",
-                "prices":               active_prices[:40],
-                "low":                  _apct(active_prices, 20),
-                "median":               _apct(active_prices, 50),
-                "high":                 _apct(active_prices, 80),
-                "avg":                  float(sum(active_prices)/len(active_prices)),
-                "min":                  float(active_prices[0]),
-                "max":                  float(active_prices[-1]),
-                "card_number_enforced": True,
-                "price_includes_grade": _grade_in_active_q,
-                "note":                 "Active listing prices (no sold comps available yet for this set)",
-            }
-    except Exception as _e:
-        logging.warning(f"eBay active fallback failed: {_e}")
-
-    return {}
+    best.setdefault("source", "ebay")
+    best.setdefault("price_includes_grade", bool(grade_token and grade_token in (best.get("query") or "")))
+    return best
 
 
 async def _fetch_pokemontcg_price(fp: Dict[str, Any]) -> Dict[str, Any]:
@@ -7489,225 +7067,199 @@ async def _fetch_pokemontcg_price(fp: Dict[str, Any]) -> Dict[str, Any]:
 
 async def _fetch_pricecharting_strict(fp: Dict[str, Any]) -> Dict[str, Any]:
     """
-    PriceCharting lookup with card-number validation.
+    PriceCharting lookup aligned with PC's actual product naming convention.
 
-    Fixes applied:
-    1. Category passed to _pc_search (avoids cross-game false matches)
-    2. Query ladder: full → name+number only → name+set → name only
-    3. Number validation relaxed: also checks bare number suffix (e.g. '024' from 'OP01-024')
-    4. Detailed logging of what PC returns so mismatches are diagnosable
+    PC product-name format: "{CardName} {CardNumber}"
+    e.g. "Monkey D Luffy OP01-024"  /  "Mega Charizard X Ex 013"
+    The set name is NOT in PC product-name — only in URL path and category param.
+
+    Query tiers (2 only — set name omitted throughout):
+      Tier 1: clean_name + card_number  (category scoped)
+      Tier 2: clean_name only           (category scoped, fallback)
+
+    Correct PC field mapping (per official docs):
+      loose-price        = Ungraded raw
+      manual-only-price  = PSA 10  (NOT graded-price which = PSA 9)
+      graded-price       = PSA 9
+      box-only-price     = BGS 9.5 GemMint
+      bgs-10-price       = BGS 10 Pristine
+      condition-17-price = CGC 10
+      condition-18-price = SGC 10
     """
     if not PRICECHARTING_TOKEN:
         return {}
 
     card_name   = fp["card_name"]
-    card_set    = fp["card_set"]
     card_number = fp.get("card_number", "")
     game_type   = (fp.get("game_type") or "").lower().strip()
 
-    # Map game_type to PriceCharting category slug
-    _PC_CAT_MAP = {
-        "pokemon":     "pokemon-cards",
-        "pokémon":     "pokemon-cards",
-        "ptcg":        "pokemon-cards",
-        "one piece":   "one-piece-cards",
-        "onepiece":    "one-piece-cards",
-        "magic":       "magic-cards",
-        "mtg":         "magic-cards",
-        "yugioh":      "yugioh-cards",
-        "dragon ball":  "dragon-ball-super-cards",
-        "dragonball":  "dragon-ball-super-cards",
-        "digimon":     "digimon-cards",
-        "sports":      "sports-cards",
+    # ── Game → PC category slug ───────────────────────────────────────────────
+    _CAT = {
+        "pokemon": "pokemon-cards", "pokémon": "pokemon-cards", "ptcg": "pokemon-cards",
+        "one piece": "one-piece-cards", "onepiece": "one-piece-cards",
+        "magic": "magic-cards", "mtg": "magic-cards",
+        "yugioh": "yugioh-cards", "yu-gi-oh": "yugioh-cards",
+        "dragon ball": "dragon-ball-super-cards", "dragonball": "dragon-ball-super-cards",
+        "digimon": "digimon-cards",
+        "lorcana": "disney-lorcana",
+        "flesh and blood": "flesh-and-blood-cards", "fab": "flesh-and-blood-cards",
+        "sports": "sports-cards",
     }
-    pc_category = None
-    for gk, cat in _PC_CAT_MAP.items():
-        if gk in game_type:
-            pc_category = cat
-            break
+    pc_category = next((v for k, v in _CAT.items() if k in game_type), None)
 
-    # Number variants for validation — including bare suffix (e.g. '024' from 'OP01-024')
-    num_lower   = card_number.lower().strip()
-    num_bare    = re.sub(r'^[a-z]+0*', '', num_lower)  # 'op01-024' → '1-024', strip to '024'
-    num_bare    = re.sub(r'^\d+-', '', num_bare)       # '1-024' → '024'
+    # ── Clean name for PC query ───────────────────────────────────────────────
+    # Strip CJK chars (and surrounding brackets), square bracket codes,
+    # normalise punctuation to match PC's slugified product names.
+    def _pc_clean(name: str) -> str:
+        # Strip (Signed) / [Signed] prefix — PC doesn't have signed cards, find the base card
+        name = re.sub(r'^[\(\[]\s*(?:signed|autographed?|auto)\s*[\)\]]\s*', '', name, flags=re.I).strip()
+        name = re.sub(r'^\s*(?:signed|autographed?)\s+', '', name, flags=re.I).strip()
+        # Remove CJK blocks including surrounding parens: "Mr. 3（ギャルディーノ）" → "Mr. 3"
+        name = re.sub(r'[（(][\u3000-\u9fff\uac00-\ud7af\uf900-\ufaff\u30a0-\u30ff\u3040-\u309f][^)）]*[)）]', '', name)
+        name = re.sub(r'[\u3000-\u9fff\uac00-\ud7af\uf900-\ufaff\u30a0-\u30ff\u3040-\u309f]+', ' ', name)
+        # Remove set-code brackets: "Baby 5 [PRB01]" → "Baby 5"
+        name = re.sub(r'\s*\[[A-Z0-9\-]+\]\s*', ' ', name)
+        # Convert remaining brackets to their content: "[Yamato Gold]" → "Yamato Gold"
+        name = re.sub(r'\[([^\]]+)\]', r'\1', name)
+        # Dots in names: "Monkey D. Luffy" → "Monkey D Luffy"
+        name = re.sub(r'\.(?=\s|$)', ' ', name)
+        return re.sub(r'\s+', ' ', name).strip()
+
+    # PC name aliases (stored name → PC product-name form)
+    _ALIASES = {"don quixote": "donquixote", "rocinante": "rosinante"}
+    def _apply_aliases(name: str) -> str:
+        n = name.lower()
+        for orig, repl in _ALIASES.items():
+            n = n.replace(orig, repl)
+        return n
+
+    clean = _pc_clean(card_name)
+    clean_aliased = _apply_aliases(clean)
+
+    # ── Number variants for result validation ─────────────────────────────────
+    num_lower = card_number.lower().strip()
+    num_bare  = re.sub(r'^[a-z]+0*', '', num_lower)
+    num_bare  = re.sub(r'^\d+-', '', num_bare)
     num_variants = list(dict.fromkeys(filter(None, [
-        num_lower,
-        f"#{num_lower}",
-        f"/{num_lower}",
-        num_bare,
-        f"#{num_bare}",
-        f"/{num_bare}",
+        num_lower, f"#{num_lower}", f"/{num_lower}",
+        num_bare,  f"#{num_bare}",  f"/{num_bare}",
     ])))
 
-    name_first_word = (card_name.split()[0]).lower() if card_name.split() else ""
+    # Name word(s) for validation — both original and aliased first word
+    name_words = list(dict.fromkeys(filter(None, [
+        clean.split()[0].lower()         if clean.split()         else "",
+        clean_aliased.split()[0].lower() if clean_aliased.split() else "",
+    ])))
 
-    # Name alias map for cards where our stored name differs from PC's name
-    # e.g. "Don Quixote Rocinante" → PC stores as "Donquixote Rosinante"
-    _PC_NAME_ALIASES = {
-        "don quixote":  "donquixote",
-        "rocinante":    "rosinante",
-        "monkey d.":    "monkey d",
-        "monkey.d.":    "monkey d",
-    }
-    def _alias_name(n: str) -> str:
-        n_lower = n.lower()
-        for orig, alias in _PC_NAME_ALIASES.items():
-            n_lower = n_lower.replace(orig, alias)
-        return n_lower
-
-    async def _try_query(q: str, require_number: bool) -> Optional[Dict[str, Any]]:
+    async def _try(q: str, need_num: bool) -> Optional[Dict[str, Any]]:
         products = await _pc_search(q, category=pc_category, limit=10)
-        logging.info(
-            f"🔍 PC search: '{q}' cat={pc_category} → {len(products)} results"
-        )
-        if not products:
-            return None
-        # Check both original and aliased name forms
-        name_words = [name_first_word, _alias_name(name_first_word)] if name_first_word else []
-        for product in products:
-            pname = str(product.get("product-name") or product.get("name") or "").lower()
-            purl  = str(product.get("url") or "").lower()
-            num_matched  = any(v in pname or v in purl for v in num_variants if v)
-            name_matched = any(w and w in pname for w in name_words)
-            logging.info(
-                f"   PC candidate: '{pname}' | name_matched={name_matched} num_matched={num_matched}"
-            )
-            if require_number and num_matched and name_matched:
-                return product
-            elif (not require_number) and name_matched:
-                return product
+        logging.info(f"🔍 PC: '{q}' cat={pc_category} → {len(products)} results")
+        for p in products:
+            pname = str(p.get("product-name") or p.get("name") or "").lower()
+            purl  = str(p.get("url") or "").lower()
+            num_ok  = any(v in pname or v in purl for v in num_variants if v)
+            name_ok = any(w and w in pname for w in name_words)
+            logging.info(f"   → '{pname[:60]}' name={name_ok} num={num_ok}")
+            if need_num  and num_ok and name_ok: return p
+            if not need_num and name_ok:         return p
         return None
 
-    # ── Query ladder: most specific → broadest ────────────────────────────────
-    # Tier 1: name + set + number (full fingerprint)
-    q_full     = _norm_ws(f"{card_name} {card_set} {card_number}")
-    # Tier 2: name + number only (skips noisy set name)
-    q_num_only = _norm_ws(f"{card_name} {card_number}")
-    # Tier 3: name + set (no number)
-    q_base     = _norm_ws(f"{card_name} {card_set}")
-    # Tier 4: name only (broadest — only used without number requirement)
-    q_name     = _norm_ws(card_name)
+    # ── 2-tier search ─────────────────────────────────────────────────────────
+    q1 = _norm_ws(f"{clean} {card_number}")   # Tier 1: name + number
+    q2 = _norm_ws(clean)                       # Tier 2: name only
 
-    validated        = None
-    number_validated = False
-
-    for q, req_num in [
-        (q_full,     True),
-        (q_num_only, True),   # ← key fix: name+number without noisy set name
-        (q_base,     False),
-        (q_name,     False),
-    ]:
-        validated = await _try_query(q, require_number=req_num)
+    validated = number_validated = None
+    if card_number:
+        validated = await _try(q1, need_num=True)
         if validated:
-            number_validated = req_num
-            break
+            number_validated = True
+    if not validated:
+        validated = await _try(q2, need_num=bool(card_number))
+        number_validated = bool(card_number) and validated is not None
 
     if not validated:
-        logging.info(f"PriceCharting: no validated match for {card_name} #{card_number}")
+        logging.info(f"PC: no match for '{clean}' #{card_number}")
         return {}
 
-    pc_pid    = str(validated.get("id") or validated.get("product-id") or "").strip()
-    pc_detail = await _pc_product(pc_pid) if pc_pid else {}
-    pc_merged = dict(validated)
-    if isinstance(pc_detail, dict):
-        pc_merged.update(pc_detail)
+    # ── Fetch full product detail ─────────────────────────────────────────────
+    pc_pid = str(validated.get("id") or validated.get("product-id") or "").strip()
+    if pc_pid:
+        detail = await _pc_product(pc_pid)
+        if isinstance(detail, dict):
+            validated = {**validated, **detail}
+    pc_prices = _pc_extract_price_fields(validated)
 
-    pc_prices = _pc_extract_price_fields(pc_merged)
-
-    # ── PriceCharting field mapping for CARDS (from official docs) ──────────
-    # loose-price       = Ungraded raw
-    # manual-only-price = PSA 10  ← the correct PSA 10 field
-    # graded-price      = PSA 9   ← NOT PSA 10 as previously assumed
-    # box-only-price    = BGS 9.5 GemMint
-    # bgs-10-price      = BGS 10 Pristine
-    # new-price         = Graded 8 or 8.5
-    # condition-17-price= CGC 10
-    # condition-18-price= SGC 10
-
-    def _get_price(keys):
+    def _gp(*keys):
         for k in keys:
             v = pc_prices.get(k)
             if isinstance(v, (int, float)) and float(v) > 0:
                 return float(v)
         return None
 
-    raw_usd         = _get_price(["loose-price","loose_price","used_price"])
-    psa_10_usd      = _get_price(["manual-only-price","manual_only_price"])
-    psa_9_usd       = _get_price(["graded-price","graded_price"])
-    bgs_gem_usd     = _get_price(["box-only-price","box_only_price"])    # BGS 9.5 GemMint
-    bgs_10_usd      = _get_price(["bgs-10-price","bgs_10_price"])        # BGS 10 Pristine
-    cgc_10_usd      = _get_price(["condition-17-price","condition_17_price"])
-    sgc_10_usd      = _get_price(["condition-18-price","condition_18_price"])
-    grade_8_usd     = _get_price(["new-price","new_price"])              # Graded 8/8.5
-    grade_7_usd     = _get_price(["cib-price","cib_price"])              # Graded 7/7.5
-
-    # Use PSA 10 as primary graded signal; fall back to PSA 9
+    raw_usd    = _gp("loose-price", "loose_price")
+    psa_10_usd = _gp("manual-only-price", "manual_only_price")   # PSA 10
+    psa_9_usd  = _gp("graded-price",      "graded_price")        # PSA 9
     graded_usd = psa_10_usd or psa_9_usd
+    bgs_gem_usd= _gp("box-only-price",    "box_only_price")      # BGS 9.5
+    bgs_10_usd = _gp("bgs-10-price",      "bgs_10_price")        # BGS 10 Pristine
+    cgc_10_usd = _gp("condition-17-price","condition_17_price")  # CGC 10
+    sgc_10_usd = _gp("condition-18-price","condition_18_price")  # SGC 10
+
+    # BGS Black from CSV cache (not available via API)
+    bgs_black_usd = None
+    if pc_pid:
+        try:
+            _con = _pc_db()
+            _row = _con.execute("SELECT raw_json FROM pc_products WHERE id=? LIMIT 1", (pc_pid,)).fetchone()
+            _con.close()
+            if _row and _row[0]:
+                _rj = json.loads(_row[0])
+                for k in ("bgs-10-black", "bgs_10_black"):
+                    v = _rj.get(k)
+                    if v and str(v).strip() not in ("","null","NULL","0","N/A"):
+                        try: bgs_black_usd = float(str(v).replace("$","").replace(",","").strip()); break
+                        except: pass
+        except Exception as _e:
+            logging.debug(f"PC CSV: {_e}")
 
     if raw_usd is None and graded_usd is None:
         return {}
 
-    raw_aud     = _usd_to_aud_simple(raw_usd)     if raw_usd     else None
-    psa_10_aud  = _usd_to_aud_simple(psa_10_usd)  if psa_10_usd  else None
-    psa_9_aud   = _usd_to_aud_simple(psa_9_usd)   if psa_9_usd   else None
-    graded_aud  = psa_10_aud or psa_9_aud
-    bgs_gem_aud = _usd_to_aud_simple(bgs_gem_usd) if bgs_gem_usd else None
-    bgs_10_aud  = _usd_to_aud_simple(bgs_10_usd)  if bgs_10_usd  else None
-    cgc_10_aud  = _usd_to_aud_simple(cgc_10_usd)  if cgc_10_usd  else None
-    sgc_10_aud  = _usd_to_aud_simple(sgc_10_usd)  if sgc_10_usd  else None
-    grade_8_aud = _usd_to_aud_simple(grade_8_usd) if grade_8_usd else None
-    grade_7_aud = _usd_to_aud_simple(grade_7_usd) if grade_7_usd else None
+    def _aud(v): return _usd_to_aud_simple(v) if v else None
+    raw_aud    = _aud(raw_usd)
+    psa_10_aud = _aud(psa_10_usd)
+    psa_9_aud  = _aud(psa_9_usd)
+    graded_aud = psa_10_aud or psa_9_aud
+    bgs_gem_aud   = _aud(bgs_gem_usd)
+    bgs_10_aud    = _aud(bgs_10_usd)
+    bgs_black_aud = _aud(bgs_black_usd)
+    cgc_10_aud    = _aud(cgc_10_usd)
+    sgc_10_aud    = _aud(sgc_10_usd)
 
     logging.info(
-        f"✅ PriceCharting: raw=${raw_aud} PSA10=${psa_10_aud} PSA9=${psa_9_aud} "
-        f"BGS_Gem=${bgs_gem_aud} BGS10={bgs_10_aud} CGC10={cgc_10_aud} SGC10={sgc_10_aud} | "
-        f"product='{pc_merged.get('product-name') or pc_merged.get('name')}'"
+        f"✅ PC: '{validated.get('product-name') or validated.get('name')}' | "
+        f"raw=${raw_aud} PSA10=${psa_10_aud} PSA9=${psa_9_aud} "
+        f"BGSBlack={bgs_black_aud} BGS10={bgs_10_aud} CGC10={cgc_10_aud}"
     )
 
-    # For the reconciler: use PSA 10 as the primary signal (it's what eBay comps
-    # are also PSA-10 based). The grader brand factor will be applied on top.
-    _is_graded_lookup = fp.get("is_graded", False)
-    if _is_graded_lookup:
-        # Prefer PSA 10 (manual-only-price) as the graded signal.
-        # Fall back to PSA 9 (graded-price) only if PSA 10 not available.
-        # Raw is used when no graded price exists.
-        if psa_10_aud and psa_10_aud > 0:
-            _pc_median   = psa_10_aud
-            _pc_incl_grd = True
-        elif psa_9_aud and psa_9_aud > 0:
-            _pc_median   = psa_9_aud
-            _pc_incl_grd = True
-        else:
-            _pc_median   = raw_aud
-            _pc_incl_grd = False
-    else:
-        _pc_median   = raw_aud
-        _pc_incl_grd = False
+    _is_graded = fp.get("is_graded", False)
+    _pc_median   = (graded_aud if _is_graded and graded_aud else raw_aud)
+    _pc_incl_grd = bool(_is_graded and graded_aud)
 
     return {
         "source":                "pricecharting",
-        "product_name":          pc_merged.get("product-name") or pc_merged.get("name"),
+        "product_name":          validated.get("product-name") or validated.get("name"),
         "product_id":            pc_pid,
-        "product_url":           pc_merged.get("url"),
-        # Ungraded
-        "raw_price_usd":         raw_usd,
-        "raw_price_aud":         raw_aud,
-        # PSA grades
-        "psa_10_price_aud":      psa_10_aud,
-        "psa_9_price_aud":       psa_9_aud,
-        "graded_price_usd":      graded_usd,
-        "graded_price_aud":      graded_aud,
-        # Other graders
-        "bgs_gem_price_aud":     bgs_gem_aud,   # BGS 9.5
-        "bgs_10_price_aud":      bgs_10_aud,    # BGS 10 Pristine
-        "cgc_10_price_aud":      cgc_10_aud,
+        "product_url":           validated.get("url"),
+        "raw_price_usd":         raw_usd,       "raw_price_aud":         raw_aud,
+        "psa_10_price_aud":      psa_10_aud,    "psa_9_price_aud":       psa_9_aud,
+        "graded_price_usd":      graded_usd,    "graded_price_aud":      graded_aud,
+        "bgs_black_price_aud":   bgs_black_aud, "bgs_10_price_aud":      bgs_10_aud,
+        "bgs_gem_price_aud":     bgs_gem_aud,   "cgc_10_price_aud":      cgc_10_aud,
         "sgc_10_price_aud":      sgc_10_aud,
-        "grade_8_price_aud":     grade_8_aud,
-        "grade_7_price_aud":     grade_7_aud,
-        # Reconciler signal
         "median":                _pc_median,
         "card_number_validated": number_validated,
-        "query":                 q_full,
+        "query":                 q1 if card_number else q2,
         "count":                 5,
         "price_includes_grade":  _pc_incl_grd,
     }
