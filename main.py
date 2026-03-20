@@ -8340,21 +8340,26 @@ def _cla_resolve_price(
     """
     Grade 10 / Grade 12 price resolver.
 
-    Priority:
+    Source priority:
       1. PC graded fields  — matched by product ID, always trusted
-      2. eBay graded comps — keyword search, only used when PC has no graded data,
-                             validated against PC raw price to reject wrong-card matches
+      2. eBay graded comps — keyword search, used as fallback or averaged with PC
       3. PC raw price      — grade mult applied via layered engine
       4. eBay raw comps    — last resort, grade mult applied
-      5. Rarity table      — pure estimate when all live data is missing
+      5. Rarity table      — pure estimate when all live data missing
 
-    PC ALWAYS beats eBay at equal distance. eBay graded prices are cross-checked
-    against PC raw: if eBay implied > pc_raw * max_grade_mult * 2.0, it is rejected
-    as a likely wrong-card match.
+    Averaging rule:
+      - PC only:        use PC price directly
+      - eBay only:      use eBay price directly (PC had no graded data)
+      - Both PC + eBay: average the two implied prices
+        (two independent sources agreeing is more reliable than one)
 
-    Grade 10 target  = PSA 10 (factor 1.0 = direct match)
-    Grade 12 target  = BGS Black (factor 1.0 = direct match)
-    All other sources: factor = target_psa_equiv / source_psa_equiv
+    eBay sanity ceiling: eBay implied price must not exceed
+      PC graded implied × 3.0  (if PC has graded data)
+      PC raw × grade_mult × 2.5 (if PC has raw price only)
+    Anything above the ceiling is rejected as a wrong-card match.
+
+    Grade 10 target = PSA 10 equiv (factor 1.0 = direct)
+    Grade 12 target = BGS Black equiv (factor 1.0 = direct)
     """
     _PSA_EQUIV: Dict[str, float] = {
         "bgs black":     6.525,
@@ -8394,41 +8399,45 @@ def _cla_resolve_price(
         _target_psa_equiv = 1.000
         _grade_label      = "Grade 10"
 
-    def _make_candidate(price, src_psa_equiv, label, source, source_rank):
+    def _make_candidate(price, src_psa_equiv, label, source):
         factor   = _target_psa_equiv / src_psa_equiv
         implied  = round(price * factor, 2)
         distance = abs(factor - 1.0)
-        return {"label": label, "source": source, "source_rank": source_rank,
-                "price": price, "factor": round(factor, 4),
-                "implied": implied, "distance": distance}
+        return {"label": label, "source": source, "price": price,
+                "factor": round(factor, 4), "implied": implied, "distance": distance}
 
-    # ── PC raw price (for sanity-checking eBay later) ─────────────────────────
+    # ── PC raw price (used for ceiling calc) ─────────────────────────────────
     try:
         _pc_raw = float((pc_result or {}).get("raw_price_aud") or 0)
     except (TypeError, ValueError):
         _pc_raw = 0.0
 
-    # ── 1. PC graded candidates (source_rank=0, always preferred) ────────────
-    pc_candidates:   List[Dict[str, Any]] = []
-    ebay_candidates: List[Dict[str, Any]] = []
-
+    # ── 1. Best PC graded candidate ───────────────────────────────────────────
+    pc_candidates = []
     for field, src_psa_equiv, label in _PC_FIELD_MAP:
         try:
             val = float((pc_result or {}).get(field) or 0)
         except (TypeError, ValueError):
             val = 0.0
         if val > 0:
-            c = _make_candidate(val, src_psa_equiv, label, "pricecharting", 0)
+            c = _make_candidate(val, src_psa_equiv, label, "pricecharting")
             pc_candidates.append(c)
-            logging.debug(f"  {_grade_label} PC: {label} ${val:.2f} × {c['factor']:.4f} = ${c['implied']:.2f}")
+            logging.info(f"  {_grade_label} PC: {label} ${val:.2f} × {c['factor']:.4f} = ${c['implied']:.2f} | {card_name}")
 
-    # ── 2. eBay graded candidates (source_rank=1, only used when PC has nothing) ─
-    # Cross-check: if PC raw is available, eBay implied must be within
-    # pc_raw * max_reasonable_mult to be accepted.  This catches wrong-card
-    # matches where eBay returns an expensive unrelated card.
-    _max_grade_mult = _cla_grade_mult_tiered(grade, _pc_raw) if _pc_raw > 0 else 25.0
-    _ebay_ceiling   = _pc_raw * _max_grade_mult * 2.5 if _pc_raw > 0 else float("inf")
+    pc_candidates.sort(key=lambda c: c["distance"])
+    best_pc = pc_candidates[0] if pc_candidates else None
 
+    # ── 2. Best eBay graded candidate — with sanity ceiling ───────────────────
+    # Ceiling derived from best available PC reference to reject wrong-card matches.
+    if best_pc:
+        _ebay_ceiling = best_pc["implied"] * 3.0
+    elif _pc_raw > 0:
+        _max_mult     = _cla_grade_mult_tiered(grade, _pc_raw)
+        _ebay_ceiling = _pc_raw * _max_mult * 2.5
+    else:
+        _ebay_ceiling = float("inf")  # no PC reference — accept anything, rely on rarity table fallback
+
+    ebay_candidates = []
     for ebay_res in (ebay_results or []):
         if not ebay_res:
             continue
@@ -8449,69 +8458,76 @@ def _cla_resolve_price(
                 break
 
         if src_psa_equiv is None:
-            # Raw/ungraded eBay — always last resort
+            # Raw/ungraded eBay — handled separately below
             ebay_candidates.append({
-                "label": "eBay Raw", "source": "ebay_raw", "source_rank": 2,
+                "label": "eBay Raw", "source": "ebay_raw",
                 "price": ebay_price, "factor": None,
                 "implied": ebay_price, "distance": 999.0,
             })
         else:
-            c = _make_candidate(ebay_price, src_psa_equiv, f"eBay {matched_label}", "ebay", 1)
-            # Sanity check against PC raw — reject obvious wrong-card matches
+            c = _make_candidate(ebay_price, src_psa_equiv, f"eBay {matched_label}", "ebay")
             if c["implied"] > _ebay_ceiling:
                 logging.warning(
                     f"⚠️ {_grade_label}: rejecting eBay {matched_label} ${ebay_price:.2f} "
                     f"(implied ${c['implied']:.2f} > ceiling ${_ebay_ceiling:.2f}) "
-                    f"— likely wrong-card match for {card_name}"
+                    f"— likely wrong-card match | {card_name}"
                 )
                 continue
             ebay_candidates.append(c)
-            logging.debug(f"  {_grade_label} eBay: {c['label']} ${ebay_price:.2f} × {c['factor']:.4f} = ${c['implied']:.2f}")
+            logging.info(f"  {_grade_label} eBay: {c['label']} ${ebay_price:.2f} × {c['factor']:.4f} = ${c['implied']:.2f} | {card_name}")
 
-    # ── 3. Decide best candidate ──────────────────────────────────────────────
-    # PC always beats eBay. Within each source, pick closest distance.
-    # Only fall through to eBay when PC has no graded data at all.
-    pc_candidates.sort(key=lambda c: c["distance"])
     ebay_candidates.sort(key=lambda c: c["distance"])
+    best_ebay = next((c for c in ebay_candidates if c["distance"] < 999.0), None)
 
-    best_candidate = None
+    # ── 3. Resolve base price ─────────────────────────────────────────────────
     raw_base_aud   = 0.0
-    _apply_grade   = True
+    _apply_grade   = False
     sources_used   = []
+    best_candidate = None
 
-    if pc_candidates:
-        best_candidate = pc_candidates[0]
-        raw_base_aud   = best_candidate["implied"]
-        _apply_grade   = False
-        sources_used   = ["pricecharting"]
+    if best_pc and best_ebay:
+        # Both sources available — average them
+        raw_base_aud   = round((best_pc["implied"] + best_ebay["implied"]) / 2.0, 2)
+        sources_used   = ["pricecharting", "ebay"]
+        best_candidate = best_pc  # for audit trail
         logging.info(
-            f"🎯 {_grade_label}: PC best={best_candidate['label']} "
-            f"${best_candidate['price']:.2f} × {best_candidate['factor']:.4f} "
+            f"🎯 {_grade_label}: averaged PC {best_pc['label']} ${best_pc['implied']:.2f} "
+            f"+ eBay {best_ebay['label']} ${best_ebay['implied']:.2f} "
             f"= ${raw_base_aud:.2f} AUD | {card_name}"
         )
-    elif ebay_candidates and ebay_candidates[0]["distance"] < 999.0:
-        best_candidate = ebay_candidates[0]
-        raw_base_aud   = best_candidate["implied"]
-        _apply_grade   = False
-        sources_used   = ["ebay"]
+    elif best_pc:
+        # PC only
+        raw_base_aud   = best_pc["implied"]
+        sources_used   = ["pricecharting"]
+        best_candidate = best_pc
         logging.info(
-            f"🎯 {_grade_label}: eBay best={best_candidate['label']} "
-            f"${best_candidate['price']:.2f} × {best_candidate['factor']:.4f} "
-            f"= ${raw_base_aud:.2f} AUD (no PC graded data) | {card_name}"
+            f"🎯 {_grade_label}: PC only — {best_pc['label']} ${best_pc['price']:.2f} "
+            f"× {best_pc['factor']:.4f} = ${raw_base_aud:.2f} AUD | {card_name}"
+        )
+    elif best_ebay:
+        # eBay only (PC had no graded data)
+        raw_base_aud   = best_ebay["implied"]
+        sources_used   = ["ebay"]
+        best_candidate = best_ebay
+        logging.info(
+            f"🎯 {_grade_label}: eBay only (no PC graded) — {best_ebay['label']} ${best_ebay['price']:.2f} "
+            f"× {best_ebay['factor']:.4f} = ${raw_base_aud:.2f} AUD | {card_name}"
         )
     elif _pc_raw > 0:
-        # PC raw only — apply grade mult via layered engine
-        raw_base_aud = _pc_raw
-        _apply_grade = True
-        sources_used = ["pricecharting_raw"]
-        logging.info(f"📦 {_grade_label}: PC raw ${_pc_raw:.2f} (grade mult will apply) | {card_name}")
-    elif ebay_candidates:
-        # Raw eBay fallback
-        best_candidate = ebay_candidates[0]
-        raw_base_aud   = best_candidate["price"]
+        # No graded data anywhere — use PC raw, apply grade mult via layered engine
+        raw_base_aud   = _pc_raw
         _apply_grade   = True
-        sources_used   = ["ebay_raw"]
-        logging.info(f"📦 {_grade_label}: raw eBay ${raw_base_aud:.2f} (grade mult will apply) | {card_name}")
+        sources_used   = ["pricecharting_raw"]
+        logging.info(f"📦 {_grade_label}: PC raw ${_pc_raw:.2f} (grade mult will apply) | {card_name}")
+    else:
+        # Check raw eBay as absolute last resort before rarity table
+        raw_ebay = next((c for c in ebay_candidates if c["distance"] == 999.0), None)
+        if raw_ebay:
+            raw_base_aud = raw_ebay["price"]
+            _apply_grade = True
+            sources_used = ["ebay_raw"]
+            best_candidate = raw_ebay
+            logging.info(f"📦 {_grade_label}: raw eBay ${raw_base_aud:.2f} (grade mult will apply) | {card_name}")
 
     # ── 4. No data — rarity table ─────────────────────────────────────────────
     if raw_base_aud <= 0:
@@ -8529,6 +8545,8 @@ def _cla_resolve_price(
         return est
 
     # ── 5. Apply attribute multipliers exactly once ───────────────────────────
+    # _apply_grade=False: graded source already encodes grade premium via factor
+    # _apply_grade=True:  starting from raw price, grade mult still needed
     lv = cla_layered_valuation(
         raw_base_aud=raw_base_aud, grade=grade if _apply_grade else "",
         rarity=rarity, variant_type=variant_type, finish=finish,
@@ -8554,7 +8572,7 @@ def _cla_resolve_price(
         "grade_multiplier":     round(lv["grade_mult"], 4),
         "slab_premium_added":   0.0,
         "multiplier_reason":    f"{_grade_label}_{_best_label.lower().replace(' ','_')}",
-        "confidence":           "high" if (best_candidate and best_candidate["distance"] < 0.1)
+        "confidence":           "high" if len(sources_used) > 1
                                 else "medium" if best_candidate else "estimate",
         "source":               "grade_resolved",
         "sources_used":         sources_used,
@@ -8568,6 +8586,8 @@ def _cla_resolve_price(
         "best_source_label":    _best_label,
         "best_source_factor":   best_candidate["factor"] if best_candidate else None,
         "best_source_price":    best_candidate["price"]  if best_candidate else None,
+        "pc_candidate":         best_pc,
+        "ebay_candidate":       best_ebay,
         "layered_checks":       lv["checks"],
         "active_checks":        lv["active_checks"],
         "all_candidates":       pc_candidates + ebay_candidates,
