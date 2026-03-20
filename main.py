@@ -8321,6 +8321,7 @@ def _cla_resolve_price(
     pc_result:        Dict[str, Any],
     grade:            str,
     card_name:        str,
+    ebay_results:     Optional[List[Dict[str, Any]]] = None,
     game_type:        str        = "",
     rarity:           str        = "",
     variant_type:     str        = "",
@@ -8337,170 +8338,190 @@ def _cla_resolve_price(
     card_number:      str        = "",
 ) -> Dict[str, Any]:
     """
-    CLA 10 / CLA 12 price resolver — single source of truth.
+    Grade 10 / Grade 12 price resolver.
 
-    Takes whatever PriceCharting returned (any combination of graded/raw fields),
-    picks the best available source using a dynamic conversion factor, then applies
-    the CLA layered attribute multipliers exactly once.
+    Builds a unified candidate pool from ALL available sources — PriceCharting
+    graded fields AND eBay sold comps — then picks the one requiring the smallest
+    dynamic conversion factor to reach the target grade price.
 
-    No grader brand factor. No legacy path. No apply_cla_valuation.
-    Multiplier is applied once here and never again.
+    Grade 10 target  = PSA 10 equivalent (factor 1.0 = direct match)
+    Grade 12 target  = BGS Black equivalent (factor 1.0 = direct match)
 
-    PSA-equivalency table (PSA 10 = 1.000):
-        BGS 10 Black   = 6.525
-        BGS 10 Pristine= 1.307
-        PSA 10         = 1.000
-        CGC 10         = 0.810
-        BGS 9.5 Gem    = 0.810
-        PSA 9          = 0.667
-        SGC 10         = 0.600
-        Raw            = via grade tier table (no PSA equiv — handled separately)
+    For every other source:  factor = target_psa_equiv / source_psa_equiv
+    Best source = smallest abs(factor - 1.0) — least correction needed.
 
-    CLA targets:
-        CLA 10 = 1.000 PSA equiv
-        CLA 12 = 6.525 PSA equiv
+    If no graded source exists at all: raw price × grade tier table.
+    If no raw price: rarity table estimate.
 
-    Dynamic factor = cla_target_psa_equiv / source_psa_equiv
-    Best source = smallest abs(factor - 1.0) — i.e. smallest correction needed.
+    Attribute multipliers (pop, language, finish, edition, signed, error, promo)
+    applied exactly once on top. Grade multiplier only applied when starting
+    from a raw/ungraded base (graded sources already encode the grade premium).
     """
-    # ── Determine target PSA equiv from grade ────────────────────────────────
-    _gv = _cla_parse_grade(grade) or 0.0
-    if _gv >= 12:
-        _cla_psa_equiv = 6.525   # CLA 12 = BGS Black
-        _grade_label   = "CLA 12"
-    else:
-        _cla_psa_equiv = 1.000   # CLA 10 = PSA 10
-        _grade_label   = "CLA 10"
+    # ── PSA-equivalency table ─────────────────────────────────────────────────
+    # Used for both PC fields and eBay query grade token parsing.
+    _PSA_EQUIV: Dict[str, float] = {
+        "bgs black":     6.525,
+        "bgs 10 black":  6.525,
+        "bgs10 black":   6.525,
+        "bgs 10":        1.307,
+        "bgs10":         1.307,
+        "psa 10":        1.000,
+        "psa10":         1.000,
+        "gem mint 10":   1.000,
+        "cgc 10":        0.810,
+        "cgc10":         0.810,
+        "bgs 9.5":       0.810,
+        "bgs9.5":        0.810,
+        "psa 9":         0.667,
+        "psa9":          0.667,
+        "sgc 10":        0.600,
+        "sgc10":         0.600,
+        "psa 8":         0.400,
+        "psa8":          0.400,
+    }
 
-    # ── PSA-equivalency for each PC source ───────────────────────────────────
-    # (source_key, psa_equiv, label)
-    # Ordered by proximity to CLA 10 target by default; re-ranked dynamically below.
-    _PC_SOURCES = [
-        ("bgs_black_price_aud", 6.525, "BGS Black"),
-        ("bgs_10_price_aud",    1.307, "BGS 10 Pristine"),
-        ("psa_10_price_aud",    1.000, "PSA 10"),
-        ("cgc_10_price_aud",    0.810, "CGC 10"),
-        ("bgs_gem_price_aud",   0.810, "BGS 9.5"),
-        ("psa_9_price_aud",     0.667, "PSA 9"),
-        ("sgc_10_price_aud",    0.600, "SGC 10"),
+    # PC field → (psa_equiv, label)
+    _PC_FIELD_MAP = [
+        ("bgs_black_price_aud", 6.525, "PC BGS Black"),
+        ("bgs_10_price_aud",    1.307, "PC BGS 10 Pristine"),
+        ("psa_10_price_aud",    1.000, "PC PSA 10"),
+        ("cgc_10_price_aud",    0.810, "PC CGC 10"),
+        ("bgs_gem_price_aud",   0.810, "PC BGS 9.5"),
+        ("psa_9_price_aud",     0.667, "PC PSA 9"),
+        ("sgc_10_price_aud",    0.600, "PC SGC 10"),
     ]
 
-    # ── Build candidate list from whatever PC actually returned ───────────────
-    candidates = []
-    for field, src_psa_equiv, label in _PC_SOURCES:
-        val = (pc_result or {}).get(field)
-        if not val:
+    # ── Target PSA equiv from grade ───────────────────────────────────────────
+    _gv = _cla_parse_grade(grade) or 0.0
+    if _gv >= 12:
+        _target_psa_equiv = 6.525
+        _grade_label      = "Grade 12"
+    else:
+        _target_psa_equiv = 1.000
+        _grade_label      = "Grade 10"
+
+    def _make_candidate(price: float, src_psa_equiv: float, label: str, source: str) -> Dict:
+        factor   = _target_psa_equiv / src_psa_equiv
+        implied  = round(price * factor, 2)
+        distance = abs(factor - 1.0)
+        return {"label": label, "source": source, "price": price,
+                "factor": round(factor, 4), "implied": implied, "distance": distance}
+
+    candidates: List[Dict[str, Any]] = []
+
+    # ── 1. PC graded fields ───────────────────────────────────────────────────
+    for field, src_psa_equiv, label in _PC_FIELD_MAP:
+        try:
+            val = float((pc_result or {}).get(field) or 0)
+        except (TypeError, ValueError):
+            val = 0.0
+        if val > 0:
+            c = _make_candidate(val, src_psa_equiv, label, "pricecharting")
+            candidates.append(c)
+            logging.debug(f"  {_grade_label} PC: {label} ${val:.2f} × {c['factor']:.4f} = ${c['implied']:.2f}")
+
+    # ── 2. eBay sold comps ────────────────────────────────────────────────────
+    # Parse grade token from the query string to determine PSA equiv.
+    for ebay_res in (ebay_results or []):
+        if not ebay_res:
             continue
         try:
-            val = float(val)
+            ebay_price = float(ebay_res.get("median") or 0)
         except (TypeError, ValueError):
             continue
-        if val <= 0:
+        if ebay_price <= 0:
             continue
 
-        factor   = _cla_psa_equiv / src_psa_equiv
-        implied  = round(val * factor, 2)
-        distance = abs(factor - 1.0)   # 0 = perfect match, higher = more correction
-        candidates.append({
-            "field":    field,
-            "label":    label,
-            "pc_price": val,
-            "factor":   round(factor, 4),
-            "implied":  implied,
-            "distance": distance,
-        })
-        logging.debug(
-            f"  CLA candidate: {label} ${val:.2f} × {factor:.4f} = ${implied:.2f} "
-            f"(distance={distance:.4f})"
-        )
+        query_lower    = (ebay_res.get("query") or "").lower()
+        src_psa_equiv  = None
+        matched_label  = None
+        for token, equiv in sorted(_PSA_EQUIV.items(), key=lambda x: -len(x[0])):
+            if token in query_lower:
+                src_psa_equiv = equiv
+                matched_label = token.upper()
+                break
 
-    # ── Sort by distance — closest source wins ────────────────────────────────
+        if src_psa_equiv is None:
+            # No grade token — raw/ungraded eBay comp, always last resort
+            candidates.append({
+                "label": "eBay Raw", "source": "ebay_raw",
+                "price": ebay_price, "factor": None,
+                "implied": ebay_price, "distance": 999.0,
+            })
+            logging.debug(f"  {_grade_label} eBay raw: ${ebay_price:.2f}")
+        else:
+            c = _make_candidate(ebay_price, src_psa_equiv, f"eBay {matched_label}", "ebay")
+            candidates.append(c)
+            logging.debug(f"  {_grade_label} eBay: {c['label']} ${ebay_price:.2f} × {c['factor']:.4f} = ${c['implied']:.2f}")
+
+    # ── 3. Sort — closest wins ────────────────────────────────────────────────
     candidates.sort(key=lambda c: c["distance"])
 
     raw_base_aud   = 0.0
     best_candidate = None
+    _apply_grade   = True
+    sources_used   = []
 
-    if candidates:
+    if candidates and candidates[0]["distance"] < 999.0:
         best_candidate = candidates[0]
         raw_base_aud   = best_candidate["implied"]
+        _apply_grade   = False
+        sources_used   = [best_candidate["source"]]
         logging.info(
-            f"🎯 {_grade_label}: best PC source = {best_candidate['label']} "
-            f"${best_candidate['pc_price']:.2f} × {best_candidate['factor']:.4f} "
-            f"= ${raw_base_aud:.2f} AUD for {card_name}"
+            f"🎯 {_grade_label}: best={best_candidate['label']} "
+            f"${best_candidate['price']:.2f} × {best_candidate['factor']:.4f} "
+            f"= ${raw_base_aud:.2f} AUD | {len(candidates)} candidates | {card_name}"
         )
+    elif candidates:
+        best_candidate = candidates[0]
+        raw_base_aud   = best_candidate["price"]
+        _apply_grade   = True
+        sources_used   = ["ebay_raw"]
+        logging.info(f"📦 {_grade_label}: raw eBay ${raw_base_aud:.2f} (grade mult will apply) | {card_name}")
     else:
-        # No graded PC data — fall back to raw price, then rarity table
-        _raw = float((pc_result or {}).get("raw_price_aud") or 0.0)
-        if _raw > 0:
-            raw_base_aud = _raw
-            logging.info(
-                f"📦 {_grade_label}: no graded PC data — using raw ${_raw:.2f} AUD "
-                f"(grade multiplier will apply via layered engine) for {card_name}"
-            )
-        else:
-            logging.info(
-                f"📦 {_grade_label}: no PC data at all — using rarity table base for {card_name}"
-            )
+        try:
+            _pc_raw = float((pc_result or {}).get("raw_price_aud") or 0)
+        except (TypeError, ValueError):
+            _pc_raw = 0.0
+        if _pc_raw > 0:
+            raw_base_aud = _pc_raw
+            _apply_grade = True
+            sources_used = ["pricecharting_raw"]
+            logging.info(f"📦 {_grade_label}: PC raw ${_pc_raw:.2f} (grade mult will apply) | {card_name}")
 
-    # ── If we have a grade-converted base, skip the grade multiplier ──────────
-    # The conversion factor already prices the card at the CLA target grade.
-    # Pass grade="" to cla_layered_valuation so it doesn't apply grade mult again.
-    # Only apply grade mult when we're starting from raw (no graded source found).
-    _apply_grade = (best_candidate is None)
-
-    # ── If still no base — use rarity table via _cla_estimate_from_attributes ─
+    # ── 4. No data — rarity table ─────────────────────────────────────────────
     if raw_base_aud <= 0:
         est = _cla_estimate_from_attributes(
-            game_type        = game_type,
-            rarity           = rarity,
-            variant_type     = variant_type,
-            finish           = finish,
-            language         = language,
-            is_signed        = is_signed,
-            signed_by        = signed_by,
-            grade            = grade,
-            rank_within_card = rank_within_card,
-            rank_total       = rank_total,
-            card_set         = card_set,
-            card_number      = card_number,
-            is_error         = is_error,
-            is_promo         = is_promo,
+            game_type=game_type, rarity=rarity, variant_type=variant_type,
+            finish=finish, language=language, is_signed=is_signed, signed_by=signed_by,
+            grade=grade, rank_within_card=rank_within_card, rank_total=rank_total,
+            card_set=card_set, card_number=card_number, is_error=is_error, is_promo=is_promo,
         )
-        est["price_source"]      = f"attr_estimate_{_grade_label.lower().replace(' ','')}"
+        est["price_source"]       = f"attr_estimate_{_grade_label.lower().replace(' ','')}"
         est["grader_brand_factor"] = 1.0
-        est["card_name"]         = card_name
-        logging.info(
-            f"📊 {_grade_label}: rarity table estimate "
-            f"${est.get('current_price', 0):.2f} AUD for {card_name}"
-        )
+        est["card_name"]          = card_name
+        est["all_candidates"]     = candidates
+        logging.info(f"📊 {_grade_label}: rarity table ${est.get('current_price',0):.2f} AUD | {card_name}")
         return est
 
-    # ── Apply remaining attribute multipliers exactly once ────────────────────
-    # grade="" when we already have a grade-converted base (don't double-apply).
-    # grade=grade when starting from raw (grade mult still needed).
+    # ── 5. Apply attribute multipliers exactly once ───────────────────────────
+    # _apply_grade=False when a graded source was found (factor already encodes grade).
+    # _apply_grade=True  when starting from raw (grade mult still needed).
     lv = cla_layered_valuation(
-        raw_base_aud     = raw_base_aud,
-        grade            = grade if _apply_grade else "",
-        rarity           = rarity,
-        variant_type     = variant_type,
-        finish           = finish,
-        language         = language,
-        edition          = edition,
-        is_signed        = is_signed,
-        signed_by        = signed_by,
-        game_type        = game_type,
-        rank_within_card = rank_within_card,
-        rank_total       = rank_total,
-        is_error         = is_error,
-        is_promo         = is_promo,
+        raw_base_aud=raw_base_aud, grade=grade if _apply_grade else "",
+        rarity=rarity, variant_type=variant_type, finish=finish,
+        language=language, edition=edition, is_signed=is_signed, signed_by=signed_by,
+        game_type=game_type, rank_within_card=rank_within_card, rank_total=rank_total,
+        is_error=is_error, is_promo=is_promo,
     )
 
     final_price = lv["final_value"]
     logging.info(
-        f"✅ {_grade_label} final: ${raw_base_aud:.2f} base × attr checks "
-        f"{lv['active_checks']} = ${final_price:.2f} AUD for {card_name}"
+        f"✅ {_grade_label} final: ${raw_base_aud:.2f} × attr {lv['active_checks']} "
+        f"= ${final_price:.2f} AUD | {card_name}"
     )
 
+    _best_label = best_candidate["label"] if best_candidate else "raw"
     return {
         "current_price":        final_price,
         "final_price":          final_price,
@@ -8510,14 +8531,11 @@ def _cla_resolve_price(
         "multiplier_applied":   round(lv["total_mult"], 4),
         "grade_multiplier":     round(lv["grade_mult"], 4),
         "slab_premium_added":   0.0,
-        "multiplier_reason":    (
-            f"{_grade_label}_pc_{best_candidate['label'].lower().replace(' ','_')}"
-            if best_candidate else
-            f"{_grade_label}_raw_grade_table"
-        ),
-        "confidence":           "medium" if best_candidate else "estimate",
-        "source":               "pc_cla_resolved",
-        "sources_used":         ["pricecharting"],
+        "multiplier_reason":    f"{_grade_label}_{_best_label.lower().replace(' ','_')}",
+        "confidence":           "high" if (best_candidate and best_candidate["distance"] < 0.1)
+                                else "medium" if best_candidate else "estimate",
+        "source":               "grade_resolved",
+        "sources_used":         sources_used,
         "price_includes_grade": True,
         "grade_12_uplift":      (_gv >= 12),
         "grader_brand_factor":  1.0,
@@ -8525,15 +8543,13 @@ def _cla_resolve_price(
         "last_updated":         datetime.now().isoformat(),
         "fingerprint_used":     True,
         "estimated":            (best_candidate is None),
-        "pc_source_used":       best_candidate["label"] if best_candidate else "rarity_table",
-        "pc_source_factor":     best_candidate["factor"] if best_candidate else None,
-        "pc_source_price":      best_candidate["pc_price"] if best_candidate else None,
+        "best_source_label":    _best_label,
+        "best_source_factor":   best_candidate["factor"] if best_candidate else None,
+        "best_source_price":    best_candidate["price"]  if best_candidate else None,
         "layered_checks":       lv["checks"],
         "active_checks":        lv["active_checks"],
-        "all_pc_candidates":    candidates,   # full audit trail
+        "all_candidates":       candidates,
     }
-
-
 def apply_cla_valuation(signal_price: float, signal_includes_grade: bool, search_query: str, target_grade: str | None,
                         rank_within_card: int | None = None, rank_total: int | None = None,
                         slab_premium_add_aud: float = 70.0) -> dict:
