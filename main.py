@@ -8758,26 +8758,26 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
             f"num={card_number} | grade={grade} | lang={language}"
         )
 
-        # ── Detect CLA grader and grade ──────────────────────────────────────
-        _grader_norm = grader.upper()
-        _is_cla = _grader_norm in ("CLA", "COLLECTORS LEAGUE", "COLLECTORS LEAGUE AUSTRALIA", "")
+        # ── Detect grade ─────────────────────────────────────────────────────
         grade_is_12_plus = False
         grade_is_10_plus = False
+        _grade_val = 0.0
         try:
             _gm = re.search(r"(\d+(?:\.\d+)?)", grade)
             if _gm:
-                _gv = float(_gm.group(1))
-                if _gv >= 12: grade_is_12_plus = True
-                if _gv >= 10: grade_is_10_plus = True
+                _grade_val = float(_gm.group(1))
+                if _grade_val >= 12: grade_is_12_plus = True
+                if _grade_val >= 10: grade_is_10_plus = True
         except Exception:
             pass
 
-        # ── CLA 10 / 12: dedicated resolver — runs before everything else ─────
-        # Fetches PC, picks the best available source (graded fields ranked by
-        # proximity to CLA target), applies attribute factors once, returns.
-        # No eBay graded comps. No grader brand factor. No legacy path. Ever.
-        if _is_cla and (grade_is_10_plus or grade_is_12_plus):
-            # Still need fingerprint for PC lookup
+        # ── Grade-based resolver — runs for ALL graded cards ──────────────────
+        # Grader brand is irrelevant to market value — what matters is the grade
+        # number and the card's attributes. Fetches PC + eBay at multiple grade
+        # tiers in parallel, picks the signal closest to the target grade, applies
+        # one dynamic conversion factor, then attribute multipliers once.
+        # No grader brand factor. No legacy path. No apply_cla_valuation.
+        if grade and (grade_is_10_plus or grade_is_12_plus):
             fp: Dict[str, Any] = {}
             fp_error: Optional[str] = None
             try:
@@ -8792,17 +8792,47 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                 )
             except ValueError as ve:
                 fp_error = str(ve)
-                logging.warning(f"⚠️ CLA fingerprint incomplete ({ve}) — will use rarity table")
+                logging.warning(f"⚠️ Fingerprint incomplete ({ve}) — resolver will use rarity table")
 
-            pc_result: Dict[str, Any] = {}
+            pc_result:    Dict[str, Any]       = {}
+            ebay_results: List[Dict[str, Any]] = []
+
             if fp and not fp_error:
-                try:
-                    pc_result = await _fetch_pricecharting_strict(fp) or {}
-                except Exception as _pce:
-                    logging.warning(f"⚠️ CLA PC fetch failed: {_pce}")
+                _fp_base = dict(fp)
+                _fp_base["is_graded"] = True
+
+                if grade_is_12_plus:
+                    _fp_bgs_black = dict(_fp_base)
+                    _fp_bgs_black["_grade_token_override"] = "BGS 10 Black"
+                    _fp_psa10 = dict(_fp_base)
+                    _fp_psa10["_grade_token_override"] = "PSA 10"
+                    _fp_raw = dict(fp); _fp_raw["is_graded"] = False; _fp_raw["grade"] = ""
+                    pc_result, eb_bgs_black, eb_psa10, eb_raw = await asyncio.gather(
+                        _fetch_pricecharting_strict(fp),
+                        _ebay_sold_strict(_fp_bgs_black, limit=30, days_lookback=180),
+                        _ebay_sold_strict(_fp_psa10,     limit=40, days_lookback=90),
+                        _ebay_sold_strict(_fp_raw,       limit=20, days_lookback=60),
+                    )
+                    ebay_results = [r for r in [eb_bgs_black, eb_psa10, eb_raw] if r]
+                else:
+                    _fp_psa10 = dict(_fp_base)
+                    _fp_psa10["_grade_token_override"] = "PSA 10"
+                    _fp_psa9  = dict(_fp_base)
+                    _fp_psa9["_grade_token_override"]  = "PSA 9"
+                    _fp_raw = dict(fp); _fp_raw["is_graded"] = False; _fp_raw["grade"] = ""
+                    pc_result, eb_psa10, eb_psa9, eb_raw = await asyncio.gather(
+                        _fetch_pricecharting_strict(fp),
+                        _ebay_sold_strict(_fp_psa10, limit=40, days_lookback=90),
+                        _ebay_sold_strict(_fp_psa9,  limit=30, days_lookback=90),
+                        _ebay_sold_strict(_fp_raw,   limit=20, days_lookback=60),
+                    )
+                    ebay_results = [r for r in [eb_psa10, eb_psa9, eb_raw] if r]
+
+                pc_result = pc_result or {}
 
             result = _cla_resolve_price(
                 pc_result        = pc_result,
+                ebay_results     = ebay_results,
                 grade            = grade,
                 card_name        = card_name,
                 game_type        = game_type,
@@ -8821,10 +8851,11 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                 card_number      = card_number,
             )
             result["pricecharting_detail"] = pc_result if pc_result else None
-            result["grader"]               = grader or "CLA"
+            result["ebay_detail"]          = ebay_results[0] if ebay_results else None
+            result["grader"]               = grader or ""
             return result
 
-        # ── Step 1: Build fingerprint (non-CLA path) ──────────────────────────
+        # ── Step 1: Build fingerprint (grades below 10 / ungraded path) ──────
         fp: Dict[str, Any] = {}
         fp_error: Optional[str] = None
         try:
