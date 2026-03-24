@@ -6895,80 +6895,127 @@ async def _ebay_sold_strict(
             _q(card_name, grade_token) if card_set else None,  # T3: name+grade
         ])))
 
-    # ── Run tiers until MIN_SALES met ─────────────────────────────────────────
-    # For graded card queries (contain a grade token like "PSA 10"), 1 comp is
-    # enough — a single confirmed PSA 10 sale is a reliable price anchor.
-    # For raw/ungraded queries, keep MIN_SALES=3 to avoid single-outlier signals.
-    MIN_SALES = 3
-    best: Optional[Dict[str, Any]] = None
+    # ── Strategy: run sold comps AND grade-filtered active listings in parallel ──
+    # For graded cards, a live BIN listing IS the market — sellers don't list below
+    # what the card is worth, and for new cards with few sold comps, active listings
+    # are more reliable than falling back to raw sold prices.
+    #
+    # Resolution priority (highest to lowest):
+    #   1. Graded sold comps  (confirmed transactions, grade in query)
+    #   2. Graded active BIN  (live market, grade in query — preferred over raw sold)
+    #   3. Raw sold comps     (ungraded, grade mult will be applied by caller)
+    #   4. Raw active BIN     (last resort, grade mult will be applied)
 
-    for tier_q in tiers:
+    MIN_SALES = 3
+    best_graded_sold:  Optional[Dict[str, Any]] = None
+    best_raw_sold:     Optional[Dict[str, Any]] = None
+    best_graded_active: Optional[Dict[str, Any]] = None
+
+    # Build grade-filtered active query to run in parallel
+    _q_grade_active = ""
+    if grade_token:
+        _q_grade_active = _q(card_name, card_number, grade_token) if card_number else _q(card_name, card_set, grade_token)
+    _q_base_active = _q(card_name, card_number) if card_number else _q(card_name, card_set)
+
+    # Run all sold-comp tiers AND the grade-filtered active query concurrently
+    async def _run_tier(tier_q: str) -> Dict[str, Any]:
         grade_in_tier = bool(grade_token and grade_token.lower() in tier_q.lower())
         effective_min = 1 if grade_in_tier else MIN_SALES
-
-        logging.info(f"🔍 eBay: '{tier_q}' (min_sales={effective_min})")
-        # Query AU and US in parallel — US has far more sold comps for graded cards.
-        # Prices from US are converted to AUD by _ebay_completed_stats.
+        logging.info(f"🔍 eBay sold: '{tier_q}'")
         au, us = await asyncio.gather(
             _ebay_completed_stats(tier_q, limit=limit, days_lookback=days_lookback, global_id="EBAY-AU"),
             _ebay_completed_stats(tier_q, limit=limit, days_lookback=days_lookback, global_id="EBAY-US"),
         )
-        # Pick higher-volume market; merge if both have data
-        result = au if (au.get("count") or 0) >= (us.get("count") or 0) else us
         au_prices = au.get("prices") or []
         us_prices = us.get("prices") or []
         if au_prices and us_prices:
             merged = sorted(au_prices + us_prices)
             trim = max(1, len(merged) // 10)
             trimmed = merged[trim:-trim] if len(merged) > 2 * trim else merged
-            result = dict(result)
+            result = dict(au)
             result["prices"] = merged
             result["count"]  = len(merged)
             result["median"] = round(statistics.median(trimmed), 2) if trimmed else 0
-
+        else:
+            result = au if (au.get("count") or 0) >= (us.get("count") or 0) else us
         count = result.get("count") or 0
-        logging.info(f"   → {count} comps (AU+US), median=${result.get('median', 0):.2f} AUD")
-
+        logging.info(f"   → {count} sold (AU+US), median=${result.get('median', 0):.2f} AUD")
         if count >= effective_min:
-            best = dict(result)
-            best["query"] = tier_q
-            break
-        elif count > 0 and (best is None or count > (best.get("count") or 0)):
-            best = dict(result)
-            best["query"] = tier_q
+            result["query"] = tier_q
+            return result
+        elif count > 0:
+            result["query"] = tier_q
+            result["_sparse"] = True  # below min but not empty
+            return result
+        return {}
 
-    # ── Active listings fallback ──────────────────────────────────────────────
-    # Two passes: first with grade token (graded-only signal), then without.
-    # This prevents raw and graded listings being mixed into the same median.
-    _active_queries: List[str] = []
-    if grade_token:
-        # Grade-filtered first — a Buy-It-Now PSA 10 at $180 is a real price floor
-        _q_grade = _q(card_name, card_number, grade_token) if card_number else _q(card_name, card_set, grade_token)
-        if _q_grade not in tiers:
-            _active_queries.append(_q_grade)
-    _q_base = _q(card_name, card_number) if card_number else _q(card_name, card_set)
-    _active_queries.append(_q_base)
+    async def _run_active(active_q: str) -> Dict[str, Any]:
+        if not active_q:
+            return {}
+        logging.info(f"🔍 eBay active: '{active_q}'")
+        try:
+            stats = await _ebay_active_stats(active_q, limit=20)
+            med = float((stats or {}).get("median") or 0)
+            cnt = int((stats or {}).get("count") or 0)
+            if med > 0 and cnt >= 1:
+                logging.info(f"   → {cnt} active listings, median=${med:.2f} AUD")
+                return {
+                    "source":               "ebay_active",
+                    "query":                active_q,
+                    "count":                cnt,
+                    "median":               med,
+                    "prices":               stats.get("prices") or [],
+                    "price_includes_grade": bool(grade_token and grade_token.lower() in active_q.lower()),
+                }
+        except Exception as _ae:
+            logging.debug(f"Active query error: {_ae}")
+        return {}
 
-    if not best or not (best.get("count") or 0):
-        for active_q in _active_queries:
-            logging.info(f"   No sold comps — active fallback: '{active_q}'")
-            try:
-                active_stats = await _ebay_active_stats(active_q, limit=20)
-                active_med   = float((active_stats or {}).get("median") or 0)
-                active_cnt   = int((active_stats or {}).get("count")  or 0)
-                if active_med > 0 and active_cnt >= 1:
-                    best = {
-                        "source":               "ebay_active",
-                        "query":                active_q,
-                        "count":                active_cnt,
-                        "median":               active_med,
-                        "prices":               active_stats.get("prices") or [],
-                        "price_includes_grade": bool(grade_token and grade_token.lower() in active_q.lower()),
-                    }
-                    logging.info(f"   Active: {active_cnt} listings, median=${active_med:.2f} AUD")
-                    break
-            except Exception as _ae:
-                logging.debug(f"Active fallback: {_ae}")
+    # Fire all queries concurrently: sold comps for each tier + grade-filtered active
+    tier_tasks  = [_run_tier(tq) for tq in tiers]
+    async def _noop() -> Dict[str, Any]:
+        return {}
+    active_task = _run_active(_q_grade_active) if _q_grade_active else _noop()
+
+    all_results = await asyncio.gather(*tier_tasks, active_task)
+    tier_results   = all_results[:-1]
+    active_graded  = all_results[-1] if _q_grade_active else {}
+
+    # Categorise results
+    for i, tr in enumerate(tier_results):
+        if not tr:
+            continue
+        tq = tiers[i]
+        has_grade = bool(grade_token and grade_token.lower() in tq.lower())
+        if has_grade and not tr.get("_sparse"):
+            if best_graded_sold is None:
+                best_graded_sold = tr
+        elif not has_grade and not tr.get("_sparse"):
+            if best_raw_sold is None:
+                best_raw_sold = tr
+        elif tr.get("_sparse"):
+            # sparse graded sold: keep as weak signal
+            if has_grade and best_graded_sold is None:
+                best_graded_sold = tr  # even sparse graded > raw
+
+    if active_graded and (active_graded.get("count") or 0) >= 1:
+        best_graded_active = active_graded
+
+    # ── Priority resolution ───────────────────────────────────────────────────
+    if best_graded_sold:
+        best = best_graded_sold
+        logging.info(f"✅ Using graded sold comps: ${best.get('median',0):.2f} AUD")
+    elif best_graded_active:
+        best = best_graded_active
+        logging.info(f"✅ Using graded active BIN (no sold comps): ${best.get('median',0):.2f} AUD")
+    elif best_raw_sold:
+        best = best_raw_sold
+        logging.info(f"📦 Using raw sold comps (grade mult will apply): ${best.get('median',0):.2f} AUD")
+    else:
+        # Last resort: raw active listings
+        best = await _run_active(_q_base_active)
+        if best:
+            logging.info(f"📦 Using raw active BIN: ${best.get('median',0):.2f} AUD")
 
     if not best:
         return {}
