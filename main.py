@@ -7926,7 +7926,13 @@ def _cla_parse_grade(grade_str: str) -> float | None:
 #
 _CLA_GRADE_TIERS: List[tuple] = [
     # (min_grade, (mult_$3, mult_$15, mult_$50, mult_$150, mult_$500))
-    (12.0, (23.5, 17.6, 12.9,  9.40, 7.93)),  # CLA 12 Ultra Flawless = 90% BGS Black (CLA_10 × 5.8734)
+    # Grade 12 calibration (AU market observed 2023-2026):
+    #   $3 raw → ~$15 (5×)  | $15 raw → ~$52 (3.5×) | $50 raw → ~$125 (2.5×)
+    #   $150 raw → ~$270 (1.8×) | $500 raw → ~$750 (1.5×)
+    # CLA is a boutique AU grader — NOT BGS Black equivalent (which is 6.5× PSA 10).
+    # Previous values (23.5, 17.6, 12.9, 9.40, 7.93) were formula-derived (Grade 10 × 5.87)
+    # and did not reflect real AU market prices; they caused 10–20× inflation.
+    (12.0, (5.0,  3.5,  2.5,  1.80, 1.50)),  # CLA 12 Ultra Flawless — realistic AU premium
     (10.0, (4.0,  3.0,  2.2,  1.60, 1.35)),  # CLA/PSA 10 Flawless
     ( 9.5, (3.0,  2.4,  1.9,  1.45, 1.25)),  # Near-gem
     ( 9.0, (2.5,  2.0,  1.6,  1.30, 1.15)),  # PSA 9 Mint
@@ -8393,7 +8399,12 @@ def _cla_resolve_price(
 
     _gv = _cla_parse_grade(grade) or 0.0
     if _gv >= 12:
-        _target_psa_equiv = 6.525
+        # CLA 12 target = 1.5× PSA 10 equivalent.
+        # The old value (6.525 = BGS Black ratio) caused 10-20× inflation because
+        # PC BGS 10 Pristine data (src factor 1.307) was scaled by 6.525/1.307 = 4.99×
+        # on top of an already-graded price. CLA is a boutique AU grader and does not
+        # command BGS Black premiums; 1.5× PSA 10 matches observed AU market data.
+        _target_psa_equiv = 1.50
         _grade_label      = "Grade 12"
     else:
         _target_psa_equiv = 1.000
@@ -8545,17 +8556,53 @@ def _cla_resolve_price(
         return est
 
     # ── 5. Apply attribute multipliers exactly once ───────────────────────────
-    # _apply_grade=False: graded source already encodes grade premium via factor
-    # _apply_grade=True:  starting from raw price, grade mult still needed
-    lv = cla_layered_valuation(
-        raw_base_aud=raw_base_aud, grade=grade if _apply_grade else "",
-        rarity=rarity, variant_type=variant_type, finish=finish,
-        language=language, edition=edition, is_signed=is_signed, signed_by=signed_by,
-        game_type=game_type, rank_within_card=rank_within_card, rank_total=rank_total,
-        is_error=is_error, is_promo=is_promo,
-    )
+    # _apply_grade=False: base comes from actual graded sale comps (PSA 10, BGS 10, etc.)
+    #   — the comp price ALREADY reflects the card's finish/language/rarity premium.
+    #   — Applying finish/language on top = double-counting. ONLY pop_rank still applies
+    #     (a #1 pop CLA 12 does add scarcity on top of any graded comp).
+    # _apply_grade=True: base is raw/ungraded — ALL attribute multipliers needed.
+    if _apply_grade:
+        # Raw base: apply full attribute stack (grade + finish + language + edition + signed…)
+        lv = cla_layered_valuation(
+            raw_base_aud=raw_base_aud, grade=grade,
+            rarity=rarity, variant_type=variant_type, finish=finish,
+            language=language, edition=edition, is_signed=is_signed, signed_by=signed_by,
+            game_type=game_type, rank_within_card=rank_within_card, rank_total=rank_total,
+            is_error=is_error, is_promo=is_promo,
+        )
+    else:
+        # Graded comp base: skip grade + attribute mults (already priced in).
+        # Pass pop_rank only — scarcity within the graded pop is additive.
+        lv = cla_layered_valuation(
+            raw_base_aud=raw_base_aud, grade="",
+            rarity="", variant_type="", finish="",
+            language="english", edition="", is_signed=False, signed_by="",
+            game_type=game_type, rank_within_card=rank_within_card, rank_total=rank_total,
+            is_error=False, is_promo=False,
+        )
 
     final_price = lv["final_value"]
+
+    # ── Sanity cap — prevent outlier signals from producing absurd finals ──────
+    # Synced with _reconcile_prices() cap schedule. Uses raw_base_aud (the graded
+    # comp signal) as the reference, not final_price (which would make the cap useless).
+    #   signal < $15   → cap 3.0× signal (grad comp → CLA 12 shouldn't triple that)
+    #   signal < $50   → cap 2.5×
+    #   signal < $200  → cap 2.0×
+    #   signal ≥ $200  → cap 1.5×
+    if raw_base_aud > 0:
+        if   raw_base_aud < 15:   _cap_ratio = 3.0
+        elif raw_base_aud < 50:   _cap_ratio = 2.5
+        elif raw_base_aud < 200:  _cap_ratio = 2.0
+        else:                     _cap_ratio = 1.5
+        _price_cap = round(raw_base_aud * _cap_ratio, 2)
+        if final_price > _price_cap:
+            logging.warning(
+                f"⚠️ {_grade_label} sanity cap: ${final_price:.2f} → ${_price_cap:.2f} "
+                f"(signal=${raw_base_aud:.2f} × {_cap_ratio}) | {card_name}"
+            )
+            final_price = _price_cap
+
     logging.info(
         f"✅ {_grade_label} final: ${raw_base_aud:.2f} × attr {lv['active_checks']} "
         f"= ${final_price:.2f} AUD | {card_name}"
