@@ -7749,16 +7749,23 @@ def _cla_estimate_from_attributes(
         ("hologram",         24.0),
         ("limited edition",  22.0),
         ("series ii",        14.0),
-        ("galaxy",           12.0),
+        ("galaxy",           12.0),   # Decipher Galaxy Series cards
         ("dark empire",       8.8),
         ("chromium",         10.0),
         ("chrome",           10.0),
         ("foil",              8.0),
         ("embossed",          7.2),
         ("prism",             7.2),
+        ("cover gallery",     5.6),   # Decipher Cover Gallery subset
         ("rare",              4.0),
         ("uncommon",          2.0),
         ("common",            1.0),
+        # Catch-all for vintage Decipher/Topps cards with no explicit rarity stored
+        # card_set keywords: "decipher", "topps", "vehicles", "jedi", "sith"
+        ("decipher",          4.0),
+        ("topps",             3.2),
+        ("vehicles",          3.6),
+        ("premiere",          4.0),
     ]]
     _GENERIC_BASES: List[tuple] = [(k, round(r * _GEN_ANCHOR, 2)) for k, r in [
         ("parallel",         25.0),
@@ -8614,23 +8621,37 @@ def _cla_resolve_price(
 
     final_price = lv["final_value"]
 
-    # ── Sanity cap — prevent outlier signals from producing absurd finals ──────
-    # Synced with _reconcile_prices() cap schedule. Uses raw_base_aud (the graded
-    # comp signal) as the reference, not final_price (which would make the cap useless).
-    #   signal < $15   → cap 3.0× signal (grad comp → CLA 12 shouldn't triple that)
-    #   signal < $50   → cap 2.5×
-    #   signal < $200  → cap 2.0×
-    #   signal ≥ $200  → cap 1.5×
+    # ── Sanity cap — two separate schedules for the two paths ─────────────────
+    #
+    # PATH 1 — _apply_grade=False (graded comp signal, PSA-equiv factor conversion)
+    #   The factor is always close to 1.0×; the only additional mult is pop_rank (max 1.25×).
+    #   Cap = signal × 2.0 is generous headroom.
+    #
+    # PATH 2 — _apply_grade=True (raw signal, full grade + attribute stack)
+    #   Grade mult alone can be 2.5–5.0×. Combined with JP (1.15×) + finish (1.40×),
+    #   the legitimate total can reach 8.05× for Grade 12 on a cheap card.
+    #   Cap = grade_table_max × 2.5 so normal multiplications are never truncated.
+    #   Only true outliers fire it (e.g. $5 card matched a $500 wrong-card eBay raw).
     if raw_base_aud > 0:
-        if   raw_base_aud < 15:   _cap_ratio = 3.0
-        elif raw_base_aud < 50:   _cap_ratio = 2.5
-        elif raw_base_aud < 200:  _cap_ratio = 2.0
-        else:                     _cap_ratio = 1.5
+        if not _apply_grade:
+            # Graded comp path — tight cap, factor conversion is near 1.0×
+            _cap_ratio = 2.0
+        else:
+            # Raw signal path — look up the table-maximum mult for this grade
+            _grade_max_at_3 = 1.0   # mult at $3 breakpoint = highest possible for this grade
+            for _min_g, _tiers in _CLA_GRADE_TIERS:
+                if _gv >= _min_g:
+                    _grade_max_at_3 = _tiers[0]
+                    break
+            _cap_ratio = round(_grade_max_at_3 * 3.5, 1)   # 3.5× above table max: accommodates
+            # full attr stack (grade × finish × JP × signed) without clipping legitimate values
+
         _price_cap = round(raw_base_aud * _cap_ratio, 2)
         if final_price > _price_cap:
             logging.warning(
-                f"⚠️ {_grade_label} sanity cap: ${final_price:.2f} → ${_price_cap:.2f} "
-                f"(signal=${raw_base_aud:.2f} × {_cap_ratio}) | {card_name}"
+                f"⚠️ {_grade_label} sanity cap ({'raw' if _apply_grade else 'graded-comp'} path): "
+                f"${final_price:.2f} → ${_price_cap:.2f} "
+                f"(signal=${raw_base_aud:.2f} × {_cap_ratio}×) | {card_name}"
             )
             final_price = _price_cap
 
@@ -9411,17 +9432,7 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                 variant_in_query = any(
                     tok.lower() in sq_lower for tok in variant_tokens if tok
                 )
-                # If rarity/variant is set and this query doesn't include it,
-                # the result is from a broadened query that matched a cheaper
-                # common version of the card (e.g. common Mr. 3 instead of
-                # Rare Parallel Mr. 3).  Skip these signals entirely — a wrong
-                # low price is worse than no price.
                 if variant_tokens and not variant_in_query:
-                    # Only skip LOW-value signals — a cheap price without the variant
-                    # token means a bulk common was matched (e.g. $0.29 Mr. 3 common
-                    # instead of the $35 Rare Parallel).  High-value signals ($30+)
-                    # for the correct card name/number are almost certainly right even
-                    # if the rarity label wasn't in the query string.
                     _VARIANT_SKIP_THRESHOLD = 30.0
                     if price < _VARIANT_SKIP_THRESHOLD:
                         logging.warning(
@@ -9429,6 +9440,28 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                             f"— variant token {variant_tokens} not present (likely wrong card)"
                         )
                         continue
+                    # ── Signed card guard ─────────────────────────────────────────
+                    # If the card is signed but the query doesn't contain "Signed",
+                    # the eBay price is for an UNSIGNED copy.  The PHP signed multiplier
+                    # (1.8× artist / 4.5× celebrity) will be applied afterward, but only
+                    # if the backend returns signed_multiplier=1 (not pre-applied).
+                    # However: for vintage signed cards where the attr_estimate already
+                    # encodes the signed premium (cla_layered_valuation), using the
+                    # attr_estimate directly is more accurate than eBay_unsigned × PHP_mult.
+                    # Prefer attr_estimate when: is_signed=True AND "Signed" not in query
+                    # AND attr_estimate is available AND attr_estimate > unsigned_price.
+                    if is_signed and "signed" not in sq_lower and _attr_est:
+                        _ae_price = float(_attr_est.get("current_price", 0) or 0)
+                        if _ae_price > 0 and _ae_price > price:
+                            logging.info(
+                                f"✍️ Signed card: attr_estimate ${_ae_price:.2f} > "
+                                f"unsigned eBay ${price:.2f} — using attr_estimate | {card_name}"
+                            )
+                            _attr_est["search_query"]        = ""
+                            _attr_est["queries_tried"]       = queries
+                            _attr_est["card_name"]           = card_name
+                            _attr_est["grader_brand_factor"] = 1.0
+                            return _attr_est
                     else:
                         logging.info(
                             f"ℹ️ High-value signal ${price:.2f} accepted without variant token "
