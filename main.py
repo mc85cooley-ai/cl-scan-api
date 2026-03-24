@@ -954,7 +954,8 @@ async def _fx_usd_to_aud() -> float:
     return 1.50
 
 
-async def _ebay_completed_stats(keyword_query: str, limit: int = 120, days_lookback: int = 120) -> dict:
+async def _ebay_completed_stats(keyword_query: str, limit: int = 120, days_lookback: int = 120,
+                                global_id: str = "EBAY-AU") -> dict:
     """
     Fetch eBay completed/sold items stats using FindingService (AppID only).
 
@@ -1008,12 +1009,7 @@ async def _ebay_completed_stats(keyword_query: str, limit: int = 120, days_lookb
             params = {
                 "OPERATION-NAME": "findCompletedItems",
                 "SERVICE-VERSION": "1.13.0",
-                "GLOBAL-ID": "EBAY-AU",
-                "RESPONSE-DATA-FORMAT": "JSON",
-                "REST-PAYLOAD": "true",
-                "SECURITY-APPNAME": EBAY_APP_ID,
-                "keywords": q,
-                "itemFilter(0).name": "SoldItemsOnly",
+                "GLOBAL-ID": global_id,
                 "itemFilter(0).value": "true",
                 "paginationInput.entriesPerPage": "100",
                 "paginationInput.pageNumber": str(page),
@@ -6900,14 +6896,22 @@ async def _ebay_sold_strict(
         ])))
 
     # ── Run tiers until MIN_SALES met ─────────────────────────────────────────
+    # For graded card queries (contain a grade token like "PSA 10"), 1 comp is
+    # enough — a single confirmed PSA 10 sale is a reliable price anchor.
+    # For raw/ungraded queries, keep MIN_SALES=3 to avoid single-outlier signals.
     MIN_SALES = 3
     best: Optional[Dict[str, Any]] = None
 
     for tier_q in tiers:
-        logging.info(f"🔍 eBay: '{tier_q}'")
+        grade_in_tier = bool(grade_token and grade_token.lower() in tier_q.lower())
+        effective_min = 1 if grade_in_tier else MIN_SALES
+
+        logging.info(f"🔍 eBay: '{tier_q}' (min_sales={effective_min})")
+        # Query AU and US in parallel — US has far more sold comps for graded cards.
+        # Prices from US are converted to AUD by _ebay_completed_stats.
         au, us = await asyncio.gather(
-            _ebay_completed_stats(tier_q, limit=limit, days_lookback=days_lookback),
-            _ebay_completed_stats(tier_q, limit=limit, days_lookback=days_lookback),
+            _ebay_completed_stats(tier_q, limit=limit, days_lookback=days_lookback, global_id="EBAY-AU"),
+            _ebay_completed_stats(tier_q, limit=limit, days_lookback=days_lookback, global_id="EBAY-US"),
         )
         # Pick higher-volume market; merge if both have data
         result = au if (au.get("count") or 0) >= (us.get("count") or 0) else us
@@ -6923,9 +6927,9 @@ async def _ebay_sold_strict(
             result["median"] = round(statistics.median(trimmed), 2) if trimmed else 0
 
         count = result.get("count") or 0
-        logging.info(f"   → {count} comps, median=${result.get('median', 0):.2f} AUD")
+        logging.info(f"   → {count} comps (AU+US), median=${result.get('median', 0):.2f} AUD")
 
-        if count >= MIN_SALES:
+        if count >= effective_min:
             best = dict(result)
             best["query"] = tier_q
             break
@@ -6934,24 +6938,37 @@ async def _ebay_sold_strict(
             best["query"] = tier_q
 
     # ── Active listings fallback ──────────────────────────────────────────────
+    # Two passes: first with grade token (graded-only signal), then without.
+    # This prevents raw and graded listings being mixed into the same median.
+    _active_queries: List[str] = []
+    if grade_token:
+        # Grade-filtered first — a Buy-It-Now PSA 10 at $180 is a real price floor
+        _q_grade = _q(card_name, card_number, grade_token) if card_number else _q(card_name, card_set, grade_token)
+        if _q_grade not in tiers:
+            _active_queries.append(_q_grade)
+    _q_base = _q(card_name, card_number) if card_number else _q(card_name, card_set)
+    _active_queries.append(_q_base)
+
     if not best or not (best.get("count") or 0):
-        active_q = _q(card_name, card_number) if card_number else _q(card_name, card_set)
-        logging.info(f"   No sold comps — active fallback: '{active_q}'")
-        try:
-            active = await _ebay_find_items(active_q, limit=10, sold=False)
-            prices = [float(p) for p in (active if isinstance(active, list) else []) if p]
-            if prices:
-                best = {
-                    "source":               "ebay_active",
-                    "query":                active_q,
-                    "count":                len(prices),
-                    "median":               round(statistics.median(prices), 2),
-                    "prices":               prices,
-                    "price_includes_grade": False,
-                }
-                logging.info(f"   Active: {len(prices)} listings, median=${best['median']:.2f} AUD")
-        except Exception as _ae:
-            logging.debug(f"Active fallback: {_ae}")
+        for active_q in _active_queries:
+            logging.info(f"   No sold comps — active fallback: '{active_q}'")
+            try:
+                active_stats = await _ebay_active_stats(active_q, limit=20)
+                active_med   = float((active_stats or {}).get("median") or 0)
+                active_cnt   = int((active_stats or {}).get("count")  or 0)
+                if active_med > 0 and active_cnt >= 1:
+                    best = {
+                        "source":               "ebay_active",
+                        "query":                active_q,
+                        "count":                active_cnt,
+                        "median":               active_med,
+                        "prices":               active_stats.get("prices") or [],
+                        "price_includes_grade": bool(grade_token and grade_token.lower() in active_q.lower()),
+                    }
+                    logging.info(f"   Active: {active_cnt} listings, median=${active_med:.2f} AUD")
+                    break
+            except Exception as _ae:
+                logging.debug(f"Active fallback: {_ae}")
 
     if not best:
         return {}
