@@ -7682,7 +7682,7 @@ def _cla_estimate_from_attributes(
         ("leader rare",          225.0),  # L: $180/$0.80
         ("secret rare",           69.0),  # SEC: $55/$0.80
         ("sec",                   69.0),
-        ("super rare",            25.0),  # SR: $20/$0.80
+        ("super rare",            37.0),  # SR: $29.60 AU raw observed avg (was 25×=$20 — too low)
         ("sr",                    25.0),
         ("illustration rare",     22.5),
         ("full art",              22.5),
@@ -7708,7 +7708,7 @@ def _cla_estimate_from_attributes(
         ("rainbow rare",                 70.0),
         ("alt art",                      70.0),
         ("ultra rare",                   45.0),
-        ("double rare",                  12.5),
+        ("double rare",                  18.0),   # ex / double rare: ~$7.20 AU raw (was 12.5×=$5.00 — too low)
         ("radiant rare",                 38.0),
         ("trainer gallery",              30.0),
         ("holo rare",                    15.0),
@@ -7759,7 +7759,7 @@ def _cla_estimate_from_attributes(
         game_table = _POKEMON_BASES
     elif "dragon ball" in game or "dragonball" in game or "dbz" in game:
         game_table = _DBZ_BASES
-    elif any(g in game for g in ("star wars", "starwars")):
+    elif any(g in game for g in ("star wars", "starwars", "star_wars")):
         game_table = _STAR_WARS_BASES
     else:
         game_table = _GENERIC_BASES
@@ -7872,6 +7872,7 @@ def _cla_estimate_from_attributes(
         "source":               "cla_attribute_estimate",
         "sources_used":         ["cla_attribute_estimate"],
         "price_includes_grade": True,
+        "price_reliability":    "auto_save",   # permit PHP to save; est is better than stale bad data
         "grade_12_uplift":      False,
         "variant_matched":      True,
         "matched_rarity_tier":  matched_tier,
@@ -8525,11 +8526,24 @@ def _cla_resolve_price(
             f"× {best_ebay['factor']:.4f} = ${raw_base_aud:.2f} AUD | {card_name}"
         )
     elif _pc_raw > 0:
-        # No graded data anywhere — use PC raw, apply grade mult via layered engine
-        raw_base_aud   = _pc_raw
-        _apply_grade   = True
-        sources_used   = ["pricecharting_raw"]
-        logging.info(f"📦 {_grade_label}: PC raw ${_pc_raw:.2f} (grade mult will apply) | {card_name}")
+        # No graded data anywhere — use PC raw, apply grade mult via layered engine.
+        # Minimum raw floor: a wrong-card PC match (e.g. Japanese bulk junk at $0.17)
+        # must not drive the final price. Reject signals below these AUD thresholds
+        # and fall through to the rarity table which uses observed tier ratios.
+        #   Grade 12: raw must be ≥ $1.50 (cheapest legit CLA 12 is a $1.50 common)
+        #   Grade 10: raw must be ≥ $0.50
+        _pc_raw_min = 1.50 if _gv >= 12 else 0.50
+        if _pc_raw < _pc_raw_min:
+            logging.warning(
+                f"⚠️ {_grade_label}: PC raw ${_pc_raw:.2f} < floor ${_pc_raw_min:.2f} "
+                f"— wrong-card PC match, falling to rarity table | {card_name}"
+            )
+            # raw_base_aud stays 0 → falls to rarity table below
+        else:
+            raw_base_aud   = _pc_raw
+            _apply_grade   = True
+            sources_used   = ["pricecharting_raw"]
+            logging.info(f"📦 {_grade_label}: PC raw ${_pc_raw:.2f} (grade mult will apply) | {card_name}")
     else:
         # Check raw eBay as absolute last resort before rarity table
         raw_ebay = next((c for c in ebay_candidates if c["distance"] == 999.0), None)
