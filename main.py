@@ -1,6 +1,13 @@
 """
 The Collectors League Australia - Scan API
-Futureproof v6.9.28 (2026-03-16)
+Futureproof v6.9.29 (2026-03-25)
+
+What changed vs v6.9.29 (2026-03-25)
+- ✅ FIX: Star Wars anchor bumped $2.50 → $4.00 — vintage Decipher/Dark Horse common floor was too low
+- ✅ FIX: _STAR_WARS_BASES: added "dark horse", "cam kennedy", "artist edition" tiers; bumped "dark empire" 8.8×→10×, "cover gallery" 5.6×→8×, "series ii" 14×→16×, "hologram" 24×→28×
+- ✅ FIX: cla_layered_valuation CHECK 6 — added franchise artist tier (3.5×, floor $80) for Cam Kennedy, Hildebrandt, Struzan, McQuarrie, Dorman, Wheatley; was incorrectly lumped with generic comic artist (2.2×)
+- ✅ FIX: _ebay_sold_strict — days_lookback extended to 365 for vintage signed Star Wars/sports; 180 for other non-TCG signed cards (was 90 for all)
+- ✅ FIX: _ebay_sold_strict non-TCG tiers now inject "signed" keyword when is_signed=True, preventing unsigned comps from polluting the base price before the signed multiplier fires
 
 What changed vs v6.9.2 (2026-03-16)
 - ✅ CRITICAL FIX: Added missing /api/fingerprint/generate endpoint — was returning 404,
@@ -568,7 +575,7 @@ def safe_endpoint(func):
 # ==============================
 # Config
 # ==============================
-APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-03-18-v6.9.28")
+APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-03-25-v6.9.29")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
@@ -6872,10 +6879,41 @@ async def _ebay_sold_strict(
             elif n >= 8:   grade_token = "PSA 8"
             elif n >= 7:   grade_token = "PSA 7"
 
+    # ── Fix 3: Extend days_lookback for vintage signed non-TCG cards ─────────
+    # Vintage Star Wars / sports autos sell infrequently — 90 days often returns
+    # zero comps, causing the system to fall back to the attribute estimate with
+    # the wrong base. Extend the window so we capture the real market signal.
+    #   Vintage signed Star Wars/sports → 365 days (annual market)
+    #   Other signed non-TCG            → 180 days
+    #   Everything else                 → unchanged (caller's days_lookback)
+    _is_vintage_signed = (
+        not _is_tcg
+        and fp.get("is_signed", False)
+        and any(sw in game_lower for sw in ("star", "sport", "starwars", "baseball",
+                                             "basketball", "football", "cricket",
+                                             "nrl", "afl", "rugby"))
+    )
+    _is_signed_non_tcg = not _is_tcg and fp.get("is_signed", False)
+    if _is_vintage_signed and days_lookback < 365:
+        days_lookback = 365
+        logging.info(f"_ebay_sold_strict: extended lookback to 365d for vintage signed non-TCG | {card_name}")
+    elif _is_signed_non_tcg and days_lookback < 180:
+        days_lookback = 180
+        logging.info(f"_ebay_sold_strict: extended lookback to 180d for signed non-TCG | {card_name}")
+
     # ── Variant token: only high-signal rarities ──────────────────────────────
     _skip = {"common", "uncommon", "rare", "regular", "standard", ""}
     _variant = rarity if rarity.lower() not in _skip else (
                variant_type if variant_type.lower() not in _skip else "")
+
+    # Fix 4: for signed non-TCG cards, build a "signed" token to inject into
+    # non-TCG tiers so we fetch signed comps rather than unsigned base prices.
+    # (The signed multiplier then fires on the correct signed-card signal.)
+    _signed_token = ""
+    if _is_signed_non_tcg:
+        _signed_by_clean = (fp.get("signed_by") or "").strip()
+        # Include signer name in token when known — more specific comps
+        _signed_token = _norm_ws(f"Signed {_signed_by_clean}") if _signed_by_clean else "Signed"
 
     def _q(*parts):
         return _norm_ws(" ".join(p for p in parts if p))
@@ -6888,12 +6926,25 @@ async def _ebay_sold_strict(
             _q(card_name, card_number, _variant) if _variant else None,  # T3: with variant
         ])))
     else:
-        # Non-TCG (Star Wars, sports): sellers rarely use card numbers
-        tiers = list(dict.fromkeys(filter(None, [
-            _q(card_name, card_set, grade_token),      # T1: name+set+grade
-            _q(card_name, card_set),                   # T2: name+set
-            _q(card_name, grade_token) if card_set else None,  # T3: name+grade
-        ])))
+        # Non-TCG (Star Wars, sports): sellers rarely use card numbers.
+        # Fix 4: inject signed token into tiers when card is signed — this ensures
+        # the eBay comps fetched are actually for signed copies, not unsigned raw
+        # cards. Without this, "Boba Fett Dark Empire signed" queries return unsigned
+        # results and the signed multiplier fires on the wrong $4 base.
+        if _signed_token:
+            tiers = list(dict.fromkeys(filter(None, [
+                _q(card_name, card_set, _signed_token, grade_token),   # T1: name+set+signed+grade
+                _q(card_name, card_set, _signed_token),                # T2: name+set+signed
+                _q(card_name, _signed_token, grade_token),             # T3: name+signed+grade
+                _q(card_name, _signed_token),                          # T4: name+signed (broadest)
+            ])))
+            logging.info(f"_ebay_sold_strict: signed non-TCG tiers with token='{_signed_token}' | {card_name}")
+        else:
+            tiers = list(dict.fromkeys(filter(None, [
+                _q(card_name, card_set, grade_token),      # T1: name+set+grade
+                _q(card_name, card_set),                   # T2: name+set
+                _q(card_name, grade_token) if card_set else None,  # T3: name+grade
+            ])))
 
     # ── Strategy: run sold comps AND grade-filtered active listings in parallel ──
     # For graded cards, a live BIN listing IS the market — sellers don't list below
@@ -7728,7 +7779,7 @@ def _cla_estimate_from_attributes(
     _OP_ANCHOR  = 0.80   # One Piece Common AUD (PC observed avg)
     _PK_ANCHOR  = 0.40   # Pokemon Common AUD
     _DBZ_ANCHOR = 0.80   # Dragon Ball Common AUD
-    _SW_ANCHOR  = 2.50   # Star Wars Common AUD (vintage, higher floor)
+    _SW_ANCHOR  = 4.00   # Star Wars Common AUD — bumped from $2.50; vintage Decipher/Dark Horse floor
     _GEN_ANCHOR = 0.80   # Generic Common AUD
 
     # Ratios relative to common = 1.0x (derived from observed market relationships)
@@ -7793,26 +7844,31 @@ def _cla_estimate_from_attributes(
         ("common",            1.0),
     ]]
     _STAR_WARS_BASES: List[tuple] = [(k, round(r * _SW_ANCHOR, 2)) for k, r in [
-        ("hologram",         24.0),
-        ("limited edition",  22.0),
-        ("series ii",        14.0),
-        ("galaxy",           12.0),   # Decipher Galaxy Series cards
-        ("dark empire",       8.8),
-        ("chromium",         10.0),
-        ("chrome",           10.0),
-        ("foil",              8.0),
-        ("embossed",          7.2),
-        ("prism",             7.2),
-        ("cover gallery",     5.6),   # Decipher Cover Gallery subset
-        ("rare",              4.0),
-        ("uncommon",          2.0),
-        ("common",            1.0),
-        # Catch-all for vintage Decipher/Topps cards with no explicit rarity stored
-        # card_set keywords: "decipher", "topps", "vehicles", "jedi", "sith"
-        ("decipher",          4.0),
-        ("topps",             3.2),
-        ("vehicles",          3.6),
-        ("premiere",          4.0),
+        # ── Premium subsets (most-specific keys first) ────────────────────────
+        # Artist-edition / autograph-run cards command the highest raw premiums.
+        # Cam Kennedy's Dark Empire art is the most sought-after in vintage SW autos.
+        ("cam kennedy artist",  20.0),  # Cam Kennedy signed artist-edition set
+        ("artist edition",      18.0),  # Generic artist-edition subsets
+        ("dark horse",          14.0),  # Dark Horse Comics (DH-prefix, 1993-1998)
+        ("hologram",            28.0),  # Decipher/Topps holograms — rarest insert type
+        ("limited edition",     22.0),  # Limited print runs
+        ("series ii",           16.0),  # Series II / later series (shorter print)
+        ("galaxy",              14.0),  # Decipher Galaxy Series
+        ("dark empire",         10.0),  # Dark Empire I/II — Cam Kennedy art
+        ("chromium",            10.0),  # Chromium/Chrome premium variants
+        ("chrome",              10.0),
+        ("cover gallery",        8.0),  # Decipher Cover Gallery — artist signed sets
+        ("foil",                 8.0),
+        ("embossed",             7.2),
+        ("prism",                7.2),
+        ("rare",                 4.0),
+        ("uncommon",             2.0),
+        ("common",               1.0),
+        # ── Set/publisher catch-alls (fire when no specific key matched above) ─
+        ("decipher",             4.0),
+        ("topps",                3.2),
+        ("vehicles",             3.6),
+        ("premiere",             4.0),
     ]]
     _GENERIC_BASES: List[tuple] = [(k, round(r * _GEN_ANCHOR, 2)) for k, r in [
         ("parallel",         25.0),
@@ -8165,10 +8221,15 @@ def cla_layered_valuation(
     running *= edition_mult
 
     # ── CHECK 6: Signed / autograph premium ───────────────────────────────────
-    # Three tiers:
-    #   TCG artist (Ken Sugimori etc):          1.8×  floor $20
-    #   Comic/card artist (Cam Kennedy etc):    2.2×  floor $45
-    #   Celebrity/actor (Harrison Ford etc):    4.5×  floor $150
+    # Four tiers:
+    #   TCG artist (Ken Sugimori etc):              1.8×  floor $20
+    #   Franchise artist (Cam Kennedy, Struzan etc):3.5×  floor $80
+    #   Comic/card artist (generic):                2.2×  floor $45
+    #   Celebrity/actor (Harrison Ford etc):        4.5×  floor $150
+    #
+    # Franchise artists are the definitive illustrators of a specific IP —
+    # their autographs carry a meaningful premium over generic comic artists
+    # because collectors of that franchise specifically seek their signatures.
     _tcg_games_s = ("pokemon", "one piece", "dragon ball", "yugioh", "magic",
                      "mtg", "digimon", "lorcana", "weiss", "vanguard", "fab")
     _is_tcg = any(g in game for g in _tcg_games_s)
@@ -8178,6 +8239,22 @@ def cla_layered_valuation(
         "harrison", "hamill", "fisher", "prowse", "ford",
         "williams", "mayhew", "daniels", "oz",
     ))
+    # Franchise / IP-defining artists — primary illustrators of a specific universe.
+    # Cam Kennedy: Dark Empire I & II (definitive Star Wars Dark Horse artist)
+    # Hildebrandt brothers: original SW poster art
+    # Ralph McQuarrie: original SW concept/production art
+    # Drew Struzan: SW theatrical poster artist
+    # Dave Dorman: Dark Horse cover artist
+    # Tsunekazu Ishihara / Ken Sugimori: Pokémon (handled by TCG tier above)
+    _FRANCHISE_ARTISTS = {
+        "cam kennedy", "kennedy",
+        "hildebrandt", "greg hildebrandt", "tim hildebrandt",
+        "mcquarrie", "ralph mcquarrie",
+        "struzan", "drew struzan",
+        "dorman", "dave dorman",
+        "wheatley", "john wheatley",
+    }
+    _is_franchise_artist = any(a in _signer_lower for a in _FRANCHISE_ARTISTS)
     signed_mult  = 1.0
     signed_floor = 0.0
     if is_signed:
@@ -8187,8 +8264,11 @@ def cla_layered_valuation(
         elif _is_celebrity:
             signed_mult  = 4.50   # Celebrity / major actor
             signed_floor = 150.0
+        elif _is_franchise_artist:
+            signed_mult  = 3.50   # Franchise / IP-defining artist (Cam Kennedy etc)
+            signed_floor = 80.0
         else:
-            signed_mult  = 2.20   # Comic / card artist (Cam Kennedy, Hildebrandt etc)
+            signed_mult  = 2.20   # Generic comic / card artist
             signed_floor = 45.0
     checks["signed"] = signed_mult
     running *= signed_mult
