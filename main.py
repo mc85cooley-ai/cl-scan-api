@@ -1,6 +1,25 @@
 """
 The Collectors League Australia - Scan API
-Futureproof v6.9.29 (2026-03-25)
+Futureproof v6.9.30 (2026-03-25)
+
+What changed vs v6.9.30 (2026-03-25)
+- ✅ NEW: _cluster_mean(prices, tolerance=0.15) helper — finds the largest group of prices
+  within 15% of each other and returns their mean. Eliminates rogue outlier listings
+  (e.g. one $5k listing among ten $300 listings) without losing genuine price spread.
+  Returns None + cluster_size=0 when no consensus cluster of ≥2 prices forms.
+- ✅ NEW: _ebay_active_stats and _ebay_completed_stats now compute cluster_mean alongside
+  median. The cluster_mean replaces median as the primary price signal when a valid
+  consensus cluster forms (≥2 prices, cluster covers ≥40% of total listings).
+  Median is retained as fallback and always included in the response for transparency.
+- ✅ NEW: cluster_size, cluster_low, cluster_high, cluster_coverage fields added to eBay
+  stat responses so the UI can show "12 of 15 listings agree on ~$300" context.
+- ✅ NEW: _ebay_sold_strict priority flipped for non-TCG cards (Star Wars, sports, memorabilia).
+  New order: (1) graded active BIN → (2) blend active+sold → (3) raw active → (4) raw sold.
+  TCG cards (Pokémon, One Piece, etc.) retain the existing sold-first priority unchanged.
+  Rationale: for low-liquidity vintage cards current asks ARE the market; historic sales
+  are sparse and mix different market environments.
+- ✅ NEW: _run_active in _ebay_sold_strict now passes signed query when is_signed=True
+  for non-TCG, and applies cluster_mean to the active price list before returning.
 
 What changed vs v6.9.29 (2026-03-25)
 - ✅ FIX: Star Wars anchor bumped $2.50 → $4.00 — vintage Decipher/Dark Horse common floor was too low
@@ -575,7 +594,7 @@ def safe_endpoint(func):
 # ==============================
 # Config
 # ==============================
-APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-03-25-v6.9.29")
+APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-03-25-v6.9.30")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
@@ -1096,20 +1115,35 @@ async def _ebay_completed_stats(keyword_query: str, limit: int = 120, days_lookb
         raw_low  = min(raw_low,  raw_median * 0.95)
         raw_high = max(raw_high, raw_median * 1.05)
 
+    # ── Cluster mean: consensus price band within 15% of each other ───────────
+    # Eliminates rogue outlier listings (e.g. one $5k among ten $300 listings)
+    # without discarding genuine price spread. Use cluster_mean as primary signal
+    # when a valid consensus cluster forms (≥2 prices, covers ≥40% of listings).
+    cl     = _cluster_mean(prices, tolerance=0.15, min_cluster=2)
+    use_cm = (not cl["fallback_used"]) and (cl["cluster_coverage"] >= 0.40)
+    primary_price = cl["cluster_mean"] if use_cm else raw_median
+
     out = {
         "source": "ebay",
         "query": q,
         "count": count,
         "currency": "AUD",
         "prices": prices[:target],
-        "low": raw_low,
-        "median": raw_median,
-        "high": raw_high,
+        "low": cl["cluster_low"]  if use_cm else raw_low,
+        "median": primary_price,
+        "high": cl["cluster_high"] if use_cm else raw_high,
         "avg": float(sum(prices) / count),
         "p20": raw_low,
         "p80": raw_high,
         "min": float(prices[0]),
         "max": float(prices[-1]),
+        # Cluster fields — always included so callers can inspect/log
+        "cluster_mean":     cl["cluster_mean"],
+        "cluster_size":     cl["cluster_size"],
+        "cluster_low":      cl["cluster_low"],
+        "cluster_high":     cl["cluster_high"],
+        "cluster_coverage": cl["cluster_coverage"],
+        "cluster_used":     use_cm,
     }
     _EBAY_CACHE[cache_key] = {"ts": now, "data": out}
     return out
@@ -2791,20 +2825,34 @@ async def _ebay_active_stats(keyword_query: str, limit: int = 120) -> dict:
         raw_low  = min(raw_low,  raw_median * 0.95)
         raw_high = max(raw_high, raw_median * 1.05)
 
+    # ── Cluster mean: consensus price band within 15% of each other ───────────
+    # Active listings are asks, not transactions — outlier sellers inflate the
+    # naive mean badly. Cluster mean finds where the market has actually settled.
+    cl     = _cluster_mean(prices, tolerance=0.15, min_cluster=2)
+    use_cm = (not cl["fallback_used"]) and (cl["cluster_coverage"] >= 0.40)
+    primary_price = cl["cluster_mean"] if use_cm else raw_median
+
     out = {
         "source": "ebay",
         "query": q,
         "count": count,
         "currency": "AUD",
         "prices": prices[:target],
-        "low": raw_low,
-        "median": raw_median,
-        "high": raw_high,
+        "low": cl["cluster_low"]  if use_cm else raw_low,
+        "median": primary_price,
+        "high": cl["cluster_high"] if use_cm else raw_high,
         "avg": float(sum(prices) / count),
         "p20": raw_low,
         "p80": raw_high,
         "min": float(prices[0]),
         "max": float(prices[-1]),
+        # Cluster fields
+        "cluster_mean":     cl["cluster_mean"],
+        "cluster_size":     cl["cluster_size"],
+        "cluster_low":      cl["cluster_low"],
+        "cluster_high":     cl["cluster_high"],
+        "cluster_coverage": cl["cluster_coverage"],
+        "cluster_used":     use_cm,
     }
     _EBAY_CACHE[cache_key] = {"ts": now, "data": out}
     return out
@@ -3143,6 +3191,86 @@ def _stats(values: List[float]) -> Dict[str, Any]:
         "low": round(min(v), 2),
         "high": round(max(v), 2),
         "sample_size": len(v),
+    }
+
+
+def _cluster_mean(
+    prices: List[float],
+    tolerance: float = 0.15,
+    min_cluster: int = 2,
+) -> Dict[str, Any]:
+    """
+    Find the largest consensus price cluster and return their mean.
+
+    Algorithm:
+      1. Sort prices.
+      2. Sliding window: keep valid while ps[hi] / ps[lo] <= ratio_threshold.
+      3. Return mean of the largest window.
+
+    min_cluster scales with sample size:
+      - 1-4 listings  → min 2 in cluster (small sample, don't be greedy)
+      - 5-9 listings  → min 3 in cluster
+      - 10+ listings  → min 4 in cluster
+    This prevents a 2-listing "cluster" of the two rogue-high prices from
+    being chosen when the other 8 listings are genuinely all over the place.
+
+    Returns:
+      cluster_mean, cluster_size, cluster_low, cluster_high,
+      cluster_coverage (fraction of total), fallback_used
+    """
+    empty = {
+        "cluster_mean": None,
+        "cluster_size": 0,
+        "cluster_low": None,
+        "cluster_high": None,
+        "cluster_coverage": 0.0,
+        "fallback_used": True,
+    }
+    if not prices:
+        return empty
+
+    ps = sorted(float(p) for p in prices if p and float(p) > 0)
+    n  = len(ps)
+    if n == 0:
+        return empty
+
+    # Scale min_cluster with sample size — prevents 2-item clusters on larger sets
+    effective_min = min_cluster
+    if n >= 10:
+        effective_min = max(min_cluster, 4)
+    elif n >= 5:
+        effective_min = max(min_cluster, 3)
+
+    # The ratio threshold: window is valid while ps[hi] / ps[lo] <= ratio_threshold
+    ratio_threshold = (1.0 + tolerance) / max(1.0 - tolerance, 1e-9)
+
+    best_lo = best_hi = 0
+    best_len = 1
+
+    lo = 0
+    for hi in range(n):
+        # Shrink window from left until ratio condition holds
+        while ps[lo] > 0 and (ps[hi] / ps[lo]) > ratio_threshold:
+            lo += 1
+        window_len = hi - lo + 1
+        if window_len > best_len:
+            best_len = window_len
+            best_lo  = lo
+            best_hi  = hi
+
+    if best_len < effective_min:
+        return empty
+
+    cluster = ps[best_lo : best_hi + 1]
+    cmean   = sum(cluster) / len(cluster)
+
+    return {
+        "cluster_mean":     round(cmean, 2),
+        "cluster_size":     len(cluster),
+        "cluster_low":      round(cluster[0],  2),
+        "cluster_high":     round(cluster[-1], 2),
+        "cluster_coverage": round(len(cluster) / n, 4),
+        "fallback_used":    False,
     }
 
 def _safe_end_time(item: dict) -> str:
@@ -7006,16 +7134,26 @@ async def _ebay_sold_strict(
         logging.info(f"🔍 eBay active: '{active_q}'")
         try:
             stats = await _ebay_active_stats(active_q, limit=20)
-            med = float((stats or {}).get("median") or 0)
+            # Prefer cluster_mean when available — it is the consensus market price
+            med = float((stats or {}).get("cluster_mean") or (stats or {}).get("median") or 0)
             cnt = int((stats or {}).get("count") or 0)
             if med > 0 and cnt >= 1:
-                logging.info(f"   → {cnt} active listings, median=${med:.2f} AUD")
+                cl_used = bool((stats or {}).get("cluster_used"))
+                logging.info(
+                    f"   → {cnt} active listings, "
+                    f"{'cluster_mean' if cl_used else 'median'}=${med:.2f} AUD"
+                    + (f" ({stats.get('cluster_size')} of {cnt} in consensus band)" if cl_used else "")
+                )
                 return {
                     "source":               "ebay_active",
                     "query":                active_q,
                     "count":                cnt,
                     "median":               med,
                     "prices":               stats.get("prices") or [],
+                    "cluster_mean":         stats.get("cluster_mean"),
+                    "cluster_size":         stats.get("cluster_size"),
+                    "cluster_coverage":     stats.get("cluster_coverage"),
+                    "cluster_used":         cl_used,
                     "price_includes_grade": bool(grade_token and grade_token.lower() in active_q.lower()),
                 }
         except Exception as _ae:
@@ -7053,20 +7191,61 @@ async def _ebay_sold_strict(
         best_graded_active = active_graded
 
     # ── Priority resolution ───────────────────────────────────────────────────
-    if best_graded_sold:
-        best = best_graded_sold
-        logging.info(f"✅ Using graded sold comps: ${best.get('median',0):.2f} AUD")
-    elif best_graded_active:
-        best = best_graded_active
-        logging.info(f"✅ Using graded active BIN (no sold comps): ${best.get('median',0):.2f} AUD")
-    elif best_raw_sold:
-        best = best_raw_sold
-        logging.info(f"📦 Using raw sold comps (grade mult will apply): ${best.get('median',0):.2f} AUD")
+    # TCG cards (Pokémon, One Piece, etc.): sold comps are primary.
+    #   These cards trade frequently — actual transactions are more reliable
+    #   than asks. Existing sold-first order is preserved.
+    #
+    # Non-TCG cards (Star Wars, sports, memorabilia): active listings are primary.
+    #   These trade infrequently. Current asks from knowledgeable sellers ARE
+    #   the market — historic sales may be months old and from a different
+    #   macro environment. Cluster mean on active removes rogue outlier asks.
+    if _is_tcg:
+        # ── TCG: sold first (unchanged) ──────────────────────────────────────
+        if best_graded_sold:
+            best = best_graded_sold
+            logging.info(f"✅ [TCG] Using graded sold comps: ${best.get('median',0):.2f} AUD")
+        elif best_graded_active:
+            best = best_graded_active
+            logging.info(f"✅ [TCG] Using graded active BIN (no sold comps): ${best.get('median',0):.2f} AUD")
+        elif best_raw_sold:
+            best = best_raw_sold
+            logging.info(f"📦 [TCG] Using raw sold comps (grade mult will apply): ${best.get('median',0):.2f} AUD")
+        else:
+            best = await _run_active(_q_base_active)
+            if best:
+                logging.info(f"📦 [TCG] Using raw active BIN: ${best.get('median',0):.2f} AUD")
     else:
-        # Last resort: raw active listings
-        best = await _run_active(_q_base_active)
-        if best:
-            logging.info(f"📦 Using raw active BIN: ${best.get('median',0):.2f} AUD")
+        # ── Non-TCG: active first, sold as confidence check / blend ──────────
+        if best_graded_active and best_graded_sold:
+            # Both sources available — blend: 60% active (current market) + 40% sold
+            act_med  = float(best_graded_active.get("median") or 0)
+            sold_med = float(best_graded_sold.get("median")   or 0)
+            blended  = round(act_med * 0.60 + sold_med * 0.40, 2)
+            best = dict(best_graded_active)
+            best["median"]          = blended
+            best["source"]          = "ebay_active_sold_blend"
+            best["active_median"]   = act_med
+            best["sold_median"]     = sold_med
+            logging.info(
+                f"✅ [non-TCG] Blended active ${act_med:.2f} (60%) + sold ${sold_med:.2f} (40%) "
+                f"= ${blended:.2f} AUD"
+            )
+        elif best_graded_active:
+            best = best_graded_active
+            logging.info(
+                f"✅ [non-TCG] Active listings primary: ${best.get('median',0):.2f} AUD"
+                + (f" (cluster of {best.get('cluster_size')} listings)" if best.get("cluster_used") else "")
+            )
+        elif best_graded_sold:
+            best = best_graded_sold
+            logging.info(f"📦 [non-TCG] Falling back to graded sold (no active): ${best.get('median',0):.2f} AUD")
+        elif best_raw_sold:
+            best = best_raw_sold
+            logging.info(f"📦 [non-TCG] Raw sold comps (grade mult will apply): ${best.get('median',0):.2f} AUD")
+        else:
+            best = await _run_active(_q_base_active)
+            if best:
+                logging.info(f"📦 [non-TCG] Raw active BIN: ${best.get('median',0):.2f} AUD")
 
     if not best:
         return {}
