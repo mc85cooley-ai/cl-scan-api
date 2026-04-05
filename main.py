@@ -12882,15 +12882,21 @@ async def ai_grade(request: AIGradeRequest):
 
     logging.info(f"🤖 AI Grade: {len(request.images)} image(s) — context: {request.card_context!r}")
 
-    # Call Claude — ANTHROPIC_API_KEY is read from env automatically by the SDK
-    client = _anthropic_sdk.Anthropic(api_key=ANTHROPIC_API_KEY)
-
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=2000,
-        system=request.system_prompt or "You are an expert trading card grader. Return ONLY valid JSON.",
-        messages=[{"role": "user", "content": content}],
-    )
+    # Use async client so we don't block the FastAPI event loop
+    try:
+        client = _anthropic_sdk.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        response = await client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=2000,
+            system=request.system_prompt or "You are an expert trading card grader. Return ONLY valid JSON.",
+            messages=[{"role": "user", "content": content}],
+        )
+    except Exception as e:
+        logging.error(f"❌ AI Grade Anthropic call failed: {e}")
+        return JSONResponse(status_code=500, content={
+            "success": False,
+            "message": f"Anthropic API call failed: {str(e)}",
+        })
 
     raw_text = response.content[0].text.strip()
 
