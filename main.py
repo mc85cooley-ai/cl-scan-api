@@ -145,8 +145,15 @@ except Exception:
     ImageOps = None
     ImageFilter = None
 
-
 PIL_AVAILABLE = bool(Image)
+
+# Anthropic SDK — used by /api/ai-grade for CLA official grading
+try:
+    import anthropic as _anthropic_sdk
+    ANTHROPIC_AVAILABLE = True
+except Exception:
+    _anthropic_sdk = None
+    ANTHROPIC_AVAILABLE = False
 
 # u2500u2500 Shared async HTTP client u2014 reused across all requests to avoid per-call
 #    TCP + TLS handshake overhead. Timeout of 120s covers large OpenAI payloads.
@@ -596,10 +603,11 @@ def safe_endpoint(func):
 # ==============================
 APP_VERSION = os.getenv("CL_SCAN_VERSION", "2026-03-25-v6.9.30")
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-POKEMONTCG_API_KEY = os.getenv("POKEMONTCG_API_KEY", "").strip()
-PRICECHARTING_TOKEN = os.getenv("PRICECHARTING_TOKEN", "").strip()
-ADMIN_TOKEN = os.getenv("CL_ADMIN_TOKEN", "").strip()  # optional
+OPENAI_API_KEY      = os.getenv("OPENAI_API_KEY",      "").strip()
+POKEMONTCG_API_KEY  = os.getenv("POKEMONTCG_API_KEY",  "").strip()
+PRICECHARTING_TOKEN = os.getenv("PRICECHARTING_TOKEN",  "").strip()
+ADMIN_TOKEN         = os.getenv("CL_ADMIN_TOKEN",       "").strip()  # optional
+ANTHROPIC_API_KEY   = os.getenv("ANTHROPIC_API_KEY",    "").strip()  # used by /api/ai-grade
 
 # ═══════════════════════════════════════════════════════
 # SIMPLE API KEY AUTHENTICATION (Render env vars)
@@ -7905,6 +7913,17 @@ class MarketPriceLookupRequest(BaseModel):
     grader: Optional[str] = None           # PSA / BGS / CGC / SGC / CLA / CGA / TAG etc.
 
 
+# ── AI Grade request model — used by /api/ai-grade ───────────────────────────
+class AIGradeImageItem(BaseModel):
+    face:       str   # "front" or "back"
+    b64:        str   # base64-encoded image bytes
+    media_type: str   # "image/jpeg" | "image/png" | "image/webp"
+
+class AIGradeRequest(BaseModel):
+    images:        List[AIGradeImageItem]
+    card_context:  Optional[str] = ""    # "Card Name | Set | Number"
+    system_prompt: Optional[str] = ""   # built by PHP, passed through verbatim
+
 
 # ========================================
 # CLA ATTRIBUTE-BASED VALUATION (no-comps fallback)
@@ -12803,6 +12822,96 @@ async def fingerprint_match(
         "matches": [],
         "total":   0,
         "note":    "Registry matching is performed locally by the WordPress plugin.",
+    })
+
+
+# ========================================
+# CLA AI GRADE
+# ========================================
+
+@app.post("/api/ai-grade")
+@safe_endpoint
+async def ai_grade(request: AIGradeRequest):
+    """
+    CLA Official AI Grading endpoint.
+
+    Accepts card images (base64) + a system prompt built by cg-ai-grade.php,
+    calls Claude Vision using ANTHROPIC_API_KEY from Render environment,
+    and returns a fully structured grade JSON that pre-fills every field
+    in the WordPress official grading modal.
+
+    Called by: cg-ai-grade.php → wp_ajax_cg_ai_grade → this endpoint.
+    """
+    if not ANTHROPIC_AVAILABLE or _anthropic_sdk is None:
+        return JSONResponse(status_code=500, content={
+            "success": False,
+            "error":   "anthropic SDK not installed. Add 'anthropic>=0.25.0' to requirements.txt and redeploy.",
+        })
+
+    if not ANTHROPIC_API_KEY:
+        return JSONResponse(status_code=500, content={
+            "success": False,
+            "error":   "ANTHROPIC_API_KEY environment variable is not set in Render.",
+        })
+
+    if not request.images:
+        return JSONResponse(status_code=400, content={
+            "success": False,
+            "error":   "No images provided.",
+        })
+
+    # Build the content array for Claude
+    content = []
+    for img in request.images:
+        content.append({
+            "type":   "image",
+            "source": {
+                "type":       "base64",
+                "media_type": img.media_type,
+                "data":       img.b64,
+            },
+        })
+        content.append({
+            "type": "text",
+            "text": f"This is the {img.face.upper()} face of the card.",
+        })
+    content.append({
+        "type": "text",
+        "text": "Grade this card to CLA standards. Return ONLY the JSON object — no markdown, no explanation.",
+    })
+
+    logging.info(f"🤖 AI Grade: {len(request.images)} image(s) — context: {request.card_context!r}")
+
+    # Call Claude — ANTHROPIC_API_KEY is read from env automatically by the SDK
+    client = _anthropic_sdk.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=2000,
+        system=request.system_prompt or "You are an expert trading card grader. Return ONLY valid JSON.",
+        messages=[{"role": "user", "content": content}],
+    )
+
+    raw_text = response.content[0].text.strip()
+
+    # Strip markdown fences if the model adds them despite instructions
+    raw_text = raw_text.replace("```json", "").replace("```", "").strip()
+
+    try:
+        grade = json.loads(raw_text)
+    except json.JSONDecodeError as e:
+        logging.warning(f"AI Grade JSON parse failed: {e} — raw: {raw_text[:300]}")
+        return JSONResponse(status_code=500, content={
+            "success": False,
+            "error":   f"Could not parse Claude response as JSON: {e}",
+            "raw":     raw_text[:500],
+        })
+
+    logging.info(f"✅ AI Grade complete — grade: {grade.get('grade')} score: {grade.get('score_100')}")
+
+    return JSONResponse(content={
+        "success": True,
+        "grade":   grade,
     })
 
 
