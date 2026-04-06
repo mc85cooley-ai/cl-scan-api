@@ -12835,90 +12835,133 @@ async def ai_grade(request: AIGradeRequest):
     """
     CLA Official AI Grading endpoint.
 
-    Accepts card images (base64) + a system prompt built by cg-ai-grade.php,
-    calls Claude Vision using ANTHROPIC_API_KEY from Render environment,
-    and returns a fully structured grade JSON that pre-fills every field
-    in the WordPress official grading modal.
+    Primary:  Claude Vision (Anthropic) — ANTHROPIC_API_KEY
+    Fallback: GPT-4o Vision (OpenAI)   — OPENAI_API_KEY (used automatically if Anthropic fails)
 
     Called by: cg-ai-grade.php → wp_ajax_cg_ai_grade → this endpoint.
     """
-    if not ANTHROPIC_AVAILABLE or _anthropic_sdk is None:
-        return JSONResponse(status_code=500, content={
-            "success": False,
-            "error":   "anthropic SDK not installed. Add 'anthropic>=0.25.0' to requirements.txt and redeploy.",
-        })
-
-    if not ANTHROPIC_API_KEY:
-        return JSONResponse(status_code=500, content={
-            "success": False,
-            "error":   "ANTHROPIC_API_KEY environment variable is not set in Render.",
-        })
-
     if not request.images:
         return JSONResponse(status_code=400, content={
             "success": False,
-            "error":   "No images provided.",
+            "message": "No images provided.",
         })
 
-    # Build the content array for Claude
-    content = []
-    for img in request.images:
-        content.append({
-            "type":   "image",
-            "source": {
-                "type":       "base64",
-                "media_type": img.media_type,
-                "data":       img.b64,
-            },
-        })
-        content.append({
-            "type": "text",
-            "text": f"This is the {img.face.upper()} face of the card.",
-        })
-    content.append({
-        "type": "text",
-        "text": "Grade this card to CLA standards. Return ONLY the JSON object — no markdown, no explanation.",
+    system_prompt = request.system_prompt or "You are an expert trading card grader. Return ONLY valid JSON."
+    errors = []
+
+    # ── 1. Try Anthropic (Claude) ──────────────────────────────────────────────
+    if ANTHROPIC_AVAILABLE and _anthropic_sdk and ANTHROPIC_API_KEY:
+        try:
+            logging.info(f"🤖 AI Grade [Anthropic]: {len(request.images)} image(s) — {request.card_context!r}")
+
+            content = []
+            for img in request.images:
+                content.append({
+                    "type":   "image",
+                    "source": {
+                        "type":       "base64",
+                        "media_type": img.media_type,
+                        "data":       img.b64,
+                    },
+                })
+                content.append({"type": "text", "text": f"This is the {img.face.upper()} face of the card."})
+            content.append({"type": "text", "text": "Grade this card to CLA standards. Return ONLY the JSON object — no markdown, no explanation."})
+
+            client = _anthropic_sdk.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+            response = await client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=2000,
+                system=system_prompt,
+                messages=[{"role": "user", "content": content}],
+            )
+
+            raw_text = response.content[0].text.strip().replace("```json", "").replace("```", "").strip()
+            grade = json.loads(raw_text)
+
+            logging.info(f"✅ AI Grade [Anthropic] complete — {grade.get('grade')} / {grade.get('score_100')}")
+            return JSONResponse(content={"success": True, "grade": grade, "provider": "anthropic"})
+
+        except json.JSONDecodeError as e:
+            msg = f"Anthropic response JSON parse failed: {e}"
+            logging.warning(f"⚠ {msg}")
+            errors.append(msg)
+        except Exception as e:
+            msg = f"Anthropic call failed: {str(e)}"
+            logging.error(f"❌ {msg}")
+            errors.append(msg)
+    else:
+        reason = "SDK unavailable" if not ANTHROPIC_AVAILABLE else "API key not set"
+        errors.append(f"Anthropic skipped — {reason}")
+        logging.warning(f"⚠ AI Grade: Anthropic skipped — {reason}")
+
+    # ── 2. Fallback: OpenAI GPT-4o Vision ─────────────────────────────────────
+    if OPENAI_API_KEY:
+        try:
+            logging.info(f"🔄 AI Grade [OpenAI fallback]: {len(request.images)} image(s)")
+
+            # Build OpenAI-format content — image_url with base64 data URI
+            oai_content = []
+            for img in request.images:
+                oai_content.append({
+                    "type": "text",
+                    "text": f"This is the {img.face.upper()} face of the card.",
+                })
+                oai_content.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url":    f"data:{img.media_type};base64,{img.b64}",
+                        "detail": "high",
+                    },
+                })
+            oai_content.append({
+                "type": "text",
+                "text": "Grade this card to CLA standards. Return ONLY the JSON object — no markdown, no explanation.",
+            })
+
+            http = _get_http_client()
+            oai_resp = await http.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type":  "application/json",
+                },
+                json={
+                    "model":      "gpt-4o",
+                    "max_tokens": 2000,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user",   "content": oai_content},
+                    ],
+                },
+                timeout=60.0,
+            )
+
+            oai_data = oai_resp.json()
+            raw_text = oai_data["choices"][0]["message"]["content"].strip()
+            raw_text = raw_text.replace("```json", "").replace("```", "").strip()
+            grade = json.loads(raw_text)
+
+            logging.info(f"✅ AI Grade [OpenAI] complete — {grade.get('grade')} / {grade.get('score_100')}")
+            return JSONResponse(content={"success": True, "grade": grade, "provider": "openai_fallback"})
+
+        except json.JSONDecodeError as e:
+            msg = f"OpenAI response JSON parse failed: {e}"
+            logging.warning(f"⚠ {msg}")
+            errors.append(msg)
+        except Exception as e:
+            msg = f"OpenAI fallback failed: {str(e)}"
+            logging.error(f"❌ {msg}")
+            errors.append(msg)
+    else:
+        errors.append("OpenAI fallback skipped — OPENAI_API_KEY not set")
+
+    # ── Both providers failed ──────────────────────────────────────────────────
+    logging.error(f"❌ AI Grade: all providers failed — {errors}")
+    return JSONResponse(status_code=500, content={
+        "success": False,
+        "message": "AI grading failed on all providers. " + " | ".join(errors),
     })
 
-    logging.info(f"🤖 AI Grade: {len(request.images)} image(s) — context: {request.card_context!r}")
-
-    # Use async client so we don't block the FastAPI event loop
-    try:
-        client = _anthropic_sdk.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-        response = await client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=2000,
-            system=request.system_prompt or "You are an expert trading card grader. Return ONLY valid JSON.",
-            messages=[{"role": "user", "content": content}],
-        )
-    except Exception as e:
-        logging.error(f"❌ AI Grade Anthropic call failed: {e}")
-        return JSONResponse(status_code=500, content={
-            "success": False,
-            "message": f"Anthropic API call failed: {str(e)}",
-        })
-
-    raw_text = response.content[0].text.strip()
-
-    # Strip markdown fences if the model adds them despite instructions
-    raw_text = raw_text.replace("```json", "").replace("```", "").strip()
-
-    try:
-        grade = json.loads(raw_text)
-    except json.JSONDecodeError as e:
-        logging.warning(f"AI Grade JSON parse failed: {e} — raw: {raw_text[:300]}")
-        return JSONResponse(status_code=500, content={
-            "success": False,
-            "error":   f"Could not parse Claude response as JSON: {e}",
-            "raw":     raw_text[:500],
-        })
-
-    logging.info(f"✅ AI Grade complete — grade: {grade.get('grade')} score: {grade.get('score_100')}")
-
-    return JSONResponse(content={
-        "success": True,
-        "grade":   grade,
-    })
 
 
 # ========================================
