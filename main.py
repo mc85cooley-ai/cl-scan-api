@@ -110,6 +110,7 @@ import json
 import sqlite3
 import csv
 import secrets
+import random
 
 # Optional scientific stack for market trend predictions
 try:
@@ -557,6 +558,31 @@ _FX_CACHE = {"ts": 0, "usd_aud": None}
 _EBAY_CACHE = {}  # key -> {ts, data}
 FX_CACHE_SECONDS = int(os.getenv("FX_CACHE_SECONDS", "3600"))
 
+
+def _evict_stale_caches() -> int:
+    """Remove expired entries from _EBAY_CACHE and trim _TRANSLATE_CACHE.
+
+    Call periodically to prevent unbounded memory growth on long-running instances.
+    Returns the number of entries removed.
+    """
+    now = int(time.time())
+    removed = 0
+    # eBay cache: stale after 2× the longest TTL (1 hour)
+    stale_ebay = [k for k, v in _EBAY_CACHE.items()
+                  if now - int((v or {}).get("ts", 0)) > 3600]
+    for k in stale_ebay:
+        _EBAY_CACHE.pop(k, None)
+        removed += 1
+    # Translation cache: cap at 2,000 entries (each is a short string)
+    if len(_TRANSLATE_CACHE) > 2000:
+        overflow = len(_TRANSLATE_CACHE) - 2000
+        for k in list(_TRANSLATE_CACHE.keys())[:overflow]:
+            _TRANSLATE_CACHE.pop(k, None)
+            removed += 1
+    if removed:
+        logging.info(f"Cache eviction: removed {removed} stale entries")
+    return removed
+
 # ==============================
 # App & CORS
 # ==============================
@@ -642,15 +668,15 @@ async def verify_api_key(credentials: HTTPAuthorizationCredentials = Security(se
         return "development"
 
     tok = credentials.credentials.strip()
-    if tok not in valid:
-        logging.warning(f"❌ Invalid API key attempt: {tok[:10]}...")
+    if not any(secrets.compare_digest(tok, k) for k in valid):
+        logging.warning(f"❌ Invalid API key attempt: {tok[:4]}****")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API key",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    logging.info(f"✅ Authenticated: {tok[:10]}...")
+    logging.info(f"✅ Authenticated: {tok[:4]}****")
     return tok
 
 async def verify_api_key_optional(credentials: HTTPAuthorizationCredentials = Security(security)) -> Optional[str]:
@@ -967,25 +993,25 @@ def _build_ebay_query_ladder(
             seen.add(q)
     return out
 async def _fx_usd_to_aud() -> float:
-    """Return live-ish USD->AUD rate with a short cache. Falls back to 1.50 if unavailable."""
+    """Return live-ish USD->AUD rate with a short cache. Falls back to AUD_MULTIPLIER if unavailable."""
     try:
         now = int(time.time())
         if _FX_CACHE.get("usd_aud") and (now - int(_FX_CACHE.get("ts") or 0) < FX_CACHE_SECONDS):
             return float(_FX_CACHE["usd_aud"])
-        # exchangerate.host is free and doesn't require an API key
-        url = "https://api.exchangerate.host/latest?base=USD&symbols=AUD"
-        async with httpx.AsyncClient(timeout=15.0, headers={"User-Agent": UA}) as client:
-            r = await client.get(url)
-            if r.status_code == 200:
-                j = r.json()
-                rate = float(((j.get("rates") or {}).get("AUD")) or 0.0)
-                if rate > 0.5:
-                    _FX_CACHE["usd_aud"] = rate
-                    _FX_CACHE["ts"] = now
-                    return rate
+        # frankfurter.app — genuinely free, no API key required
+        url = "https://api.frankfurter.app/latest?base=USD&symbols=AUD"
+        client = _get_http_client()
+        r = await client.get(url, timeout=15.0, headers={"User-Agent": UA})
+        if r.status_code == 200:
+            j = r.json()
+            rate = float(((j.get("rates") or {}).get("AUD")) or 0.0)
+            if rate > 0.5:
+                _FX_CACHE["usd_aud"] = rate
+                _FX_CACHE["ts"] = now
+                return rate
     except Exception:
         pass
-    return 1.50
+    return float(AUD_MULTIPLIER)  # env-var fallback (default 1.44)
 
 
 async def _ebay_completed_stats(keyword_query: str, limit: int = 120, days_lookback: int = 120,
@@ -1041,12 +1067,17 @@ async def _ebay_completed_stats(keyword_query: str, limit: int = 120, days_lookb
     async with httpx.AsyncClient(timeout=20.0, headers=headers) as client:
         for page in range(1, pages + 1):
             params = {
-                "OPERATION-NAME": "findCompletedItems",
-                "SERVICE-VERSION": "1.13.0",
-                "GLOBAL-ID": global_id,
-                "itemFilter(0).value": "true",
+                "OPERATION-NAME":              "findCompletedItems",
+                "SERVICE-VERSION":             "1.13.0",
+                "GLOBAL-ID":                   global_id,
+                "RESPONSE-DATA-FORMAT":        "JSON",
+                "REST-PAYLOAD":                "true",
+                "SECURITY-APPNAME":            EBAY_APP_ID,
+                "keywords":                    q,
+                "itemFilter(0).name":          "SoldItemsOnly",
+                "itemFilter(0).value":         "true",
                 "paginationInput.entriesPerPage": "100",
-                "paginationInput.pageNumber": str(page),
+                "paginationInput.pageNumber":  str(page),
             }
 
             try:
@@ -1194,7 +1225,7 @@ def _pc_init_db():
             raw_json TEXT
         )
     """)
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_pc_snapshots_pid_date ON pc_price_snapshots(product_id, snap_date)""")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_pc_snapshots_pid_date ON pc_price_snapshots(product_id, snap_date)")
     con.commit()
     con.close()
 
@@ -1820,6 +1851,31 @@ if USE_EBAY_API:
 # ==============================
 def _b64(img: bytes) -> str:
     return base64.b64encode(img).decode("utf-8")
+
+
+def _compress_image(raw: bytes, max_long: int = 1200, quality: int = 88) -> bytes:
+    """Resize to max_long px on the long edge and re-encode as JPEG.
+
+    Single shared helper replacing the four near-identical implementations that
+    previously lived inline in /api/verify, /api/overlay-variants,
+    /api/fingerprint/generate, and /api/defect-scan.
+    EXIF orientation is corrected before resizing.
+    Falls back to raw bytes if PIL is unavailable or the image is invalid.
+    """
+    if not PIL_AVAILABLE or not raw or len(raw) < 200:
+        return raw
+    try:
+        im = Image.open(io.BytesIO(raw)).convert("RGB")
+        im = ImageOps.exif_transpose(im)
+        w, h = im.size
+        if max(w, h) > max_long:
+            scale = max_long / max(w, h)
+            im = im.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=quality, optimize=True)
+        return buf.getvalue()
+    except Exception:
+        return raw
 
 
 def _make_defect_filter_variants(img_bytes: bytes) -> Dict[str, bytes]:
@@ -2569,6 +2625,7 @@ async def _openai_chat(messages: List[Dict[str, Any]], max_tokens: int = 1200, t
                 r = await client.post(url, headers=headers, json=payload)
             except httpx.TransportError:
                 # Client may have gone stale — reset and retry once
+                global _HTTP_CLIENT
                 _HTTP_CLIENT = None
                 client = _get_http_client()
                 r = await client.post(url, headers=headers, json=payload)
@@ -2605,16 +2662,27 @@ async def _openai_text(messages: List[Dict[str, Any]], max_tokens: int = 220, te
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     payload = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature}
 
-    try:
-        client = _get_http_client()
-        r = await client.post(url, headers=headers, json=payload)
-        if r.status_code != 200:
-            return {"error": True, "status": r.status_code, "message": r.text[:700]}
-        data = r.json()
-        content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
-        return {"error": False, "content": (content or "").strip()}
-    except Exception as e:
-        return {"error": True, "status": 0, "message": str(e)}
+    last_error: Dict[str, Any] = {}
+    for attempt in range(3):
+        try:
+            client = _get_http_client()
+            r = await client.post(url, headers=headers, json=payload)
+            if r.status_code == 200:
+                data = r.json()
+                content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+                return {"error": False, "content": (content or "").strip()}
+            elif r.status_code in (429, 503) and attempt < 2:
+                await asyncio.sleep(3 * (attempt + 1))
+                last_error = {"error": True, "status": r.status_code, "message": r.text[:700]}
+                continue
+            else:
+                return {"error": True, "status": r.status_code, "message": r.text[:700]}
+        except Exception as e:
+            last_error = {"error": True, "status": 0, "message": str(e)}
+            if attempt < 2:
+                await asyncio.sleep(2)
+            continue
+    return last_error
 
 
 async def _generate_market_spoken_brief(
@@ -3004,11 +3072,11 @@ async def _ebay_find_items(keyword_query: str, limit: int = 5, sold: bool = Fals
 async def _fetch_html(url: str) -> str:
     """Fetch text content from a URL (used for CSV downloads)."""
     try:
-        async with httpx.AsyncClient(timeout=30.0, headers={"User-Agent": UA}) as client:
-            r = await client.get(url)
-            if r.status_code != 200:
-                return ""
-            return r.text or ""
+        client = _get_http_client()
+        r = await client.get(url, timeout=30.0, headers={"User-Agent": UA})
+        if r.status_code != 200:
+            return ""
+        return r.text or ""
     except Exception:
         return ""
 
@@ -3021,11 +3089,11 @@ async def _pokemontcg_get(path: str, params: Optional[Dict[str, Any]] = None) ->
     url = path if path.startswith("http") else f"{POKEMONTCG_BASE}{path}"
     headers = {"X-Api-Key": POKEMONTCG_API_KEY}
     try:
-        async with httpx.AsyncClient(timeout=12.0) as client:
-            r = await client.get(url, headers=headers, params=params)
-            if r.status_code != 200:
-                return {}
-            return r.json() if r.content else {}
+        client = _get_http_client()
+        r = await client.get(url, headers=headers, params=params, timeout=12.0)
+        if r.status_code != 200:
+            return {}
+        return r.json() if r.content else {}
     except Exception:
         return {}
 
@@ -3442,6 +3510,11 @@ def robots_txt():
 
 @app.get("/health")
 def health():
+    # Piggyback cache eviction on health-check polls (Render pings /health every 30s)
+    try:
+        _evict_stale_caches()
+    except Exception:
+        pass
     return {
         "ok": True,
         "service": "cl-scan-api",
@@ -3754,26 +3827,11 @@ async def verify(
     # We resize to max 1200px on the long edge at JPEG quality 88 before sending
     # to OpenAI. This preserves enough detail for fine defect detection while
     # keeping the base64 payload and server memory under control.
-    def _compress_for_ai(raw_bytes: bytes, max_long: int = 1200, quality: int = 88) -> bytes:
-        if not PIL_AVAILABLE:
-            return raw_bytes
-        try:
-            im = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
-            w, h = im.size
-            long_edge = max(w, h)
-            if long_edge > max_long:
-                scale = max_long / long_edge
-                im = im.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
-            buf = io.BytesIO()
-            im.save(buf, format="JPEG", quality=quality, optimize=True)
-            return buf.getvalue()
-        except Exception:
-            return raw_bytes  # fallback: pass original
-
-    front_bytes  = _compress_for_ai(front_bytes)
-    back_bytes   = _compress_for_ai(back_bytes)
+    # Compress images using shared helper (max 1200px, JPEG q88)
+    front_bytes  = _compress_image(front_bytes)
+    back_bytes   = _compress_image(back_bytes)
     if angled_bytes and len(angled_bytes) > 200:
-        angled_bytes = _compress_for_ai(angled_bytes)
+        angled_bytes = _compress_image(angled_bytes)
     # ─────────────────────────────────────────────────────────────────────
 
     provided_name = _norm_ws(card_name or "")
@@ -5142,14 +5200,7 @@ Keep grading logic identical; only tailor advice tone and context.
             "verify_token": f"vfy_{secrets.token_urlsafe(12)}",
             "market_context_mode": "click_only",
         })
-    
-    # ==============================
-    # Market Context (Click-only) - Cards
-    # Primary: PriceCharting (current prices, includes graded where available)
-    # Secondary: PokemonTCG links (ID + marketplace links, not history)
-    # eBay API: scaffold only (disabled)
-    # ==============================
-    
+
 
 @app.post("/api/market-context")
 @safe_endpoint
@@ -5887,9 +5938,9 @@ async def market_context(
         "Here’s the go:",
     ]
 
-    opener = secrets.choice(slang_openers)
+    opener = random.choice(slang_openers)
     if secrets.randbelow(100) < 25:
-        opener = f"{opener} {secrets.choice(openers_2)}"
+        opener = f"{opener} {random.choice(openers_2)}"
 
     grade_line = ""
     if exp_grade_key:
@@ -5901,7 +5952,7 @@ async def market_context(
         f" The asks look {trend_hint} at the moment.",
         f" Market mood is {trend_hint} based on current listings.",
     ]
-    trend_line = secrets.choice(trend_phrases)
+    trend_line = random.choice(trend_phrases)
 
     # Where does *your* copy likely sit inside the live range?
     est_value_aud = None
@@ -5930,7 +5981,7 @@ async def market_context(
             f" Given the condition call, I’d slot your copy at about {_money(est_value_aud)} AUD in that current range.",
             f" Realistically, your one probably lives around {_money(est_value_aud)} AUD (condition-wise), not at the tippy-top.",
         ]
-        position_line = secrets.choice(position_templates)
+        position_line = random.choice(position_templates)
 
     graded_line = ""
     if exp_grade_key and exp_grade_key in grade_market:
@@ -5940,7 +5991,7 @@ async def market_context(
                 f" If it lands that grade in a slab, graded asks are roughly {_money(st.get('median'))} AUD (current listings).",
                 f" In the graded lane at that number, you’re seeing about {_money(st.get('median'))} AUD on asks right now.",
             ]
-            graded_line = " " + secrets.choice(graded_templates)
+            graded_line = " " + random.choice(graded_templates)
 
     # Grading decision language — keep it collector-real, not the same line every time
     grade_advice = ""
@@ -5950,12 +6001,12 @@ async def market_context(
         gc = 0.0
 
     if worth_grading is True:
-        grade_advice = " " + secrets.choice([
+        grade_advice = " " + random.choice([
             f" If you’re chasing a slab or cleaner resale, it can be a decent shout if you’re chasing a slab or a cleaner resale.",
             f" I’d consider sending it if you want it protected/registry-ready.",
         ])
     elif worth_grading is False:
-        grade_advice = " " + secrets.choice([
+        grade_advice = " " + random.choice([
             f" I’d only send it if it’s a personal PC piece or you want it in the registry slabbed up.",
             f" This feels more like a binder/PC card unless you just want it in plastic for the vibe.",
             f" If you’re grading for profit, I’d be picky here — but for the collection? send it.",
@@ -5965,7 +6016,7 @@ async def market_context(
     # Buyer vs Seller intent tailoring (language only; underlying data is the same)
     if intent_context == "BUYING":
         if buy_target_aud is not None:
-            advice_line = " " + secrets.choice([
+            advice_line = " " + random.choice([
                 f" If you’re buying raw, I’d want to be around {_money(buy_target_aud)} AUD or less for this condition.",
                 f" Raw buy target: about {_money(buy_target_aud)} AUD (or under) — that’s where it starts to make sense.",
                 f" If you’re hunting a deal, try land it near {_money(buy_target_aud)} AUD — anything higher is paying for hope."
@@ -5976,7 +6027,7 @@ async def market_context(
         if base is not None:
             list_at = float(base) * 1.08
             take_at = float(base)
-            advice_line = " " + secrets.choice([
+            advice_line = " " + random.choice([
                 f" If you’re selling, I’d list around {_money(list_at)} AUD (allow room for offers) and aim to accept near {_money(take_at)} AUD depending on interest.",
                 f" Seller target: list about {_money(list_at)} AUD, realistically expect {_money(take_at)} AUD (condition + timing will move it).",
                 f" If you want a faster sale, price closer to {_money(take_at)} AUD; if you can wait, start near {_money(list_at)} AUD and adjust."
@@ -6567,7 +6618,14 @@ def process_ebay_to_timeseries(ebay_data: dict, active_data: dict, target_days: 
     return series
 
 def generate_mock_price_history(days: int):
-    """Generate mock historical price data for demo UI."""
+    """Generate mock historical price data for demo/dev UI only.
+
+    WARNING: Uses non-deterministic np.random — results change on every call.
+    Do NOT call this in production code paths that write to SQLite.
+    This function exists purely for UI demonstration when real price history
+    is unavailable. It is not called by any live endpoint.
+    """
+    logging.warning("generate_mock_price_history() called — this is demo-only data.")
     data = []
     base_price = 100.0
     for i in range(days):
@@ -7909,6 +7967,7 @@ class MarketPriceLookupRequest(BaseModel):
     is_error_card: Optional[bool] = None   # Factory misprint / miscut / wrong-back
     is_promo: Optional[bool] = None        # Tournament / event / prerelease promo
     language: Optional[str] = None         # Japanese, Korean, Chinese — omit/None for English default
+    game_type: Optional[str] = None        # pokemon / one piece / dragon ball / magic / etc.
     extra_attributes: Optional[str] = None # Catch-all: Prerelease stamp, Staff stamp, Galaxy foil etc.
     grader: Optional[str] = None           # PSA / BGS / CGC / SGC / CLA / CGA / TAG etc.
 
@@ -8567,8 +8626,12 @@ def _parse_grade_from_query(q: str) -> float | None:
 #   BGS 10 Black      >> PSA 10 (all sub-grades perfect, 6× more valuable)
 #
 # CLA (Collectors League — worldwide grader, 12-point scale):
-#   CLA 10 Flawless      ≈ 0.70× PSA 10  (between SGC 0.60 and CGC 0.81)
-#   CLA 12 Ultra Flawless ≈ 0.95× PSA 10  (premium unique grade, near PSA parity)
+#   CLA 10 Flawless       = PSA 10 equivalent   → factor 1.000×
+#   CLA 11                = interpolated         → factor 2.424× (geometric mean 10↔12)
+#   CLA 12 Ultra Flawless ≈ 90% of BGS Black     → factor 5.874×
+#   Note: these are price-CONVERSION MULTIPLIERS (PSA eBay comp → estimated CLA value),
+#   not percentage premiums. "CLA 12 at 5.87×" means if PSA 10 comps at $100,
+#   CLA 12 estimates at ~$587 — matching BGS Black minus a boutique liquidity discount.
 #
 # The function is GRADE-AWARE for BGS/CGC/CLA since those graders use
 # non-standard scales or have distinct tiers within the same numeric grade.
@@ -10051,17 +10114,14 @@ Return JSON ONLY with keys:
     plan = None
 
     try:
-        import openai  # type: ignore
-        api_key = os.getenv("OPENAI_API_KEY", "")
-        if api_key:
-            client = openai.OpenAI(api_key=api_key)
-            resp = client.chat.completions.create(
-                model=os.getenv("OPENAI_MODEL_SELL_PLAN", "gpt-4o-mini"),
-                messages=[{"role": "user", "content": prompt}],
-                response_format={"type": "json_object"},
-                max_tokens=700,
-            )
-            plan = json.loads(resp.choices[0].message.content)
+        # Use the shared async helper — avoids blocking the event loop
+        _sp_result = await _openai_chat(
+            [{"role": "user", "content": prompt}],
+            max_tokens=700,
+            temperature=0.3,
+        )
+        if not _sp_result.get("error"):
+            plan = _parse_json_or_none(_sp_result.get("content", ""))
     except Exception:
         plan = None
 
@@ -10427,24 +10487,8 @@ async def generate_overlay_variants(
 
     # Compress before filter processing — _make_defect_filter_variants will also
     # resize internally to 800px but compressing here reduces IO overhead too.
-    def _compress_overlay(raw: bytes) -> bytes:
-        if not PIL_AVAILABLE or not raw:
-            return raw
-        try:
-            im = Image.open(io.BytesIO(raw)).convert("RGB")
-            im = ImageOps.exif_transpose(im)
-            w, h = im.size
-            if max(w, h) > 1000:
-                scale = 1000 / max(w, h)
-                im = im.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
-            buf = io.BytesIO()
-            im.save(buf, format="JPEG", quality=85, optimize=True)
-            return buf.getvalue()
-        except Exception:
-            return raw
-
-    front_bytes = _compress_overlay(front_bytes)
-    back_bytes  = _compress_overlay(back_bytes) if back_bytes else None
+    front_bytes = _compress_image(front_bytes, max_long=1000, quality=85)
+    back_bytes  = _compress_image(back_bytes,  max_long=1000, quality=85) if back_bytes else None
 
     front_variants = _make_defect_filter_variants(front_bytes)
     back_variants  = _make_defect_filter_variants(back_bytes) if back_bytes else {}
@@ -10522,35 +10566,17 @@ async def defect_scan(
     quick mode:  CV-only, no AI.  ~2-4 s.
     full  mode:  CV + AI ROI labelling + natural-language synthesis.  ~15-20 s.
     """
-    import time
-    t0 = time.time()
+    t0 = time.time()  # `time` imported at module level
 
     # ── 1. Read and compress images ───────────────────────────────────────────
-    def _compress(raw: bytes, max_long: int = 1200, quality: int = 88) -> bytes:
-        if not PIL_AVAILABLE or not raw or len(raw) < 200:
-            return raw
-        try:
-            im = Image.open(io.BytesIO(raw)).convert("RGB")
-            im = ImageOps.exif_transpose(im)
-            w, h = im.size
-            long_edge = max(w, h)
-            if long_edge > max_long:
-                scale = max_long / long_edge
-                im = im.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
-            buf = io.BytesIO()
-            im.save(buf, format="JPEG", quality=quality, optimize=True)
-            return buf.getvalue()
-        except Exception:
-            return raw
-
     # Read raw upload bytes first (chain-of-custody), then compress for processing.
     front_raw = await front.read()
     back_raw  = await back.read()  if back  and back.filename  else b""
     extra_raw = await extra.read() if extra and extra.filename else b""
 
-    front_bytes = _compress(front_raw)
-    back_bytes  = _compress(back_raw)  if back_raw  else b""
-    extra_bytes = _compress(extra_raw) if extra_raw else b""
+    front_bytes = _compress_image(front_raw)
+    back_bytes  = _compress_image(back_raw)  if back_raw  else b""
+    extra_bytes = _compress_image(extra_raw) if extra_raw else b""
 
     def _sha256(b: bytes) -> str:
         try:
@@ -11403,57 +11429,53 @@ async def add_to_collection(
     """
     Add a card to user's collection.
 
-    NOTE: For now this returns success and expects WordPress (PHP) to write to WP DB.
-    (Later we can wire this to a direct MySQL connection or webhook.)
+    STUB: WordPress (PHP) writes to the WP database directly.
+    This endpoint exists for forward-compatibility; it returns success
+    but does not persist data server-side. Collection management is owned by PHP.
     """
-    try:
-        return JSONResponse(content={
-            "success": True,
-            "message": "Card added to collection",
-            "user_id": user_id,
-            "submission_id": submission_id
-        })
-    except Exception as e:
-        return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
+    return JSONResponse(content={
+        "success": True,
+        "message": "Card added to collection (PHP handles persistence)",
+        "user_id": user_id,
+        "submission_id": submission_id,
+        "_stub": True,
+    })
 
 
 @app.get("/api/collection/value-history")
 @safe_endpoint
 async def get_collection_value_history(user_id: int, days: int = 30):
-    """Get collection value over time for charts (mock structure for now)."""
-    from datetime import timedelta
-    base_date = datetime.now()
+    """Collection value history — NOT YET IMPLEMENTED.
 
-    history = []
-    for i in range(days):
-        date = base_date - timedelta(days=days - i)
-        history.append({
-            "date": date.strftime("%Y-%m-%d"),
-            "total_value": 5000 + (i * 50),
-            "card_count": 15
-        })
-
-    return JSONResponse(content={
-        "success": True,
-        "history": history,
-        "current_total": history[-1]["total_value"] if history else 0
-    })
+    Returns a 501 stub. Collection value history is tracked in WordPress;
+    a real implementation would query the WP DB or a separate analytics store.
+    """
+    return JSONResponse(
+        content={
+            "success": False,
+            "message": "Collection value history endpoint is not yet implemented. "
+                       "Track value history through the WordPress plugin directly.",
+            "_stub": True,
+        },
+        status_code=501,
+    )
 
 
 @app.post("/api/collection/update-values-mock")
 @safe_endpoint
 async def update_collection_market_values_mock(user_id: int = Form(...)):
+    """DEPRECATED — use /api/collection/update-values instead.
+
+    Returns a 410 Gone so callers know to switch endpoints.
     """
-    DEPRECATED mock — use /api/collection/update-values instead.
-    Kept for backward compatibility with any old frontend code.
-    """
-    return JSONResponse(content={
-        "success": True,
-        "updated_count": 15,
-        "total_value": 5250.00,
-        "change_24h": 125.00,
-        "change_percent": 2.4
-    })
+    return JSONResponse(
+        content={
+            "success": False,
+            "message": "This endpoint is deprecated. Use /api/collection/update-values instead.",
+            "_stub": True,
+        },
+        status_code=410,
+    )
 
 
 # ========================================
@@ -12012,10 +12034,19 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
+# Per-session timestamp of last OpenAI frame analysis call.
+# Prevents camera clients from triggering an AI call on every video frame.
+_ws_last_analysis: Dict[str, float] = {}
+_WS_MIN_INTERVAL = 2.0  # seconds between AI calls per session
+
 
 @app.websocket("/ws/live-grading/{session_id}")
 async def live_grading_websocket(websocket: WebSocket, session_id: str):
-    """WebSocket endpoint for real-time grading feedback."""
+    """WebSocket endpoint for real-time grading feedback.
+
+    Frame rate limited to one AI call per _WS_MIN_INTERVAL seconds per session
+    to prevent runaway OpenAI API usage from high-fps camera clients.
+    """
     await manager.connect(websocket)
 
     try:
@@ -12024,6 +12055,11 @@ async def live_grading_websocket(websocket: WebSocket, session_id: str):
 
             if data.get("type") == "frame":
                 frame_base64 = data.get("frame")
+                now_ts = time.time()
+                last_ts = _ws_last_analysis.get(session_id, 0.0)
+                if now_ts - last_ts < _WS_MIN_INTERVAL:
+                    continue  # too soon — skip frame, keep connection alive
+                _ws_last_analysis[session_id] = now_ts
                 feedback = await analyze_live_frame(frame_base64)
                 await manager.send_feedback(websocket, feedback)
 
@@ -12032,12 +12068,14 @@ async def live_grading_websocket(websocket: WebSocket, session_id: str):
 
     except WebSocketDisconnect:
         manager.disconnect(websocket)
+        _ws_last_analysis.pop(session_id, None)
     except Exception as e:
         try:
             await websocket.send_json({"type": "error", "message": str(e)})
         except Exception:
             pass
         manager.disconnect(websocket)
+        _ws_last_analysis.pop(session_id, None)
 
 
 async def analyze_live_frame(frame_base64: str) -> dict:
@@ -12644,24 +12682,7 @@ async def fingerprint_generate(
             pass
 
     # ── 2. Compress (same helper as defect-scan) ──────────────────────────────
-    def _compress_fp(raw: bytes, max_long: int = 1200, quality: int = 88) -> bytes:
-        if not PIL_AVAILABLE or not raw or len(raw) < 200:
-            return raw
-        try:
-            im = Image.open(io.BytesIO(raw)).convert("RGB")
-            im = ImageOps.exif_transpose(im)
-            w, h = im.size
-            long_edge = max(w, h)
-            if long_edge > max_long:
-                scale = max_long / long_edge
-                im = im.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
-            buf = io.BytesIO()
-            im.save(buf, format="JPEG", quality=quality, optimize=True)
-            return buf.getvalue()
-        except Exception:
-            return raw
-
-    front_proc = _compress_fp(front_bytes)
+    front_proc = _compress_image(front_bytes)
     # back not needed for fingerprint vectors but kept for future use
 
     # ── 3. Run fingerprint pipeline (same blocks 6a-6f as defect-scan) ───────
