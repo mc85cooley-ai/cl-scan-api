@@ -1260,20 +1260,21 @@ except Exception as _e:
     print(f"INFO: Claude market cache init skipped: {_e}")
 
 
-# ── System prompt — kept tight to minimise tokens ────────────────────────────
+# ── System prompt — knowledge-based, no web_search tool needed ───────────────
+# Haiku's training data covers card prices well enough for a fallback estimate.
+# No tool use = no multi-turn overhead = simpler + cheaper + actually works.
 _CLAUDE_MARKET_SYSTEM = (
-    "You are a trading card price analyst. Search for recent market prices "
-    "and return ONLY a JSON object — no markdown, no explanation.\n\n"
+    "You are a trading card price expert with deep knowledge of TCG and collectible card markets. "
+    "Estimate the current market value based on your training knowledge and return ONLY a JSON object — "
+    "no markdown, no explanation, no extra text.\n\n"
     "Rules:\n"
-    "- Search eBay sold listings and/or TCGPlayer/PriceCharting for the card\n"
-    "- For graded cards: find PSA 10 comps (Grade 10) or BGS Black/PSA 10 x1.5 (Grade 12)\n"
-    "- Convert all prices to AUD (use 1 USD = 1.55 AUD if no live rate available)\n"
-    "- Maximum 2 web searches — be efficient\n"
+    "- Estimate in AUD (use 1 USD = 1.55 AUD)\n"
+    "- For graded cards: Grade 10 = PSA 10 equivalent, Grade 12 = BGS Black equivalent (~1.5x PSA 10)\n"
+    "- Use your knowledge of eBay sold prices, TCGPlayer, PriceCharting for this card\n"
+    "- If you genuinely don't know the card, return price_aud: 0\n"
+    "- confidence: \"high\" if you know this card well, \"medium\" if approximate, \"low\" if uncertain\n"
     "- Return ONLY this exact JSON:\n"
-    '{"price_aud":<number>,"confidence":"high|medium|low|none","source":"<site>",'
-    '"comp_count":<int>,"note":"<max 8 words>"}\n\n'
-    "If no reliable data found return:\n"
-    '{"price_aud":0,"confidence":"none","source":"","comp_count":0,"note":"no comps found"}'
+    '{"price_aud":<number>,"confidence":"high|medium|low|none","source":"knowledge","comp_count":0,"note":"<max 8 words>"}'
 )
 
 
@@ -1351,22 +1352,21 @@ async def _claude_market_lookup(
     ]
     user_msg = "\n".join(ln for ln in _lines if ln)
 
-    # ── Haiku call with web_search ────────────────────────────────────────────
+    # ── Haiku call — knowledge-based, no tools ───────────────────────────────
+    # web_search_20250305 on Haiku doesn't reliably produce text blocks after
+    # tool use without multi-turn handling. Dropping it: Haiku's training data
+    # covers TCG/collectible card prices well enough for a fallback estimate,
+    # and this path only fires when eBay + PriceCharting both returned nothing.
     try:
         client = _anthropic_sdk.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
         response = await client.messages.create(
             model      = "claude-haiku-4-5-20251001",
-            # 600 tokens: tool_use ~100 + JSON answer ~120 + buffer
-            # 200 was too low — tool_use consumed budget before final answer
-            max_tokens = 600,
+            max_tokens = 250,   # JSON answer only — no tool overhead
             system     = _CLAUDE_MARKET_SYSTEM,
-            tools      = [{"type": "web_search_20250305", "name": "web_search"}],
             messages   = [{"role": "user", "content": user_msg}],
         )
 
-        # Response blocks: [text?] -> [tool_use] -> [tool_result] -> [text(JSON)]
-        # Keep the last NON-EMPTY text block — a blank trailing block after
-        # tool use should not overwrite a good JSON answer.
+        # Simple single text block response — no tool use in play
         result_text = ""
         for block in response.content:
             if getattr(block, "type", None) == "text":
