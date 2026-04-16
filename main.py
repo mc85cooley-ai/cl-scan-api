@@ -1356,16 +1356,23 @@ async def _claude_market_lookup(
         client = _anthropic_sdk.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
         response = await client.messages.create(
             model      = "claude-haiku-4-5-20251001",
-            max_tokens = 200,                          # JSON answer is tiny
+            # 600 tokens: tool_use ~100 + JSON answer ~120 + buffer
+            # 200 was too low — tool_use consumed budget before final answer
+            max_tokens = 600,
             system     = _CLAUDE_MARKET_SYSTEM,
             tools      = [{"type": "web_search_20250305", "name": "web_search"}],
             messages   = [{"role": "user", "content": user_msg}],
         )
 
+        # Response blocks: [text?] -> [tool_use] -> [tool_result] -> [text(JSON)]
+        # Keep the last NON-EMPTY text block — a blank trailing block after
+        # tool use should not overwrite a good JSON answer.
         result_text = ""
         for block in response.content:
             if getattr(block, "type", None) == "text":
-                result_text = block.text.strip()
+                _t = block.text.strip()
+                if _t:
+                    result_text = _t
 
         if not result_text:
             logging.info(f"🤖 Claude market: empty response for {card_name}")
