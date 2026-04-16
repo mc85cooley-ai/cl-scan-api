@@ -1234,6 +1234,193 @@ try:
 except Exception as _e:
     print(f"INFO: PriceCharting DB init skipped: {_e}")
 
+
+# ── Claude market lookup cache ────────────────────────────────────────────────
+def _claude_cache_init():
+    con = _pc_db()
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS claude_market_cache (
+            cache_key   TEXT PRIMARY KEY,
+            card_name   TEXT,
+            card_number TEXT,
+            grade       TEXT,
+            result_json TEXT,
+            cached_at   TEXT
+        )
+    """)
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS idx_cmc_key ON claude_market_cache(cache_key, cached_at)"
+    )
+    con.commit()
+    con.close()
+
+try:
+    _claude_cache_init()
+except Exception as _e:
+    print(f"INFO: Claude market cache init skipped: {_e}")
+
+
+# ── System prompt — kept tight to minimise tokens ────────────────────────────
+_CLAUDE_MARKET_SYSTEM = (
+    "You are a trading card price analyst. Search for recent market prices "
+    "and return ONLY a JSON object — no markdown, no explanation.\n\n"
+    "Rules:\n"
+    "- Search eBay sold listings and/or TCGPlayer/PriceCharting for the card\n"
+    "- For graded cards: find PSA 10 comps (Grade 10) or BGS Black/PSA 10 x1.5 (Grade 12)\n"
+    "- Convert all prices to AUD (use 1 USD = 1.55 AUD if no live rate available)\n"
+    "- Maximum 2 web searches — be efficient\n"
+    "- Return ONLY this exact JSON:\n"
+    '{"price_aud":<number>,"confidence":"high|medium|low|none","source":"<site>",'
+    '"comp_count":<int>,"note":"<max 8 words>"}\n\n'
+    "If no reliable data found return:\n"
+    '{"price_aud":0,"confidence":"none","source":"","comp_count":0,"note":"no comps found"}'
+)
+
+
+async def _claude_market_lookup(
+    card_name:   str,
+    card_number: str,
+    card_set:    str,
+    grade:       str,
+    game_type:   str,
+    rarity:      str  = "",
+    is_signed:   bool = False,
+    language:    str  = "english",
+) -> dict:
+    """
+    Claude Haiku + web_search — fires ONLY when eBay/PC both returned nothing.
+
+    Token budget (worst case):
+      System prompt : ~120 tokens  (fixed)
+      User message  : ~80  tokens  (card facts, no padding)
+      2× web search : ~3000 tokens (search result snippets)
+      Response      : ~120 tokens  (JSON only, max_tokens=200)
+      Total         : ~3320 tokens on Haiku ≈ $0.001 AUD per card
+
+    Results cached 24 hours in SQLite — repeat calls within a day are free.
+    Returns {} on any failure — never raises.
+    """
+    if not ANTHROPIC_AVAILABLE or not _anthropic_sdk or not ANTHROPIC_API_KEY:
+        return {}
+
+    # ── 24-hour SQLite cache ──────────────────────────────────────────────────
+    _ck_raw   = f"{card_name}|{card_number}|{grade}|{game_type}".lower().strip()
+    cache_key = hashlib.md5(_ck_raw.encode()).hexdigest()
+
+    try:
+        con = _pc_db()
+        row = con.execute(
+            "SELECT result_json FROM claude_market_cache "
+            "WHERE cache_key=? AND cached_at >= datetime('now','-24 hours') LIMIT 1",
+            (cache_key,)
+        ).fetchone()
+        con.close()
+        if row and row[0]:
+            cached = json.loads(row[0])
+            cached["from_cache"] = True
+            logging.info(
+                f"💾 Claude market CACHE HIT: {card_name} #{card_number} "
+                f"→ ${cached.get('price_aud', 0):.2f} AUD"
+            )
+            return cached
+    except Exception as _ce:
+        logging.debug(f"Claude cache read: {_ce}")
+
+    # ── Compact user message — every word costs tokens ────────────────────────
+    grade_note = ""
+    try:
+        _gv = float(re.search(r"(\d+(?:\.\d+)?)", grade).group(1))
+        if _gv >= 12:
+            grade_note = " (find BGS Black or PSA 10 × 1.5 comps)"
+        elif _gv >= 10:
+            grade_note = " (find PSA 10 graded comps)"
+        elif _gv >= 9:
+            grade_note = " (find PSA 9 graded comps)"
+    except Exception:
+        pass
+
+    _lines = [
+        f"Card: {card_name}",
+        f"Number: {card_number}"          if card_number else None,
+        f"Set: {card_set}"                if card_set    else None,
+        f"Game: {game_type}"              if game_type   else None,
+        f"Grade: {grade}{grade_note}"     if grade       else None,
+        f"Rarity: {rarity}"               if rarity      else None,
+        "Signed copy"                     if is_signed   else None,
+        f"Language: {language}"           if language and language.lower() != "english" else None,
+    ]
+    user_msg = "\n".join(ln for ln in _lines if ln)
+
+    # ── Haiku call with web_search ────────────────────────────────────────────
+    try:
+        client = _anthropic_sdk.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        response = await client.messages.create(
+            model      = "claude-haiku-4-5-20251001",
+            max_tokens = 200,                          # JSON answer is tiny
+            system     = _CLAUDE_MARKET_SYSTEM,
+            tools      = [{"type": "web_search_20250305", "name": "web_search"}],
+            messages   = [{"role": "user", "content": user_msg}],
+        )
+
+        result_text = ""
+        for block in response.content:
+            if getattr(block, "type", None) == "text":
+                result_text = block.text.strip()
+
+        if not result_text:
+            logging.info(f"🤖 Claude market: empty response for {card_name}")
+            return {}
+
+        result_text = result_text.replace("```json", "").replace("```", "").strip()
+        parsed = json.loads(result_text)
+
+        price = float(parsed.get("price_aud") or 0)
+        conf  = str(parsed.get("confidence") or "none")
+        src   = str(parsed.get("source")     or "claude_web_search")
+        count = int(parsed.get("comp_count") or 0)
+        note  = str(parsed.get("note")       or "")
+        if conf not in ("high", "medium", "low", "none"):
+            conf = "low"
+
+        out = {
+            "price_aud":  round(price, 2),
+            "confidence": conf,
+            "source":     src or "claude_web_search",
+            "comp_count": count,
+            "note":       note,
+            "from_cache": False,
+        }
+
+        logging.info(
+            f"🤖 Claude market: {card_name} #{card_number} "
+            f"→ ${price:.2f} AUD | conf={conf} | comps={count} | src={src}"
+        )
+
+        # Write to cache only when we got a real price
+        if price > 0:
+            try:
+                con = _pc_db()
+                con.execute(
+                    "INSERT OR REPLACE INTO claude_market_cache "
+                    "(cache_key,card_name,card_number,grade,result_json,cached_at) "
+                    "VALUES (?,?,?,?,?,datetime('now'))",
+                    (cache_key, card_name, card_number, grade, json.dumps(out))
+                )
+                con.commit()
+                con.close()
+            except Exception as _we:
+                logging.debug(f"Claude cache write: {_we}")
+
+        return out
+
+    except json.JSONDecodeError as _je:
+        logging.warning(f"🤖 Claude market JSON parse failed ({card_name}): {_je}")
+        return {}
+    except Exception as _e:
+        logging.warning(f"🤖 Claude market lookup failed ({card_name}): {_e}")
+        return {}
+
+
 # ═══════════════════════════════════════════════════════
 # PRICE HISTORY (persistent snapshots for market-trends)
 # Stored in SQLite (defaults to the same DB file as PriceCharting)
@@ -9398,6 +9585,48 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
             result["pricecharting_detail"] = pc_result if pc_result else None
             result["ebay_detail"]          = ebay_results[0] if ebay_results else None
             result["grader"]               = grader or ""
+
+            # ── Claude fallback for grade 10/12 path ─────────────────────────
+            # _cla_resolve_price returned 0 — PC + eBay both empty.
+            # Try Claude web search before returning a zero price.
+            _rp = float(result.get("current_price") or result.get("final_price") or 0)
+            _rc = str(result.get("confidence") or "none")
+            if (_rp <= 0 or _rc == "none") and ANTHROPIC_AVAILABLE and ANTHROPIC_API_KEY:
+                try:
+                    _cr = await _claude_market_lookup(
+                        card_name   = card_name,
+                        card_number = card_number,
+                        card_set    = card_set,
+                        grade       = grade,
+                        game_type   = game_type,
+                        rarity      = rarity,
+                        is_signed   = is_signed,
+                        language    = language,
+                    )
+                    _cp = float(_cr.get("price_aud") or 0)
+                    _cc = _cr.get("confidence", "none")
+                    if _cp > 0 and _cc in ("high", "medium", "low"):
+                        logging.info(
+                            f"✅ Claude grade-path fill: ${_cp:.2f} AUD "
+                            f"conf={_cc} | {card_name} #{card_number}"
+                        )
+                        result.update({
+                            "current_price":      _cp,
+                            "final_price":        _cp,
+                            "final_value":        _cp,
+                            "signal_price":       _cp,
+                            "confidence":         _cc,
+                            "sources_used":       ["claude_web_search"],
+                            "source":             "claude_web_search",
+                            "multiplier_applied": 1.0,
+                            "multiplier_reason":  "claude_web_search",
+                            "claude_note":        _cr.get("note", ""),
+                            "claude_source":      _cr.get("source", ""),
+                            "price_source":       "claude_web_search",
+                        })
+                except Exception as _cge:
+                    logging.warning(f"Claude grade-path lookup failed: {_cge}")
+
             return result
 
         # ── Step 1: Build fingerprint (grades below 10 / ungraded path) ──────
@@ -9620,17 +9849,78 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
 
             logging.info(
                 f"ℹ️ No market comps for {card_name} #{card_number} "
-                f"— using pre-computed attribute estimate"
+                f"— trying Claude web search before attribute estimate"
             )
+
+            # ── Claude web search (fires before rarity table) ─────────────────
+            # eBay + PriceCharting + TCGPlayer all returned nothing.
+            # Claude searches the live web — ~$0.001 AUD per card, cached 24h.
+            _claude_result: dict = {}
+            if ANTHROPIC_AVAILABLE and ANTHROPIC_API_KEY:
+                try:
+                    _claude_result = await _claude_market_lookup(
+                        card_name   = card_name,
+                        card_number = card_number,
+                        card_set    = card_set,
+                        grade       = grade,
+                        game_type   = game_type,
+                        rarity      = rarity,
+                        is_signed   = is_signed,
+                        language    = language,
+                    )
+                except Exception as _cle:
+                    logging.warning(f"Claude market lookup error: {_cle}")
+
+            _claude_price = float(_claude_result.get("price_aud") or 0)
+            _claude_conf  = _claude_result.get("confidence", "none")
+
+            if _claude_price > 0 and _claude_conf in ("high", "medium", "low"):
+                logging.info(
+                    f"✅ Claude market fill: ${_claude_price:.2f} AUD "
+                    f"conf={_claude_conf} | {card_name} #{card_number}"
+                )
+                return {
+                    "current_price":        _claude_price,
+                    "final_price":          _claude_price,
+                    "final_value":          _claude_price,
+                    "signal_price":         _claude_price,
+                    "base_price":           _claude_price,
+                    "multiplier_applied":   1.0,
+                    "multiplier_reason":    "claude_web_search",
+                    "slab_premium_added":   0.0,
+                    "confidence":           _claude_conf,
+                    "sources_used":         ["claude_web_search"],
+                    "source":               "claude_web_search",
+                    "source_breakdown":     {"claude": _claude_price},
+                    "sample_sizes":         {"claude": _claude_result.get("comp_count", 0)},
+                    "sources_agreed_pct":   100,
+                    "max_deviation_pct":    0.0,
+                    "price_includes_grade": True,
+                    "grade_12_uplift":      bool(grade_is_12_plus),
+                    "card_name":            card_name,
+                    "search_query":         f"{card_name} {card_number}".strip(),
+                    "fingerprint_used":     bool(fp),
+                    "grader":               grader or "CLA",
+                    "grader_brand_factor":  1.0,
+                    "last_updated":         datetime.now().isoformat(),
+                    "claude_note":          _claude_result.get("note", ""),
+                    "claude_source":        _claude_result.get("source", ""),
+                    "price_source":         "claude_web_search",
+                    "tcgplayer_detail":     tcg_result  if tcg_result  else None,
+                    "ebay_detail":          ebay_result if ebay_result else None,
+                    "pricecharting_detail": pc_result   if pc_result   else None,
+                }
+
+            # ── Attribute estimate (rarity table) — last resort ───────────────
             if _attr_est and _attr_est.get("current_price", 0) > 0:
-                _attr_est["card_name"]          = card_name
-                _attr_est["search_query"]       = ""
-                _attr_est["fingerprint_used"]   = True
+                _attr_est["card_name"]           = card_name
+                _attr_est["search_query"]        = ""
+                _attr_est["fingerprint_used"]    = True
                 _attr_est["grader_brand_factor"] = 1.0
-                _attr_est["price_source"]       = "attr_estimate"
-                _attr_est["tcgplayer_detail"]   = tcg_result  if tcg_result  else None
-                _attr_est["ebay_detail"]        = ebay_result if ebay_result else None
-                _attr_est["pricecharting_detail"] = pc_result if pc_result   else None
+                _attr_est["price_source"]        = "attr_estimate"
+                _attr_est["tcgplayer_detail"]    = tcg_result  if tcg_result  else None
+                _attr_est["ebay_detail"]         = ebay_result if ebay_result else None
+                _attr_est["pricecharting_detail"]= pc_result   if pc_result   else None
                 logging.info(
                     f"📊 Attr estimate: ${_attr_est['current_price']:.2f} AUD "
                     f"for {card_name} | tier={_attr_est.get('matched_rarity_tier','?')}"
