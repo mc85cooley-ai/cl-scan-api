@@ -1287,25 +1287,22 @@ async def _claude_market_lookup(
     rarity:      str  = "",
     is_signed:   bool = False,
     language:    str  = "english",
+    image_url:   str  = "",        # front slab image — improves variant/rarity accuracy
 ) -> dict:
     """
-    Claude Haiku + web_search — fires ONLY when eBay/PC both returned nothing.
+    Claude Haiku — fires ONLY when eBay/PC both returned nothing.
 
-    Token budget (worst case):
-      System prompt : ~120 tokens  (fixed)
-      User message  : ~80  tokens  (card facts, no padding)
-      2× web search : ~3000 tokens (search result snippets)
-      Response      : ~120 tokens  (JSON only, max_tokens=200)
-      Total         : ~3320 tokens on Haiku ≈ $0.001 AUD per card
-
-    Results cached 24 hours in SQLite — repeat calls within a day are free.
+    Token budget:
+      Without image: ~300 input + 150 output ≈ $0.0004 AUD
+      With image:   ~1900 input + 150 output ≈ $0.001  AUD
+      All results cached 24h in SQLite — repeat calls are free.
     Returns {} on any failure — never raises.
     """
     if not ANTHROPIC_AVAILABLE or not _anthropic_sdk or not ANTHROPIC_API_KEY:
         return {}
 
     # ── 24-hour SQLite cache ──────────────────────────────────────────────────
-    _ck_raw   = f"{card_name}|{card_number}|{grade}|{game_type}".lower().strip()
+    _ck_raw   = f"{card_name}|{card_number}|{grade}|{game_type}|{bool(image_url)}".lower().strip()
     cache_key = hashlib.md5(_ck_raw.encode()).hexdigest()
 
     try:
@@ -1352,18 +1349,59 @@ async def _claude_market_lookup(
     ]
     user_msg = "\n".join(ln for ln in _lines if ln)
 
+    # ── Fetch and base64-encode image if URL provided ─────────────────────────
+    # We fetch it server-side so the URL doesn't need to be publicly accessible.
+    # Keeps image tokens to a minimum by resizing to max 512px (still readable).
+    _img_b64   = None
+    _img_mtype = "image/jpeg"
+    if image_url:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as _hc:
+                _ir = await _hc.get(image_url, follow_redirects=True)
+            if _ir.status_code == 200:
+                _img_bytes = _ir.content
+                _img_mtype = _ir.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+                # Resize to max 512px longest side to cap token cost (~800 tokens vs ~1600)
+                if PIL_AVAILABLE and _img_bytes:
+                    try:
+                        _pil = Image.open(io.BytesIO(_img_bytes)).convert("RGB")
+                        _pil.thumbnail((512, 512), Image.LANCZOS)
+                        _buf = io.BytesIO()
+                        _pil.save(_buf, format="JPEG", quality=85)
+                        _img_bytes = _buf.getvalue()
+                        _img_mtype = "image/jpeg"
+                    except Exception:
+                        pass  # use original bytes if PIL fails
+                _img_b64 = base64.b64encode(_img_bytes).decode()
+                logging.info(f"🖼️  Claude market: image fetched for {card_name} ({len(_img_bytes)//1024}KB)")
+        except Exception as _ie:
+            logging.debug(f"Claude market image fetch failed: {_ie}")
+            _img_b64 = None  # proceed without image
+
+    # ── Build message content — image first if available ─────────────────────
+    if _img_b64:
+        _msg_content = [
+            {
+                "type":   "image",
+                "source": {
+                    "type":       "base64",
+                    "media_type": _img_mtype,
+                    "data":       _img_b64,
+                },
+            },
+            {"type": "text", "text": user_msg},
+        ]
+    else:
+        _msg_content = user_msg   # plain string — same as before
+
     # ── Haiku call — knowledge-based, no tools ───────────────────────────────
-    # web_search_20250305 on Haiku doesn't reliably produce text blocks after
-    # tool use without multi-turn handling. Dropping it: Haiku's training data
-    # covers TCG/collectible card prices well enough for a fallback estimate,
-    # and this path only fires when eBay + PriceCharting both returned nothing.
     try:
         client = _anthropic_sdk.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
         response = await client.messages.create(
             model      = "claude-haiku-4-5-20251001",
-            max_tokens = 250,   # JSON answer only — no tool overhead
+            max_tokens = 250,
             system     = _CLAUDE_MARKET_SYSTEM,
-            messages   = [{"role": "user", "content": user_msg}],
+            messages   = [{"role": "user", "content": _msg_content}],
         )
 
         # Simple single text block response — no tool use in play
@@ -8164,6 +8202,7 @@ class MarketPriceLookupRequest(BaseModel):
     game_type: Optional[str] = None        # pokemon / one piece / dragon ball / magic / etc.
     extra_attributes: Optional[str] = None # Catch-all: Prerelease stamp, Staff stamp, Galaxy foil etc.
     grader: Optional[str] = None           # PSA / BGS / CGC / SGC / CLA / CGA / TAG etc.
+    image_url: Optional[str] = None          # Front slab image URL — passed to Claude for visual identification
 
 
 # ── AI Grade request model — used by /api/ai-grade ───────────────────────────
@@ -9609,6 +9648,7 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                         rarity      = rarity,
                         is_signed   = is_signed,
                         language    = language,
+                        image_url   = getattr(request, "image_url", None) or "",
                     )
                     _cp = float(_cr.get("price_aud") or 0)
                     _cc = _cr.get("confidence", "none")
@@ -9874,6 +9914,7 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                         rarity      = rarity,
                         is_signed   = is_signed,
                         language    = language,
+                        image_url   = getattr(request, "image_url", None) or "",
                     )
                 except Exception as _cle:
                     logging.warning(f"Claude market lookup error: {_cle}")
