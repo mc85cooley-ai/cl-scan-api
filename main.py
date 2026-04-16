@@ -1319,7 +1319,7 @@ async def _claude_market_lookup(
         if row and row[0]:
             cached = json.loads(row[0])
             cached["from_cache"] = True
-            logging.info(
+            logging.warning(
                 f"💾 Claude market CACHE HIT: {card_name} #{card_number} "
                 f"→ ${cached.get('price_aud', 0):.2f} AUD"
             )
@@ -1416,7 +1416,7 @@ async def _claude_market_lookup(
                     result_text = _t
 
         if not result_text:
-            logging.info(f"🤖 Claude market: empty response for {card_name}")
+            logging.warning(f"🤖 Claude market: EMPTY RESPONSE for {card_name} | stop_reason={getattr(response, 'stop_reason', '?')} | blocks={[getattr(b,'type','?') for b in response.content]}")
             return {}
 
         result_text = result_text.replace("```json", "").replace("```", "").strip()
@@ -1439,9 +1439,9 @@ async def _claude_market_lookup(
             "from_cache": False,
         }
 
-        logging.info(
+        logging.warning(
             f"🤖 Claude market: {card_name} #{card_number} "
-            f"→ ${price:.2f} AUD | conf={conf} | comps={count} | src={src}"
+            f"→ ${price:.2f} AUD | conf={conf} | comps={count} | src={src} | text={result_text[:80]!r}"
         )
 
         # Write to cache only when we got a real price
@@ -1462,10 +1462,10 @@ async def _claude_market_lookup(
         return out
 
     except json.JSONDecodeError as _je:
-        logging.warning(f"🤖 Claude market JSON parse failed ({card_name}): {_je}")
+        logging.warning(f"🤖 Claude market JSON PARSE FAILED ({card_name}): {_je} | raw={result_text[:120]!r}")
         return {}
     except Exception as _e:
-        logging.warning(f"🤖 Claude market lookup failed ({card_name}): {_e}")
+        logging.warning(f"🤖 Claude market EXCEPTION ({card_name}): {type(_e).__name__}: {_e}")
         return {}
 
 
@@ -9660,7 +9660,7 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
                     _cp = float(_cr.get("price_aud") or 0)
                     _cc = _cr.get("confidence", "none")
                     if _cp > 0 and _cc in ("high", "medium", "low"):
-                        logging.info(
+                        logging.warning(
                             f"✅ Claude grade-path fill: ${_cp:.2f} AUD "
                             f"conf={_cc} | {card_name} #{card_number}"
                         )
@@ -9932,7 +9932,7 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
             _claude_conf  = _claude_result.get("confidence", "none")
 
             if _claude_price > 0 and _claude_conf in ("high", "medium", "low"):
-                logging.info(
+                logging.warning(
                     f"✅ Claude market fill: ${_claude_price:.2f} AUD "
                     f"conf={_claude_conf} | {card_name} #{card_number}"
                 )
