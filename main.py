@@ -1299,7 +1299,10 @@ async def _claude_market_lookup(
     Returns {} on any failure — never raises.
     """
     if not ANTHROPIC_AVAILABLE or not _anthropic_sdk or not ANTHROPIC_API_KEY:
+        logging.warning(f"🔎 DIAG _claude_market_lookup SKIPPED: available={ANTHROPIC_AVAILABLE} key={bool(ANTHROPIC_API_KEY)}")
         return {}
+
+    logging.warning(f"🔎 DIAG _claude_market_lookup ENTERED: {card_name} #{card_number} grade={grade}")
 
     # ── 24-hour SQLite cache ──────────────────────────────────────────────────
     _ck_raw   = f"{card_name}|{card_number}|{grade}|{game_type}|{bool(image_url)}".lower().strip()
@@ -9633,10 +9636,14 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
             result["grader"]               = grader or ""
 
             # ── Claude fallback for grade 10/12 path ─────────────────────────
-            # _cla_resolve_price returned 0 — PC + eBay both empty.
-            # Try Claude web search before returning a zero price.
             _rp = float(result.get("current_price") or result.get("final_price") or 0)
             _rc = str(result.get("confidence") or "none")
+            logging.warning(
+                f"🔎 DIAG grade-path {card_name} #{card_number}: "
+                f"price={_rp} conf={_rc} "
+                f"anthropic={ANTHROPIC_AVAILABLE} key={bool(ANTHROPIC_API_KEY)} "
+                f"gate={(_rp <= 0 or _rc == 'none')}"
+            )
             if (_rp <= 0 or _rc == "none") and ANTHROPIC_AVAILABLE and ANTHROPIC_API_KEY:
                 try:
                     _cr = await _claude_market_lookup(
@@ -9900,9 +9907,11 @@ async def market_price_lookup(request: MarketPriceLookupRequest):
             )
 
             # ── Claude web search (fires before rarity table) ─────────────────
-            # eBay + PriceCharting + TCGPlayer all returned nothing.
-            # Claude searches the live web — ~$0.001 AUD per card, cached 24h.
             _claude_result: dict = {}
+            logging.warning(
+                f"🔎 DIAG precision-path {card_name} #{card_number}: "
+                f"anthropic={ANTHROPIC_AVAILABLE} key={bool(ANTHROPIC_API_KEY)}"
+            )
             if ANTHROPIC_AVAILABLE and ANTHROPIC_API_KEY:
                 try:
                     _claude_result = await _claude_market_lookup(
