@@ -15,7 +15,7 @@ httpx==0.28.1
 python-dotenv==1.0.1
 
 # AI/OpenAI
-openai>=2.29.0
+openai>=2.32.0
 
 # Web Scraping
 beautifulsoup4==4.12.3
