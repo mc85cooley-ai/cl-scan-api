@@ -99,6 +99,7 @@ from pydantic import BaseModel
 from datetime import datetime, timedelta
 from statistics import mean, median
 from functools import wraps
+from contextlib import asynccontextmanager
 from fastapi import WebSocket
 from starlette.websockets import WebSocketDisconnect
 import base64
@@ -554,7 +555,7 @@ async def _openai_label_rois(rois: List[Dict[str, Any]], front_bytes: Optional[b
 
 
 # Simple in-memory caches (per-process)
-_FX_CACHE = {"ts": 0, "usd_aud": None}
+_FX_CACHE = {"ts": 0, "usd_aud": None, "gbp_aud": None, "eur_aud": None, "cad_aud": None, "jpy_aud": None}
 _EBAY_CACHE = {}  # key -> {ts, data}
 FX_CACHE_SECONDS = int(os.getenv("FX_CACHE_SECONDS", "3600"))
 
@@ -586,7 +587,21 @@ def _evict_stale_caches() -> int:
 # ==============================
 # App & CORS
 # ==============================
-app = FastAPI(title="Collectors League Scan API")
+@asynccontextmanager
+async def _lifespan(app):
+    """Startup / shutdown lifecycle for the FastAPI app.
+    - Startup: log version
+    - Shutdown: close shared HTTP client cleanly (avoids ResourceWarning on Render restarts)
+    """
+    logging.info(f"🚀 Starting Collectors League Scan API v6.9.30")
+    yield
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT and not _HTTP_CLIENT.is_closed:
+        await _HTTP_CLIENT.aclose()
+        logging.info("🛑 Shared HTTP client closed cleanly")
+
+
+app = FastAPI(title="Collectors League Scan API", lifespan=_lifespan)
 
 logger = logging.getLogger("cl-scan-api")
 
@@ -992,26 +1007,60 @@ def _build_ebay_query_ladder(
             out.append(q)
             seen.add(q)
     return out
-async def _fx_usd_to_aud() -> float:
-    """Return live-ish USD->AUD rate with a short cache. Falls back to AUD_MULTIPLIER if unavailable."""
+async def _fx_refresh() -> dict:
+    """Fetch USD, GBP, EUR, CAD, JPY → AUD in a single Frankfurter call.
+    Cached for FX_CACHE_SECONDS (default 1 hour). Returns the full cache dict.
+    Replaces the old per-currency hardcoded multipliers scattered through eBay price conversion.
+    """
+    now = int(time.time())
+    if _FX_CACHE.get("usd_aud") and (now - int(_FX_CACHE.get("ts") or 0) < FX_CACHE_SECONDS):
+        return _FX_CACHE
     try:
-        now = int(time.time())
-        if _FX_CACHE.get("usd_aud") and (now - int(_FX_CACHE.get("ts") or 0) < FX_CACHE_SECONDS):
-            return float(_FX_CACHE["usd_aud"])
-        # frankfurter.app — genuinely free, no API key required
-        url = "https://api.frankfurter.app/latest?base=USD&symbols=AUD"
+        # Single call returns all needed rates — AUD as base so we get direct AUD values
+        url = "https://api.frankfurter.app/latest?base=AUD&symbols=USD,GBP,EUR,CAD,JPY"
         client = _get_http_client()
         r = await client.get(url, timeout=15.0, headers={"User-Agent": UA})
         if r.status_code == 200:
-            j = r.json()
-            rate = float(((j.get("rates") or {}).get("AUD")) or 0.0)
-            if rate > 0.5:
-                _FX_CACHE["usd_aud"] = rate
-                _FX_CACHE["ts"] = now
-                return rate
+            rates = r.json().get("rates", {})
+            # Frankfurter gives units-per-1-AUD → invert to get AUD-per-1-unit
+            def _inv(key, fallback):
+                v = float(rates.get(key) or 0)
+                return round(1.0 / v, 6) if v > 0 else fallback
+            _FX_CACHE.update({
+                "ts":      now,
+                "usd_aud": _inv("USD", 1.55),
+                "gbp_aud": _inv("GBP", 1.98),
+                "eur_aud": _inv("EUR", 1.69),
+                "cad_aud": _inv("CAD", 1.14),
+                "jpy_aud": _inv("JPY", 0.0103),
+            })
     except Exception:
-        pass
-    return float(AUD_MULTIPLIER)  # env-var fallback (default 1.44)
+        pass  # stale values remain — better than crashing
+    return _FX_CACHE
+
+
+async def _fx_usd_to_aud() -> float:
+    """USD → AUD. Backward-compatible wrapper around _fx_refresh()."""
+    fx = await _fx_refresh()
+    return float(fx.get("usd_aud") or AUD_MULTIPLIER)
+
+
+async def _fx_to_aud(amount: float, currency: str) -> float:
+    """Convert any supported currency amount to AUD using live rates.
+    Returns 0.0 for unknown currencies so callers can skip bad data.
+    Replaces all hardcoded GBP*1.27, EUR*1.09, CAD*0.74, JPY/150 blocks.
+    """
+    if amount <= 0:
+        return 0.0
+    cur = (currency or "").upper().strip()
+    if cur in ("AUD", ""):
+        return float(amount)
+    fx = await _fx_refresh()
+    rate = float(fx.get(f"{cur.lower()}_aud") or 0)
+    if rate <= 0:
+        logging.debug(f"_fx_to_aud: unknown currency {cur!r} — skipping item")
+        return 0.0
+    return round(amount * rate, 4)
 
 
 async def _ebay_completed_stats(keyword_query: str, limit: int = 120, days_lookback: int = 120,
@@ -1064,8 +1113,8 @@ async def _ebay_completed_stats(keyword_query: str, limit: int = 120, days_lookb
     url = "https://svcs.ebay.com/services/search/FindingService/v1"
     headers = {"User-Agent": UA}
 
-    async with httpx.AsyncClient(timeout=20.0, headers=headers) as client:
-        for page in range(1, pages + 1):
+    client = _get_http_client()
+    for page in range(1, pages + 1):
             params = {
                 "OPERATION-NAME":              "findCompletedItems",
                 "SERVICE-VERSION":             "1.13.0",
@@ -1081,7 +1130,7 @@ async def _ebay_completed_stats(keyword_query: str, limit: int = 120, days_lookb
             }
 
             try:
-                r = await client.get(url, params=params)
+                r = await client.get(url, params=params, headers=headers)
                 r.raise_for_status()
                 j = r.json()
             except Exception:
@@ -1106,20 +1155,9 @@ async def _ebay_completed_stats(keyword_query: str, limit: int = 120, days_lookb
                         continue
                     # Convert to AUD based on currency. JPY must be converted or
                     # a ¥9,000 card appears as AUD $9,000 — 140× inflation.
-                    if cur == "USD":
-                        val = float(_usd_to_aud_simple(val) or 0.0)
-                    elif cur == "JPY":
-                        # Approximate JPY→USD at ~150 JPY/USD, then to AUD
-                        val = float(_usd_to_aud_simple(val / 150.0) or 0.0)
-                    elif cur == "GBP":
-                        val = float(_usd_to_aud_simple(val * 1.27) or 0.0)
-                    elif cur == "EUR":
-                        val = float(_usd_to_aud_simple(val * 1.09) or 0.0)
-                    elif cur == "CAD":
-                        val = float(_usd_to_aud_simple(val * 0.74) or 0.0)
-                    elif cur not in ("AUD", ""):
-                        # Unknown currency — skip rather than treat as AUD
-                        continue
+                    val = await _fx_to_aud(val, cur if cur else "AUD")
+                    if val <= 0:
+                        continue  # unknown currency or conversion failed
                     # Ignore insane values (protect against parsing weird lots)
                     if val <= 0 or val > 50_000:
                         continue
@@ -1189,8 +1227,10 @@ async def _ebay_completed_stats(keyword_query: str, limit: int = 120, days_lookb
 
 
 def _pc_db():
-    con = sqlite3.connect(PRICECHARTING_DB_PATH)
+    con = sqlite3.connect(PRICECHARTING_DB_PATH, check_same_thread=False)
     con.row_factory = sqlite3.Row
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=5000")
     return con
 
 def _pc_init_db():
@@ -1299,10 +1339,10 @@ async def _claude_market_lookup(
     Returns {} on any failure — never raises.
     """
     if not ANTHROPIC_AVAILABLE or not _anthropic_sdk or not ANTHROPIC_API_KEY:
-        logging.warning(f"🔎 DIAG _claude_market_lookup SKIPPED: available={ANTHROPIC_AVAILABLE} key={bool(ANTHROPIC_API_KEY)}")
+        logging.debug(f"🔎 DIAG _claude_market_lookup SKIPPED: available={ANTHROPIC_AVAILABLE} key={bool(ANTHROPIC_API_KEY)}")
         return {}
 
-    logging.warning(f"🔎 DIAG _claude_market_lookup ENTERED: {card_name} #{card_number} grade={grade}")
+    logging.debug(f"🔎 DIAG _claude_market_lookup ENTERED: {card_name} #{card_number} grade={grade}")
 
     # ── 24-hour SQLite cache ──────────────────────────────────────────────────
     _ck_raw   = f"{card_name}|{card_number}|{grade}|{game_type}|{bool(image_url)}".lower().strip()
@@ -1319,7 +1359,7 @@ async def _claude_market_lookup(
         if row and row[0]:
             cached = json.loads(row[0])
             cached["from_cache"] = True
-            logging.warning(
+            logging.info(
                 f"💾 Claude market CACHE HIT: {card_name} #{card_number} "
                 f"→ ${cached.get('price_aud', 0):.2f} AUD"
             )
@@ -1439,7 +1479,7 @@ async def _claude_market_lookup(
             "from_cache": False,
         }
 
-        logging.warning(
+        logging.info(
             f"🤖 Claude market: {card_name} #{card_number} "
             f"→ ${price:.2f} AUD | conf={conf} | comps={count} | src={src} | text={result_text[:80]!r}"
         )
@@ -1477,8 +1517,10 @@ async def _claude_market_lookup(
 PRICE_HISTORY_DB_PATH = os.getenv("PRICE_HISTORY_DB_PATH", PRICECHARTING_DB_PATH).strip() or PRICECHARTING_DB_PATH
 
 def _ph_db():
-    con = sqlite3.connect(PRICE_HISTORY_DB_PATH)
+    con = sqlite3.connect(PRICE_HISTORY_DB_PATH, check_same_thread=False)
     con.row_factory = sqlite3.Row
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=5000")
     return con
 
 def _ph_init_db():
@@ -3036,18 +3078,9 @@ async def _ebay_active_stats(keyword_query: str, limit: int = 120) -> dict:
                             cur = str(pr.get("currency") or DEFAULT_CURRENCY).upper()
                             if val <= 0:
                                 continue
-                            if cur == "USD":
-                                val = float(_usd_to_aud_simple(val) or 0.0)
-                            elif cur == "JPY":
-                                val = float(_usd_to_aud_simple(val / 150.0) or 0.0)
-                            elif cur == "GBP":
-                                val = float(_usd_to_aud_simple(val * 1.27) or 0.0)
-                            elif cur == "EUR":
-                                val = float(_usd_to_aud_simple(val * 1.09) or 0.0)
-                            elif cur == "CAD":
-                                val = float(_usd_to_aud_simple(val * 0.74) or 0.0)
-                            elif cur not in ("AUD", ""):
-                                continue  # skip unknown currencies
+                            val = await _fx_to_aud(val, cur if cur else "AUD")
+                            if val <= 0:
+                                continue  # unknown currency or conversion failed
                             if val <= 0 or val > 50_000:
                                 continue
                             prices.append(val)
@@ -3094,18 +3127,9 @@ async def _ebay_active_stats(keyword_query: str, limit: int = 120) -> dict:
                             cur = str(cp.get("@currencyId", "USD")).upper()
                             if p <= 0:
                                 continue
-                            if cur == "USD":
-                                p = float(_usd_to_aud_simple(p) or 0.0)
-                            elif cur == "JPY":
-                                p = float(_usd_to_aud_simple(p / 150.0) or 0.0)
-                            elif cur == "GBP":
-                                p = float(_usd_to_aud_simple(p * 1.27) or 0.0)
-                            elif cur == "EUR":
-                                p = float(_usd_to_aud_simple(p * 1.09) or 0.0)
-                            elif cur == "CAD":
-                                p = float(_usd_to_aud_simple(p * 0.74) or 0.0)
-                            elif cur not in ("AUD", ""):
-                                continue
+                            p = await _fx_to_aud(p, cur if cur else "AUD")
+                            if p <= 0:
+                                continue  # unknown currency or conversion failed
                             if p <= 0 or p > 50_000:
                                 continue
                             prices.append(p)
@@ -13237,13 +13261,23 @@ async def ai_grade(request: AIGradeRequest):
 
             client = _anthropic_sdk.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
             response = await client.messages.create(
-                model="claude-sonnet-4-20250514",
+                model="claude-sonnet-4-6",
                 max_tokens=2000,
                 system=system_prompt,
                 messages=[{"role": "user", "content": content}],
             )
 
-            raw_text = response.content[0].text.strip().replace("```json", "").replace("```", "").strip()
+            raw_text = ""
+            for _block in response.content:
+                if getattr(_block, "type", None) == "text" and (_block.text or "").strip():
+                    raw_text = _block.text.strip()
+                    break
+            if not raw_text:
+                raise ValueError(
+                    f"Empty Anthropic response (stop_reason={getattr(response, 'stop_reason', '?')}, "
+                    f"blocks={[getattr(b, 'type', '?') for b in response.content]})"
+                )
+            raw_text = raw_text.replace("```json", "").replace("```", "").strip()
             grade = json.loads(raw_text)
 
             logging.info(f"✅ AI Grade [Anthropic] complete — {grade.get('grade')} / {grade.get('score_100')}")
