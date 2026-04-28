@@ -1,6 +1,8 @@
 # ============================================================================
-# PRODUCTION REQUIREMENTS.TXT
-# Updated for real price history system with database
+# PRODUCTION REQUIREMENTS — Collectors League Scan API
+# Cleaned up: removed packages that are in requirements but never imported
+# in main.py (psycopg2, SQLAlchemy, alembic, redis, python-jose, passlib,
+# openai SDK). Added scipy (actually used). Pinned more tightly.
 # ============================================================================
 
 # Core FastAPI & Server
@@ -8,14 +10,19 @@ fastapi==0.115.6
 uvicorn[standard]==0.34.0
 python-multipart==0.0.20
 
-# HTTP Client
+# HTTP Client (used directly — OpenAI is called via raw HTTP, not SDK)
 httpx==0.28.1
 
 # Environment Variables
 python-dotenv==1.0.1
 
-# AI/OpenAI
-openai>=2.32.0
+# NOTE: The openai Python SDK is NOT imported anywhere in main.py.
+# All OpenAI calls are raw httpx POST requests to api.openai.com.
+# Removing it saves ~60MB of cold-start memory on Render's free tier.
+# If you ever switch to the SDK, add: openai>=2.32.0
+
+# Anthropic SDK — used by /api/ai-grade and _claude_market_lookup
+anthropic>=0.25.0
 
 # Web Scraping
 beautifulsoup4==4.12.3
@@ -27,64 +34,36 @@ qrcode[pil]==7.4.2
 # Image Processing
 Pillow>=11.0.0
 
-# Numerical Computing
+# Numerical / Scientific (numpy + scipy both used in fingerprint + market trend code)
 numpy==1.26.3
-
-anthropic>=0.25.0
-
-# ============================================================================
-# DATABASE DEPENDENCIES (NEW - Required for Phase 1)
-# ============================================================================
-
-# PostgreSQL Database Driver
-psycopg2-binary==2.9.9
-
-# ORM (Object-Relational Mapping)
-sqlalchemy==2.0.25
-
-# Database Migrations
-alembic==1.13.1
+scipy==1.13.1
 
 # ============================================================================
-# CACHING (NEW - Optional but Recommended)
+# REMOVED — these were in requirements but are NEVER imported in main.py.
+# The app uses SQLite (stdlib), not PostgreSQL. No Redis, no JWT auth layer.
+# Keeping them added ~180MB to the Render slug and slowed cold starts.
 # ============================================================================
-
-# Redis for distributed caching
-redis==5.0.1
-
-# ============================================================================
-# AUTHENTICATION & SECURITY (NEW - For Simple Auth)
-# ============================================================================
-
-# JWT tokens and password hashing
-python-jose[cryptography]==3.3.0
-passlib[bcrypt]==1.7.4
+# psycopg2-binary    — PostgreSQL driver (app uses sqlite3)
+# sqlalchemy         — ORM (app uses raw sqlite3 calls)
+# alembic            — DB migrations (app uses CREATE TABLE IF NOT EXISTS)
+# redis              — Caching (app uses in-process dicts + SQLite)
+# python-jose        — JWT tokens (no JWT auth in main.py)
+# passlib[bcrypt]    — Password hashing (no password hashing in main.py)
 
 # ============================================================================
-# MONITORING & LOGGING (OPTIONAL - Can add later)
+# OPTIONAL MONITORING (uncomment when ready)
 # ============================================================================
-
-# Prometheus metrics (uncomment when needed)
 # prometheus-client==0.19.0
-
-# Structured JSON logging (uncomment when needed)
 # python-json-logger==2.0.7
-
-# Error tracking (uncomment when needed)
 # sentry-sdk==1.40.0
 
 # ============================================================================
-# RATE LIMITING (OPTIONAL - Can add later)
+# OPTIONAL RATE LIMITING
 # ============================================================================
-
-# API rate limiting (uncomment when needed)
 # slowapi==0.1.9
 
 # ============================================================================
-# TESTING (OPTIONAL - For development)
+# TESTING (development only)
 # ============================================================================
-
-# Testing framework (uncomment for development)
 # pytest==7.4.3
 # pytest-asyncio==0.21.1
-# httpx[test]==0.28.1
