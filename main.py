@@ -13262,10 +13262,17 @@ async def ai_grade(request: AIGradeRequest):
             client = _anthropic_sdk.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
             response = await client.messages.create(
                 model="claude-sonnet-4-6",
-                max_tokens=2000,
+                max_tokens=3000,
                 system=system_prompt,
                 messages=[{"role": "user", "content": content}],
             )
+
+            # Detect truncation before attempting JSON parse
+            if getattr(response, "stop_reason", None) == "max_tokens":
+                raise ValueError(
+                    "Anthropic response truncated — hit max_tokens limit before JSON completed. "
+                    "Increase max_tokens further if this recurs."
+                )
 
             raw_text = ""
             for _block in response.content:
@@ -13329,7 +13336,7 @@ async def ai_grade(request: AIGradeRequest):
                 },
                 json={
                     "model":      "gpt-4o",
-                    "max_tokens": 2000,
+                    "max_tokens": 3000,
                     "messages": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user",   "content": oai_content},
@@ -13339,6 +13346,9 @@ async def ai_grade(request: AIGradeRequest):
             )
 
             oai_data = oai_resp.json()
+            if "choices" not in oai_data:
+                err = oai_data.get("error", {}).get("message", str(oai_data))
+                raise Exception(f"OpenAI API error: {err}")
             raw_text = oai_data["choices"][0]["message"]["content"].strip()
             raw_text = raw_text.replace("```json", "").replace("```", "").strip()
             grade = json.loads(raw_text)
