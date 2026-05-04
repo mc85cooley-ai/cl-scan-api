@@ -2111,8 +2111,14 @@ STRICT_CARD_NUMBER = os.getenv("STRICT_CARD_NUMBER", "1").strip() in ("1","true"
 
 
 
-if not OPENAI_API_KEY:
-    print("WARNING: OPENAI_API_KEY not set! Vision ID/assessment will fail.")
+if not OPENAI_API_KEY and not ANTHROPIC_API_KEY:
+    print("WARNING: Neither OPENAI_API_KEY nor ANTHROPIC_API_KEY is set! Vision ID/assessment will fail.")
+elif not OPENAI_API_KEY:
+    print("INFO: OPENAI_API_KEY not set — all AI calls will route directly to Anthropic Claude.")
+elif not ANTHROPIC_API_KEY:
+    print("INFO: ANTHROPIC_API_KEY not set — Claude fallback disabled. OpenAI only.")
+else:
+    print("INFO: Both OPENAI_API_KEY and ANTHROPIC_API_KEY set — Claude fallback active.")
 if not POKEMONTCG_API_KEY:
     print("INFO: POKEMONTCG_API_KEY not set (Pokemon enrichment disabled).")
 if not PRICECHARTING_TOKEN:
@@ -2882,11 +2888,218 @@ def _same_number(a: str, b: str) -> bool:
     return _card_number_for_query(a) == _card_number_for_query(b)
 
 # ==============================
+# ══════════════════════════════════════════════════════════════════════════════
+# ANTHROPIC CLAUDE FALLBACK
+# Called automatically when OpenAI fails (any error, timeout, or 5xx).
+# _openai_chat → _claude_fallback_chat  (vision: claude-sonnet-4-6,
+#                                         text:   claude-haiku-4-5-20251001)
+# _openai_text → _claude_fallback_text  (haiku only — no JSON enforcement)
+#
+# Format conversion: OpenAI image_url blocks → Anthropic image source blocks.
+# System messages extracted from the messages array → Anthropic `system` param.
+# JSON responses enforced via prompt instruction (Anthropic has no response_format).
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _openai_to_anthropic_messages(messages: List[Dict[str, Any]]) -> tuple:
+    """
+    Convert OpenAI chat messages list to Anthropic API format.
+
+    OpenAI                              →  Anthropic
+    ──────────────────────────────────────────────────
+    {"role":"system","content":"..."}   →  system= param (extracted out)
+    {"type":"image_url",                →  {"type":"image","source":
+      "image_url":{"url":"data:..."}}        {"type":"base64","media_type":...,
+                                              "data":...}}
+    {"type":"text","text":"..."}        →  {"type":"text","text":"..."} (unchanged)
+
+    Returns:
+        (system_str: str | None, anthropic_messages: list)
+    """
+    system_parts: List[str] = []
+    out_msgs: List[Dict[str, Any]] = []
+
+    for msg in messages:
+        role    = msg.get("role", "user")
+        content = msg.get("content", "")
+
+        # ── System messages go into the system param, not the messages array ──
+        if role == "system":
+            if isinstance(content, str):
+                system_parts.append(content)
+            elif isinstance(content, list):
+                for blk in content:
+                    if isinstance(blk, dict) and blk.get("type") == "text":
+                        system_parts.append(blk.get("text", ""))
+            continue
+
+        # ── Convert content blocks ────────────────────────────────────────────
+        if isinstance(content, str):
+            out_content: Any = content
+
+        elif isinstance(content, list):
+            out_blocks: List[Dict[str, Any]] = []
+            for blk in content:
+                if not isinstance(blk, dict):
+                    continue
+                btype = blk.get("type", "")
+
+                if btype == "text":
+                    out_blocks.append({"type": "text", "text": blk.get("text", "")})
+
+                elif btype == "image_url":
+                    url = (blk.get("image_url") or {}).get("url", "")
+                    if url.startswith("data:"):
+                        # data:image/jpeg;base64,/9j/...
+                        try:
+                            header, b64data = url.split(",", 1)
+                            media_type = header.split(";")[0].replace("data:", "")
+                        except ValueError:
+                            media_type, b64data = "image/jpeg", url
+                        out_blocks.append({
+                            "type": "image",
+                            "source": {
+                                "type":       "base64",
+                                "media_type": media_type,
+                                "data":       b64data,
+                            },
+                        })
+                    elif url:
+                        # Plain URL — Anthropic supports these via url source type
+                        out_blocks.append({
+                            "type": "image",
+                            "source": {"type": "url", "url": url},
+                        })
+            out_content = out_blocks
+
+        else:
+            out_content = str(content)
+
+        out_msgs.append({"role": role, "content": out_content})
+
+    system_str = "\n\n".join(system_parts) if system_parts else None
+    return system_str, out_msgs
+
+
+async def _claude_fallback_chat(
+    messages:    List[Dict[str, Any]],
+    max_tokens:  int   = 1200,
+    temperature: float = 0.1,
+) -> Dict[str, Any]:
+    """
+    Claude replacement for _openai_chat (JSON-enforced vision/text completions).
+
+    Model selection:
+      • Any message contains an image  →  claude-sonnet-4-6  (vision capable)
+      • Text-only messages             →  claude-haiku-4-5-20251001  (fast + cheap)
+
+    JSON enforcement: injected into the system prompt since Anthropic has no
+    response_format parameter. Output is cleaned of any accidental markdown fences.
+
+    Never raises — returns {"error": True, ...} on any failure.
+    """
+    if not ANTHROPIC_AVAILABLE or not _anthropic_sdk or not ANTHROPIC_API_KEY:
+        return {"error": True, "status": 0, "message": "Anthropic SDK/key not available"}
+
+    try:
+        system_str, anthropic_msgs = _openai_to_anthropic_messages(messages)
+
+        # Detect whether any content block is an image
+        has_vision = any(
+            isinstance(msg.get("content"), list)
+            and any(b.get("type") == "image" for b in msg["content"])
+            for msg in anthropic_msgs
+        )
+        model = (
+            os.getenv("ANTHROPIC_VISION_MODEL", "claude-sonnet-4-6")
+            if has_vision
+            else os.getenv("ANTHROPIC_TEXT_MODEL", "claude-haiku-4-5-20251001")
+        )
+
+        # Enforce JSON output via system prompt (Anthropic has no response_format param)
+        json_instruction = (
+            "\n\nCRITICAL: Your response MUST be a single valid JSON object only. "
+            "No markdown code fences, no explanation, no text before or after the JSON. "
+            "Start your response with { and end with }."
+        )
+        if system_str:
+            system_str += json_instruction
+        else:
+            system_str = "You are a helpful AI assistant." + json_instruction
+
+        client = _anthropic_sdk.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        resp = await client.messages.create(
+            model       = model,
+            max_tokens  = max_tokens,
+            temperature = temperature,
+            system      = system_str,
+            messages    = anthropic_msgs,
+        )
+
+        content = (resp.content[0].text if resp.content else "").strip()
+
+        # Strip accidental markdown fences Claude sometimes adds
+        if content.startswith("```"):
+            content = re.sub(r"^```(?:json)?\s*\n?", "", content)
+            content = re.sub(r"\n?\s*```\s*$",        "", content)
+            content = content.strip()
+
+        logging.info(
+            f"✅ Claude fallback (chat) OK — model={model} "
+            f"in={resp.usage.input_tokens} out={resp.usage.output_tokens}"
+        )
+        return {"error": False, "content": content, "provider": "anthropic", "model": model}
+
+    except Exception as exc:
+        logging.error(f"❌ Claude fallback (chat) failed: {exc}")
+        return {"error": True, "status": 0, "message": str(exc), "provider": "anthropic"}
+
+
+async def _claude_fallback_text(
+    messages:    List[Dict[str, Any]],
+    max_tokens:  int   = 220,
+    temperature: float = 0.6,
+) -> Dict[str, Any]:
+    """
+    Claude replacement for _openai_text (free-form text, no JSON enforcement).
+    Always uses claude-haiku-4-5-20251001 — cheap, fast, good enough for spoken briefs.
+    Never raises — returns {"error": True, ...} on any failure.
+    """
+    if not ANTHROPIC_AVAILABLE or not _anthropic_sdk or not ANTHROPIC_API_KEY:
+        return {"error": True, "status": 0, "message": "Anthropic SDK/key not available"}
+
+    try:
+        system_str, anthropic_msgs = _openai_to_anthropic_messages(messages)
+
+        model  = os.getenv("ANTHROPIC_TEXT_MODEL", "claude-haiku-4-5-20251001")
+        client = _anthropic_sdk.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+
+        kwargs: Dict[str, Any] = {
+            "model":       model,
+            "max_tokens":  max_tokens,
+            "temperature": temperature,
+            "messages":    anthropic_msgs,
+        }
+        if system_str:
+            kwargs["system"] = system_str
+
+        resp    = await client.messages.create(**kwargs)
+        content = (resp.content[0].text if resp.content else "").strip()
+
+        logging.info(f"✅ Claude fallback (text) OK — model={model}")
+        return {"error": False, "content": content, "provider": "anthropic", "model": model}
+
+    except Exception as exc:
+        logging.error(f"❌ Claude fallback (text) failed: {exc}")
+        return {"error": True, "status": 0, "message": str(exc), "provider": "anthropic"}
+
+
 # OpenAI helper (vision)
 # ==============================
 async def _openai_chat(messages: List[Dict[str, Any]], max_tokens: int = 1200, temperature: float = 0.1) -> Dict[str, Any]:
     if not OPENAI_API_KEY:
-        raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+        # No OpenAI key at all — go straight to Claude
+        logging.warning("⚠️  OpenAI key not set — routing _openai_chat directly to Claude fallback")
+        return await _claude_fallback_chat(messages, max_tokens=max_tokens, temperature=temperature)
 
     url = "https://api.openai.com/v1/chat/completions"
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -2916,12 +3129,26 @@ async def _openai_chat(messages: List[Dict[str, Any]], max_tokens: int = 1200, t
                 last_error = {"error": True, "status": r.status_code, "message": r.text[:700]}
                 continue
             else:
-                return {"error": True, "status": r.status_code, "message": r.text[:700]}
+                last_error = {"error": True, "status": r.status_code, "message": r.text[:700]}
+                break   # non-retryable HTTP error → go straight to Claude
         except Exception as e:
             last_error = {"error": True, "status": 0, "message": str(e)}
             if attempt < 2:
                 await asyncio.sleep(2)
             continue
+
+    # ── All OpenAI attempts exhausted — try Anthropic Claude ─────────────────
+    logging.warning(
+        f"⚠️  OpenAI failed after retries "
+        f"(status={last_error.get('status',0)}, msg={str(last_error.get('message',''))[:120]}) "
+        f"— falling back to Claude"
+    )
+    claude_result = await _claude_fallback_chat(messages, max_tokens=max_tokens, temperature=temperature)
+    if not claude_result.get("error"):
+        return claude_result
+
+    # Both providers failed — return the OpenAI error (more informative for debugging)
+    logging.error(f"❌ Both OpenAI and Claude failed. OpenAI: {last_error} | Claude: {claude_result}")
     return last_error
 
 
@@ -2931,7 +3158,8 @@ async def _openai_chat(messages: List[Dict[str, Any]], max_tokens: int = 1200, t
 async def _openai_text(messages: List[Dict[str, Any]], max_tokens: int = 220, temperature: float = 0.6) -> Dict[str, Any]:
     """Lightweight text generation helper (no JSON response_format)."""
     if not OPENAI_API_KEY:
-        return {"error": True, "status": 0, "message": "OpenAI API key not configured"}
+        logging.warning("⚠️  OpenAI key not set — routing _openai_text directly to Claude fallback")
+        return await _claude_fallback_text(messages, max_tokens=max_tokens, temperature=temperature)
 
     url = "https://api.openai.com/v1/chat/completions"
     model = os.getenv("OPENAI_TEXT_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
@@ -2953,12 +3181,23 @@ async def _openai_text(messages: List[Dict[str, Any]], max_tokens: int = 220, te
                 last_error = {"error": True, "status": r.status_code, "message": r.text[:700]}
                 continue
             else:
-                return {"error": True, "status": r.status_code, "message": r.text[:700]}
+                last_error = {"error": True, "status": r.status_code, "message": r.text[:700]}
+                break   # non-retryable → fall through to Claude
         except Exception as e:
             last_error = {"error": True, "status": 0, "message": str(e)}
             if attempt < 2:
                 await asyncio.sleep(2)
             continue
+
+    # ── All OpenAI attempts exhausted — try Anthropic Claude ─────────────────
+    logging.warning(
+        f"⚠️  OpenAI text failed (status={last_error.get('status',0)}) — falling back to Claude"
+    )
+    claude_result = await _claude_fallback_text(messages, max_tokens=max_tokens, temperature=temperature)
+    if not claude_result.get("error"):
+        return claude_result
+
+    logging.error(f"❌ Both OpenAI and Claude text failed.")
     return last_error
 
 
@@ -3774,15 +4013,22 @@ def health():
         _evict_stale_caches()
     except Exception:
         pass
+    _primary   = "openai"    if OPENAI_API_KEY     else ("anthropic" if ANTHROPIC_API_KEY else "none")
+    _fallback  = "anthropic" if (OPENAI_API_KEY and ANTHROPIC_API_KEY) else "none"
     return {
         "ok": True,
         "service": "cl-scan-api",
         "version": APP_VERSION,
         "has_openai_key": bool(OPENAI_API_KEY),
+        "has_anthropic_key": bool(ANTHROPIC_API_KEY),
+        "ai_primary": _primary,
+        "ai_fallback": _fallback,
         "has_pokemontcg_key": bool(POKEMONTCG_API_KEY),
         "has_pricecharting_token": bool(PRICECHARTING_TOKEN),
         "use_ebay_api": bool(USE_EBAY_API and EBAY_APP_ID),
         "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        "model_fallback_vision": os.getenv("ANTHROPIC_VISION_MODEL", "claude-sonnet-4-6"),
+        "model_fallback_text": os.getenv("ANTHROPIC_TEXT_MODEL", "claude-haiku-4-5-20251001"),
         "allowed_origins": ALLOWED_ORIGINS,
         "supports": ["cards", "memorabilia", "sealed_products", "market_context_click_only", "half_grades", "error_card_detection", "grading_standard_selector", "expanded_tcg_support"],
     }
