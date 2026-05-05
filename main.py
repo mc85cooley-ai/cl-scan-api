@@ -13493,85 +13493,6 @@ async def fingerprint_match(
 # CLA AI GRADE
 # ========================================
 
-# Anthropic hard limit: 5 MB (5,242,880 bytes) of raw image data.
-# Target 4 MB to leave headroom for metadata/encoding overhead.
-_ANTHROPIC_MAX_IMAGE_BYTES = 4 * 1024 * 1024  # 4 MB
-
-logging.info(f"PIL available for image compression: {PIL_AVAILABLE}")
-
-
-def _compress_b64_image(b64: str, media_type: str) -> tuple[str, str]:
-    """
-    Decode -> resize/recompress -> re-encode a base64 image so it stays under
-    Anthropic's 5 MB raw-bytes limit.  Returns (new_b64, new_media_type).
-
-    Raises ValueError if the image is oversized and PIL is unavailable, so the
-    caller can surface a clear error instead of sending a request that will 400.
-    """
-    raw = base64.b64decode(b64)
-    original_size = len(raw)
-
-    logging.info(f"_compress_b64_image: decoded {original_size:,} bytes, limit {_ANTHROPIC_MAX_IMAGE_BYTES:,}")
-
-    if original_size <= _ANTHROPIC_MAX_IMAGE_BYTES:
-        logging.info("Image within limit — no compression needed.")
-        return b64, media_type
-
-    # PIL unavailable — raise so caller returns a meaningful error
-    if not PIL_AVAILABLE:
-        raise ValueError(
-            f"Image is {original_size:,} bytes which exceeds Anthropic's 5 MB limit, "
-            "and Pillow (PIL) is not installed so automatic compression is unavailable. "
-            "Install Pillow (pip install Pillow) or reduce the image size before uploading."
-        )
-
-    # Compress with PIL
-    try:
-        img = Image.open(BytesIO(raw)).convert("RGB")
-        logging.info(f"Opened image {img.width}x{img.height} for compression.")
-        quality = 85
-        scale = 1.0
-
-        while True:
-            buf = BytesIO()
-            if scale < 1.0:
-                w = max(1, int(img.width * scale))
-                h = max(1, int(img.height * scale))
-                frame = img.resize((w, h), Image.LANCZOS)
-            else:
-                frame = img
-            frame.save(buf, format="JPEG", quality=quality, optimize=True)
-            data = buf.getvalue()
-
-            logging.info(f"Compression attempt: scale={scale:.2f} quality={quality} -> {len(data):,} bytes")
-
-            if len(data) <= _ANTHROPIC_MAX_IMAGE_BYTES:
-                new_b64 = base64.b64encode(data).decode()
-                logging.info(
-                    f"Image compressed {original_size:,} -> {len(data):,} bytes "
-                    f"(scale={scale:.2f}, quality={quality})"
-                )
-                return new_b64, "image/jpeg"
-
-            # Step down quality first, then resolution
-            if quality > 55:
-                quality -= 10
-            elif scale > 0.25:
-                scale = round(max(0.25, scale - 0.15), 2)
-            else:
-                # Absolute last resort
-                new_b64 = base64.b64encode(data).decode()
-                logging.warning(
-                    f"Could only compress to {len(data):,} bytes "
-                    f"(limit {_ANTHROPIC_MAX_IMAGE_BYTES:,}) — sending anyway."
-                )
-                return new_b64, "image/jpeg"
-
-    except Exception as exc:
-        logging.error(f"Image compression exception: {exc}")
-        raise ValueError(f"Image compression failed: {exc}") from exc
-
-
 @app.post("/api/ai-grade")
 @safe_endpoint
 async def ai_grade(request: AIGradeRequest):
@@ -13599,13 +13520,31 @@ async def ai_grade(request: AIGradeRequest):
 
             content = []
             for img in request.images:
-                compressed_b64, compressed_mt = _compress_b64_image(img.b64, img.media_type)
+                # Decode → compress to well under Anthropic's 5 MB limit → re-encode
+                try:
+                    raw_bytes = base64.b64decode(img.b64)
+                    compressed_bytes = _compress_image(raw_bytes, max_long=1200, quality=82)
+                    if len(compressed_bytes) > 3 * 1024 * 1024 and PIL_AVAILABLE:
+                        compressed_bytes = _compress_image(raw_bytes, max_long=800, quality=72)
+                    if len(compressed_bytes) > 3 * 1024 * 1024 and PIL_AVAILABLE:
+                        compressed_bytes = _compress_image(raw_bytes, max_long=600, quality=60)
+                    final_b64 = base64.b64encode(compressed_bytes).decode()
+                    final_mt  = "image/jpeg"
+                    logging.info(
+                        f"ai_grade [Anthropic] pre-compress ({img.face}): "
+                        f"{len(raw_bytes):,} → {len(compressed_bytes):,} bytes"
+                    )
+                except Exception as _ce:
+                    logging.warning(f"ai_grade Anthropic pre-compress failed ({_ce}), using original")
+                    final_b64 = img.b64
+                    final_mt  = img.media_type
+
                 content.append({
                     "type":   "image",
                     "source": {
                         "type":       "base64",
-                        "media_type": compressed_mt,
-                        "data":       compressed_b64,
+                        "media_type": final_mt,
+                        "data":       final_b64,
                     },
                 })
                 content.append({"type": "text", "text": f"This is the {img.face.upper()} face of the card."})
@@ -13663,7 +13602,25 @@ async def ai_grade(request: AIGradeRequest):
             # Build OpenAI-format content — image_url with base64 data URI
             oai_content = []
             for img in request.images:
-                compressed_b64, compressed_mt = _compress_b64_image(img.b64, img.media_type)
+                # Decode → compress to well under limits → re-encode
+                try:
+                    raw_bytes = base64.b64decode(img.b64)
+                    compressed_bytes = _compress_image(raw_bytes, max_long=1200, quality=82)
+                    if len(compressed_bytes) > 3 * 1024 * 1024 and PIL_AVAILABLE:
+                        compressed_bytes = _compress_image(raw_bytes, max_long=800, quality=72)
+                    if len(compressed_bytes) > 3 * 1024 * 1024 and PIL_AVAILABLE:
+                        compressed_bytes = _compress_image(raw_bytes, max_long=600, quality=60)
+                    final_b64 = base64.b64encode(compressed_bytes).decode()
+                    final_mt  = "image/jpeg"
+                    logging.info(
+                        f"ai_grade [OpenAI] pre-compress ({img.face}): "
+                        f"{len(raw_bytes):,} → {len(compressed_bytes):,} bytes"
+                    )
+                except Exception as _ce:
+                    logging.warning(f"ai_grade OpenAI pre-compress failed ({_ce}), using original")
+                    final_b64 = img.b64
+                    final_mt  = img.media_type
+
                 oai_content.append({
                     "type": "text",
                     "text": f"This is the {img.face.upper()} face of the card.",
@@ -13671,7 +13628,7 @@ async def ai_grade(request: AIGradeRequest):
                 oai_content.append({
                     "type": "image_url",
                     "image_url": {
-                        "url":    f"data:{compressed_mt};base64,{compressed_b64}",
+                        "url":    f"data:{final_mt};base64,{final_b64}",
                         "detail": "high",
                     },
                 })
