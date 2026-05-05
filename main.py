@@ -13493,6 +13493,71 @@ async def fingerprint_match(
 # CLA AI GRADE
 # ========================================
 
+# Anthropic hard limit: 5 MB (5,242,880 bytes) of raw image data.
+# This helper compresses a base64 image to stay safely under that limit.
+_ANTHROPIC_MAX_IMAGE_BYTES = 4 * 1024 * 1024  # 4 MB — comfortable headroom
+
+def _compress_b64_image(b64: str, media_type: str) -> tuple[str, str]:
+    """
+    Decode → resize/recompress → re-encode a base64 image so it fits within
+    Anthropic's 5 MB raw-bytes limit.  Returns (new_b64, new_media_type).
+
+    Falls back to the original data unchanged if PIL is unavailable or if the
+    image is already within the limit.
+    """
+    raw = base64.b64decode(b64)
+    if len(raw) <= _ANTHROPIC_MAX_IMAGE_BYTES:
+        return b64, media_type          # already fine — nothing to do
+
+    if not PIL_AVAILABLE:
+        # Can't compress without PIL; return as-is and let the API reject it
+        logging.warning(
+            f"⚠ Image is {len(raw):,} bytes (>{_ANTHROPIC_MAX_IMAGE_BYTES:,}) "
+            "but PIL is unavailable — cannot compress. Sending as-is."
+        )
+        return b64, media_type
+
+    try:
+        img = Image.open(BytesIO(raw)).convert("RGB")
+        quality = 88
+        scale   = 1.0
+
+        while True:
+            buf = BytesIO()
+            w = int(img.width  * scale)
+            h = int(img.height * scale)
+            resized = img.resize((w, h), Image.LANCZOS) if scale < 1.0 else img
+            resized.save(buf, format="JPEG", quality=quality, optimize=True)
+            data = buf.getvalue()
+
+            if len(data) <= _ANTHROPIC_MAX_IMAGE_BYTES:
+                new_b64 = base64.b64encode(data).decode()
+                logging.info(
+                    f"🗜 Image compressed {len(raw):,} → {len(data):,} bytes "
+                    f"(scale={scale:.2f}, quality={quality})"
+                )
+                return new_b64, "image/jpeg"
+
+            # Reduce quality first (preserves resolution), then scale down
+            if quality > 60:
+                quality -= 10
+            else:
+                scale = max(0.25, scale - 0.15)
+
+            if scale <= 0.25 and quality <= 60:
+                # Last resort — accept whatever we have
+                new_b64 = base64.b64encode(data).decode()
+                logging.warning(
+                    f"⚠ Could only compress image to {len(data):,} bytes "
+                    f"(limit {_ANTHROPIC_MAX_IMAGE_BYTES:,}) — sending anyway."
+                )
+                return new_b64, "image/jpeg"
+
+    except Exception as exc:
+        logging.warning(f"⚠ Image compression failed ({exc}) — sending original.")
+        return b64, media_type
+
+
 @app.post("/api/ai-grade")
 @safe_endpoint
 async def ai_grade(request: AIGradeRequest):
@@ -13520,12 +13585,13 @@ async def ai_grade(request: AIGradeRequest):
 
             content = []
             for img in request.images:
+                compressed_b64, compressed_mt = _compress_b64_image(img.b64, img.media_type)
                 content.append({
                     "type":   "image",
                     "source": {
                         "type":       "base64",
-                        "media_type": img.media_type,
-                        "data":       img.b64,
+                        "media_type": compressed_mt,
+                        "data":       compressed_b64,
                     },
                 })
                 content.append({"type": "text", "text": f"This is the {img.face.upper()} face of the card."})
@@ -13583,6 +13649,7 @@ async def ai_grade(request: AIGradeRequest):
             # Build OpenAI-format content — image_url with base64 data URI
             oai_content = []
             for img in request.images:
+                compressed_b64, compressed_mt = _compress_b64_image(img.b64, img.media_type)
                 oai_content.append({
                     "type": "text",
                     "text": f"This is the {img.face.upper()} face of the card.",
@@ -13590,7 +13657,7 @@ async def ai_grade(request: AIGradeRequest):
                 oai_content.append({
                     "type": "image_url",
                     "image_url": {
-                        "url":    f"data:{img.media_type};base64,{img.b64}",
+                        "url":    f"data:{compressed_mt};base64,{compressed_b64}",
                         "detail": "high",
                     },
                 })
