@@ -13494,68 +13494,82 @@ async def fingerprint_match(
 # ========================================
 
 # Anthropic hard limit: 5 MB (5,242,880 bytes) of raw image data.
-# This helper compresses a base64 image to stay safely under that limit.
-_ANTHROPIC_MAX_IMAGE_BYTES = 4 * 1024 * 1024  # 4 MB — comfortable headroom
+# Target 4 MB to leave headroom for metadata/encoding overhead.
+_ANTHROPIC_MAX_IMAGE_BYTES = 4 * 1024 * 1024  # 4 MB
+
+logging.info(f"PIL available for image compression: {PIL_AVAILABLE}")
+
 
 def _compress_b64_image(b64: str, media_type: str) -> tuple[str, str]:
     """
-    Decode → resize/recompress → re-encode a base64 image so it fits within
+    Decode -> resize/recompress -> re-encode a base64 image so it stays under
     Anthropic's 5 MB raw-bytes limit.  Returns (new_b64, new_media_type).
 
-    Falls back to the original data unchanged if PIL is unavailable or if the
-    image is already within the limit.
+    Raises ValueError if the image is oversized and PIL is unavailable, so the
+    caller can surface a clear error instead of sending a request that will 400.
     """
     raw = base64.b64decode(b64)
-    if len(raw) <= _ANTHROPIC_MAX_IMAGE_BYTES:
-        return b64, media_type          # already fine — nothing to do
+    original_size = len(raw)
 
-    if not PIL_AVAILABLE:
-        # Can't compress without PIL; return as-is and let the API reject it
-        logging.warning(
-            f"⚠ Image is {len(raw):,} bytes (>{_ANTHROPIC_MAX_IMAGE_BYTES:,}) "
-            "but PIL is unavailable — cannot compress. Sending as-is."
-        )
+    logging.info(f"_compress_b64_image: decoded {original_size:,} bytes, limit {_ANTHROPIC_MAX_IMAGE_BYTES:,}")
+
+    if original_size <= _ANTHROPIC_MAX_IMAGE_BYTES:
+        logging.info("Image within limit — no compression needed.")
         return b64, media_type
 
+    # PIL unavailable — raise so caller returns a meaningful error
+    if not PIL_AVAILABLE:
+        raise ValueError(
+            f"Image is {original_size:,} bytes which exceeds Anthropic's 5 MB limit, "
+            "and Pillow (PIL) is not installed so automatic compression is unavailable. "
+            "Install Pillow (pip install Pillow) or reduce the image size before uploading."
+        )
+
+    # Compress with PIL
     try:
         img = Image.open(BytesIO(raw)).convert("RGB")
-        quality = 88
-        scale   = 1.0
+        logging.info(f"Opened image {img.width}x{img.height} for compression.")
+        quality = 85
+        scale = 1.0
 
         while True:
             buf = BytesIO()
-            w = int(img.width  * scale)
-            h = int(img.height * scale)
-            resized = img.resize((w, h), Image.LANCZOS) if scale < 1.0 else img
-            resized.save(buf, format="JPEG", quality=quality, optimize=True)
+            if scale < 1.0:
+                w = max(1, int(img.width * scale))
+                h = max(1, int(img.height * scale))
+                frame = img.resize((w, h), Image.LANCZOS)
+            else:
+                frame = img
+            frame.save(buf, format="JPEG", quality=quality, optimize=True)
             data = buf.getvalue()
+
+            logging.info(f"Compression attempt: scale={scale:.2f} quality={quality} -> {len(data):,} bytes")
 
             if len(data) <= _ANTHROPIC_MAX_IMAGE_BYTES:
                 new_b64 = base64.b64encode(data).decode()
                 logging.info(
-                    f"🗜 Image compressed {len(raw):,} → {len(data):,} bytes "
+                    f"Image compressed {original_size:,} -> {len(data):,} bytes "
                     f"(scale={scale:.2f}, quality={quality})"
                 )
                 return new_b64, "image/jpeg"
 
-            # Reduce quality first (preserves resolution), then scale down
-            if quality > 60:
+            # Step down quality first, then resolution
+            if quality > 55:
                 quality -= 10
+            elif scale > 0.25:
+                scale = round(max(0.25, scale - 0.15), 2)
             else:
-                scale = max(0.25, scale - 0.15)
-
-            if scale <= 0.25 and quality <= 60:
-                # Last resort — accept whatever we have
+                # Absolute last resort
                 new_b64 = base64.b64encode(data).decode()
                 logging.warning(
-                    f"⚠ Could only compress image to {len(data):,} bytes "
+                    f"Could only compress to {len(data):,} bytes "
                     f"(limit {_ANTHROPIC_MAX_IMAGE_BYTES:,}) — sending anyway."
                 )
                 return new_b64, "image/jpeg"
 
     except Exception as exc:
-        logging.warning(f"⚠ Image compression failed ({exc}) — sending original.")
-        return b64, media_type
+        logging.error(f"Image compression exception: {exc}")
+        raise ValueError(f"Image compression failed: {exc}") from exc
 
 
 @app.post("/api/ai-grade")
