@@ -11452,17 +11452,19 @@ async def defect_scan(
         cv_summary_lines = []
         for z in ranked_zones[:5]:
             sev_word = {1: "minor", 2: "moderate", 3: "severe"}.get(z.get("severity", 0), "unknown")
-            cv_summary_lines.append(f"- {z.get('label','zone')} ({z.get('side','?')}): CV-detected {sev_word} anomaly")
+            cv_summary_lines.append(f"- {z.get('label','zone')} ({z.get('side','?')}): {sev_word} anomaly detected")
 
         synth_prompt = (
-            f"You are a professional card defect analyst. "
-            f"A collector has scanned a {'named ' + card_name if card_name else 'trading'} card "
-            f"{'from ' + card_set if card_set else ''}. "
-            f"Below are the defects found by CV analysis and AI ROI inspection. "
-            f"Write a clear, honest 3-5 sentence defect summary for the collector. "
-            f"Mention the most impactful issues first. Do NOT recommend a grade. "
-            f"CV findings:\n" + ("\n".join(cv_summary_lines) or "None detected") +
-            f"\nAI ROI findings:\n" + ("\n".join(defect_lines) or "No AI-confirmed defects") +
+            f"You are a professional card grading analyst writing a condition summary for a collector's certificate. "
+            f"A {'named ' + card_name if card_name else 'trading'} card "
+            f"{'from ' + card_set if card_set else ''} has been forensically examined. "
+            f"Below are the condition findings from the examination. "
+            f"Write a clear, professional 3-5 sentence condition summary. "
+            f"Focus on what was found and where. Mention the most impactful issues first. "
+            f"Do NOT reference scanning technology, computer vision, or AI systems. "
+            f"Do NOT recommend a grade. Write as a human grader describing physical condition. "
+            f"Examination findings:\n" + ("\n".join(cv_summary_lines) or "No anomalies detected") +
+            f"\nConfirmed defects:\n" + ("\n".join(defect_lines) or "None confirmed") +
             f"\nFormat: plain text, no markdown, no bullet points."
         )
         synth_res = await _openai_chat(
