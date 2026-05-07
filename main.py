@@ -11467,7 +11467,10 @@ async def defect_scan(
             f"\nConfirmed defects:\n" + ("\n".join(defect_lines) or "None confirmed") +
             f"\nFormat: plain text, no markdown, no bullet points."
         )
-        synth_res = await _openai_chat(
+        # Use _openai_text (no response_format) — this prompt asks for plain text,
+        # not JSON. Using _openai_chat here caused OpenAI 400 errors on every request
+        # because response_format=json_object requires "json" in the prompt.
+        synth_res = await _openai_text(
             [{"role": "user", "content": synth_prompt}],
             max_tokens=300,
             temperature=0.2,
