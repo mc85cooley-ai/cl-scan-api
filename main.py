@@ -2136,6 +2136,88 @@ def _b64(img: bytes) -> str:
     return base64.b64encode(img).decode("utf-8")
 
 
+def _compute_hires_dhash(raw_bytes: bytes, min_width: int = 2000) -> str:
+    """
+    Compute a 4096-bit (1024 hex char) high-resolution difference hash.
+
+    Mirrors PHP cgdna_compute_hires_dhash() in cg-dna-hires.php exactly:
+      - Resize to 65×64 grayscale → 64 columns × 64 rows of left-right comparisons
+      - 4096 bits packed as 1024 lowercase hex chars
+
+    At 1200 DPI a standard 2.5" trading card is ~3000 px wide; at 65×64 the
+    hash captures halftone dot gradient structure across the full card surface.
+
+    Two scans of the SAME physical card:  Hamming distance 0–30
+    Two DIFFERENT physical copies:         Hamming distance 80–300+
+
+    Returns '' if image width < min_width (not a hires scan) or on any error.
+    This function MUST receive the original, uncompressed image bytes.
+    Do NOT pass the output of _compress_image() — it is capped at 1200 px,
+    below the hires threshold, and the discrimination would be lost.
+
+    @param raw_bytes   Raw bytes of the uploaded image (before any compression).
+    @param min_width   Minimum image width to qualify as hires (default 2000 px).
+    """
+    if not raw_bytes or not PIL_AVAILABLE:
+        return ""
+    try:
+        im = Image.open(io.BytesIO(raw_bytes))
+        if im.width < min_width:
+            return ""                   # Low-res scan — fall back to legacy phash
+        im = im.convert("L").resize((65, 64), Image.LANCZOS)
+        bits = ""
+        for _y in range(64):
+            for _x in range(64):
+                bits += "1" if im.getpixel((_x, _y)) < im.getpixel((_x + 1, _y)) else "0"
+        return "".join(
+            format(int(bits[_i:_i + 4], 2), "x") for _i in range(0, 4096, 4)
+        ).zfill(1024)
+    except Exception as _e:
+        logging.warning("_compute_hires_dhash: failed — %s", _e)
+        return ""
+
+
+def _compute_hires_phash(
+    dhash_front:       str,
+    dhash_back:        str,
+    hires_dhash_front: str,
+    card_name:         str = "",
+    card_set:          str = "",
+    card_year:         str = "",
+    card_number:       str = "",
+) -> str:
+    """
+    Compute a physical-card-unique fingerprint hash (SHA-256).
+
+    Mirrors the phash_input construction in PHP cgd_generate_local_fingerprint()
+    after the hires fix — both files must use the IDENTICAL formula so hashes
+    computed server-side and client-side resolve to the same value.
+
+    When hires_dhash_front is non-empty, two physically different copies of the
+    same card design produce different hashes (the 4096-bit hires dHash is the
+    discriminator). When hires_dhash_front is empty the formula degrades to the
+    legacy design-level hash — identical to the old behaviour.
+
+    Field order (must match PHP exactly):
+      dhash_front | dhash_back | tile_seed | hires_dhash_front |
+      card_name | card_set | card_year | card_number
+
+    tile_seed is left empty here (tile fingerprints are not computed server-side;
+    the hires dHash alone provides sufficient discrimination between physical copies).
+    """
+    parts = [
+        dhash_front,
+        dhash_back,
+        "",                                     # tile_seed — not computed server-side
+        hires_dhash_front,                      # physical-copy discriminator
+        (card_name or "").lower().strip(),
+        (card_set  or "").lower().strip(),
+        card_year   or "",
+        card_number or "",
+    ]
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()
+
+
 def _compress_image(raw: bytes, max_long: int = 1200, quality: int = 88) -> bytes:
     """Resize to max_long px on the long edge and re-encode as JPEG.
 
@@ -11713,7 +11795,8 @@ async def defect_scan(
     else:
         # ── 6a. dHash (64-bit difference hash) — identical to PHP GD dHash ──
         # 9×8 grayscale → compare adjacent columns → 64-bit → 16-char hex.
-        # Used as both phash (primary identity) and print_dot_hash (print pixel proxy).
+        # Used as print_dot_hash (print pixel proxy). The phash is now hires-aware
+        # (see block 6a-hires below) so it can discriminate physical copies.
         try:
             _im_dhash = Image.open(io.BytesIO(front_proc)).convert("L").resize((9, 8), Image.LANCZOS)
             _bits = ""
@@ -11721,11 +11804,46 @@ async def defect_scan(
                 for _x in range(8):
                     _bits += "1" if _im_dhash.getpixel((_x, _y)) < _im_dhash.getpixel((_x + 1, _y)) else "0"
             _dhex = "".join(format(int(_bits[_i:_i+4], 2), "x") for _i in range(0, 64, 4)).zfill(16)
-            _fp["phash"]          = _dhex
-            _fp["print_dot_hash"] = _dhex  # dHash IS derived from the physical print pixels
+            _fp["print_dot_hash"] = _dhex
         except Exception as _e:
+            _dhex = ""
             _fp_errors["phash"] = str(_e)
             logging.warning("fingerprint_vectors: dHash failed — %s", _e)
+
+        # ── 6a-hires. High-res dHash (4096-bit) + hires-aware phash ──────────
+        # Computed from front_raw (original upload bytes — NOT the compressed
+        # front_proc). front_raw is available in this scope from the read at the
+        # top of defect_scan(). The hires threshold mirrors PHP: width ≥ 2000 px.
+        #
+        # WHY THIS FIXES THE FALSE POSITIVE:
+        #   The 64-bit low-res dHash (block 6a) is design-level: two physically
+        #   different copies of the same card produce IDENTICAL values because the
+        #   card artwork is the same. PHP was using this as fingerprint_hash, so
+        #   the DB match lookup short-circuited to 100% before the hires comparison
+        #   could run. By folding hires_dhash_front into the phash here, each
+        #   physical copy gets a unique fingerprint_hash in the DB — eliminating
+        #   the false confirmed_match entirely.
+        try:
+            _hires_front = _compute_hires_dhash(front_raw)   # front_raw = original bytes
+            _hires_back  = _compute_hires_dhash(back_raw)    # back_raw  = original bytes
+            _fp["hires_dhash_front"] = _hires_front
+            _fp["hires_dhash_back"]  = _hires_back
+            _fp["is_hires_scan"]     = bool(_hires_front)
+            # Hires-aware phash — unique per physical copy when hires data is present.
+            # Falls back to legacy design-level hash when image is low-res.
+            _hires_phash = _compute_hires_phash(
+                dhash_front       = _dhex,
+                dhash_back        = "",          # back dhash not computed here
+                hires_dhash_front = _hires_front,
+                card_name         = card_name or "",
+                card_set          = card_set  or "",
+            )
+            _fp["phash"] = _hires_phash
+        except Exception as _e:
+            # Hires failed — fall back to low-res phash so defect results still return
+            _fp["phash"] = _dhex
+            _fp_errors["hires_dhash"] = str(_e)
+            logging.warning("fingerprint_vectors: hires dHash failed — %s", _e)
 
         # ── 6b. Surface hash — SHA-256 of 32×32 centre crop pixel data ───────
         # Captures ink/foil micro-pattern of the card face independent of border noise.
@@ -11834,6 +11952,9 @@ async def defect_scan(
     response["border_sig_front"]     = _fp.get("border_sig_front", "")
     response["color_zones_front"]    = _fp.get("color_zones_front", {})
     response["intensity_hist_front"] = _fp.get("intensity_hist_front", [])
+    response["hires_dhash_front"]    = _fp.get("hires_dhash_front", "")
+    response["hires_dhash_back"]     = _fp.get("hires_dhash_back", "")
+    response["is_hires_scan"]        = _fp.get("is_hires_scan", False)
     response["fp_source"]            = "api" if _fp.get("phash") else "unavailable"
     # fp_errors only appears in the response when something went wrong.
     # An empty dict (all blocks succeeded) is omitted to keep the response clean.
@@ -13343,7 +13464,8 @@ async def fingerprint_generate(
     elif not front_proc:
         _fp_errors["front_proc"] = "front_proc bytes were empty"
     else:
-        # 3a. dHash — 64-bit perceptual hash
+        # 3a. dHash — 64-bit perceptual hash (design-level, used as print_dot_hash)
+        # The hires-aware phash is computed in block 3a-hires below.
         try:
             _im_dh = Image.open(io.BytesIO(front_proc)).convert("L").resize((9, 8), Image.LANCZOS)
             _bits  = ""
@@ -13351,11 +13473,33 @@ async def fingerprint_generate(
                 for _x in range(8):
                     _bits += "1" if _im_dh.getpixel((_x, _y)) < _im_dh.getpixel((_x + 1, _y)) else "0"
             _dhex = "".join(format(int(_bits[_i:_i+4], 2), "x") for _i in range(0, 64, 4)).zfill(16)
-            _fp["phash"]          = _dhex
             _fp["print_dot_hash"] = _dhex
         except Exception as _e:
+            _dhex = ""
             _fp_errors["phash"] = str(_e)
             logging.warning("fingerprint_generate: dHash failed — %s", _e)
+
+        # 3a-hires. High-res dHash (4096-bit) + hires-aware phash
+        # front_bytes here is the ORIGINAL upload (before _compress_image at line 13333).
+        # This is the only place in this function where we have access to the full-res
+        # bytes — use them before they are discarded.
+        try:
+            _hires_front = _compute_hires_dhash(front_bytes)    # original bytes, pre-compression
+            _hires_back  = _compute_hires_dhash(back_bytes) if back_bytes else ""
+            _fp["hires_dhash_front"] = _hires_front
+            _fp["hires_dhash_back"]  = _hires_back
+            _fp["is_hires_scan"]     = bool(_hires_front)
+            _fp["phash"] = _compute_hires_phash(
+                dhash_front       = _dhex,
+                dhash_back        = "",
+                hires_dhash_front = _hires_front,
+                card_name         = card_name or "",
+                card_set          = card_set  or "",
+            )
+        except Exception as _e:
+            _fp["phash"] = _dhex       # fallback to low-res phash
+            _fp_errors["hires_dhash"] = str(_e)
+            logging.warning("fingerprint_generate: hires dHash failed — %s", _e)
 
         # 3b. Surface hash — SHA-256 of 32×32 centre crop (.tobytes() fix)
         try:
@@ -13454,6 +13598,9 @@ async def fingerprint_generate(
         "border_sig_front":     _fp.get("border_sig_front", ""),
         "color_zones_front":    _fp.get("color_zones_front", {}),
         "intensity_hist_front": _fp.get("intensity_hist_front", []),
+        "hires_dhash_front":    _fp.get("hires_dhash_front", ""),
+        "hires_dhash_back":     _fp.get("hires_dhash_back", ""),
+        "is_hires_scan":        _fp.get("is_hires_scan", False),
         "fp_source":            "api" if _fp.get("phash") else "unavailable",
         "source":               "api" if _fp.get("phash") else "unavailable",
     }
