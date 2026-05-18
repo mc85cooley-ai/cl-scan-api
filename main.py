@@ -13675,19 +13675,38 @@ async def ai_grade(request: AIGradeRequest):
                 # Decode → compress to well under Anthropic's 5 MB limit → re-encode
                 try:
                     raw_bytes = base64.b64decode(img.b64)
-                    compressed_bytes = _compress_image(raw_bytes, max_long=1200, quality=82)
-                    if len(compressed_bytes) > 3 * 1024 * 1024 and PIL_AVAILABLE:
-                        compressed_bytes = _compress_image(raw_bytes, max_long=800, quality=72)
-                    if len(compressed_bytes) > 3 * 1024 * 1024 and PIL_AVAILABLE:
-                        compressed_bytes = _compress_image(raw_bytes, max_long=600, quality=60)
+                    # Scans are 1200 DPI — a standard trading card is ~3000×4200px.
+                    # Preserve native resolution for grading accuracy; corner micro-blunting
+                    # and edge micro-chipping are only visible at high pixel counts.
+                    # Compress only if needed to stay under Anthropic's 20 MB API limit.
+                    raw_size = len(raw_bytes)
+                    if raw_size <= 15 * 1024 * 1024:
+                        # Under 15 MB — send native, just re-encode to JPEG if not already
+                        try:
+                            if PIL_AVAILABLE:
+                                img_obj = Image.open(BytesIO(raw_bytes))
+                                buf = BytesIO()
+                                img_obj.save(buf, format="JPEG", quality=92)
+                                compressed_bytes = buf.getvalue()
+                            else:
+                                compressed_bytes = raw_bytes
+                        except Exception:
+                            compressed_bytes = raw_bytes
+                    else:
+                        # Over 15 MB — step down resolution until it fits
+                        compressed_bytes = _compress_image(raw_bytes, max_long=3000, quality=90)
+                        if len(compressed_bytes) > 15 * 1024 * 1024 and PIL_AVAILABLE:
+                            compressed_bytes = _compress_image(raw_bytes, max_long=2400, quality=88)
+                        if len(compressed_bytes) > 15 * 1024 * 1024 and PIL_AVAILABLE:
+                            compressed_bytes = _compress_image(raw_bytes, max_long=1800, quality=85)
                     final_b64 = base64.b64encode(compressed_bytes).decode()
                     final_mt  = "image/jpeg"
                     logging.info(
-                        f"ai_grade [Anthropic] pre-compress ({img.face}): "
-                        f"{len(raw_bytes):,} → {len(compressed_bytes):,} bytes"
+                        f"ai_grade [Anthropic] image ({img.face}): "
+                        f"raw={raw_size:,}B → sent={len(compressed_bytes):,}B"
                     )
                 except Exception as _ce:
-                    logging.warning(f"ai_grade Anthropic pre-compress failed ({_ce}), using original")
+                    logging.warning(f"ai_grade Anthropic image prep failed ({_ce}), using original")
                     final_b64 = img.b64
                     final_mt  = img.media_type
 
@@ -13700,12 +13719,12 @@ async def ai_grade(request: AIGradeRequest):
                     },
                 })
                 content.append({"type": "text", "text": f"This is the {img.face.upper()} face of the card."})
-            content.append({"type": "text", "text": "Grade this card to CLA standards. Return ONLY the JSON object — no markdown, no explanation."})
+            content.append({"type": "text", "text": "Grade this card to CLA standards. Return ONLY the JSON object — no markdown, no explanation. Ensure all fields including manufacturing.risk_indicators are populated."})
 
             client = _anthropic_sdk.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
             response = await client.messages.create(
                 model="claude-sonnet-4-6",
-                max_tokens=3000,
+                max_tokens=5000,  # Bumped from 3000 — full CLA JSON with all notes + risk indicators needs headroom
                 system=system_prompt,
                 messages=[{"role": "user", "content": content}],
             )
@@ -13729,6 +13748,18 @@ async def ai_grade(request: AIGradeRequest):
                 )
             raw_text = raw_text.replace("```json", "").replace("```", "").strip()
             grade = json.loads(raw_text)
+
+            # ── Field presence check — log warnings for any missing top-level blocks ──
+            _required_blocks = ["grade", "score_100", "subgrades", "findings", "raw_card", "content", "manufacturing", "certification", "internal_notes"]
+            _missing = [k for k in _required_blocks if k not in grade]
+            if _missing:
+                logging.warning(f"⚠ AI Grade [Anthropic] — missing fields in response: {_missing}")
+            # Check risk_indicators specifically since it's the last block and most likely to be truncated
+            _risk = grade.get("manufacturing", {}).get("risk_indicators", {})
+            if not _risk:
+                logging.warning("⚠ AI Grade [Anthropic] — manufacturing.risk_indicators is empty or missing (possible truncation)")
+            else:
+                logging.info(f"✅ AI Grade risk_indicators present: {list(_risk.keys())}")
 
             logging.info(f"✅ AI Grade [Anthropic] complete — {grade.get('grade')} / {grade.get('score_100')}")
             return JSONResponse(content={"success": True, "grade": grade, "provider": "anthropic"})
@@ -13757,16 +13788,30 @@ async def ai_grade(request: AIGradeRequest):
                 # Decode → compress to well under limits → re-encode
                 try:
                     raw_bytes = base64.b64decode(img.b64)
-                    compressed_bytes = _compress_image(raw_bytes, max_long=1200, quality=82)
-                    if len(compressed_bytes) > 3 * 1024 * 1024 and PIL_AVAILABLE:
-                        compressed_bytes = _compress_image(raw_bytes, max_long=800, quality=72)
-                    if len(compressed_bytes) > 3 * 1024 * 1024 and PIL_AVAILABLE:
-                        compressed_bytes = _compress_image(raw_bytes, max_long=600, quality=60)
+                    # Same logic as Anthropic — preserve 1200 DPI scan resolution.
+                    raw_size = len(raw_bytes)
+                    if raw_size <= 15 * 1024 * 1024:
+                        try:
+                            if PIL_AVAILABLE:
+                                img_obj = Image.open(BytesIO(raw_bytes))
+                                buf = BytesIO()
+                                img_obj.save(buf, format="JPEG", quality=92)
+                                compressed_bytes = buf.getvalue()
+                            else:
+                                compressed_bytes = raw_bytes
+                        except Exception:
+                            compressed_bytes = raw_bytes
+                    else:
+                        compressed_bytes = _compress_image(raw_bytes, max_long=3000, quality=90)
+                        if len(compressed_bytes) > 15 * 1024 * 1024 and PIL_AVAILABLE:
+                            compressed_bytes = _compress_image(raw_bytes, max_long=2400, quality=88)
+                        if len(compressed_bytes) > 15 * 1024 * 1024 and PIL_AVAILABLE:
+                            compressed_bytes = _compress_image(raw_bytes, max_long=1800, quality=85)
                     final_b64 = base64.b64encode(compressed_bytes).decode()
                     final_mt  = "image/jpeg"
                     logging.info(
-                        f"ai_grade [OpenAI] pre-compress ({img.face}): "
-                        f"{len(raw_bytes):,} → {len(compressed_bytes):,} bytes"
+                        f"ai_grade [OpenAI] image ({img.face}): "
+                        f"raw={raw_size:,}B → sent={len(compressed_bytes):,}B"
                     )
                 except Exception as _ce:
                     logging.warning(f"ai_grade OpenAI pre-compress failed ({_ce}), using original")
@@ -13786,7 +13831,11 @@ async def ai_grade(request: AIGradeRequest):
                 })
             oai_content.append({
                 "type": "text",
-                "text": "Grade this card to CLA standards. Return ONLY the JSON object — no markdown, no explanation.",
+                "text": (
+                    "Grade this card strictly following the CLA grading system defined in the system prompt. "
+                    "Every field in the JSON schema must be populated — including all manufacturing.risk_indicators values. "
+                    "Return ONLY the JSON object — no markdown, no explanation, no preamble."
+                ),
             })
 
             http = _get_http_client()
@@ -13798,7 +13847,7 @@ async def ai_grade(request: AIGradeRequest):
                 },
                 json={
                     "model":      "gpt-4o",
-                    "max_tokens": 3000,
+                    "max_tokens": 5000,  # Bumped from 3000 to match Anthropic headroom
                     "messages": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user",   "content": oai_content},
