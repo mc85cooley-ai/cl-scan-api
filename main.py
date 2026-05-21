@@ -13670,40 +13670,50 @@ async def ai_grade(request: AIGradeRequest):
         try:
             logging.info(f"🤖 AI Grade [Anthropic]: {len(request.images)} image(s) — {request.card_context!r}")
 
+            # Anthropic hard limit: 5 MB per image (raw decoded bytes)
+            ANTHROPIC_MAX_BYTES = 5 * 1024 * 1024  # 5,242,880 bytes
+
             content = []
             for img in request.images:
-                # Decode → compress to well under Anthropic's 5 MB limit → re-encode
+                # Decode → compress to under Anthropic's 5 MB limit → re-encode
                 try:
                     raw_bytes = base64.b64decode(img.b64)
-                    # Scans are 1200 DPI — a standard trading card is ~3000×4200px.
-                    # Preserve native resolution for grading accuracy; corner micro-blunting
-                    # and edge micro-chipping are only visible at high pixel counts.
-                    # Compress only if needed to stay under Anthropic's 20 MB API limit.
-                    raw_size = len(raw_bytes)
-                    if raw_size <= 15 * 1024 * 1024:
-                        # Under 15 MB — send native, just re-encode to JPEG if not already
+                    raw_size  = len(raw_bytes)
+
+                    if PIL_AVAILABLE:
+                        # Step 1: Always convert to JPEG first — removes PNG/TIFF overhead.
+                        # quality=92 keeps corner micro-blunting and edge detail visible.
                         try:
-                            if PIL_AVAILABLE:
-                                img_obj = Image.open(BytesIO(raw_bytes))
-                                buf = BytesIO()
-                                img_obj.save(buf, format="JPEG", quality=92)
-                                compressed_bytes = buf.getvalue()
-                            else:
-                                compressed_bytes = raw_bytes
+                            img_obj = Image.open(BytesIO(raw_bytes)).convert("RGB")
+                            img_obj = ImageOps.exif_transpose(img_obj)
+                            buf = BytesIO()
+                            img_obj.save(buf, format="JPEG", quality=92, optimize=True)
+                            compressed_bytes = buf.getvalue()
                         except Exception:
                             compressed_bytes = raw_bytes
-                    else:
-                        # Over 15 MB — step down resolution until it fits
-                        compressed_bytes = _compress_image(raw_bytes, max_long=3000, quality=90)
-                        if len(compressed_bytes) > 15 * 1024 * 1024 and PIL_AVAILABLE:
+
+                        # Step 2: If still over 5 MB, progressively reduce resolution.
+                        # 3000px long edge preserves enough detail for corner/edge grading.
+                        if len(compressed_bytes) > ANTHROPIC_MAX_BYTES:
+                            compressed_bytes = _compress_image(raw_bytes, max_long=3000, quality=90)
+                        if len(compressed_bytes) > ANTHROPIC_MAX_BYTES:
                             compressed_bytes = _compress_image(raw_bytes, max_long=2400, quality=88)
-                        if len(compressed_bytes) > 15 * 1024 * 1024 and PIL_AVAILABLE:
+                        if len(compressed_bytes) > ANTHROPIC_MAX_BYTES:
                             compressed_bytes = _compress_image(raw_bytes, max_long=1800, quality=85)
+                        if len(compressed_bytes) > ANTHROPIC_MAX_BYTES:
+                            compressed_bytes = _compress_image(raw_bytes, max_long=1400, quality=82)
+                        if len(compressed_bytes) > ANTHROPIC_MAX_BYTES:
+                            # Last resort — 1200px is still sufficient for grading
+                            compressed_bytes = _compress_image(raw_bytes, max_long=1200, quality=80)
+                    else:
+                        compressed_bytes = raw_bytes  # PIL unavailable — send raw
+
                     final_b64 = base64.b64encode(compressed_bytes).decode()
                     final_mt  = "image/jpeg"
                     logging.info(
                         f"ai_grade [Anthropic] image ({img.face}): "
                         f"raw={raw_size:,}B → sent={len(compressed_bytes):,}B"
+                        + (" ✅" if len(compressed_bytes) <= ANTHROPIC_MAX_BYTES else " ⚠️ STILL OVER LIMIT")
                     )
                 except Exception as _ce:
                     logging.warning(f"ai_grade Anthropic image prep failed ({_ce}), using original")
@@ -13788,25 +13798,29 @@ async def ai_grade(request: AIGradeRequest):
                 # Decode → compress to well under limits → re-encode
                 try:
                     raw_bytes = base64.b64decode(img.b64)
-                    # Same logic as Anthropic — preserve 1200 DPI scan resolution.
+                    # Same limit as Anthropic — 5 MB per image.
                     raw_size = len(raw_bytes)
-                    if raw_size <= 15 * 1024 * 1024:
+                    if PIL_AVAILABLE:
                         try:
-                            if PIL_AVAILABLE:
-                                img_obj = Image.open(BytesIO(raw_bytes))
-                                buf = BytesIO()
-                                img_obj.save(buf, format="JPEG", quality=92)
-                                compressed_bytes = buf.getvalue()
-                            else:
-                                compressed_bytes = raw_bytes
+                            img_obj = Image.open(BytesIO(raw_bytes)).convert("RGB")
+                            img_obj = ImageOps.exif_transpose(img_obj)
+                            buf = BytesIO()
+                            img_obj.save(buf, format="JPEG", quality=92, optimize=True)
+                            compressed_bytes = buf.getvalue()
                         except Exception:
                             compressed_bytes = raw_bytes
-                    else:
-                        compressed_bytes = _compress_image(raw_bytes, max_long=3000, quality=90)
-                        if len(compressed_bytes) > 15 * 1024 * 1024 and PIL_AVAILABLE:
+                        if len(compressed_bytes) > ANTHROPIC_MAX_BYTES:
+                            compressed_bytes = _compress_image(raw_bytes, max_long=3000, quality=90)
+                        if len(compressed_bytes) > ANTHROPIC_MAX_BYTES:
                             compressed_bytes = _compress_image(raw_bytes, max_long=2400, quality=88)
-                        if len(compressed_bytes) > 15 * 1024 * 1024 and PIL_AVAILABLE:
+                        if len(compressed_bytes) > ANTHROPIC_MAX_BYTES:
                             compressed_bytes = _compress_image(raw_bytes, max_long=1800, quality=85)
+                        if len(compressed_bytes) > ANTHROPIC_MAX_BYTES:
+                            compressed_bytes = _compress_image(raw_bytes, max_long=1400, quality=82)
+                        if len(compressed_bytes) > ANTHROPIC_MAX_BYTES:
+                            compressed_bytes = _compress_image(raw_bytes, max_long=1200, quality=80)
+                    else:
+                        compressed_bytes = raw_bytes
                     final_b64 = base64.b64encode(compressed_bytes).decode()
                     final_mt  = "image/jpeg"
                     logging.info(
