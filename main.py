@@ -8588,9 +8588,41 @@ class MarketPriceLookupRequest(BaseModel):
 
 # ── AI Grade request model — used by /api/ai-grade ───────────────────────────
 class AIGradeImageItem(BaseModel):
-    face:       str   # "front" or "back"
+    face:       str   # "front" / "back", or a corner-crop label like "front_corner_TL"
     b64:        str   # base64-encoded image bytes
     media_type: str   # "image/jpeg" | "image/png" | "image/webp"
+
+
+_CORNER_LABELS = {
+    "TL": "top-left",
+    "TR": "top-right",
+    "BL": "bottom-left",
+    "BR": "bottom-right",
+}
+
+def _ai_grade_caption_for_face(face: str) -> str:
+    """
+    Build the caption text sent alongside each image in /api/ai-grade.
+    Plain "front"/"back" get the original caption. Corner-crop labels
+    (e.g. "front_corner_BR", produced by cg-ai-grade.php as native-resolution
+    detail crops) get a caption that tells the model what it's looking at and
+    why — the full-card image gets downsampled before the model sees it, so
+    these crops are the real evidence for corner/edge condition, not filler.
+    """
+    m = re.match(r"^(front|back)_corner_(TL|TR|BL|BR)$", face, re.IGNORECASE)
+    if m:
+        which_face = m.group(1).upper()
+        corner_key = m.group(2).upper()
+        corner_name = _CORNER_LABELS.get(corner_key, corner_key)
+        return (
+            f"This is a zoomed, native-resolution close-up of the {which_face} face — "
+            f"{corner_name} corner, including the corner tip and the adjoining edge "
+            f"segments on both sides. The full-card image is downsampled before you see "
+            f"it and can lose fine wear at this scale; treat this crop as your primary "
+            f"evidence for corner and edge condition in this specific area."
+        )
+    return f"This is the {face.upper()} face of the card."
+
 
 class AIGradeRequest(BaseModel):
     images:        List[AIGradeImageItem]
@@ -13731,7 +13763,7 @@ async def ai_grade(request: AIGradeRequest):
                         "data":       final_b64,
                     },
                 })
-                content.append({"type": "text", "text": f"This is the {img.face.upper()} face of the card."})
+                content.append({"type": "text", "text": _ai_grade_caption_for_face(img.face)})
             content.append({"type": "text", "text": "Grade this card to CLA standards. Return ONLY the JSON object — no markdown, no explanation. Ensure all fields including manufacturing.risk_indicators are populated."})
 
             client = _anthropic_sdk.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
@@ -13828,7 +13860,7 @@ async def ai_grade(request: AIGradeRequest):
 
                 oai_content.append({
                     "type": "text",
-                    "text": f"This is the {img.face.upper()} face of the card.",
+                    "text": _ai_grade_caption_for_face(img.face),
                 })
                 oai_content.append({
                     "type": "image_url",
