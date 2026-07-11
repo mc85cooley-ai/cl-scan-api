@@ -8608,12 +8608,29 @@ def _ai_grade_caption_for_face(face: str) -> str:
     detail crops) get a caption that tells the model what it's looking at and
     why — the full-card image gets downsampled before the model sees it, so
     these crops are the real evidence for corner/edge condition, not filler.
+    A "_macro" suffix (e.g. "front_corner_BR_macro") is a second, tighter,
+    higher-magnification crop of just the outer ~9% of that same corner —
+    added because edge whitening and micro-chipping have been measured as
+    small as ~30x60px on a full scan, small enough to still be easy to miss
+    even in the wider context crop.
     """
-    m = re.match(r"^(front|back)_corner_(TL|TR|BL|BR)$", face, re.IGNORECASE)
+    m = re.match(r"^(front|back)_corner_(TL|TR|BL|BR)(_macro)?$", face, re.IGNORECASE)
     if m:
         which_face = m.group(1).upper()
         corner_key = m.group(2).upper()
+        is_macro = bool(m.group(3))
         corner_name = _CORNER_LABELS.get(corner_key, corner_key)
+        if is_macro:
+            return (
+                f"This is an EXTREME macro close-up of the {which_face} face — {corner_name} "
+                f"corner — magnified far beyond the paired context crop for this same corner. "
+                f"It exists because edge whitening and micro-chipping can be as small as a few "
+                f"dozen pixels on the original scan — easy to miss even when zoomed. Use this "
+                f"macro crop specifically to confirm or rule out whitening/chipping right at "
+                f"the corner tip and the first short stretch of each adjoining edge; use the "
+                f"paired (non-macro) context crop of this same corner to judge overall shape "
+                f"and blunting."
+            )
         return (
             f"This is a zoomed, native-resolution close-up of the {which_face} face — "
             f"{corner_name} corner, including the corner tip and the adjoining edge "
