@@ -13770,6 +13770,10 @@ async def ai_grade(request: AIGradeRequest):
             response = await client.messages.create(
                 model="claude-sonnet-4-6",
                 max_tokens=5000,  # Bumped from 3000 — full CLA JSON with all notes + risk indicators needs headroom
+                temperature=0.0,  # Forensic grading must be as consistent as possible run-to-run on
+                                  # identical images — this was previously unset (API default 1.0,
+                                  # max randomness), which is very likely why the same submission was
+                                  # observed swinging between Grade 10 and Grade 8 across repeated runs.
                 system=system_prompt,
                 messages=[{"role": "user", "content": content}],
             )
@@ -13886,8 +13890,10 @@ async def ai_grade(request: AIGradeRequest):
                     "Content-Type":  "application/json",
                 },
                 json={
-                    "model":      "gpt-4o",
-                    "max_tokens": 5000,  # Bumped from 3000 to match Anthropic headroom
+                    "model":       "gpt-4o",
+                    "max_tokens":  5000,  # Bumped from 3000 to match Anthropic headroom
+                    "temperature": 0.0,   # Match the Anthropic path — grading should be as
+                                          # consistent as possible run-to-run, not creative.
                     "messages": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user",   "content": oai_content},
