@@ -8668,7 +8668,13 @@ def _ai_grade_caption_for_face(face: str) -> str:
 class AIGradeRequest(BaseModel):
     images:        List[AIGradeImageItem]
     card_context:  Optional[str] = ""    # "Card Name | Set | Number"
-    system_prompt: Optional[str] = ""   # built by PHP, passed through verbatim
+    system_prompt: Optional[str] = ""   # built by PHP, passed through verbatim — STATIC, cacheable
+    card_brief:    Optional[str] = ""
+    # card_brief carries everything specific to this submission (identity, measured
+    # centering, assessment date, grader directives). It is deliberately NOT in the
+    # system prompt: caching matches on the prompt prefix, so a single interpolated
+    # card name would make the whole ~15,500-token methodology uncacheable and
+    # re-billed at full rate on every grade.
     dual_run:      Optional[bool] = False
     # dual_run: grade the same images twice concurrently and report where the two
     # assessments disagree. Run A (temperature 0.0) is what gets returned; run B
@@ -13725,6 +13731,45 @@ async def fingerprint_match(
 # CLA AI GRADE
 # ========================================
 
+# ── Image sizing for Claude's vision encoder ──────────────────────────────────
+# Claude sees images as 28x28 patches, so an image costs ceil(w/28) * ceil(h/28)
+# visual tokens. Anything over the model's visual-token budget OR its long-edge
+# limit is downscaled by the API BEFORE processing — which means oversized uploads
+# buy nothing. Per Anthropic's own vision guidance, an image that has to be resized
+# increases time-to-first-token without giving any additional model performance.
+#
+# A 1519x2143 card scan arrives at the encoder as roughly 924x1304 no matter what.
+# Resizing to the fitted size before upload sends the model an identical picture
+# while cutting payload bytes, Render CPU and latency.
+CLAUDE_VISUAL_TOKEN_BUDGET = 1568
+CLAUDE_LONG_EDGE_LIMIT     = 1568
+
+
+def _claude_visual_tokens(w: int, h: int) -> int:
+    return math.ceil(w / 28) * math.ceil(h / 28)
+
+
+def _claude_vision_fit(w: int, h: int) -> Tuple[int, int, bool]:
+    """
+    Largest size preserving aspect ratio that the API will accept without
+    downscaling. Returns (width, height, would_have_been_resized).
+    """
+    if w <= 0 or h <= 0:
+        return w, h, False
+    if max(w, h) <= CLAUDE_LONG_EDGE_LIMIT and _claude_visual_tokens(w, h) <= CLAUDE_VISUAL_TOKEN_BUDGET:
+        return w, h, False
+
+    lo, hi = 0.01, 1.0
+    for _ in range(50):                      # binary search on the scale factor
+        mid = (lo + hi) / 2
+        tw, th = max(1, int(w * mid)), max(1, int(h * mid))
+        if max(tw, th) <= CLAUDE_LONG_EDGE_LIMIT and _claude_visual_tokens(tw, th) <= CLAUDE_VISUAL_TOKEN_BUDGET:
+            lo = mid
+        else:
+            hi = mid
+    return max(1, int(w * lo)), max(1, int(h * lo)), True
+
+
 def _openai_responses_text(data: Dict[str, Any]) -> str:
     """
     Pull the assistant text out of a Responses API payload.
@@ -13850,17 +13895,12 @@ async def ai_grade(request: AIGradeRequest):
             # crops are all well under 1000px, but the full-card images (3000px) and
             # the paired border composites are not — so when the batch crosses the
             # threshold the ceiling has to be applied to every image in it.
-            ANTHROPIC_MANY_IMAGE_COUNT = 20
-            ANTHROPIC_MANY_IMAGE_EDGE  = 1900   # 2000 is the limit; leave headroom
-            _many_images = len(request.images) > ANTHROPIC_MANY_IMAGE_COUNT
-            _max_edge    = ANTHROPIC_MANY_IMAGE_EDGE if _many_images else 3000
-            if _many_images:
-                logging.info(
-                    f"ai_grade [Anthropic]: {len(request.images)} images exceeds the "
-                    f"{ANTHROPIC_MANY_IMAGE_COUNT}-image threshold — capping every image at "
-                    f"{ANTHROPIC_MANY_IMAGE_EDGE}px on the long edge to satisfy the 2000px "
-                    f"many-image limit"
-                )
+            # Every image is fitted to the vision encoder's own limits below, which
+            # lands well under 1568px on the long edge — comfortably inside the 2000px
+            # many-image ceiling too, so that ceiling can no longer be breached and the
+            # image count is free to exceed 20 without any forced quality reduction.
+            _many_images = len(request.images) > 20
+            _max_edge    = CLAUDE_LONG_EDGE_LIMIT
 
             if not PIL_AVAILABLE:
                 raise ValueError(
@@ -13870,28 +13910,51 @@ async def ai_grade(request: AIGradeRequest):
                 )
 
             content = []
+
+            # Card brief first: it tells the model what it is looking at and hands it
+            # the measured centering before it sees a single pixel. Kept out of the
+            # system prompt so the system prompt stays cacheable.
+            if request.card_brief:
+                content.append({"type": "text", "text": request.card_brief})
+
             for img in request.images:
                 # Decode → resize → compress to under Anthropic's 5 MB limit → re-encode
                 try:
                     raw_bytes = base64.b64decode(img.b64)
                     raw_size  = len(raw_bytes)
 
-                    # Resize to the ceiling for this batch first. This preserves corner
-                    # micro-blunting and edge detail for grading while reliably reducing
-                    # file size for typical 600–1200 DPI scans. Unlike a quality-only
-                    # pass, resizing always produces a smaller output.
-                    compressed_bytes = _compress_image(raw_bytes, max_long=_max_edge, quality=90)
+                    # Fit to the encoder's limits. The API would downscale to exactly
+                    # this size anyway, so the model receives an identical picture —
+                    # this just stops us paying the latency and bandwidth to ship
+                    # pixels that get thrown away on arrival.
+                    _fit_long = _max_edge
+                    if PIL_AVAILABLE:
+                        try:
+                            with Image.open(io.BytesIO(raw_bytes)) as _probe:
+                                _pw, _ph = _probe.size
+                            _tw, _th, _would_resize = _claude_vision_fit(_pw, _ph)
+                            _fit_long = max(_tw, _th)
+                            if _would_resize:
+                                logging.info(
+                                    f"ai_grade [Anthropic] {img.face}: {_pw}x{_ph} → {_tw}x{_th} "
+                                    f"({_claude_visual_tokens(_tw, _th)} visual tokens) — the API would "
+                                    f"have downscaled to this regardless"
+                                )
+                        except Exception as _fe:
+                            logging.warning(f"ai_grade [Anthropic] {img.face}: could not probe size ({_fe})")
+
+                    compressed_bytes = _compress_image(raw_bytes, max_long=_fit_long, quality=90)
 
                     # Progressive fallback — each step drops ~30–40% more size. Every
                     # step is clamped to _max_edge so a large image can never climb back
                     # over the many-image dimension limit.
                     for _step_edge, _step_q in (
-                        (2400, 87), (1800, 85), (1400, 82), (1200, 80), (900, 75)
+                        (1400, 87), (1200, 85), (1000, 82), (900, 78), (700, 72)
                     ):
                         if len(compressed_bytes) <= ANTHROPIC_MAX_BYTES:
                             break
                         compressed_bytes = _compress_image(
-                            raw_bytes, max_long=min(_step_edge, _max_edge), quality=_step_q
+                            raw_bytes, max_long=min(_step_edge, _fit_long), quality=_step_q
                         )
 
                     if len(compressed_bytes) > ANTHROPIC_MAX_BYTES:
@@ -13915,7 +13978,7 @@ async def ai_grade(request: AIGradeRequest):
                     logging.warning(f"ai_grade Anthropic image prep failed ({_ce}) — attempting hard resize")
                     try:
                         _salvaged = _compress_image(
-                            base64.b64decode(img.b64), max_long=min(1200, _max_edge), quality=80
+                            base64.b64decode(img.b64), max_long=min(1200, CLAUDE_LONG_EDGE_LIMIT), quality=80
                         )
                         final_b64 = base64.b64encode(_salvaged).decode()
                         final_mt  = "image/jpeg"
@@ -13950,7 +14013,16 @@ async def ai_grade(request: AIGradeRequest):
                                        # unset (API default 1.0, max randomness), which is very likely
                                        # why the same submission was observed swinging between Grade 10
                                        # and Grade 8 across repeated runs.
-                    system=system_prompt,
+                    # Cache breakpoint at the end of the system prompt. The block is
+                    # ~15,500 tokens and byte-identical on every grade, so without this
+                    # it is re-billed in full every single time. A cache hit costs 10%
+                    # of the input rate, and cache reads are excluded from the
+                    # input-tokens-per-minute rate limit as well.
+                    system=[{
+                        "type": "text",
+                        "text": system_prompt,
+                        "cache_control": {"type": "ephemeral"},
+                    }],
                     messages=[{"role": "user", "content": content}],
                 )
 
@@ -13971,6 +14043,25 @@ async def ai_grade(request: AIGradeRequest):
                         f"Empty Anthropic response (stop_reason={getattr(response, 'stop_reason', '?')}, "
                         f"blocks={[getattr(b, 'type', '?') for b in response.content]})"
                     )
+                # Ground truth on cost, so nobody has to rely on an estimate.
+                try:
+                    u   = response.usage
+                    _cw = getattr(u, "cache_creation_input_tokens", 0) or 0
+                    _cr = getattr(u, "cache_read_input_tokens", 0) or 0
+                    _in = getattr(u, "input_tokens", 0) or 0
+                    if _cr:
+                        _state = "CACHE HIT"
+                    elif _cw:
+                        _state = "cache written (first grade in this window)"
+                    else:
+                        _state = "NO CACHE — check the system prompt is byte-identical between calls"
+                    logging.info(
+                        f"ai_grade [Anthropic] usage: uncached_in={_in:,} cache_write={_cw:,} "
+                        f"cache_read={_cr:,} out={getattr(u, 'output_tokens', 0):,} — {_state}"
+                    )
+                except Exception:
+                    pass
+
                 text = text.replace("```json", "").replace("```", "").strip()
                 return json.loads(text)
 
@@ -14090,6 +14181,10 @@ async def ai_grade(request: AIGradeRequest):
             # Completions (secondary). Same images, same captions, different envelope.
             oai_input   = []   # Responses API
             oai_content = []   # Chat Completions
+
+            if request.card_brief:
+                oai_input.append({"type": "input_text", "text": request.card_brief})
+                oai_content.append({"type": "text",     "text": request.card_brief})
             for img in request.images:
                 # Decode → compress to well under limits → re-encode
                 try:
