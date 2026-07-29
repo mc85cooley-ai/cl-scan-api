@@ -13923,27 +13923,60 @@ async def ai_grade(request: AIGradeRequest):
                     raw_bytes = base64.b64decode(img.b64)
                     raw_size  = len(raw_bytes)
 
-                    # Fit to the encoder's limits. The API would downscale to exactly
-                    # this size anyway, so the model receives an identical picture —
-                    # this just stops us paying the latency and bandwidth to ship
-                    # pixels that get thrown away on arrival.
-                    _fit_long = _max_edge
+                    # SIZING POLICY — read the comment before changing this.
+                    #
+                    # The API downscales anything over the vision encoder's limits, so
+                    # pre-resizing to the fitted size looks free. It is NOT free: it
+                    # adds a SECOND lossy generation. Our pipeline would be
+                    # decode -> Lanczos -> JPEG re-encode -> API decode, where sending
+                    # the original is decode -> API resample, one generation from the
+                    # highest-quality data available.
+                    #
+                    # That extra generation lands on the full-card images, and the full
+                    # card is the primary evidence for the SURFACE category — faint
+                    # hairline scratches and foil texture are low-contrast
+                    # high-frequency features, exactly what re-encoding damages and
+                    # exactly where JPEG ringing can be misread AS a defect. Grades
+                    # dropped when this was applied unconditionally, surface worst.
+                    #
+                    # So: only pre-resize genuinely oversized uploads, where the payload
+                    # and latency saving is large enough to be worth one generation.
+                    # Normal scans pass through untouched and the API resamples once.
+                    PRERESIZE_EDGE_THRESHOLD  = 2400              # px on the long edge
+                    PRERESIZE_BYTES_THRESHOLD = 3 * 1024 * 1024   # or over 3 MB
+
+                    _fit_long   = None
+                    _passthru   = True
                     if PIL_AVAILABLE:
                         try:
                             with Image.open(io.BytesIO(raw_bytes)) as _probe:
                                 _pw, _ph = _probe.size
-                            _tw, _th, _would_resize = _claude_vision_fit(_pw, _ph)
-                            _fit_long = max(_tw, _th)
-                            if _would_resize:
+                            if max(_pw, _ph) > PRERESIZE_EDGE_THRESHOLD or raw_size > PRERESIZE_BYTES_THRESHOLD:
+                                _tw, _th, _ = _claude_vision_fit(_pw, _ph)
+                                _fit_long = max(_tw, _th)
+                                _passthru = False
                                 logging.info(
-                                    f"ai_grade [Anthropic] {img.face}: {_pw}x{_ph} → {_tw}x{_th} "
-                                    f"({_claude_visual_tokens(_tw, _th)} visual tokens) — the API would "
-                                    f"have downscaled to this regardless"
+                                    f"ai_grade [Anthropic] {img.face}: {_pw}x{_ph} oversized "
+                                    f"({raw_size:,}B) → pre-resizing to {_tw}x{_th}"
+                                )
+                            else:
+                                logging.info(
+                                    f"ai_grade [Anthropic] {img.face}: {_pw}x{_ph} ({raw_size:,}B) "
+                                    f"sent as-is — the API resamples once from the original"
                                 )
                         except Exception as _fe:
                             logging.warning(f"ai_grade [Anthropic] {img.face}: could not probe size ({_fe})")
+                            _passthru = False
+                            _fit_long = CLAUDE_LONG_EDGE_LIMIT
 
-                    compressed_bytes = _compress_image(raw_bytes, max_long=_fit_long, quality=90)
+                    if _passthru and raw_size <= ANTHROPIC_MAX_BYTES:
+                        compressed_bytes = raw_bytes
+                    else:
+                        # quality 95, not 90: if we must add a generation, spend bytes
+                        # rather than surface detail.
+                        compressed_bytes = _compress_image(
+                            raw_bytes, max_long=(_fit_long or CLAUDE_LONG_EDGE_LIMIT), quality=95
+                        )
 
                     # Progressive fallback — each step drops ~30–40% more size. Every
                     # step is clamped to _max_edge so a large image can never climb back
@@ -13954,7 +13987,9 @@ async def ai_grade(request: AIGradeRequest):
                         if len(compressed_bytes) <= ANTHROPIC_MAX_BYTES:
                             break
                         compressed_bytes = _compress_image(
-                            raw_bytes, max_long=min(_step_edge, _fit_long), quality=_step_q
+                            raw_bytes,
+                            max_long=min(_step_edge, _fit_long or CLAUDE_LONG_EDGE_LIMIT),
+                            quality=_step_q,
                         )
 
                     if len(compressed_bytes) > ANTHROPIC_MAX_BYTES:
