@@ -13725,6 +13725,52 @@ async def fingerprint_match(
 # CLA AI GRADE
 # ========================================
 
+def _openai_responses_text(data: Dict[str, Any]) -> str:
+    """
+    Pull the assistant text out of a Responses API payload.
+
+    The output array interleaves reasoning items with message items, so indexing
+    into it positionally is wrong — reasoning usually comes first and carries no
+    text. This walks by item type and concatenates only message text.
+    """
+    if not isinstance(data, dict):
+        return ""
+
+    text = (data.get("output_text") or "").strip()
+    if text:
+        return text
+
+    parts: List[str] = []
+    for item in (data.get("output") or []):
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        for c in (item.get("content") or []):
+            if isinstance(c, dict) and c.get("type") in ("output_text", "text") and c.get("text"):
+                parts.append(c["text"])
+    return "\n".join(parts).strip()
+
+
+# ── OpenAI fallback configuration ─────────────────────────────────────────────
+# GPT-4o was retired from ChatGPT in Feb 2026 and is legacy in the API. The
+# fallback now targets the GPT-5.6 family, which is reasoning-capable and reached
+# through the Responses API (Chat Completions still accepts these models and is
+# kept as a secondary path below).
+#
+# Env-overridable so the model can be changed without a redeploy of this file:
+#   OPENAI_GRADE_MODEL       default gpt-5.6-terra  (balanced tier, $2.50/$15 per MTok)
+#   OPENAI_GRADE_REASONING   default low           (none|low|medium|high|xhigh|max)
+#   OPENAI_GRADE_MAX_OUTPUT  default 10000         (reasoning tokens bill as output
+#                                                   and consume this budget BEFORE
+#                                                   the JSON is written, so this has
+#                                                   to be well above the ~3k the
+#                                                   grading JSON itself needs)
+#   OPENAI_GRADE_MAX_EDGE    default 0 = automatic by batch size
+OPENAI_GRADE_MODEL      = os.getenv("OPENAI_GRADE_MODEL", "gpt-5.6-terra")
+OPENAI_GRADE_REASONING  = os.getenv("OPENAI_GRADE_REASONING", "low")
+OPENAI_GRADE_MAX_OUTPUT = int(os.getenv("OPENAI_GRADE_MAX_OUTPUT", "10000"))
+OPENAI_GRADE_MAX_EDGE   = int(os.getenv("OPENAI_GRADE_MAX_EDGE", "0"))
+
+
 # ── Dual-run comparison — used by /api/ai-grade when dual_run is requested ────
 DUAL_RUN_TOLERANCE = 0.3   # subgrade delta above which a category needs in-hand review
 
@@ -14008,37 +14054,42 @@ async def ai_grade(request: AIGradeRequest):
             # attempted and failed.
             OPENAI_MAX_BYTES = 5 * 1024 * 1024
 
-            # GPT-4o charges per 512px tile, so token cost scales with image AREA.
-            # A large batch has to be sized down aggressively or the request breaches
-            # the account's tokens-per-minute ceiling before it is ever evaluated.
+            # Token cost scales with image AREA, so a large batch has to be sized
+            # down or the request breaches the account's tokens-per-minute ceiling
+            # before it is ever evaluated. Vision guidance puts the useful range at
+            # roughly 1024–2048px, so these tiers stay inside it where they can.
             _n_img = len(request.images)
-            if   _n_img > 20: _oai_edge = 1000
+            if OPENAI_GRADE_MAX_EDGE > 0:
+                _oai_edge = OPENAI_GRADE_MAX_EDGE
+            elif _n_img > 20: _oai_edge = 1000
             elif _n_img > 12: _oai_edge = 1400
             elif _n_img > 6:  _oai_edge = 2000
             else:             _oai_edge = 3000
 
-            # Pre-flight estimate so a TPM rejection is diagnosable from the log
-            # rather than appearing as an opaque provider error.
-            _tiles_per_img = math.ceil(_oai_edge * 0.71 / 512) * math.ceil(_oai_edge / 512)
-            _est_img_tokens = _n_img * (_tiles_per_img * 170 + 85)
+            # Pre-flight so a TPM rejection is diagnosable from the log rather than
+            # appearing as an opaque provider error. Only the PROMPT side is
+            # estimated: image tokenisation differs between model families and is
+            # not something to assert a formula for, so it is reported as size only.
             _est_prompt_tokens = len(system_prompt) // 4
-            _est_total = _est_img_tokens + _est_prompt_tokens + 5000
             logging.info(
-                f"ai_grade [OpenAI] pre-flight: {_n_img} images at {_oai_edge}px "
-                f"≈ {_est_img_tokens:,} image tokens + {_est_prompt_tokens:,} prompt tokens "
-                f"≈ {_est_total:,} total"
+                f"ai_grade [OpenAI] pre-flight: model={OPENAI_GRADE_MODEL} "
+                f"reasoning={OPENAI_GRADE_REASONING} max_output={OPENAI_GRADE_MAX_OUTPUT} — "
+                f"{_n_img} images capped at {_oai_edge}px, system prompt "
+                f"~{_est_prompt_tokens:,} tokens"
             )
-            if _est_total > 30000:
+            if _est_prompt_tokens + OPENAI_GRADE_MAX_OUTPUT > 25000:
                 logging.warning(
-                    f"⚠ ai_grade [OpenAI] estimated {_est_total:,} tokens. If this account's "
-                    f"tokens-per-minute limit is below that, the fallback WILL be rejected "
-                    f"regardless of image sizing — the system prompt alone is "
-                    f"~{_est_prompt_tokens:,} tokens. Raise the OpenAI TPM limit to use the "
-                    f"fallback with batches this size."
+                    f"⚠ ai_grade [OpenAI] the system prompt (~{_est_prompt_tokens:,} tokens) plus "
+                    f"the {OPENAI_GRADE_MAX_OUTPUT:,}-token output budget already accounts for most "
+                    f"of a low tokens-per-minute allowance BEFORE any image tokens. If this "
+                    f"account is on a low usage tier the fallback will be rejected regardless of "
+                    f"image sizing — raise the tier or the per-model TPM limit."
                 )
 
-            # Build OpenAI-format content — image_url with base64 data URI
-            oai_content = []
+            # Build content in both formats: Responses API (primary) and Chat
+            # Completions (secondary). Same images, same captions, different envelope.
+            oai_input   = []   # Responses API
+            oai_content = []   # Chat Completions
             for img in request.images:
                 # Decode → compress to well under limits → re-encode
                 try:
@@ -14067,56 +14118,129 @@ async def ai_grade(request: AIGradeRequest):
                     final_b64 = img.b64
                     final_mt  = img.media_type
 
-                oai_content.append({
-                    "type": "text",
-                    "text": _ai_grade_caption_for_face(img.face),
+                _caption  = _ai_grade_caption_for_face(img.face)
+                _data_url = f"data:{final_mt};base64,{final_b64}"
+
+                # Responses API shape: input_image takes image_url as a plain data-URL
+                # STRING, not the nested {"url": ...} object Chat Completions uses.
+                oai_input.append({"type": "input_text",  "text": _caption})
+                oai_input.append({
+                    "type":      "input_image",
+                    "image_url": _data_url,
+                    "detail":    "high",
                 })
+
+                # Chat Completions shape, kept for the secondary path below.
+                oai_content.append({"type": "text", "text": _caption})
                 oai_content.append({
                     "type": "image_url",
-                    "image_url": {
-                        "url":    f"data:{final_mt};base64,{final_b64}",
-                        "detail": "high",
-                    },
+                    "image_url": {"url": _data_url, "detail": "high"},
                 })
-            oai_content.append({
-                "type": "text",
-                "text": (
-                    "Grade this card strictly following the CLA grading system defined in the system prompt. "
-                    "Every field in the JSON schema must be populated — including all manufacturing.risk_indicators values. "
-                    "Return ONLY the JSON object — no markdown, no explanation, no preamble."
-                ),
-            })
+
+            _closing = (
+                "Grade this card strictly following the CLA grading system defined in the system prompt. "
+                "Every field in the JSON schema must be populated — including all manufacturing.risk_indicators values. "
+                "Return ONLY the JSON object — no markdown, no explanation, no preamble."
+            )
+            oai_input.append({"type": "input_text", "text": _closing})
+            oai_content.append({"type": "text",     "text": _closing})
 
             http = _get_http_client()
-            oai_resp = await http.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "Content-Type":  "application/json",
-                },
-                json={
-                    "model":       "gpt-4o",
-                    "max_tokens":  5000,  # Bumped from 3000 to match Anthropic headroom
-                    "temperature": 0.0,   # Match the Anthropic path — grading should be as
-                                          # consistent as possible run-to-run, not creative.
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user",   "content": oai_content},
-                    ],
-                },
-                timeout=60.0,
-            )
+            _oai_headers = {
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type":  "application/json",
+            }
 
-            oai_data = oai_resp.json()
-            if "choices" not in oai_data:
-                err = oai_data.get("error", {}).get("message", str(oai_data))
-                raise Exception(f"OpenAI API error: {err}")
-            raw_text = oai_data["choices"][0]["message"]["content"].strip()
+            # NOTE: no temperature on either path. The GPT-5.6 family are reasoning
+            # models and control determinism through reasoning effort, not sampling
+            # temperature; sending it risks a parameter rejection for no benefit.
+
+            raw_text  = None
+            _via      = None
+            _shape_err = None
+
+            # ── Primary: Responses API ────────────────────────────────────────
+            try:
+                resp_body = {
+                    "model":        OPENAI_GRADE_MODEL,
+                    "instructions": system_prompt,
+                    "input": [
+                        {"role": "user", "content": oai_input},
+                    ],
+                    "reasoning":         {"effort": OPENAI_GRADE_REASONING},
+                    "max_output_tokens": OPENAI_GRADE_MAX_OUTPUT,
+                }
+                r = await http.post(
+                    "https://api.openai.com/v1/responses",
+                    headers=_oai_headers, json=resp_body, timeout=120.0,
+                )
+                data = r.json()
+
+                if isinstance(data, dict) and data.get("error"):
+                    raise ValueError(data["error"].get("message", str(data["error"])))
+
+                text = _openai_responses_text(data)
+                if not text:
+                    raise ValueError(
+                        f"no text in Responses output (status={data.get('status')}, "
+                        f"incomplete={data.get('incomplete_details')}). If status is "
+                        f"'incomplete' the reasoning tokens consumed the whole output budget — "
+                        f"raise OPENAI_GRADE_MAX_OUTPUT or lower OPENAI_GRADE_REASONING."
+                    )
+                raw_text = text
+                _via     = "responses"
+                logging.info(f"ai_grade [OpenAI] responded via Responses API ({OPENAI_GRADE_MODEL})")
+
+            except Exception as _re:
+                _shape_err = str(_re)
+                logging.warning(
+                    f"⚠ ai_grade [OpenAI] Responses API path failed ({_re}) — "
+                    f"retrying the same model through Chat Completions"
+                )
+
+            # ── Secondary: Chat Completions, same model ───────────────────────
+            if raw_text is None:
+                oai_resp = await http.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers=_oai_headers,
+                    json={
+                        "model":                 OPENAI_GRADE_MODEL,
+                        "max_completion_tokens": OPENAI_GRADE_MAX_OUTPUT,
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user",   "content": oai_content},
+                        ],
+                    },
+                    timeout=120.0,
+                )
+                oai_data = oai_resp.json()
+                if "choices" not in oai_data:
+                    err = oai_data.get("error", {}).get("message", str(oai_data))
+                    raise Exception(
+                        f"OpenAI API error: {err}"
+                        + (f" (Responses API also failed: {_shape_err})" if _shape_err else "")
+                    )
+                raw_text = (oai_data["choices"][0]["message"].get("content") or "").strip()
+                _via     = "chat_completions"
+
             raw_text = raw_text.replace("```json", "").replace("```", "").strip()
             grade = json.loads(raw_text)
 
-            logging.info(f"✅ AI Grade [OpenAI] complete — {grade.get('grade')} / {grade.get('score_100')}")
-            return JSONResponse(content={"success": True, "grade": grade, "provider": "openai_fallback"})
+            logging.info(
+                f"✅ AI Grade [OpenAI] complete via {_via} — "
+                f"{grade.get('grade')} / {grade.get('score_100')}"
+            )
+            return JSONResponse(content={
+                "success": True,
+                "grade":   grade,
+                # Surfaced so the grader can see this certificate was NOT produced by
+                # the primary grader. A different model grades to a different standard,
+                # which matters in a registry whose value is consistency.
+                "provider":        "openai_fallback",
+                "provider_model":  OPENAI_GRADE_MODEL,
+                "provider_via":    _via,
+                "dual_run_report": None,
+            })
 
         except json.JSONDecodeError as e:
             msg = f"OpenAI response JSON parse failed: {e}"
