@@ -8614,6 +8614,30 @@ def _ai_grade_caption_for_face(face: str) -> str:
     small as ~30x60px on a full scan, small enough to still be easy to miss
     even in the wider context crop.
     """
+    b = re.match(r"^(front|back)_border_(LR|TB)$", face, re.IGNORECASE)
+    if b:
+        which_face = b.group(1).upper()
+        pair = b.group(2).upper()
+        if pair == "LR":
+            return (
+                f"This is a paired border composite for the {which_face} face. The card's LEFT "
+                f"border strip is on the left of this image and its RIGHT border strip is on the "
+                f"right, separated by a dark gutter. Both strips are shown at IDENTICAL "
+                f"magnification, so their widths are directly comparable — measure the printed "
+                f"border thickness in each strip and report the ratio. This composite exists "
+                f"because the automatic border measurement could not resolve a border ring on "
+                f"this face (usually a full-art card), so horizontal centering for this face has "
+                f"to come from you. Do not estimate from the whole-card image; use these strips."
+            )
+        return (
+            f"This is a paired border composite for the {which_face} face. The card's TOP border "
+            f"strip is above the dark gutter and its BOTTOM border strip is below it, both at "
+            f"IDENTICAL magnification so their widths are directly comparable. Measure the "
+            f"printed border thickness in each and report the ratio. Vertical centering for this "
+            f"face has to come from you because the automatic measurement could not resolve a "
+            f"border ring here. Do not estimate from the whole-card image; use these strips."
+        )
+
     m = re.match(r"^(front|back)_corner_(TL|TR|BL|BR)(_macro)?$", face, re.IGNORECASE)
     if m:
         which_face = m.group(1).upper()
@@ -8645,6 +8669,13 @@ class AIGradeRequest(BaseModel):
     images:        List[AIGradeImageItem]
     card_context:  Optional[str] = ""    # "Card Name | Set | Number"
     system_prompt: Optional[str] = ""   # built by PHP, passed through verbatim
+    dual_run:      Optional[bool] = False
+    # dual_run: grade the same images twice concurrently and report where the two
+    # assessments disagree. Run A (temperature 0.0) is what gets returned; run B
+    # (temperature 0.4) is an independent challenger — at matched temperature the
+    # two runs would agree trivially and the check would be worthless. Any
+    # subgrade differing by more than DUAL_RUN_TOLERANCE is surfaced as needing
+    # in-hand review rather than being averaged away.
 
 
 # ========================================
@@ -13694,6 +13725,51 @@ async def fingerprint_match(
 # CLA AI GRADE
 # ========================================
 
+# ── Dual-run comparison — used by /api/ai-grade when dual_run is requested ────
+DUAL_RUN_TOLERANCE = 0.3   # subgrade delta above which a category needs in-hand review
+
+
+def _ai_grade_compare_runs(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Compare two independent grading passes over the same images.
+
+    Deliberately does NOT average them. An average of two disagreeing forensic
+    assessments is a number neither assessment supports; the disagreement itself
+    is the finding, and it is reported so the category can be looked at in hand.
+    Centering is excluded because it is measured server-side, not assessed here.
+    """
+    sa = a.get("subgrades") or {}
+    sb = b.get("subgrades") or {}
+
+    deltas: Dict[str, Any] = {}
+    disagreements: List[str] = []
+
+    for cat in ("corners", "edges", "surface"):
+        va, vb = sa.get(cat), sb.get(cat)
+        try:
+            va_f, vb_f = float(va), float(vb)
+        except (TypeError, ValueError):
+            continue
+        d = round(abs(va_f - vb_f), 2)
+        deltas[cat] = {"run_a": va_f, "run_b": vb_f, "delta": d}
+        if d > DUAL_RUN_TOLERANCE:
+            disagreements.append(cat)
+
+    max_delta = max((v["delta"] for v in deltas.values()), default=0.0)
+
+    return {
+        "status": "compared",
+        "tolerance": DUAL_RUN_TOLERANCE,
+        "deltas": deltas,
+        "disagreements": disagreements,
+        "max_delta": max_delta,
+        "grade_a": a.get("grade"),
+        "grade_b": b.get("grade"),
+        "grade_match": a.get("grade") == b.get("grade"),
+        "review_required": bool(disagreements) or a.get("grade") != b.get("grade"),
+    }
+
+
 @app.post("/api/ai-grade")
 @safe_endpoint
 async def ai_grade(request: AIGradeRequest):
@@ -13784,36 +13860,76 @@ async def ai_grade(request: AIGradeRequest):
             content.append({"type": "text", "text": "Grade this card to CLA standards. Return ONLY the JSON object — no markdown, no explanation. Ensure all fields including manufacturing.risk_indicators are populated."})
 
             client = _anthropic_sdk.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-            response = await client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=5000,  # Bumped from 3000 — full CLA JSON with all notes + risk indicators needs headroom
-                temperature=0.0,  # Forensic grading must be as consistent as possible run-to-run on
-                                  # identical images — this was previously unset (API default 1.0,
-                                  # max randomness), which is very likely why the same submission was
-                                  # observed swinging between Grade 10 and Grade 8 across repeated runs.
-                system=system_prompt,
-                messages=[{"role": "user", "content": content}],
-            )
 
-            # Detect truncation before attempting JSON parse
-            if getattr(response, "stop_reason", None) == "max_tokens":
-                raise ValueError(
-                    "Anthropic response truncated — hit max_tokens limit before JSON completed. "
-                    "Increase max_tokens further if this recurs."
+            async def _grade_once(temp: float) -> Dict[str, Any]:
+                """One full grading pass. Temperature is the only thing that varies."""
+                response = await client.messages.create(
+                    model="claude-sonnet-4-6",
+                    max_tokens=5000,  # full CLA JSON with all notes + risk indicators needs headroom
+                    temperature=temp,  # 0.0 for the graded run: forensic grading must be as consistent
+                                       # as possible run-to-run on identical images. This was previously
+                                       # unset (API default 1.0, max randomness), which is very likely
+                                       # why the same submission was observed swinging between Grade 10
+                                       # and Grade 8 across repeated runs.
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": content}],
                 )
 
-            raw_text = ""
-            for _block in response.content:
-                if getattr(_block, "type", None) == "text" and (_block.text or "").strip():
-                    raw_text = _block.text.strip()
-                    break
-            if not raw_text:
-                raise ValueError(
-                    f"Empty Anthropic response (stop_reason={getattr(response, 'stop_reason', '?')}, "
-                    f"blocks={[getattr(b, 'type', '?') for b in response.content]})"
+                # Detect truncation before attempting JSON parse
+                if getattr(response, "stop_reason", None) == "max_tokens":
+                    raise ValueError(
+                        "Anthropic response truncated — hit max_tokens limit before JSON completed. "
+                        "Increase max_tokens further if this recurs."
+                    )
+
+                text = ""
+                for _block in response.content:
+                    if getattr(_block, "type", None) == "text" and (_block.text or "").strip():
+                        text = _block.text.strip()
+                        break
+                if not text:
+                    raise ValueError(
+                        f"Empty Anthropic response (stop_reason={getattr(response, 'stop_reason', '?')}, "
+                        f"blocks={[getattr(b, 'type', '?') for b in response.content]})"
+                    )
+                text = text.replace("```json", "").replace("```", "").strip()
+                return json.loads(text)
+
+            dual_report = None
+
+            if request.dual_run:
+                # Concurrent, so the second opinion costs tokens but almost no wall time.
+                # Run B is deliberately at a higher temperature: two runs at matched
+                # temperature agree trivially and tell you nothing about whether the
+                # assessment is actually stable.
+                results = await asyncio.gather(
+                    _grade_once(0.0),
+                    _grade_once(0.4),
+                    return_exceptions=True,
                 )
-            raw_text = raw_text.replace("```json", "").replace("```", "").strip()
-            grade = json.loads(raw_text)
+                run_a, run_b = results[0], results[1]
+
+                if isinstance(run_a, Exception):
+                    raise run_a
+                grade = run_a
+
+                if isinstance(run_b, Exception):
+                    dual_report = {
+                        "status": "challenger_failed",
+                        "detail": str(run_b),
+                        "review_required": False,
+                    }
+                    logging.warning(f"⚠ AI Grade dual-run: challenger failed — {run_b}")
+                else:
+                    dual_report = _ai_grade_compare_runs(run_a, run_b)
+                    if dual_report.get("review_required"):
+                        logging.warning(
+                            f"⚠ AI Grade dual-run DISAGREEMENT — {dual_report.get('disagreements')}"
+                        )
+                    else:
+                        logging.info("✅ AI Grade dual-run: both passes agree within tolerance")
+            else:
+                grade = await _grade_once(0.0)
 
             # ── Field presence check — log warnings for any missing top-level blocks ──
             _required_blocks = ["grade", "score_100", "subgrades", "findings", "raw_card", "content", "manufacturing", "certification", "internal_notes"]
@@ -13828,7 +13944,12 @@ async def ai_grade(request: AIGradeRequest):
                 logging.info(f"✅ AI Grade risk_indicators present: {list(_risk.keys())}")
 
             logging.info(f"✅ AI Grade [Anthropic] complete — {grade.get('grade')} / {grade.get('score_100')}")
-            return JSONResponse(content={"success": True, "grade": grade, "provider": "anthropic"})
+            return JSONResponse(content={
+                "success": True,
+                "grade": grade,
+                "provider": "anthropic",
+                "dual_run_report": dual_report,   # null unless dual_run was requested
+            })
 
         except json.JSONDecodeError as e:
             msg = f"Anthropic response JSON parse failed: {e}"
