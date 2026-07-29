@@ -13798,6 +13798,24 @@ async def ai_grade(request: AIGradeRequest):
             # Anthropic hard limit: 5 MB per image (raw decoded bytes)
             ANTHROPIC_MAX_BYTES = 5 * 1024 * 1024  # 5,242,880 bytes
 
+            # Anthropic applies a SECOND, stricter limit once a request carries more
+            # than 20 images: no image may exceed 2000px on ANY dimension. Violating
+            # it 400s the whole request, not just the offending image. The corner
+            # crops are all well under 1000px, but the full-card images (3000px) and
+            # the paired border composites are not — so when the batch crosses the
+            # threshold the ceiling has to be applied to every image in it.
+            ANTHROPIC_MANY_IMAGE_COUNT = 20
+            ANTHROPIC_MANY_IMAGE_EDGE  = 1900   # 2000 is the limit; leave headroom
+            _many_images = len(request.images) > ANTHROPIC_MANY_IMAGE_COUNT
+            _max_edge    = ANTHROPIC_MANY_IMAGE_EDGE if _many_images else 3000
+            if _many_images:
+                logging.info(
+                    f"ai_grade [Anthropic]: {len(request.images)} images exceeds the "
+                    f"{ANTHROPIC_MANY_IMAGE_COUNT}-image threshold — capping every image at "
+                    f"{ANTHROPIC_MANY_IMAGE_EDGE}px on the long edge to satisfy the 2000px "
+                    f"many-image limit"
+                )
+
             if not PIL_AVAILABLE:
                 raise ValueError(
                     "Pillow (PIL) is not installed on this Render instance. "
@@ -13812,23 +13830,23 @@ async def ai_grade(request: AIGradeRequest):
                     raw_bytes = base64.b64decode(img.b64)
                     raw_size  = len(raw_bytes)
 
-                    # Always resize to 3000px on the long edge first.
-                    # This preserves corner micro-blunting and edge detail for grading
-                    # while reliably reducing file size for typical 600–1200 DPI scans.
-                    # Unlike a quality-only pass, resizing always produces a smaller output.
-                    compressed_bytes = _compress_image(raw_bytes, max_long=3000, quality=90)
+                    # Resize to the ceiling for this batch first. This preserves corner
+                    # micro-blunting and edge detail for grading while reliably reducing
+                    # file size for typical 600–1200 DPI scans. Unlike a quality-only
+                    # pass, resizing always produces a smaller output.
+                    compressed_bytes = _compress_image(raw_bytes, max_long=_max_edge, quality=90)
 
-                    # Progressive fallback — each step drops ~30–40% more size
-                    if len(compressed_bytes) > ANTHROPIC_MAX_BYTES:
-                        compressed_bytes = _compress_image(raw_bytes, max_long=2400, quality=87)
-                    if len(compressed_bytes) > ANTHROPIC_MAX_BYTES:
-                        compressed_bytes = _compress_image(raw_bytes, max_long=1800, quality=85)
-                    if len(compressed_bytes) > ANTHROPIC_MAX_BYTES:
-                        compressed_bytes = _compress_image(raw_bytes, max_long=1400, quality=82)
-                    if len(compressed_bytes) > ANTHROPIC_MAX_BYTES:
-                        compressed_bytes = _compress_image(raw_bytes, max_long=1200, quality=80)
-                    if len(compressed_bytes) > ANTHROPIC_MAX_BYTES:
-                        compressed_bytes = _compress_image(raw_bytes, max_long=900, quality=75)
+                    # Progressive fallback — each step drops ~30–40% more size. Every
+                    # step is clamped to _max_edge so a large image can never climb back
+                    # over the many-image dimension limit.
+                    for _step_edge, _step_q in (
+                        (2400, 87), (1800, 85), (1400, 82), (1200, 80), (900, 75)
+                    ):
+                        if len(compressed_bytes) <= ANTHROPIC_MAX_BYTES:
+                            break
+                        compressed_bytes = _compress_image(
+                            raw_bytes, max_long=min(_step_edge, _max_edge), quality=_step_q
+                        )
 
                     if len(compressed_bytes) > ANTHROPIC_MAX_BYTES:
                         raise ValueError(
@@ -13844,9 +13862,24 @@ async def ai_grade(request: AIGradeRequest):
                         f"raw={raw_size:,}B → sent={len(compressed_bytes):,}B ✅"
                     )
                 except Exception as _ce:
-                    logging.warning(f"ai_grade Anthropic image prep failed ({_ce}), using original")
-                    final_b64 = img.b64
-                    final_mt  = img.media_type
+                    # Passing the original through here is what turns one bad image into
+                    # a failed request: an un-resized original will breach the 2000px
+                    # many-image limit and 400 the entire call. Try one hard resize, and
+                    # if even that fails, drop this image rather than lose the grading.
+                    logging.warning(f"ai_grade Anthropic image prep failed ({_ce}) — attempting hard resize")
+                    try:
+                        _salvaged = _compress_image(
+                            base64.b64decode(img.b64), max_long=min(1200, _max_edge), quality=80
+                        )
+                        final_b64 = base64.b64encode(_salvaged).decode()
+                        final_mt  = "image/jpeg"
+                        logging.info(f"ai_grade [Anthropic] image ({img.face}): salvaged at reduced size")
+                    except Exception as _ce2:
+                        logging.error(
+                            f"ai_grade [Anthropic] image ({img.face}) SKIPPED — could not be prepared "
+                            f"at any size ({_ce2}). Grading continues without it."
+                        )
+                        continue
 
                 content.append({
                     "type":   "image",
@@ -13969,6 +14002,41 @@ async def ai_grade(request: AIGradeRequest):
         try:
             logging.info(f"🔄 AI Grade [OpenAI fallback]: {len(request.images)} image(s)")
 
+            # Defined locally: the identically-named constant in the Anthropic branch
+            # above lives inside that branch's try block, so referencing it here
+            # raised NameError whenever Anthropic was skipped outright rather than
+            # attempted and failed.
+            OPENAI_MAX_BYTES = 5 * 1024 * 1024
+
+            # GPT-4o charges per 512px tile, so token cost scales with image AREA.
+            # A large batch has to be sized down aggressively or the request breaches
+            # the account's tokens-per-minute ceiling before it is ever evaluated.
+            _n_img = len(request.images)
+            if   _n_img > 20: _oai_edge = 1000
+            elif _n_img > 12: _oai_edge = 1400
+            elif _n_img > 6:  _oai_edge = 2000
+            else:             _oai_edge = 3000
+
+            # Pre-flight estimate so a TPM rejection is diagnosable from the log
+            # rather than appearing as an opaque provider error.
+            _tiles_per_img = math.ceil(_oai_edge * 0.71 / 512) * math.ceil(_oai_edge / 512)
+            _est_img_tokens = _n_img * (_tiles_per_img * 170 + 85)
+            _est_prompt_tokens = len(system_prompt) // 4
+            _est_total = _est_img_tokens + _est_prompt_tokens + 5000
+            logging.info(
+                f"ai_grade [OpenAI] pre-flight: {_n_img} images at {_oai_edge}px "
+                f"≈ {_est_img_tokens:,} image tokens + {_est_prompt_tokens:,} prompt tokens "
+                f"≈ {_est_total:,} total"
+            )
+            if _est_total > 30000:
+                logging.warning(
+                    f"⚠ ai_grade [OpenAI] estimated {_est_total:,} tokens. If this account's "
+                    f"tokens-per-minute limit is below that, the fallback WILL be rejected "
+                    f"regardless of image sizing — the system prompt alone is "
+                    f"~{_est_prompt_tokens:,} tokens. Raise the OpenAI TPM limit to use the "
+                    f"fallback with batches this size."
+                )
+
             # Build OpenAI-format content — image_url with base64 data URI
             oai_content = []
             for img in request.images:
@@ -13977,18 +14045,17 @@ async def ai_grade(request: AIGradeRequest):
                     raw_bytes = base64.b64decode(img.b64)
                     # Same limit as Anthropic — 5 MB per image.
                     raw_size = len(raw_bytes)
-                    # Same always-resize-first approach as Anthropic path
-                    compressed_bytes = _compress_image(raw_bytes, max_long=3000, quality=90)
-                    if len(compressed_bytes) > ANTHROPIC_MAX_BYTES:
-                        compressed_bytes = _compress_image(raw_bytes, max_long=2400, quality=87)
-                    if len(compressed_bytes) > ANTHROPIC_MAX_BYTES:
-                        compressed_bytes = _compress_image(raw_bytes, max_long=1800, quality=85)
-                    if len(compressed_bytes) > ANTHROPIC_MAX_BYTES:
-                        compressed_bytes = _compress_image(raw_bytes, max_long=1400, quality=82)
-                    if len(compressed_bytes) > ANTHROPIC_MAX_BYTES:
-                        compressed_bytes = _compress_image(raw_bytes, max_long=1200, quality=80)
-                    if len(compressed_bytes) > ANTHROPIC_MAX_BYTES:
-                        compressed_bytes = _compress_image(raw_bytes, max_long=900, quality=75)
+                    # Same always-resize-first approach as the Anthropic path, but
+                    # against the batch-size-aware ceiling computed above.
+                    compressed_bytes = _compress_image(raw_bytes, max_long=_oai_edge, quality=90)
+                    for _step_edge, _step_q in (
+                        (2400, 87), (1800, 85), (1400, 82), (1200, 80), (900, 75)
+                    ):
+                        if len(compressed_bytes) <= OPENAI_MAX_BYTES:
+                            break
+                        compressed_bytes = _compress_image(
+                            raw_bytes, max_long=min(_step_edge, _oai_edge), quality=_step_q
+                        )
                     final_b64 = base64.b64encode(compressed_bytes).decode()
                     final_mt  = "image/jpeg"
                     logging.info(
