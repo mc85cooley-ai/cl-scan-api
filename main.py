@@ -13925,12 +13925,26 @@ async def ai_grade(request: AIGradeRequest):
             # crops are all well under 1000px, but the full-card images (3000px) and
             # the paired border composites are not — so when the batch crosses the
             # threshold the ceiling has to be applied to every image in it.
-            # Every image is fitted to the vision encoder's own limits below, which
-            # lands well under 1568px on the long edge — comfortably inside the 2000px
-            # many-image ceiling too, so that ceiling can no longer be breached and the
-            # image count is free to exceed 20 without any forced quality reduction.
+            # NOTE — this comment previously claimed every image was fitted below
+            # 1568px so the ceiling "can no longer be breached". That was untrue: the
+            # SIZING POLICY block further down deliberately PASSES THROUGH any image
+            # at or under PRERESIZE_EDGE_THRESHOLD (2400px) to avoid a second lossy
+            # generation. Anything between 2001px and 2400px therefore reached the API
+            # at full size, and once the batch crossed 20 images Anthropic 400'd the
+            # entire request. _many_images was computed here and then never read.
+            #
+            # The passthrough is still the right default — it protects surface detail —
+            # but it must yield to the hard API limit. The threshold below is lowered
+            # to the ceiling whenever the batch is in many-image territory.
+            MANY_IMAGE_EDGE_CAP = 2000   # Anthropic hard limit at >20 images per request
             _many_images = len(request.images) > 20
-            _max_edge    = CLAUDE_LONG_EDGE_LIMIT
+            _max_edge    = min(CLAUDE_LONG_EDGE_LIMIT, MANY_IMAGE_EDGE_CAP) if _many_images else CLAUDE_LONG_EDGE_LIMIT
+
+            if _many_images:
+                logging.info(
+                    f"ai_grade [Anthropic] {len(request.images)} images (>20) — "
+                    f"per-image dimensions capped at {MANY_IMAGE_EDGE_CAP}px"
+                )
 
             if not PIL_AVAILABLE:
                 raise ValueError(
@@ -13972,7 +13986,11 @@ async def ai_grade(request: AIGradeRequest):
                     # So: only pre-resize genuinely oversized uploads, where the payload
                     # and latency saving is large enough to be worth one generation.
                     # Normal scans pass through untouched and the API resamples once.
-                    PRERESIZE_EDGE_THRESHOLD  = 2400              # px on the long edge
+                    # In many-image batches the passthrough window closes at the API
+                    # ceiling instead of 2400px. Images already under 2000px are still
+                    # passed through untouched, so the common case keeps its single
+                    # resample; only the genuinely oversized ones pay a generation.
+                    PRERESIZE_EDGE_THRESHOLD  = MANY_IMAGE_EDGE_CAP if _many_images else 2400
                     PRERESIZE_BYTES_THRESHOLD = 3 * 1024 * 1024   # or over 3 MB
 
                     _fit_long   = None
@@ -13983,7 +14001,7 @@ async def ai_grade(request: AIGradeRequest):
                                 _pw, _ph = _probe.size
                             if max(_pw, _ph) > PRERESIZE_EDGE_THRESHOLD or raw_size > PRERESIZE_BYTES_THRESHOLD:
                                 _tw, _th, _ = _claude_vision_fit(_pw, _ph)
-                                _fit_long = max(_tw, _th)
+                                _fit_long = min(max(_tw, _th), _max_edge)
                                 _passthru = False
                                 logging.info(
                                     f"ai_grade [Anthropic] {img.face}: {_pw}x{_ph} oversized "
