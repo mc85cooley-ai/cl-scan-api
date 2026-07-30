@@ -11363,9 +11363,15 @@ async def defect_scan(
     front: UploadFile = File(...),
     back:  Optional[UploadFile] = File(None),
     extra: Optional[UploadFile] = File(None),   # close-up / detail shot
-    scan_mode:  str  = Form("quick"),            # "quick" | "full"
+    scan_mode:  str  = Form("quick"),            # "capture" | "quick" | "full"
     card_name:  Optional[str] = Form(None),
     card_set:   Optional[str] = Form(None),
+    # cg-defect-scanner.php has always posted this on full scans, and this
+    # endpoint has always thrown it away — the parameter simply did not exist,
+    # and FastAPI drops unmatched form fields silently. The grading-philosophy
+    # prompt the PHP side builds is several KB, uploaded on every full scan and
+    # never read. It is now accepted and applied to the synthesis call.
+    system_prompt: Optional[str] = Form(None),
     # Optional client-provided hashes (for chain-of-custody UI / cross-check)
     front_sha256: Optional[str] = Form(None),
     back_sha256:  Optional[str] = Form(None),
@@ -11374,8 +11380,13 @@ async def defect_scan(
     """
     Dedicated defect scanner — the only job is finding and reporting defects.
 
-    quick mode:  CV-only, no AI.  ~2-4 s.
-    full  mode:  CV + AI ROI labelling + natural-language synthesis.  ~15-20 s.
+    capture mode: image capture only — centering, filter variants, autocrop and
+                  chain-of-custody hashes. NO defect detection of any kind.
+                  This is what the Card Forensics grading panel uses: defect
+                  determination belongs to the AI grader, and running the CV
+                  detector alongside it produced a second, disagreeing verdict.
+    quick mode:   capture + CV hotspot detection, no AI.  ~2-4 s.
+    full  mode:   quick + AI ROI labelling + natural-language synthesis.  ~15-20 s.
     """
     t0 = time.time()  # `time` imported at module level
 
@@ -11408,8 +11419,11 @@ async def defect_scan(
         raise HTTPException(status_code=400, detail="Front image required")
 
     scan_mode = (scan_mode or "quick").strip().lower()
-    if scan_mode not in ("quick", "full"):
+    if scan_mode not in ("capture", "quick", "full"):
         scan_mode = "quick"
+
+    # Capture mode does no defect determination at all.
+    detect_defects = scan_mode in ("quick", "full")
 
     # ── 1b. Autocrop — detect card border and crop to 1% inside it ───────────
     # The cropped bytes are used for ALL downstream analysis (filter variants,
@@ -11538,17 +11552,23 @@ async def defect_scan(
             pass
         return zones
 
-    cv_defects = {
-        "front": _cv_zones_for_image(front_bytes, "front"),
-        "back":  _cv_zones_for_image(back_bytes,  "back")  if back_bytes  else [],
-        "extra": _cv_zones_for_image(extra_bytes, "extra") if extra_bytes else [],
-    }
+    # Skipped entirely in capture mode — this is the detector whose output used
+    # to reach the certificate as "CONFIRMED DEFECTS".
+    if detect_defects:
+        cv_defects = {
+            "front": _cv_zones_for_image(front_bytes, "front"),
+            "back":  _cv_zones_for_image(back_bytes,  "back")  if back_bytes  else [],
+            "extra": _cv_zones_for_image(extra_bytes, "extra") if extra_bytes else [],
+        }
+    else:
+        cv_defects = {"front": [], "back": [], "extra": []}
 
     # 2d. Hotspot thumbnail crops (evidence strips)
     hotspot_crops: List[Dict] = []
-    for side_key, img_bytes in [("front", front_bytes), ("back", back_bytes), ("extra", extra_bytes)]:
-        if img_bytes:
-            hotspot_crops.extend(_make_basic_hotspot_snaps(img_bytes, side_key, max_snaps=6))
+    if detect_defects:
+        for side_key, img_bytes in [("front", front_bytes), ("back", back_bytes), ("extra", extra_bytes)]:
+            if img_bytes:
+                hotspot_crops.extend(_make_basic_hotspot_snaps(img_bytes, side_key, max_snaps=6))
 
     # 2e. Severity breakdown
     all_zones = cv_defects["front"] + cv_defects["back"] + cv_defects["extra"]
@@ -11638,8 +11658,13 @@ async def defect_scan(
         # Use _openai_text (no response_format) — this prompt asks for plain text,
         # not JSON. Using _openai_chat here caused OpenAI 400 errors on every request
         # because response_format=json_object requires "json" in the prompt.
+        synth_msgs: List[Dict[str, Any]] = []
+        if system_prompt and system_prompt.strip():
+            synth_msgs.append({"role": "system", "content": system_prompt.strip()})
+        synth_msgs.append({"role": "user", "content": synth_prompt})
+
         synth_res = await _openai_text(
-            [{"role": "user", "content": synth_prompt}],
+            synth_msgs,
             max_tokens=300,
             temperature=0.2,
         )
@@ -11762,7 +11787,12 @@ async def defect_scan(
     # any future clients using the raw schema still work.
 
     # 5a. overall_severity — compute for quick mode too (was always "clean")
-    if scan_mode == "quick":
+    if not detect_defects:
+        # No detector ran, so there is no verdict to report. "clean" would be a
+        # positive claim this endpoint is no longer entitled to make.
+        overall_severity = ""
+        response["overall_severity"] = ""
+    elif scan_mode == "quick":
         if severity_breakdown["severe"] > 0:
             overall_severity = "severe"
         elif severity_breakdown["moderate"] > 0:
