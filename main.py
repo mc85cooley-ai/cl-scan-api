@@ -2784,6 +2784,23 @@ def _autocrop_card(img_bytes: bytes, inset_pct: float = 0.0, pad_pct: float = 0.
         if (cw / max(work_w, 1) < 0.60) or (ch / max(work_h, 1) < 0.60):
             return img_bytes, {"detected": False, "original_size": [orig_w, orig_h]}
 
+        # ── 5c. Aspect-ratio plausibility ────────────────────────────────────
+        # A standard trading card is 63x88mm — 0.716 w/h. The size guard above
+        # only rejects a crop that loses more than 40% of a dimension, so a
+        # detection that clipped ~14% off one side passed as valid, and the loss
+        # surfaced downstream as filter overlays with the card cut off on the
+        # right. A detected region that is not card-shaped is a failed detection,
+        # and the uncropped image is always the safer output.
+        CARD_ASPECT_MIN, CARD_ASPECT_MAX = 0.62, 0.82
+        _aspect = cw / max(ch, 1)
+        if not (CARD_ASPECT_MIN <= _aspect <= CARD_ASPECT_MAX):
+            logging.info(
+                f"autocrop: rejected — detected region {cw}x{ch} has aspect "
+                f"{_aspect:.3f}, outside the {CARD_ASPECT_MIN}-{CARD_ASPECT_MAX} "
+                f"range for a trading card. Falling back to the uncropped image."
+            )
+            return img_bytes, {"detected": False, "original_size": [orig_w, orig_h]}
+
         # ── 6. Inset + outward pad + absolute safety minimum ──────────────────
         inset_pct = max(0.0, float(inset_pct or 0.0))
         pad_pct   = max(0.0, float(pad_pct or 0.0))
