@@ -2136,7 +2136,7 @@ def _b64(img: bytes) -> str:
     return base64.b64encode(img).decode("utf-8")
 
 
-def _compute_hires_dhash(raw_bytes: bytes, min_width: int = 2000) -> str:
+def _compute_hires_dhash(raw_bytes: bytes, min_width: int = 1400) -> str:
     """
     Compute a 4096-bit (1024 hex char) high-resolution difference hash.
 
@@ -2144,8 +2144,15 @@ def _compute_hires_dhash(raw_bytes: bytes, min_width: int = 2000) -> str:
       - Resize to 65×64 grayscale → 64 columns × 64 rows of left-right comparisons
       - 4096 bits packed as 1024 lowercase hex chars
 
-    At 1200 DPI a standard 2.5" trading card is ~3000 px wide; at 65×64 the
+    At 600 DPI a standard 2.5" trading card is ~1500 px wide; at 65×64 the
     hash captures halftone dot gradient structure across the full card surface.
+
+    THRESHOLD HISTORY: min_width defaulted to 2000, written for a 1200 DPI
+    pipeline. Production scans are 600 DPI — a measured submission came in at
+    1536x2122, i.e. 614 DPI — so every one of them fell under the floor and this
+    function returned '' silently, taking the hires component of the fingerprint
+    with it. 1400 admits a 600 DPI card while still excluding phone snaps and
+    thumbnails, which is what the floor is actually for.
 
     Two scans of the SAME physical card:  Hamming distance 0–30
     Two DIFFERENT physical copies:         Hamming distance 80–300+
@@ -2153,10 +2160,10 @@ def _compute_hires_dhash(raw_bytes: bytes, min_width: int = 2000) -> str:
     Returns '' if image width < min_width (not a hires scan) or on any error.
     This function MUST receive the original, uncompressed image bytes.
     Do NOT pass the output of _compress_image() — it is capped at 1200 px,
-    below the hires threshold, and the discrimination would be lost.
+    below the hires threshold even now, and the discrimination would be lost.
 
     @param raw_bytes   Raw bytes of the uploaded image (before any compression).
-    @param min_width   Minimum image width to qualify as hires (default 2000 px).
+    @param min_width   Minimum image width to qualify as hires (default 1400 px).
     """
     if not raw_bytes or not PIL_AVAILABLE:
         return ""
@@ -2740,6 +2747,33 @@ def _autocrop_card(img_bytes: bytes, inset_pct: float = 0.0, pad_pct: float = 0.
         # Lower minimum threshold (18 instead of 22) — catches faint card edges
         thr_val = max(18.0, bg_std * 2.5)
         card_mask = diff > thr_val
+
+        # ── 3b. Is there actually a background to crop away? ──────────────────
+        # The whole method assumes the card sits on a distinguishable bed, and
+        # samples a 6% border strip to learn that bed's colour. On an image that
+        # is ALREADY cropped to the card, that strip is the card's own border —
+        # so the "background" it learns is the card. Measured on a real
+        # submission: a tightly-cropped Shining Charizard yielded a background of
+        # RGB(245,229,34), the yellow border. Everything not-yellow then reads as
+        # "card", and the fine edge pass walks inward from the right until 12% of
+        # a column is non-yellow, cutting 135px — 19% of the width — off the
+        # right-hand side. The left survived only because the black EDITION-1
+        # stamp sits close to that edge.
+        #
+        # Two independent signals that no background exists:
+        #   * the border strip is not uniform (a real bed has low variance)
+        #   * the frame is already card-shaped (63x88mm = 0.716 w/h)
+        # Either one means the safest crop is no crop.
+        BED_STD_MAX = 40.0          # uniform bed measures well under this
+        frame_aspect = work_w / max(work_h, 1)
+        if bg_std > BED_STD_MAX or (0.66 <= frame_aspect <= 0.78):
+            logging.info(
+                f"autocrop: skipped — no background detected "
+                f"(border strip std {bg_std:.1f}, frame aspect {frame_aspect:.3f}). "
+                f"Image appears already cropped to the card."
+            )
+            return img_bytes, {"detected": False, "original_size": [orig_w, orig_h],
+                               "skipped_reason": "no_background"}
 
         ys, xs = np.where(card_mask)
         if len(xs) < 200:
