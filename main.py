@@ -2136,7 +2136,7 @@ def _b64(img: bytes) -> str:
     return base64.b64encode(img).decode("utf-8")
 
 
-def _compute_hires_dhash(raw_bytes: bytes, min_width: int = 1400) -> str:
+def _compute_hires_dhash(raw_bytes: bytes, min_width: int = 2000) -> str:
     """
     Compute a 4096-bit (1024 hex char) high-resolution difference hash.
 
@@ -2144,15 +2144,8 @@ def _compute_hires_dhash(raw_bytes: bytes, min_width: int = 1400) -> str:
       - Resize to 65×64 grayscale → 64 columns × 64 rows of left-right comparisons
       - 4096 bits packed as 1024 lowercase hex chars
 
-    At 600 DPI a standard 2.5" trading card is ~1500 px wide; at 65×64 the
+    At 1200 DPI a standard 2.5" trading card is ~3000 px wide; at 65×64 the
     hash captures halftone dot gradient structure across the full card surface.
-
-    THRESHOLD HISTORY: min_width defaulted to 2000, written for a 1200 DPI
-    pipeline. Production scans are 600 DPI — a measured submission came in at
-    1536x2122, i.e. 614 DPI — so every one of them fell under the floor and this
-    function returned '' silently, taking the hires component of the fingerprint
-    with it. 1400 admits a 600 DPI card while still excluding phone snaps and
-    thumbnails, which is what the floor is actually for.
 
     Two scans of the SAME physical card:  Hamming distance 0–30
     Two DIFFERENT physical copies:         Hamming distance 80–300+
@@ -2160,10 +2153,10 @@ def _compute_hires_dhash(raw_bytes: bytes, min_width: int = 1400) -> str:
     Returns '' if image width < min_width (not a hires scan) or on any error.
     This function MUST receive the original, uncompressed image bytes.
     Do NOT pass the output of _compress_image() — it is capped at 1200 px,
-    below the hires threshold even now, and the discrimination would be lost.
+    below the hires threshold, and the discrimination would be lost.
 
     @param raw_bytes   Raw bytes of the uploaded image (before any compression).
-    @param min_width   Minimum image width to qualify as hires (default 1400 px).
+    @param min_width   Minimum image width to qualify as hires (default 2000 px).
     """
     if not raw_bytes or not PIL_AVAILABLE:
         return ""
@@ -2748,33 +2741,6 @@ def _autocrop_card(img_bytes: bytes, inset_pct: float = 0.0, pad_pct: float = 0.
         thr_val = max(18.0, bg_std * 2.5)
         card_mask = diff > thr_val
 
-        # ── 3b. Is there actually a background to crop away? ──────────────────
-        # The whole method assumes the card sits on a distinguishable bed, and
-        # samples a 6% border strip to learn that bed's colour. On an image that
-        # is ALREADY cropped to the card, that strip is the card's own border —
-        # so the "background" it learns is the card. Measured on a real
-        # submission: a tightly-cropped Shining Charizard yielded a background of
-        # RGB(245,229,34), the yellow border. Everything not-yellow then reads as
-        # "card", and the fine edge pass walks inward from the right until 12% of
-        # a column is non-yellow, cutting 135px — 19% of the width — off the
-        # right-hand side. The left survived only because the black EDITION-1
-        # stamp sits close to that edge.
-        #
-        # Two independent signals that no background exists:
-        #   * the border strip is not uniform (a real bed has low variance)
-        #   * the frame is already card-shaped (63x88mm = 0.716 w/h)
-        # Either one means the safest crop is no crop.
-        BED_STD_MAX = 40.0          # uniform bed measures well under this
-        frame_aspect = work_w / max(work_h, 1)
-        if bg_std > BED_STD_MAX or (0.66 <= frame_aspect <= 0.78):
-            logging.info(
-                f"autocrop: skipped — no background detected "
-                f"(border strip std {bg_std:.1f}, frame aspect {frame_aspect:.3f}). "
-                f"Image appears already cropped to the card."
-            )
-            return img_bytes, {"detected": False, "original_size": [orig_w, orig_h],
-                               "skipped_reason": "no_background"}
-
         ys, xs = np.where(card_mask)
         if len(xs) < 200:
             return img_bytes, {"detected": False, "original_size": [orig_w, orig_h]}
@@ -2816,23 +2782,6 @@ def _autocrop_card(img_bytes: bytes, inset_pct: float = 0.0, pad_pct: float = 0.
 
         # ── 5b. Sanity guard — relaxed to 60% (was 78%) ───────────────────────
         if (cw / max(work_w, 1) < 0.60) or (ch / max(work_h, 1) < 0.60):
-            return img_bytes, {"detected": False, "original_size": [orig_w, orig_h]}
-
-        # ── 5c. Aspect-ratio plausibility ────────────────────────────────────
-        # A standard trading card is 63x88mm — 0.716 w/h. The size guard above
-        # only rejects a crop that loses more than 40% of a dimension, so a
-        # detection that clipped ~14% off one side passed as valid, and the loss
-        # surfaced downstream as filter overlays with the card cut off on the
-        # right. A detected region that is not card-shaped is a failed detection,
-        # and the uncropped image is always the safer output.
-        CARD_ASPECT_MIN, CARD_ASPECT_MAX = 0.62, 0.82
-        _aspect = cw / max(ch, 1)
-        if not (CARD_ASPECT_MIN <= _aspect <= CARD_ASPECT_MAX):
-            logging.info(
-                f"autocrop: rejected — detected region {cw}x{ch} has aspect "
-                f"{_aspect:.3f}, outside the {CARD_ASPECT_MIN}-{CARD_ASPECT_MAX} "
-                f"range for a trading card. Falling back to the uncropped image."
-            )
             return img_bytes, {"detected": False, "original_size": [orig_w, orig_h]}
 
         # ── 6. Inset + outward pad + absolute safety minimum ──────────────────
@@ -11414,15 +11363,9 @@ async def defect_scan(
     front: UploadFile = File(...),
     back:  Optional[UploadFile] = File(None),
     extra: Optional[UploadFile] = File(None),   # close-up / detail shot
-    scan_mode:  str  = Form("quick"),            # "capture" | "quick" | "full"
+    scan_mode:  str  = Form("quick"),            # "quick" | "full"
     card_name:  Optional[str] = Form(None),
     card_set:   Optional[str] = Form(None),
-    # cg-defect-scanner.php has always posted this on full scans, and this
-    # endpoint has always thrown it away — the parameter simply did not exist,
-    # and FastAPI drops unmatched form fields silently. The grading-philosophy
-    # prompt the PHP side builds is several KB, uploaded on every full scan and
-    # never read. It is now accepted and applied to the synthesis call.
-    system_prompt: Optional[str] = Form(None),
     # Optional client-provided hashes (for chain-of-custody UI / cross-check)
     front_sha256: Optional[str] = Form(None),
     back_sha256:  Optional[str] = Form(None),
@@ -11431,13 +11374,8 @@ async def defect_scan(
     """
     Dedicated defect scanner — the only job is finding and reporting defects.
 
-    capture mode: image capture only — centering, filter variants, autocrop and
-                  chain-of-custody hashes. NO defect detection of any kind.
-                  This is what the Card Forensics grading panel uses: defect
-                  determination belongs to the AI grader, and running the CV
-                  detector alongside it produced a second, disagreeing verdict.
-    quick mode:   capture + CV hotspot detection, no AI.  ~2-4 s.
-    full  mode:   quick + AI ROI labelling + natural-language synthesis.  ~15-20 s.
+    quick mode:  CV-only, no AI.  ~2-4 s.
+    full  mode:  CV + AI ROI labelling + natural-language synthesis.  ~15-20 s.
     """
     t0 = time.time()  # `time` imported at module level
 
@@ -11470,11 +11408,8 @@ async def defect_scan(
         raise HTTPException(status_code=400, detail="Front image required")
 
     scan_mode = (scan_mode or "quick").strip().lower()
-    if scan_mode not in ("capture", "quick", "full"):
+    if scan_mode not in ("quick", "full"):
         scan_mode = "quick"
-
-    # Capture mode does no defect determination at all.
-    detect_defects = scan_mode in ("quick", "full")
 
     # ── 1b. Autocrop — detect card border and crop to 1% inside it ───────────
     # The cropped bytes are used for ALL downstream analysis (filter variants,
@@ -11603,23 +11538,17 @@ async def defect_scan(
             pass
         return zones
 
-    # Skipped entirely in capture mode — this is the detector whose output used
-    # to reach the certificate as "CONFIRMED DEFECTS".
-    if detect_defects:
-        cv_defects = {
-            "front": _cv_zones_for_image(front_bytes, "front"),
-            "back":  _cv_zones_for_image(back_bytes,  "back")  if back_bytes  else [],
-            "extra": _cv_zones_for_image(extra_bytes, "extra") if extra_bytes else [],
-        }
-    else:
-        cv_defects = {"front": [], "back": [], "extra": []}
+    cv_defects = {
+        "front": _cv_zones_for_image(front_bytes, "front"),
+        "back":  _cv_zones_for_image(back_bytes,  "back")  if back_bytes  else [],
+        "extra": _cv_zones_for_image(extra_bytes, "extra") if extra_bytes else [],
+    }
 
     # 2d. Hotspot thumbnail crops (evidence strips)
     hotspot_crops: List[Dict] = []
-    if detect_defects:
-        for side_key, img_bytes in [("front", front_bytes), ("back", back_bytes), ("extra", extra_bytes)]:
-            if img_bytes:
-                hotspot_crops.extend(_make_basic_hotspot_snaps(img_bytes, side_key, max_snaps=6))
+    for side_key, img_bytes in [("front", front_bytes), ("back", back_bytes), ("extra", extra_bytes)]:
+        if img_bytes:
+            hotspot_crops.extend(_make_basic_hotspot_snaps(img_bytes, side_key, max_snaps=6))
 
     # 2e. Severity breakdown
     all_zones = cv_defects["front"] + cv_defects["back"] + cv_defects["extra"]
@@ -11709,13 +11638,8 @@ async def defect_scan(
         # Use _openai_text (no response_format) — this prompt asks for plain text,
         # not JSON. Using _openai_chat here caused OpenAI 400 errors on every request
         # because response_format=json_object requires "json" in the prompt.
-        synth_msgs: List[Dict[str, Any]] = []
-        if system_prompt and system_prompt.strip():
-            synth_msgs.append({"role": "system", "content": system_prompt.strip()})
-        synth_msgs.append({"role": "user", "content": synth_prompt})
-
         synth_res = await _openai_text(
-            synth_msgs,
+            [{"role": "user", "content": synth_prompt}],
             max_tokens=300,
             temperature=0.2,
         )
@@ -11838,12 +11762,7 @@ async def defect_scan(
     # any future clients using the raw schema still work.
 
     # 5a. overall_severity — compute for quick mode too (was always "clean")
-    if not detect_defects:
-        # No detector ran, so there is no verdict to report. "clean" would be a
-        # positive claim this endpoint is no longer entitled to make.
-        overall_severity = ""
-        response["overall_severity"] = ""
-    elif scan_mode == "quick":
+    if scan_mode == "quick":
         if severity_breakdown["severe"] > 0:
             overall_severity = "severe"
         elif severity_breakdown["moderate"] > 0:
@@ -13976,26 +13895,12 @@ async def ai_grade(request: AIGradeRequest):
             # crops are all well under 1000px, but the full-card images (3000px) and
             # the paired border composites are not — so when the batch crosses the
             # threshold the ceiling has to be applied to every image in it.
-            # NOTE — this comment previously claimed every image was fitted below
-            # 1568px so the ceiling "can no longer be breached". That was untrue: the
-            # SIZING POLICY block further down deliberately PASSES THROUGH any image
-            # at or under PRERESIZE_EDGE_THRESHOLD (2400px) to avoid a second lossy
-            # generation. Anything between 2001px and 2400px therefore reached the API
-            # at full size, and once the batch crossed 20 images Anthropic 400'd the
-            # entire request. _many_images was computed here and then never read.
-            #
-            # The passthrough is still the right default — it protects surface detail —
-            # but it must yield to the hard API limit. The threshold below is lowered
-            # to the ceiling whenever the batch is in many-image territory.
-            MANY_IMAGE_EDGE_CAP = 2000   # Anthropic hard limit at >20 images per request
+            # Every image is fitted to the vision encoder's own limits below, which
+            # lands well under 1568px on the long edge — comfortably inside the 2000px
+            # many-image ceiling too, so that ceiling can no longer be breached and the
+            # image count is free to exceed 20 without any forced quality reduction.
             _many_images = len(request.images) > 20
-            _max_edge    = min(CLAUDE_LONG_EDGE_LIMIT, MANY_IMAGE_EDGE_CAP) if _many_images else CLAUDE_LONG_EDGE_LIMIT
-
-            if _many_images:
-                logging.info(
-                    f"ai_grade [Anthropic] {len(request.images)} images (>20) — "
-                    f"per-image dimensions capped at {MANY_IMAGE_EDGE_CAP}px"
-                )
+            _max_edge    = CLAUDE_LONG_EDGE_LIMIT
 
             if not PIL_AVAILABLE:
                 raise ValueError(
@@ -14037,45 +13942,35 @@ async def ai_grade(request: AIGradeRequest):
                     # So: only pre-resize genuinely oversized uploads, where the payload
                     # and latency saving is large enough to be worth one generation.
                     # Normal scans pass through untouched and the API resamples once.
-                    # In many-image batches the passthrough window closes at the API
-                    # ceiling instead of 2400px. Images already under 2000px are still
-                    # passed through untouched, so the common case keeps its single
-                    # resample; only the genuinely oversized ones pay a generation.
-                    PRERESIZE_EDGE_THRESHOLD  = MANY_IMAGE_EDGE_CAP if _many_images else 2400
-                    PRERESIZE_BYTES_THRESHOLD = 3 * 1024 * 1024   # or over 3 MB
-
-                    _fit_long   = None
-                    _passthru   = True
+                    # Resize whenever the encoder would downscale anyway. Passing the
+                    # original through instead was tried and it timed the request out:
+                    # two untouched 600dpi card scans are ~4.7 MB of base64 on their own,
+                    # and the whole POST reached ~13 MB, which does not complete inside
+                    # the 150s window once a Render cold start is in play.
+                    #
+                    # Quality 95 rather than the original 90. The concern that motivated
+                    # the pass-through was that a second JPEG generation might damage
+                    # faint surface detail — that was a hypothesis, never measured, and
+                    # the dominant cause of the grade drop was the prompt contradiction,
+                    # which is fixed separately. q95 keeps the added generation
+                    # essentially invisible at a third of the bytes.
+                    _fit_long = CLAUDE_LONG_EDGE_LIMIT
                     if PIL_AVAILABLE:
                         try:
                             with Image.open(io.BytesIO(raw_bytes)) as _probe:
                                 _pw, _ph = _probe.size
-                            if max(_pw, _ph) > PRERESIZE_EDGE_THRESHOLD or raw_size > PRERESIZE_BYTES_THRESHOLD:
-                                _tw, _th, _ = _claude_vision_fit(_pw, _ph)
-                                _fit_long = min(max(_tw, _th), _max_edge)
-                                _passthru = False
+                            _tw, _th, _would = _claude_vision_fit(_pw, _ph)
+                            _fit_long = max(_tw, _th)
+                            if _would:
                                 logging.info(
-                                    f"ai_grade [Anthropic] {img.face}: {_pw}x{_ph} oversized "
-                                    f"({raw_size:,}B) → pre-resizing to {_tw}x{_th}"
-                                )
-                            else:
-                                logging.info(
-                                    f"ai_grade [Anthropic] {img.face}: {_pw}x{_ph} ({raw_size:,}B) "
-                                    f"sent as-is — the API resamples once from the original"
+                                    f"ai_grade [Anthropic] {img.face}: {_pw}x{_ph} → {_tw}x{_th} "
+                                    f"({_claude_visual_tokens(_tw, _th)} visual tokens) — the API "
+                                    f"downscales to this regardless"
                                 )
                         except Exception as _fe:
                             logging.warning(f"ai_grade [Anthropic] {img.face}: could not probe size ({_fe})")
-                            _passthru = False
-                            _fit_long = CLAUDE_LONG_EDGE_LIMIT
 
-                    if _passthru and raw_size <= ANTHROPIC_MAX_BYTES:
-                        compressed_bytes = raw_bytes
-                    else:
-                        # quality 95, not 90: if we must add a generation, spend bytes
-                        # rather than surface detail.
-                        compressed_bytes = _compress_image(
-                            raw_bytes, max_long=(_fit_long or CLAUDE_LONG_EDGE_LIMIT), quality=95
-                        )
+                    compressed_bytes = _compress_image(raw_bytes, max_long=_fit_long, quality=95)
 
                     # Progressive fallback — each step drops ~30–40% more size. Every
                     # step is clamped to _max_edge so a large image can never climb back
