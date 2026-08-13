@@ -8658,9 +8658,10 @@ def _ai_grade_caption_for_face(face: str) -> str:
         return (
             f"This is a zoomed, native-resolution close-up of the {which_face} face — "
             f"{corner_name} corner, including the corner tip and the adjoining edge "
-            f"segments on both sides. The full-card image is downsampled before you see "
-            f"it and can lose fine wear at this scale; treat this crop as your primary "
-            f"evidence for corner and edge condition in this specific area."
+            f"segments on both sides. Treat this crop as your primary evidence for "
+            f"corner and edge condition in this specific area, in preference to the "
+            f"whole-card view. This tells you where to look, not what to conclude: if "
+            f"this crop shows no defect, the finding is that there is no defect."
         )
     return f"This is the {face.upper()} face of the card."
 
