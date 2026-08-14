@@ -14037,7 +14037,14 @@ async def ai_grade(request: AIGradeRequest):
                 """One full grading pass. Temperature is the only thing that varies."""
                 response = await client.messages.create(
                     model="claude-sonnet-4-6",
-                    max_tokens=5000,  # full CLA JSON with all notes + risk indicators needs headroom
+                    max_tokens=6500,  # Full CLA JSON: four long notes fields, the public
+                                      # narrative set, and assessment_internal. Raised from
+                                      # 5000 after a run whose internal fields alone ran to
+                                      # ~700 words came close to the ceiling. Headroom is
+                                      # cheap here — output tokens are only billed for what
+                                      # is actually generated — whereas truncation loses the
+                                      # entire grade and the operator sees a network error
+                                      # with no explanation.
                     temperature=temp,  # 0.0 for the graded run: forensic grading must be as consistent
                                        # as possible run-to-run on identical images. This was previously
                                        # unset (API default 1.0, max randomness), which is very likely
