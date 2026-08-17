@@ -14398,6 +14398,217 @@ async def ai_grade(request: AIGradeRequest):
 # QR CODE GENERATION
 # ========================================
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# AI DETECTION — proposes candidates, never grades
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# The counterpart to /api/ai-grade, and its replacement. That endpoint asked one
+# call to measure, detect, score and write prose; when any part went wrong the
+# rest inherited it, and nothing could intervene before it reached a document.
+#
+# This endpoint returns candidate findings and nothing else. No subgrades, no
+# grade, no centering, no customer-facing text. A human confirms or rejects each
+# candidate with the card under a microscope, and the score is composed from what
+# survives. Model variance stops being dangerous: an unconfirmed candidate is
+# deleted and never existed.
+#
+# It is also much cheaper. /api/ai-grade sends two full cards, eight corner
+# context crops, eight corner macro crops and four border composites — roughly
+# 20,000 image tokens. Detection needs the two faces, because the grader does the
+# close looking with actual glass. Corner crops existed to help the model judge
+# severity, and it no longer judges severity.
+
+class AIDetectImageItem(BaseModel):
+    face: str = "front"
+    b64:  str
+
+
+class AIDetectRequest(BaseModel):
+    submission_id: Optional[str] = ""
+    system_prompt: Optional[str] = ""
+    images:        List[AIDetectImageItem]
+
+
+_DETECT_MAX_LONG = 1568          # Claude's no-resize ceiling; see _claude_vision_fit
+_DETECT_MAX_TOKENS = 2000        # a findings array, not an essay
+
+
+def _detect_parse(text: str) -> Dict[str, Any]:
+    """Tolerate a fenced or chatty reply without letting junk through."""
+    t = (text or "").strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
+        t = re.sub(r"```\s*$", "", t).strip()
+    try:
+        return json.loads(t)
+    except Exception:
+        pass
+    i, j = t.find("{"), t.rfind("}")
+    if i != -1 and j > i:
+        try:
+            return json.loads(t[i:j + 1])
+        except Exception:
+            pass
+    raise ValueError("model did not return parseable JSON")
+
+
+def _detect_sanitise(obj: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Drop anything outside the contract.
+
+    The prompt forbids subgrades, grades and centering figures, but a prompt is
+    guidance and this is a guarantee. If a scoring key ever appears it is
+    discarded here rather than travelling on to PHP, where something downstream
+    might one day decide to trust it.
+    """
+    out: Dict[str, Any] = {"findings": [], "examined": ""}
+
+    valid_cat = {"corners", "edges", "surface"}
+    for f in (obj.get("findings") or []):
+        if not isinstance(f, dict):
+            continue
+        cat = str(f.get("category", "")).strip().lower()
+        if cat not in valid_cat:
+            continue
+        out["findings"].append({
+            "category":   cat,
+            "face":       "back" if str(f.get("face", "")).strip().lower() == "back" else "front",
+            "position":   str(f.get("position", ""))[:64],
+            "type":       str(f.get("type", ""))[:64],
+            "note":       str(f.get("note", ""))[:600],
+            "confidence": str(f.get("confidence", "")).strip().lower()[:8],
+        })
+
+    out["examined"] = str(obj.get("examined", ""))[:600]
+    return out
+
+
+@app.post("/api/ai-detect")
+@safe_endpoint
+async def ai_detect(request: AIDetectRequest):
+    """
+    Candidate detection for the CLA review queue.
+
+    Called by: cg-detect.php -> wp_ajax_cg_detect_run -> here.
+    """
+    if not request.images:
+        return JSONResponse(status_code=400, content={
+            "success": False, "message": "No images provided.",
+        })
+
+    system_prompt = request.system_prompt or (
+        "Report anything on this card that might be a defect, as candidates for a "
+        "human to examine. Do not grade. Return only JSON."
+    )
+    errors: List[str] = []
+
+    # ── Anthropic ─────────────────────────────────────────────────────────────
+    if ANTHROPIC_AVAILABLE and _anthropic_sdk and ANTHROPIC_API_KEY:
+        try:
+            content: List[Dict[str, Any]] = []
+            for img in request.images:
+                raw = base64.b64decode(img.b64)
+                raw = _compress_image(raw, max_long=_DETECT_MAX_LONG, quality=85)
+                content.append({"type": "text", "text": f"{img.face.upper()} FACE"})
+                content.append({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/jpeg",
+                               "data": base64.b64encode(raw).decode()},
+                })
+
+            client = _anthropic_sdk.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+            resp = await client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=_DETECT_MAX_TOKENS,
+                temperature=0.0,
+                system=[{
+                    "type": "text",
+                    "text": system_prompt,
+                    # The prompt is identical on every call, so it caches and is
+                    # re-billed at a tenth of rate. Nothing submission-specific
+                    # may be interpolated into it or the prefix stops matching.
+                    "cache_control": {"type": "ephemeral"},
+                }],
+                messages=[{"role": "user", "content": content}],
+            )
+
+            u = getattr(resp, "usage", None)
+            if u:
+                _cw = getattr(u, "cache_creation_input_tokens", 0) or 0
+                _cr = getattr(u, "cache_read_input_tokens", 0) or 0
+                _state = "CACHE HIT" if _cr else ("cache written" if _cw else "NO CACHE")
+                logging.info(
+                    f"ai_detect [Anthropic] usage: uncached_in={getattr(u,'input_tokens',0):,} "
+                    f"cache_write={_cw:,} cache_read={_cr:,} "
+                    f"out={getattr(u,'output_tokens',0):,} — {_state}"
+                )
+
+            text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+            data = _detect_sanitise(_detect_parse(text))
+            data.update({"success": True, "provider": "anthropic"})
+            logging.info(f"✅ ai_detect: {len(data['findings'])} candidate(s) for {request.submission_id!r}")
+            return data
+
+        except Exception as e:
+            errors.append(f"Anthropic detection failed: {e}")
+            logging.warning(f"⚠ ai_detect [Anthropic] failed — {e}")
+
+    # ── OpenAI fallback ───────────────────────────────────────────────────────
+    #
+    # Safe here in a way it was not for grading. A fallback GRADE reached a
+    # certificate with subgrades of 9.6/9.6/9.8 — values the CLA scale cannot
+    # produce, because that model was not following the defect gate. A fallback
+    # CANDIDATE is only a suggestion that a human will examine, so a second
+    # model with different judgement costs nothing but a few extra dismissals.
+    if OPENAI_API_KEY:
+        try:
+            parts: List[Dict[str, Any]] = []
+            for img in request.images:
+                raw = _compress_image(base64.b64decode(img.b64), max_long=1200, quality=80)
+                parts.append({"type": "input_text", "text": f"{img.face.upper()} FACE"})
+                parts.append({
+                    "type": "input_image",
+                    "image_url": "data:image/jpeg;base64," + base64.b64encode(raw).decode(),
+                })
+
+            _oai_headers = {
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type":  "application/json",
+            }
+
+            async with httpx.AsyncClient(timeout=180.0) as http:
+                r = await http.post(
+                    "https://api.openai.com/v1/responses",
+                    headers=_oai_headers,
+                    json={
+                        "model":             OPENAI_GRADE_MODEL,
+                        "instructions":      system_prompt,
+                        "input":             [{"role": "user", "content": parts}],
+                        "max_output_tokens": _DETECT_MAX_TOKENS,
+                    },
+                )
+                data = r.json()
+
+            if isinstance(data, dict) and data.get("error"):
+                raise ValueError(data["error"].get("message", str(data["error"])))
+
+            text = _openai_responses_text(data)
+            out = _detect_sanitise(_detect_parse(text))
+            out.update({"success": True, "provider": "openai"})
+            logging.info(f"✅ ai_detect [OpenAI fallback]: {len(out['findings'])} candidate(s)")
+            return out
+
+        except Exception as e:
+            errors.append(f"OpenAI detection failed: {e}")
+            logging.error(f"❌ ai_detect [OpenAI] failed — {e}")
+
+    logging.error(f"❌ ai_detect: all providers failed — {errors}")
+    return JSONResponse(status_code=502, content={
+        "success": False,
+        "message": "Detection unavailable: " + "; ".join(errors),
+    })
+
+
 @app.post("/api/generate-qr")
 @safe_endpoint
 async def generate_submission_qr(
