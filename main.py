@@ -14609,6 +14609,106 @@ async def ai_detect(request: AIDetectRequest):
     })
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# AI DESCRIBE — what the card IS. Never what condition it is in.
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Companion to /api/ai-detect, and deliberately blind to condition. Detection
+# proposes defects for a human to adjudicate; this supplies the context a
+# findings record cannot hold — who illustrated it, how it was printed, what
+# substrate it is on, what marks it as genuine.
+#
+# The split is the point. Condition is composed from adjudicated findings and
+# measured centering, so it cannot drift. Card context has no bearing on the
+# grade, so a model writing it can add nothing worse than a dull sentence.
+
+class AIDescribeRequest(BaseModel):
+    submission_id: Optional[str] = ""
+    system_prompt: Optional[str] = ""
+    images:        List[AIDetectImageItem]
+
+
+_DESCRIBE_MAX_TOKENS = 1200
+
+# Anything that could be read as a condition judgement. The prompt forbids it,
+# but a prompt is guidance — this is the guarantee. A stray "near mint" landing
+# in the identification paragraph would sit on a certificate beside a grade
+# composed from an entirely separate process, and the two could disagree.
+_DESCRIBE_BANNED = (
+    "mint", "grade", "condition", "defect", "flaw", "damage", "wear", "scratch",
+    "crease", "whitening", "chipping", "blunt", "centered", "centred", "centering",
+    "centring", "subgrade", "gem", "pristine", "flawless", "sharp corners",
+)
+
+
+def _describe_sanitise(obj: Dict[str, Any]) -> Dict[str, Any]:
+    out = {
+        "identification": str(obj.get("identification", ""))[:900],
+        "production":     str(obj.get("production", ""))[:900],
+        "authentication": str(obj.get("authentication", ""))[:900],
+        "language":       str(obj.get("language", ""))[:40],
+        "region":         str(obj.get("region", ""))[:40],
+        "era":            str(obj.get("era", ""))[:40],
+        "print_method":   str(obj.get("print_method", ""))[:60],
+        "substrate":      str(obj.get("substrate", ""))[:60],
+        "dropped":        [],
+    }
+    for key in ("identification", "production", "authentication"):
+        low = out[key].lower()
+        hit = next((w for w in _DESCRIBE_BANNED if w in low), None)
+        if hit:
+            out["dropped"].append(f"{key} (mentioned '{hit}')")
+            out[key] = ""
+    return out
+
+
+@app.post("/api/ai-describe")
+@safe_endpoint
+async def ai_describe(request: AIDescribeRequest):
+    if not request.images:
+        return JSONResponse(status_code=400, content={"success": False, "message": "No images provided."})
+
+    system_prompt = request.system_prompt or "Describe this trading card. Return only JSON."
+    errors: List[str] = []
+
+    if ANTHROPIC_AVAILABLE and _anthropic_sdk and ANTHROPIC_API_KEY:
+        try:
+            content: List[Dict[str, Any]] = []
+            for img in request.images:
+                raw = _compress_image(base64.b64decode(img.b64), max_long=1400, quality=85)
+                content.append({"type": "text", "text": f"{img.face.upper()} FACE"})
+                content.append({"type": "image", "source": {
+                    "type": "base64", "media_type": "image/jpeg",
+                    "data": base64.b64encode(raw).decode()}})
+
+            client = _anthropic_sdk.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+            resp = await client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=_DESCRIBE_MAX_TOKENS,
+                temperature=0.0,
+                system=[{"type": "text", "text": system_prompt,
+                         "cache_control": {"type": "ephemeral"}}],
+                messages=[{"role": "user", "content": content}],
+            )
+            u = getattr(resp, "usage", None)
+            if u:
+                _cr = getattr(u, "cache_read_input_tokens", 0) or 0
+                logging.info(f"ai_describe usage: in={getattr(u,'input_tokens',0):,} "
+                             f"cache_read={_cr:,} out={getattr(u,'output_tokens',0):,}")
+
+            text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+            data = _describe_sanitise(_detect_parse(text))
+            data.update({"success": True, "provider": "anthropic"})
+            return data
+        except Exception as e:
+            errors.append(f"Anthropic describe failed: {e}")
+            logging.warning(f"⚠ ai_describe [Anthropic] failed — {e}")
+
+    logging.error(f"❌ ai_describe: failed — {errors}")
+    return JSONResponse(status_code=502, content={
+        "success": False, "message": "Description unavailable: " + "; ".join(errors)})
+
+
 @app.post("/api/generate-qr")
 @safe_endpoint
 async def generate_submission_qr(
