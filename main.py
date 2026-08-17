@@ -14430,7 +14430,9 @@ class AIDetectRequest(BaseModel):
 
 
 _DETECT_MAX_LONG = 1568          # Claude's no-resize ceiling; see _claude_vision_fit
-_DETECT_MAX_TOKENS = 2000        # a findings array, not an essay
+_DETECT_MAX_TOKENS = 5000        # 22 positions swept; a damaged card is legitimately long
+                                 # (2000 truncated the array part-way, which read as
+                                 # the model finding a consistent handful every time)
 
 
 def _detect_parse(text: str) -> Dict[str, Any]:
