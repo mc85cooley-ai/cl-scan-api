@@ -149,7 +149,7 @@ except Exception:
 
 PIL_AVAILABLE = bool(Image)
 
-# Anthropic SDK — used by /api/ai-grade for CLA official grading
+# Anthropic SDK — retained for internal vision services; autonomous grading is disabled
 try:
     import anthropic as _anthropic_sdk
     ANTHROPIC_AVAILABLE = True
@@ -648,7 +648,7 @@ OPENAI_API_KEY      = os.getenv("OPENAI_API_KEY",      "").strip()
 POKEMONTCG_API_KEY  = os.getenv("POKEMONTCG_API_KEY",  "").strip()
 PRICECHARTING_TOKEN = os.getenv("PRICECHARTING_TOKEN",  "").strip()
 ADMIN_TOKEN         = os.getenv("CL_ADMIN_TOKEN",       "").strip()  # optional
-ANTHROPIC_API_KEY   = os.getenv("ANTHROPIC_API_KEY",    "").strip()  # used by /api/ai-grade
+ANTHROPIC_API_KEY   = os.getenv("ANTHROPIC_API_KEY",    "").strip()
 
 # ═══════════════════════════════════════════════════════
 # SIMPLE API KEY AUTHENTICATION (Render env vars)
@@ -11624,14 +11624,14 @@ async def defect_scan(
             cv_summary_lines.append(f"- {z.get('label','zone')} ({z.get('side','?')}): {sev_word} anomaly detected")
 
         synth_prompt = (
-            f"You are a professional card grading analyst writing a condition summary for a collector's certificate. "
+            f"You are an internal inspection assistant writing a private note for a human card grader. "
             f"A {'named ' + card_name if card_name else 'trading'} card "
             f"{'from ' + card_set if card_set else ''} has been forensically examined. "
             f"Below are the condition findings from the examination. "
-            f"Write a clear, professional 3-5 sentence condition summary. "
+            f"Write a concise 2-4 sentence internal inspection summary of areas to check. "
             f"Focus on what was found and where. Mention the most impactful issues first. "
-            f"Do NOT reference scanning technology, computer vision, or AI systems. "
-            f"Do NOT recommend a grade. Write as a human grader describing physical condition. "
+            f"Do NOT recommend a grade, severity deduction, certificate statement, or authenticity conclusion. "
+            f"Use tentative language because these are machine-generated inspection candidates, not confirmed findings. "
             f"Examination findings:\n" + ("\n".join(cv_summary_lines) or "No anomalies detected") +
             f"\nConfirmed defects:\n" + ("\n".join(defect_lines) or "None confirmed") +
             f"\nFormat: plain text, no markdown, no bullet points."
@@ -13864,7 +13864,13 @@ def _ai_grade_compare_runs(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, An
 
 @app.post("/api/ai-grade")
 @safe_endpoint
-async def ai_grade(request: AIGradeRequest):
+async def ai_grade(request: AIGradeRequest, api_key: str = Depends(verify_api_key)):
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail="AI grading is disabled. Use /api/ai-detect for internal inspection candidates; only human-confirmed findings may grade a card.",
+    )
+
+    # Legacy implementation retained below for rollback/reference but unreachable.
     """
     CLA Official AI Grading endpoint.
 
@@ -14430,6 +14436,43 @@ class AIDetectRequest(BaseModel):
 
 
 _DETECT_MAX_LONG = 1568          # Claude's no-resize ceiling; see _claude_vision_fit
+
+_DETECTOR_VERSION = os.getenv("CLA_DETECTOR_VERSION", "candidate-v2").strip() or "candidate-v2"
+_DETECT_PROMPT_VERSION = os.getenv("CLA_DETECT_PROMPT_VERSION", "2026-09-internal-only").strip() or "2026-09-internal-only"
+_INTERNAL_IMAGE_MAX_BYTES = int(os.getenv("CLA_INTERNAL_IMAGE_MAX_BYTES", str(12 * 1024 * 1024)))
+
+def _validate_internal_ai_images(images: List[Any], max_images: int = 2) -> None:
+    """Hard limits for internal grader-assist image endpoints.
+
+    These endpoints are not upload storage. They accept only front/back card
+    images and refuse malformed/oversized base64 before model SDKs see it.
+    """
+    if not images:
+        raise HTTPException(status_code=400, detail="At least one image is required")
+    if len(images) > max_images:
+        raise HTTPException(status_code=400, detail=f"At most {max_images} images are allowed")
+    seen = set()
+    for item in images:
+        face = str(getattr(item, "face", "") or "").strip().lower()
+        if face not in {"front", "back"}:
+            raise HTTPException(status_code=400, detail="Image face must be front or back")
+        if face in seen:
+            raise HTTPException(status_code=400, detail=f"Duplicate {face} image")
+        seen.add(face)
+        payload = str(getattr(item, "b64", "") or "")
+        if not payload:
+            raise HTTPException(status_code=400, detail=f"Missing {face} image data")
+        # Base64 expands bytes by ~4/3; reject obviously oversized strings
+        # before decoding to avoid a large temporary allocation.
+        if len(payload) > ((_INTERNAL_IMAGE_MAX_BYTES * 4 // 3) + 4096):
+            raise HTTPException(status_code=413, detail=f"{face} image exceeds size limit")
+        try:
+            decoded = base64.b64decode(payload, validate=True)
+        except Exception:
+            raise HTTPException(status_code=400, detail=f"Invalid base64 for {face} image")
+        if len(decoded) > _INTERNAL_IMAGE_MAX_BYTES:
+            raise HTTPException(status_code=413, detail=f"{face} image exceeds size limit")
+
 _DETECT_MAX_TOKENS = 5000        # 22 positions swept; a damaged card is legitimately long
                                  # (2000 truncated the array part-way, which read as
                                  # the model finding a consistent handful every time)
@@ -14487,16 +14530,13 @@ def _detect_sanitise(obj: Dict[str, Any]) -> Dict[str, Any]:
 
 @app.post("/api/ai-detect")
 @safe_endpoint
-async def ai_detect(request: AIDetectRequest):
+async def ai_detect(request: AIDetectRequest, api_key: str = Depends(verify_api_key)):
     """
     Candidate detection for the CLA review queue.
 
     Called by: cg-detect.php -> wp_ajax_cg_detect_run -> here.
     """
-    if not request.images:
-        return JSONResponse(status_code=400, content={
-            "success": False, "message": "No images provided.",
-        })
+    _validate_internal_ai_images(request.images, max_images=2)
 
     system_prompt = request.system_prompt or (
         "Report anything on this card that might be a defect, as candidates for a "
@@ -14547,7 +14587,14 @@ async def ai_detect(request: AIDetectRequest):
 
             text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
             data = _detect_sanitise(_detect_parse(text))
-            data.update({"success": True, "provider": "anthropic"})
+            data.update({
+                "success": True,
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-6",
+                "detector_version": _DETECTOR_VERSION,
+                "prompt_version": _DETECT_PROMPT_VERSION,
+                "internal_only": True,
+            })
             logging.info(f"✅ ai_detect: {len(data['findings'])} candidate(s) for {request.submission_id!r}")
             return data
 
@@ -14596,7 +14643,14 @@ async def ai_detect(request: AIDetectRequest):
 
             text = _openai_responses_text(data)
             out = _detect_sanitise(_detect_parse(text))
-            out.update({"success": True, "provider": "openai"})
+            out.update({
+                "success": True,
+                "provider": "openai",
+                "model": OPENAI_GRADE_MODEL,
+                "detector_version": _DETECTOR_VERSION,
+                "prompt_version": _DETECT_PROMPT_VERSION,
+                "internal_only": True,
+            })
             logging.info(f"✅ ai_detect [OpenAI fallback]: {len(out['findings'])} candidate(s)")
             return out
 
@@ -14618,7 +14672,7 @@ async def ai_detect(request: AIDetectRequest):
 # Companion to /api/ai-detect, and deliberately blind to condition. Detection
 # proposes defects for a human to adjudicate; this supplies the context a
 # findings record cannot hold — who illustrated it, how it was printed, what
-# substrate it is on, what marks it as genuine.
+# substrate it is on, which observable production/authentication indicators are visible. Final authenticity remains a human decision.
 #
 # The split is the point. Condition is composed from adjudicated findings and
 # measured centering, so it cannot drift. Card context has no bearing on the
@@ -14666,9 +14720,8 @@ def _describe_sanitise(obj: Dict[str, Any]) -> Dict[str, Any]:
 
 @app.post("/api/ai-describe")
 @safe_endpoint
-async def ai_describe(request: AIDescribeRequest):
-    if not request.images:
-        return JSONResponse(status_code=400, content={"success": False, "message": "No images provided."})
+async def ai_describe(request: AIDescribeRequest, api_key: str = Depends(verify_api_key)):
+    _validate_internal_ai_images(request.images, max_images=2)
 
     system_prompt = request.system_prompt or "Describe this trading card. Return only JSON."
     errors: List[str] = []
@@ -14700,7 +14753,12 @@ async def ai_describe(request: AIDescribeRequest):
 
             text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
             data = _describe_sanitise(_detect_parse(text))
-            data.update({"success": True, "provider": "anthropic"})
+            data.update({
+                "success": True,
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-6",
+                "internal_only": True,
+            })
             return data
         except Exception as e:
             errors.append(f"Anthropic describe failed: {e}")
@@ -14714,11 +14772,31 @@ async def ai_describe(request: AIDescribeRequest):
 @app.post("/api/generate-qr")
 @safe_endpoint
 async def generate_submission_qr(
-    submission_id: str = Form(...),
+    submission_id: str = Form(""),
     base_url: str = Form("https://collectors-league.com"),
+    data: str = Form(""),
+    api_key: str = Depends(verify_api_key),
 ):
     """Generate a QR code (as base64) linking to the submission details."""
-    url = f"{base_url.rstrip('/')}/submission/{submission_id}"
+    from urllib.parse import urlparse
+    parsed = urlparse(base_url)
+    allowed_qr_hosts = {
+        "collectors-league.com",
+        "www.collectors-league.com",
+    }
+    if parsed.scheme != "https" or (parsed.hostname or "").lower() not in allowed_qr_hosts:
+        raise HTTPException(status_code=400, detail="Invalid QR base URL")
+    submission_id = re.sub(r"[^A-Za-z0-9._-]", "", submission_id or "")[:64]
+    if data:
+        target = data.strip()[:2048]
+        target_parsed = urlparse(target)
+        if target_parsed.scheme != "https" or (target_parsed.hostname or "").lower() not in allowed_qr_hosts:
+            raise HTTPException(status_code=400, detail="QR data must be a Collectors League HTTPS URL")
+        url = target
+    else:
+        if not submission_id:
+            raise HTTPException(status_code=400, detail="Invalid submission id")
+        url = f"{base_url.rstrip('/')}/submission/{submission_id}"
 
     try:
         import qrcode  # type: ignore
