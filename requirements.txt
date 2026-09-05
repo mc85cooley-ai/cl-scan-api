@@ -21,8 +21,18 @@ python-dotenv==1.0.1
 # Removing it saves ~60MB of cold-start memory on Render's free tier.
 # If you ever switch to the SDK, add: openai>=2.32.0
 
-# Anthropic SDK — used by /api/ai-grade and _claude_market_lookup
-anthropic>=0.25.0
+# Anthropic SDK — used by /api/ai-grade, /api/ai-detect, /api/ai-describe
+# and _claude_market_lookup.
+#
+# PINNED, NOT >=. anthropic 1.0.0 (20 Aug 2026) removed temperature, top_p and
+# top_k from every Messages method — passing them is now a TypeError, not a
+# warning. The open upper bound here is what silently pulled 1.x on a rebuild
+# and took down detect, describe and grade in one deploy while /health kept
+# returning 200.
+#
+# temperature=0.0 is load-bearing: it is the reason an identical submission
+# grades the same twice. Do not migrate to 1.x by deleting the argument.
+anthropic==0.125.0
 
 # Web Scraping
 beautifulsoup4==4.12.3
